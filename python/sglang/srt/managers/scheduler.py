@@ -22,6 +22,7 @@ import sys
 import time
 from collections import deque
 from contextlib import contextmanager, nullcontext
+from copy import deepcopy
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
@@ -238,7 +239,12 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
+from sglang.srt.server_args import (
+    PortArgs,
+    ServerArgs,
+    get_global_server_args,
+    set_global_server_args_for_scheduler,
+)
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -339,7 +345,7 @@ class Scheduler(
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.stream_interval = server_args.stream_interval
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
+            server_args.effective_speculative_algorithm
         )
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
@@ -429,6 +435,13 @@ class Scheduler(
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
 
+        hicache_draft_plan = kv_cache_builder.prepare_dspark_hicache_draft_plan(
+            target_worker=self.tp_worker,
+            draft_worker=self.draft_worker,
+            spec_algorithm=self.spec_algorithm,
+            server_args=self.server_args,
+        )
+
         # Init cache and memory pool
         result = kv_cache_builder.build_kv_cache(
             server_args=self.server_args,
@@ -450,6 +463,7 @@ class Scheduler(
             pp_group=self.pp_group,
             enable_hierarchical_cache=self.enable_hierarchical_cache,
             enable_eic_cache=self.enable_eic_cache,
+            hicache_draft_plan=hicache_draft_plan,
         )
         self.is_hybrid_swa = result.is_hybrid_swa
         self.is_hybrid_ssm = result.is_hybrid_ssm
@@ -484,16 +498,17 @@ class Scheduler(
         else:
             self.decode_offload_manager = None
 
-        # Register draft KV pool (when spec + HiCache co-enabled).
-        kv_cache_builder.maybe_register_hicache_draft(
-            tree_cache=self.tree_cache,
-            draft_worker=self.draft_worker,
-            spec_algorithm=self.spec_algorithm,
-            server_args=self.server_args,
-            enable_hierarchical_cache=self.enable_hierarchical_cache,
-            enable_overlap=self.enable_overlap,
-            page_size=self.page_size,
-        )
+        if not self.spec_algorithm.is_dspark():
+            # Keep the fork's existing EAGLE/DFLASH draft registration path.
+            kv_cache_builder.maybe_register_hicache_draft(
+                tree_cache=self.tree_cache,
+                draft_worker=self.draft_worker,
+                spec_algorithm=self.spec_algorithm,
+                server_args=self.server_args,
+                enable_hierarchical_cache=self.enable_hierarchical_cache,
+                enable_overlap=self.enable_overlap,
+                page_size=self.page_size,
+            )
 
         # Init running status
         self.init_running_status()
@@ -876,9 +891,22 @@ class Scheduler(
             self.external_corpus_manager = None
             return
 
+        # Draft workers resolve model, loader, context-length, and attention
+        # settings independently from the target.  Never apply draft overrides
+        # to the target's ServerArgs instance.
+        draft_server_args = deepcopy(self.server_args)
+        if draft_server_args.speculative_draft_load_format is not None:
+            draft_server_args.load_format = (
+                draft_server_args.speculative_draft_load_format
+            )
+            logger.info(
+                "Using draft model load_format: %r",
+                draft_server_args.speculative_draft_load_format,
+            )
+
         # Launch a draft worker for speculative decoding
         draft_worker_kwargs = dict(
-            server_args=self.server_args,
+            server_args=draft_server_args,
             gpu_id=self.ps.gpu_id,
             tp_rank=self.ps.tp_rank,
             moe_ep_rank=self.ps.moe_ep_rank,
@@ -888,17 +916,25 @@ class Scheduler(
             attn_cp_rank=self.ps.attn_cp_rank,
             moe_dp_rank=self.ps.moe_dp_rank,
         )
-
-        if self.server_args.speculative_draft_load_format is not None:
-            self.server_args.load_format = (
-                self.server_args.speculative_draft_load_format
+        if self.spec_algorithm.is_dspark():
+            # DSpark's PP implementation consumes the already-resolved
+            # ParallelState. Keep the fork's legacy kwargs for every other
+            # speculative worker.
+            draft_worker_kwargs = dict(
+                server_args=draft_server_args,
+                gpu_id=self.ps.gpu_id,
+                ps=self.ps,
+                nccl_port=self.nccl_port,
+                target_worker=self.tp_worker,
             )
-            logger.info(
-                f"Using draft model load_format: '{self.server_args.speculative_draft_load_format}'"
-            )
 
-        DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
-        self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
+        DraftWorkerClass = self.spec_algorithm.create_worker(draft_server_args)
+        saved_server_args = get_global_server_args()
+        try:
+            set_global_server_args_for_scheduler(draft_server_args)
+            self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
+        finally:
+            set_global_server_args_for_scheduler(saved_server_args)
 
         if self.spec_algorithm.is_ngram():
             from sglang.srt.speculative.external_corpus_manager import (
@@ -1661,6 +1697,19 @@ class Scheduler(
         # into the waiting queue but can never be scheduled, blocking the queue
         # and eventually making health checks fail.
         paged_input_len = -(-input_len // self.page_size) * self.page_size
+        max_context_new_tokens = self.max_req_len - input_len - 1
+        if self.spec_algorithm.is_dspark():
+            # Until the context-boundary verifier fixes are backported, keep the
+            # two speculative windows used by target verify inside the model
+            # context.  This mirrors the req_to_token reservation headroom but
+            # protects model-visible positions rather than allocator storage.
+            max_draft_tokens = int(
+                self.server_args.max_speculative_num_draft_tokens or 0
+            )
+            max_context_new_tokens = (
+                self.max_req_len - input_len - 2 * max_draft_tokens
+            )
+
         req.sampling_params.max_new_tokens = max(
             0,
             min(
@@ -1669,7 +1718,7 @@ class Scheduler(
                     if req.sampling_params.max_new_tokens is not None
                     else 1 << 30
                 ),
-                self.max_req_len - input_len - 1,
+                max_context_new_tokens,
                 self.max_total_num_tokens - paged_input_len - self.page_size - 1,
             ),
         )
@@ -1899,8 +1948,9 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if self.spec_algorithm.is_dflash():
-            error_msg = validate_dflash_request(req)
+        if self.spec_algorithm.is_dflash_family():
+            algorithm = "DSPARK" if self.spec_algorithm.is_dspark() else "DFLASH"
+            error_msg = validate_dflash_request(req, algorithm=algorithm)
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
@@ -2820,8 +2870,8 @@ class Scheduler(
         self.batch_record_buf[self.batch_record_ct] = [batch, attr_snapshot]
 
     @contextmanager
-    def _overlap_forward_isolation(self, batch: ScheduleBatch):
-        """Make SB transactional across one overlap forward.
+    def _forward_isolation(self, batch: ScheduleBatch, *, overlap: bool):
+        """Make result-based speculative ScheduleBatch mutation transactional.
 
         1. Snapshot SB fields so V2's mid-forward mutations (forward_mode /
            input_ids / seq_lens / spec_info / ...) can be undone. V1 / non-spec
@@ -2830,13 +2880,11 @@ class Scheduler(
         2. Substitute sampling_info with a forward-only copy (orchestrator=None,
            shares the pre-accumulated penalty buffer) so V2's multiple init_new
            calls don't double-accumulate penalties.
-        3. Pin (batch, snapshot) into batch_record_buf for 2 iters so GPU
-           tensors in the snapshot survive the caching allocator past the
-           forward stream. Must run AFTER the sampling_info swap so the
-           forward-only copy gets pinned.
+        3. In overlap mode only, pin (batch, snapshot) into batch_record_buf for
+           two iterations so GPU tensors survive the forward stream.
         """
         # 1. snapshot
-        snapshot_v2_full = batch.is_spec_v2
+        snapshot_v2_full = batch.uses_result_based_spec
         sched_snapshot = (
             {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
             if snapshot_v2_full
@@ -2848,8 +2896,9 @@ class Scheduler(
         if sched_sampling_info is not None:
             batch.sampling_info = sched_sampling_info.copy_for_forward()
 
-        # 3. pin for 2-iter tensor lifetime
-        self.record_batch_in_overlap(batch)
+        # 3. pin for 2-iter tensor lifetime only when a forward stream exists.
+        if overlap:
+            self.record_batch_in_overlap(batch)
 
         try:
             yield
@@ -2859,6 +2908,108 @@ class Scheduler(
                     setattr(batch, name, value)
             else:
                 batch.sampling_info = sched_sampling_info
+
+    def _apply_dspark_sync_result(
+        self, batch: ScheduleBatch, batch_result: GenerationBatchResult
+    ) -> None:
+        """Publish the state returned by a non-overlap DSpark decode step."""
+        next_draft_input = batch_result.next_draft_input
+        new_seq_lens = batch_result.new_seq_lens
+        local_bs = batch.batch_size()
+        if next_draft_input is None or new_seq_lens is None:
+            raise RuntimeError(
+                "DSpark decode result is missing next state: "
+                f"local_bs={local_bs}, next_draft_input={next_draft_input is not None}, "
+                f"new_seq_lens={new_seq_lens is not None}."
+            )
+        if local_bs > 0 and batch_result.logits_output is None:
+            raise RuntimeError(
+                "DSpark active decode result is missing logits_output: "
+                f"local_bs={local_bs}."
+            )
+        if next_draft_input.new_seq_lens is not new_seq_lens:
+            raise RuntimeError(
+                "DSpark decode result published inconsistent sequence state: "
+                "next_draft_input.new_seq_lens and result.new_seq_lens must be "
+                f"the same tensor (local_bs={local_bs})."
+            )
+        stride = batch_result.speculative_num_draft_tokens
+        expected_device = new_seq_lens.device
+        tensor_contracts = (
+            ("new_seq_lens", new_seq_lens, (local_bs,), torch.int64),
+            (
+                "next_draft_input.new_seq_lens",
+                next_draft_input.new_seq_lens,
+                (local_bs,),
+                torch.int64,
+            ),
+            (
+                "next_draft_input.bonus_tokens",
+                next_draft_input.bonus_tokens,
+                (local_bs,),
+                torch.int64,
+            ),
+            ("accept_lens", batch_result.accept_lens, (local_bs,), torch.int32),
+        )
+        for name, tensor, expected_shape, expected_dtype in tensor_contracts:
+            if tensor is None:
+                raise RuntimeError(
+                    f"DSpark decode result is missing {name} (local_bs={local_bs})."
+                )
+            if tuple(tensor.shape) != expected_shape or tensor.dtype != expected_dtype:
+                raise RuntimeError(
+                    f"DSpark decode result has invalid {name}: local_bs={local_bs}, "
+                    f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}; expected "
+                    f"shape={expected_shape}, dtype={expected_dtype}."
+                )
+            if tensor.device != expected_device:
+                raise RuntimeError(
+                    f"DSpark decode result has invalid {name} device: "
+                    f"local_bs={local_bs}, device={tensor.device}; expected "
+                    f"device={expected_device}."
+                )
+
+        if stride is None or stride <= 0:
+            raise RuntimeError(
+                "DSpark decode result has invalid speculative_num_draft_tokens: "
+                f"local_bs={local_bs}, value={stride}."
+            )
+        expected_token_count = local_bs * int(stride)
+        next_token_ids = batch_result.next_token_ids
+        if (
+            not torch.is_tensor(next_token_ids)
+            or next_token_ids.numel() != expected_token_count
+            or next_token_ids.dtype != torch.int64
+            or next_token_ids.device != expected_device
+        ):
+            raise RuntimeError(
+                "DSpark decode result has invalid next_token_ids: "
+                f"local_bs={local_bs}, stride={stride}, "
+                f"shape={getattr(next_token_ids, 'shape', None)}, "
+                f"dtype={getattr(next_token_ids, 'dtype', None)}, "
+                f"device={getattr(next_token_ids, 'device', None)}; expected "
+                f"{expected_token_count} int64 tokens on {expected_device}."
+            )
+        for name in ("block_accept_lens", "cap_lens"):
+            tensor = getattr(batch_result, name)
+            if tensor is not None and (
+                tuple(tensor.shape) != (local_bs,)
+                or tensor.dtype != torch.int32
+                or tensor.device != expected_device
+            ):
+                raise RuntimeError(
+                    f"DSpark decode result has invalid {name}: local_bs={local_bs}, "
+                    f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+                    f"device={tensor.device}; expected shape={(local_bs,)}, "
+                    f"dtype={torch.int32}, device={expected_device}."
+                )
+
+        batch.spec_info = next_draft_input
+        batch.seq_lens = new_seq_lens
+        if batch.seq_lens_cpu is not None:
+            batch.seq_lens_cpu = new_seq_lens.to("cpu")
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
+        batch.input_ids = None
 
     def run_batch(
         self,
@@ -2882,7 +3033,7 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             if self.enable_overlap:
-                with self._overlap_forward_isolation(batch):
+                with self._forward_isolation(batch, overlap=True):
                     bs = len(batch.seq_lens)
                     future_indices = self.future_map.alloc_future_indices(bs)
 
@@ -2925,6 +3076,24 @@ class Scheduler(
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
+            elif self.spec_algorithm.is_dspark() and (
+                batch.forward_mode.is_decode() or batch.forward_mode.is_idle()
+            ):
+                # Bundled DSpark follows the upstream result-based contract even
+                # though this fork deliberately runs it without overlap.
+                with self._forward_isolation(batch, overlap=False):
+                    batch_result = self.model_worker.forward_batch_generation(batch)
+                self._apply_dspark_sync_result(batch, batch_result)
+                self.update_cache_from_scheduler(batch, batch_result)
+
+                # Result processing owns accepted-token and KV-commit bookkeeping.
+                # Copy only that result payload; next_draft_input remains on device.
+                batch_result.copy_done = self.device_module.Event()
+                batch_result.copy_to_cpu(
+                    return_logprob=batch.return_logprob,
+                    return_hidden_states=batch.return_hidden_states,
+                )
+                future_indices_or_next_token_ids = None
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}

@@ -660,7 +660,7 @@ def release_kv_cache(
 
     global_server_args = get_global_server_args()
     page_size = global_server_args.page_size
-    spec_algo = global_server_args.speculative_algorithm
+    spec_algo = global_server_args.effective_speculative_algorithm
 
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).

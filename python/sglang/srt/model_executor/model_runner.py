@@ -291,6 +291,70 @@ logger = logging.getLogger(__name__)
 _UNSET: Any = object()
 
 
+def _resolve_dspark_draft_num_layers(
+    *, draft_hf_config: Any, target_layer_ids: Optional[list[int]]
+) -> int:
+    """Match the stage count constructed by DeepseekV4ForCausalLMDSpark."""
+
+    if target_layer_ids is not None:
+        num_layers = len(target_layer_ids)
+    else:
+        num_layers = int(
+            getattr(draft_hf_config, "num_nextn_predict_layers", 1) or 1
+        )
+    if num_layers <= 0:
+        raise ValueError(
+            f"DSpark draft stage count must be positive, got {num_layers}."
+        )
+    return num_layers
+
+
+def _compute_model_num_layers(
+    *, model: Any, model_config: ModelConfig, is_draft_worker: bool
+) -> int:
+    """Resolve the logical layer count used by PP and KV-pool setup.
+
+    Multi-stage draft models such as bundled DeepSeek-V4 DSpark expose their
+    actual stage count on the loaded model. The target checkpoint's
+    ``num_nextn_predict_layers`` only indicates that an MTP/draft model exists;
+    it is not necessarily the number of stages in that draft model.
+    """
+    num_nextn_predict_layers = model_config.num_nextn_predict_layers
+    model_has_mtp_layers = (
+        num_nextn_predict_layers is not None and num_nextn_predict_layers > 0
+    )
+    model_num_layers = (
+        getattr(model, "num_stages", num_nextn_predict_layers)
+        if is_draft_worker and model_has_mtp_layers
+        else max(
+            model_config.num_hidden_layers,
+            model_config.num_attention_layers,
+        )
+    )
+    architecture = model_config.hf_config.architectures[0]
+    if architecture in ("MiMoV2MTP", "Step3p5MTP"):
+        model_num_layers = 1
+    return model_num_layers
+
+
+def _assert_pp_mtp_compat(
+    *,
+    model_has_mtp_layers: bool,
+    spec_algorithm: SpeculativeAlgorithm,
+    num_effective_layers: int,
+    model_num_layers: int,
+) -> None:
+    # DSPARK uses a separate draft worker even when the target config bundles
+    # MTP layers, so its target and draft stages can follow the PP-local
+    # lifecycle implemented by the DSpark worker.
+    assert (
+        (not model_has_mtp_layers)
+        or spec_algorithm.is_none()
+        or spec_algorithm.is_dspark()
+        or num_effective_layers == model_num_layers
+    ), "PP is not compatible with MTP models."
+
+
 def resolve_language_model(model: nn.Module) -> nn.Module:
     model_cls_name = model.__class__.__name__
     if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
@@ -348,6 +412,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         draft_model_idx: Optional[int] = None,
+        defer_device_graph_init: bool = False,
     ):
         # Parse args
         self.mem_fraction_static = mem_fraction_static
@@ -373,6 +438,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
+        if defer_device_graph_init and not is_draft_worker:
+            raise ValueError(
+                "Deferred device graph initialization is only valid for a draft worker."
+            )
+        self._device_graph_init_deferred = defer_device_graph_init
+        self.graph_runner = None
+        self.graph_mem_usage = 0
         self.is_generation = model_config.is_generation
         self.device_timer = None
         self.is_multimodal = model_config.is_multimodal
@@ -380,7 +452,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             model_config.is_multimodal_chunked_prefill_supported
         )
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
+            server_args.effective_speculative_algorithm
         )
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
@@ -416,6 +488,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dflash_use_aux_hidden_state = False
         self.dflash_target_layer_ids = None
         self.dflash_draft_num_layers = None
+        self.dspark_use_aux_hidden_state = False
+        self.dspark_target_layer_ids = None
+        self.dspark_draft_num_layers = None
+        self.dspark_draft_cell_size_per_token = None
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
             # load draft config
             draft_model_config = ModelConfig.from_server_args(
@@ -485,6 +561,53 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.dflash_target_layer_ids = dflash_draft_config.resolve_target_layer_ids(
                 target_num_layers=int(target_num_layers),
                 draft_num_layers=int(draft_num_layers),
+            )
+
+        if self.spec_algorithm.is_dspark() and not self.is_draft_worker:
+            from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+            from sglang.srt.speculative.dspark_components.dspark_config import (
+                parse_dspark_draft_config,
+            )
+
+            draft_model_config = ModelConfig.from_server_args(
+                server_args,
+                model_path=server_args.speculative_draft_model_path,
+                model_revision=server_args.speculative_draft_model_revision,
+                is_draft_model=True,
+            )
+            dflash_config = parse_dflash_draft_config(
+                draft_hf_config=draft_model_config.hf_config
+            )
+            dspark_config = parse_dspark_draft_config(
+                draft_hf_config=draft_model_config.hf_config
+            )
+            draft_num_layers = _resolve_dspark_draft_num_layers(
+                draft_hf_config=draft_model_config.hf_config,
+                target_layer_ids=dspark_config.target_layer_ids,
+            )
+            target_num_layers = int(
+                getattr(self.model_config.hf_text_config, "num_hidden_layers")
+            )
+            target_layer_ids = dflash_config.resolve_target_layer_ids(
+                target_num_layers=target_num_layers,
+                draft_num_layers=int(draft_num_layers),
+            )
+            if dspark_config.target_layer_ids is not None:
+                target_layer_ids = list(dspark_config.target_layer_ids)
+            if not dspark_config.require_markov():
+                raise ValueError(
+                    "DSPARK requires markov_rank > 0 in the bundled draft config."
+                )
+            self.dspark_use_aux_hidden_state = True
+            self.dspark_target_layer_ids = target_layer_ids
+            self.dspark_draft_num_layers = int(draft_num_layers)
+            from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+                get_dsv4_kv_bytes_per_token,
+            )
+
+            self.dspark_draft_cell_size_per_token = get_dsv4_kv_bytes_per_token(
+                qk_nope_head_dim=draft_model_config.qk_nope_head_dim,
+                qk_rope_head_dim=draft_model_config.qk_rope_head_dim,
             )
 
         # Apply the rank zero filter to logger
@@ -671,19 +794,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
         # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
         # determine the number of layers.
-        model_has_mtp_layers = self.model_config.num_nextn_predict_layers is not None
-        model_num_layers = (
-            self.model_config.num_nextn_predict_layers
-            if self.is_draft_worker and model_has_mtp_layers
-            else max(
-                self.model_config.num_hidden_layers,
-                self.model_config.num_attention_layers,
-            )
+        num_nextn_predict_layers = self.model_config.num_nextn_predict_layers
+        model_has_mtp_layers = (
+            num_nextn_predict_layers is not None and num_nextn_predict_layers > 0
         )
-        if self.model_config.hf_config.architectures[0] == "MiMoV2MTP":
-            model_num_layers = 1
-        elif self.model_config.hf_config.architectures[0] == "Step3p5MTP":
-            model_num_layers = 1
+        model_num_layers = _compute_model_num_layers(
+            model=self.model,
+            model_config=self.model_config,
+            is_draft_worker=self.is_draft_worker,
+        )
         self.start_layer = getattr(self.model, "start_layer", 0)
         self.end_layer = getattr(self.model, "end_layer", model_num_layers)
         self.num_effective_layers = self.end_layer - self.start_layer
@@ -695,14 +814,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if loop_num > 1:
             self.num_effective_layers = self.num_effective_layers * loop_num
 
-        assert (
-            (not model_has_mtp_layers)
-            or (self.spec_algorithm.is_none())
-            or (
-                (not self.spec_algorithm.is_none())
-                and (self.num_effective_layers == model_num_layers)
-            )
-        ), "PP is not compatible with MTP models."
+        _assert_pp_mtp_compat(
+            model_has_mtp_layers=model_has_mtp_layers,
+            spec_algorithm=self.spec_algorithm,
+            num_effective_layers=self.num_effective_layers,
+            model_num_layers=model_num_layers,
+        )
 
         # Apply torchao quantization
         torchao_applied = getattr(self.model, "torchao_applied", False)
@@ -780,10 +897,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                 )
             self._pre_initialize_flashinfer_allreduce_workspace()
-            self.init_device_graphs()
+            if not self._device_graph_init_deferred:
+                self.init_device_graphs()
         elif self.device == "cpu":
             self.init_attention_backend()
-            self.init_device_graphs()
+            if not self._device_graph_init_deferred:
+                self.init_device_graphs()
         elif self.device == "npu":
             self.init_attention_backend()
             # lazy init for zbal with mix mode(before graph capture when enable_cuda_graph)
@@ -797,17 +916,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     get_world_group().world_size,
                     get_world_group().cpu_group,
                 )
-            self.init_device_graphs()
+            if not self._device_graph_init_deferred:
+                self.init_device_graphs()
         elif current_platform.is_out_of_tree():
             self.init_attention_backend()
-            if current_platform.support_cuda_graph():
+            if (
+                current_platform.support_cuda_graph()
+                and not self._device_graph_init_deferred
+            ):
                 self.init_device_graphs()
-            else:
-                self.graph_runner = None
-                self.graph_mem_usage = 0
         else:
-            self.graph_runner = None
-            self.graph_mem_usage = 0
             self.init_attention_backend()
 
         if server_args.forward_hooks:
@@ -903,6 +1021,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     "set_dflash_layers_to_capture, which is required for DFLASH."
                 )
             self.model.set_dflash_layers_to_capture(self.dflash_target_layer_ids)
+        if self.dspark_use_aux_hidden_state:
+            if not hasattr(self.model, "set_dspark_layers_to_capture"):
+                raise ValueError(
+                    f"Model {self.model.__class__.__name__} does not implement "
+                    "set_dspark_layers_to_capture, which is required for DSPARK."
+                )
+            self.model.set_dspark_layers_to_capture(self.dspark_target_layer_ids)
 
     def remote_instance_init_transfer_engine(self):
         try:
@@ -2422,10 +2547,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         num_tokens_per_bs = 1
         if self.spec_algorithm.is_speculative():
             if self.is_draft_worker:
-                if not self.spec_algorithm.is_dflash():
+                if not self.spec_algorithm.is_dflash_family():
                     raise RuntimeError("This should not happen")
             capture_forward_mode = ForwardMode.TARGET_VERIFY
-            num_tokens_per_bs = self.server_args.speculative_num_draft_tokens
+            num_tokens_per_bs = (
+                self.spec_algorithm.get_num_tokens_per_req_for_target_verify(
+                    self.server_args.speculative_num_draft_tokens,
+                    self.is_draft_worker,
+                )
+            )
 
         if self.server_args.enable_return_hidden_states:
             capture_hidden_mode = CaptureHiddenMode.FULL
@@ -2569,14 +2699,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         seq_lens_sum=None,
                         seq_lens_cpu=None,
                     )
-            elif self.spec_algorithm.is_dflash():
+            elif self.spec_algorithm.is_dflash_family():
                 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
                 # Dummy warmup only needs shape metadata; avoid forcing custom-mask mode.
                 spec_info = DFlashVerifyInput(
                     draft_token=None,
                     positions=None,
-                    draft_token_num=self.server_args.speculative_num_draft_tokens,
+                    draft_token_num=num_tokens_per_bs,
                     custom_mask=None,
                     capture_hidden_mode=(
                         CaptureHiddenMode.NULL
@@ -2782,6 +2912,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"Capture {graph_backend[self.device]} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
             f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
+
+    def finish_deferred_device_graph_init(self, *, capture: bool) -> None:
+        """Complete a graph init intentionally deferred during construction.
+
+        DSpark's draft model shares the target embedding and LM head.  Its model
+        runner must therefore finish loading and return to DSparkWorkerV2 before
+        graph capture can safely execute a draft forward.
+        """
+        if not self._device_graph_init_deferred:
+            raise RuntimeError("Device graph initialization was not deferred.")
+
+        self._device_graph_init_deferred = False
+        if capture:
+            self.init_device_graphs()
 
     def init_piecewise_cuda_graphs(self):
         """Initialize piecewise CUDA graph runner."""

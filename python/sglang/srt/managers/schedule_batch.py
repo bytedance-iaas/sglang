@@ -948,7 +948,7 @@ class Req(ReqDllmMixin):
         """Check if this request is prefill-only (no token generation needed)."""
         # NOTE: when spec is enabled, prefill_only optimizations are disabled
 
-        spec_alg = get_global_server_args().speculative_algorithm
+        spec_alg = get_global_server_args().effective_speculative_algorithm
         return self.sampling_params.max_new_tokens == 0 and spec_alg is None
 
     @property
@@ -1509,6 +1509,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     can_run_dp_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None
     global_forward_mode: Optional[ForwardMode] = None
+    spec_verify_tier_num_tokens: int = -1
+    global_spec_verify_tier_num_tokens: Optional[List[int]] = None
 
     # For processing logprobs
     return_logprob: bool = False
@@ -1584,7 +1586,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = -1
-
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
 
@@ -2215,7 +2216,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             new_pages = sum(1 for r in requests if r.kv_committed_len % page_size == 0)
             return new_pages * page_size
 
-        if self.is_spec_v2:
+        if self.uses_result_based_spec:
             return self._new_tokens_required_next_decode_spec_v2(requests, page_size)
 
         server_args = get_global_server_args()
@@ -2237,9 +2238,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def _new_tokens_required_next_decode_spec_v2(self, requests, page_size):
         """Tight estimate matching eagle_info_v2.prepare_for_decode allocation."""
-        from sglang.srt.managers.utils import get_alloc_len_per_decode
+        from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 
-        alloc_len = get_alloc_len_per_decode()
+        alloc_len = get_alloc_len_per_decode(get_global_server_args())
         total = 0
         for r in requests:
             x = max(0, r.kv_committed_len + 2 * alloc_len - r.kv_allocated_len)
@@ -2282,6 +2283,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         retracted_reqs = []
+        reqs_to_abort: List[Req] = []
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        can_snapshot_decode_kv = bool(
+            getattr(kv_pool, "supports_decode_retraction_cpu_snapshot", True)
+        )
         first_iter = True
         while first_iter or (
             not self.check_decode_mem(selected_indices=sorted_indices)
@@ -2293,11 +2299,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             first_iter = False
             idx = sorted_indices.pop()
             req = self.reqs[idx]
-            retracted_reqs.append(req)
             # release memory and don't insert into the tree because we need the space instantly
-            self.release_req(idx, len(sorted_indices), server_args)
+            if (
+                server_args.disaggregation_mode == "decode"
+                and not can_snapshot_decode_kv
+            ):
+                self._mark_unsupported_decode_retraction_abort(req, kv_pool)
+                self.release_req(
+                    idx,
+                    len(sorted_indices),
+                    server_args,
+                    offload_kv_cache=False,
+                )
+                reqs_to_abort.append(req)
+            else:
+                self.release_req(idx, len(sorted_indices), server_args)
+                retracted_reqs.append(req)
 
-        reqs_to_abort: List[Req] = []
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
         ):
@@ -2311,7 +2329,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
             reqs_to_abort.append(last_req)
-            self.release_req(last_idx, 0, server_args)
+            self.release_req(
+                last_idx,
+                0,
+                server_args,
+                offload_kv_cache=can_snapshot_decode_kv,
+            )
             logger.warning(
                 "retract_decode: aborted last request %s due to OOM", last_req.rid
             )
@@ -2325,13 +2348,45 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         return retracted_reqs, new_estimate_ratio, reqs_to_abort
 
-    def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
+    def _mark_unsupported_decode_retraction_abort(self, req: Req, kv_pool) -> None:
+        allocator = self.token_to_kv_pool_allocator
+        available = allocator.available_size()
+        full_available = (
+            allocator.full_available_size()
+            if hasattr(allocator, "full_available_size")
+            else available
+        )
+        swa_available = (
+            allocator.swa_available_size()
+            if hasattr(allocator, "swa_available_size")
+            else available
+        )
+        message = (
+            "Request aborted during PD decode memory retraction because "
+            f"{type(kv_pool).__name__} does not support CPU KV snapshots. "
+            f"rid={req.rid}, seq_len={req.seqlen}, "
+            f"full_available={full_available}, swa_available={swa_available}."
+        )
+        req.to_finish = FINISH_ABORT(
+            message,
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+        logger.error(message)
+
+    def release_req(
+        self,
+        idx: int,
+        remaing_req_count: int,
+        server_args: ServerArgs,
+        *,
+        offload_kv_cache: bool = True,
+    ):
         req = self.reqs[idx]
 
         if self.hisparse_coordinator is not None and not req.finished():
             self.hisparse_coordinator.retract_req(req)
 
-        if server_args.disaggregation_mode == "decode":
+        if server_args.disaggregation_mode == "decode" and offload_kv_cache:
             req.offload_kv_cache(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             )
@@ -2369,6 +2424,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         assert not ret or self.spec_algorithm.supports_spec_v2()
         return ret
 
+    @property
+    def uses_result_based_spec(self) -> bool:
+        """Whether accepted tokens and next state are returned to the scheduler.
+
+        This fork still runs EAGLE/DFLASH through the legacy worker-owned result
+        path. Bundled DSpark is deliberately non-overlap, but its worker follows
+        the newer result-based contract used by upstream spec-v2 workers.
+        """
+        return self.is_spec_v2 or self.spec_algorithm.is_dspark()
+
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
@@ -2380,9 +2445,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
             self.attn_cp_metadata = None
 
-        if self.is_spec_v2:
+        if self.uses_result_based_spec:
             # TODO(spec-v2): all spec v2 should go through this path
             draft_input: EagleDraftInput = self.spec_info
+            if draft_input is None:
+                raise RuntimeError(
+                    "Result-based speculative decode requires draft state before "
+                    f"prepare_for_decode ({self.spec_algorithm=})."
+                )
             draft_input.prepare_for_decode(self)
 
         if not self.spec_algorithm.is_none():
@@ -2550,7 +2620,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # NOTE: spec_info filtered before batch filtering only happens in:
         # - Spec v1's verify phase
         # - Only for decode batch (running_batch)
-        has_been_filtered = v1_spec_info_filtered and not self.is_spec_v2
+        has_been_filtered = (
+            v1_spec_info_filtered and not self.uses_result_based_spec
+        )
 
         if self.spec_info:
             self.spec_info.filter_batch(
@@ -2667,8 +2739,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 if self.forward_mode.is_decode():
                     # We set evict_swa condition here with two reasons:
                     # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.
-                    # 2. Evict swa every eviction_interval tokens to reduce the overhead.
-                    if req.decode_batch_idx % eviction_interval == 1:
+                    # 2. Evict after enough tokens have slid out of the window.
+                    # Gating on token progress instead of decode iterations also
+                    # handles speculative steps that accept multiple tokens.
+                    if (
+                        req.decode_batch_idx >= 1
+                        and req.seqlen - 1 - sliding_window_size
+                        >= req.swa_evicted_seqlen + eviction_interval
+                    ):
                         self._evict_swa(req, req.seqlen - 1)
 
                     # Once the decode position has moved past the sliding window,

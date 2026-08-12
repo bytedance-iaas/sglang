@@ -27,6 +27,22 @@ _is_hip = is_hip()
 ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
 
 
+def get_dsv4_kv_bytes_per_token(
+    *, qk_nope_head_dim: int, qk_rope_head_dim: int
+) -> int:
+    """Bytes/token in the packed DSV4 SWA/compressed KV page layout."""
+
+    rope_storage_bytes = torch.bfloat16.itemsize
+    quantize_block_size = 64
+    scale_pad = 1
+    return (
+        int(qk_nope_head_dim)
+        + int(qk_rope_head_dim) * rope_storage_bytes
+        + int(qk_nope_head_dim) // quantize_block_size
+        + scale_pad
+    )
+
+
 def get_compress_state_ring_size(
     compress_ratio: int, is_speculative: bool = False
 ) -> int:
@@ -42,6 +58,17 @@ def get_compress_state_ring_size(
         return 16 if compress_ratio == 4 else 256
     else:
         return 8 if compress_ratio == 4 else 128
+
+
+def get_compress_state_write_pad(compress_ratio: int, ring_size: int) -> int:
+    """Return the largest draft-token count this ring can serve.
+
+    This mirrors ``mtp_pad`` in ``c_plan.cuh``. The bound is derived there. A
+    non-speculative ring is exactly one compression window wide, so its pad is
+    zero.
+    """
+    window_size = compress_ratio * (2 if compress_ratio == 4 else 1)
+    return ring_size - window_size + 2 if ring_size > window_size else 0
 
 
 class DeepSeekV4SingleKVPool(KVCache):
@@ -92,13 +119,10 @@ class DeepSeekV4SingleKVPool(KVCache):
                 ]
 
     def get_bytes_per_token(self) -> int:
-        dim_per_token = (
-            self.qk_nope_head_dim
-            + self.qk_rope_head_dim * self.rope_storage_dtype.itemsize
-            + self.qk_nope_head_dim // self.quantize_block_size
-            + self.scale_pad
+        return get_dsv4_kv_bytes_per_token(
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            qk_rope_head_dim=self.qk_rope_head_dim,
         )
-        return dim_per_token
 
     def create_buffer(self, *, num_pages: int):
         bytes_per_token = self.get_bytes_per_token()
@@ -356,6 +380,11 @@ class DeepSeekV4LayerItem(NamedTuple):
 
 class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
+    # DSV4 owns multiple coupled KV/state pools whose request snapshot format
+    # is not implemented in this fork. PD decode retraction must fail the
+    # selected request instead of falling through to KVCache.get_cpu_copy().
+    supports_decode_retraction_cpu_snapshot = False
+
     def __init__(
         self,
         max_num_reqs: int,
@@ -506,7 +535,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def get_ring_size(self, compress_ratio: int) -> int:
         server_args = get_global_server_args()
-        is_speculative = server_args.speculative_algorithm is not None
+        is_speculative = server_args.effective_speculative_algorithm is not None
         return get_compress_state_ring_size(compress_ratio, is_speculative)
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
@@ -520,6 +549,22 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # own equivalent cache via `_should_cache_swa + cached_loc` (in
         # set_swa_key_buffer_radix_fused), so we ignore main's precomputed loc.
         pass
+
+    def get_kv_layer_ids(self) -> List[int]:
+        """Global layer IDs aligned with the compressed KV entry layout."""
+        stage_ratios = self.compression_ratios[self._stage_start : self._stage_end]
+        c4_layer_ids = [
+            self._stage_start + local_layer_id
+            for local_layer_id, ratio in enumerate(stage_ratios)
+            if ratio == 4
+        ]
+        c128_layer_ids = [
+            self._stage_start + local_layer_id
+            for local_layer_id, ratio in enumerate(stage_ratios)
+            if ratio == 128
+        ]
+        # get_contiguous_buf_infos orders entries as C4, C4 indexer, C128.
+        return c4_layer_ids + c4_layer_ids + c128_layer_ids
 
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []
@@ -540,6 +585,17 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return data_ptrs, data_lens, item_lens
 
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        """Return the legacy heterogeneous DSV4 state component.
+
+        Keep C128 in this list for existing non-DSpark PD peers.  Bundled
+        DSpark uses ``get_dspark_pd_state_buf_infos`` below so C128 can be
+        matched by StateType without changing the baseline wire layout.
+        """
+        return self._get_state_buf_infos(include_c128=True)
+
+    def _get_state_buf_infos(
+        self, *, include_c128: bool
+    ) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []
         data_lens: List[int] = []
         item_lens: List[int] = []
@@ -557,6 +613,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             for pool in pools:
                 if pool is None:
                     continue
+                if pool.ratio == 128 and not include_c128:
+                    continue
                 t = pool.kv_score_buffer.kv_score
                 assert t.ndim == 2, f"expected 2D buffer, got {t.ndim}D"
                 data_ptrs.append(t.data_ptr())
@@ -564,6 +622,50 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 item_lens.append(t[0].nbytes * pool.ring_size)
 
         return data_ptrs, data_lens, item_lens
+
+    def get_dspark_pd_state_buf_infos(
+        self,
+    ) -> Tuple[List[int], List[int], List[int]]:
+        """Target SWA/C4 state for bundled DSpark PD, excluding C128."""
+        return self._get_state_buf_infos(include_c128=False)
+
+    def get_dspark_pd_state_layer_ids(self) -> List[int]:
+        """Global layer IDs aligned with ``get_dspark_pd_state_buf_infos``."""
+        stage_layer_ids = list(range(self._stage_start, self._stage_end))
+        c4_layer_ids = [
+            layer_id
+            for layer_id in stage_layer_ids
+            if self.compression_ratios[layer_id] == 4
+        ]
+        # Buffer order is target SWA, C4 attention state, C4 indexer state.
+        # Repeated IDs are intentional; Mooncake pairs occurrences in order.
+        return stage_layer_ids + c4_layer_ids + c4_layer_ids
+
+    def get_c128_state_buf_infos(
+        self,
+    ) -> Tuple[List[int], List[int], List[int]]:
+        """Return Full-indexed C128 state as a separate PD component."""
+        data_ptrs: List[int] = []
+        data_lens: List[int] = []
+        item_lens: List[int] = []
+        for pool in self.compress_state_pools:
+            if pool is None or pool.ratio != 128:
+                continue
+            tensor = pool.kv_score_buffer.kv_score
+            assert tensor.ndim == 2, f"expected 2D buffer, got {tensor.ndim}D"
+            data_ptrs.append(tensor.data_ptr())
+            data_lens.append(tensor.nbytes)
+            item_lens.append(
+                tensor[0].nbytes if pool.ring_size == 1 else tensor[0].nbytes * 128
+            )
+        return data_ptrs, data_lens, item_lens
+
+    def get_c128_state_layer_ids(self) -> List[int]:
+        return [
+            layer_id
+            for layer_id in range(self._stage_start, self._stage_end)
+            if self.compression_ratios[layer_id] == 128
+        ]
 
     def _init_paged_compress_states(self, enable_memory_saver: bool):
         c4_state_pool_size = self.c4_state_pool_size
@@ -798,20 +900,26 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def set_swa_key_buffer_radix_fused_norm_rope(
         self,
+        *,
         layer_id: int,
-        raw_loc: torch.Tensor,
         kv: torch.Tensor,
         kv_weight: torch.Tensor,
         eps: float,
         freqs_cis: torch.Tensor,
         positions: torch.Tensor,
+        raw_loc: Optional[torch.Tensor] = None,
+        swa_loc: Optional[torch.Tensor] = None,
     ) -> None:
-        if self._should_cache_swa:
-            if layer_id == self.start_layer or self.cached_loc is None:
-                self.cached_loc = self.translate_loc_from_full_to_swa(raw_loc)
-            swa_loc = self.cached_loc
-        else:
-            swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
+        if (raw_loc is None) == (swa_loc is None):
+            raise ValueError("Exactly one of raw_loc or swa_loc must be provided")
+        if swa_loc is None:
+            assert raw_loc is not None
+            if self._should_cache_swa:
+                if layer_id == self.start_layer or self.cached_loc is None:
+                    self.cached_loc = self.translate_loc_from_full_to_swa(raw_loc)
+                swa_loc = self.cached_loc
+            else:
+                swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
         fused_k_norm_rope_flashmla(
             kv=kv,
             kv_weight=kv_weight,

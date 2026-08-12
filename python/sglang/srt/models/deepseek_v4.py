@@ -83,7 +83,10 @@ from sglang.srt.model_executor.cuda_graph_runner import (
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    RUNAI_STREAMER_TENSOR_ATTR,
+    default_weight_loader,
+)
 from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
 
@@ -104,6 +107,11 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
+
+DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
+    ("gate_up_proj", "gate_proj", 0),
+    ("gate_up_proj", "up_proj", 1),
+]
 
 
 if TYPE_CHECKING:
@@ -167,6 +175,167 @@ def rms_normalize_triton(
         HAS_WEIGHT=(weight is not None),
     )
     return x
+
+
+def make_hc_head_params(
+    hc_mult: int, hidden_size: int
+) -> Tuple[nn.Parameter, nn.Parameter, nn.Parameter]:
+    hc_dim = hc_mult * hidden_size
+    return (
+        nn.Parameter(torch.empty(hc_mult, hc_dim, dtype=torch.float32)),
+        nn.Parameter(torch.empty(hc_mult, dtype=torch.float32)),
+        nn.Parameter(torch.empty(1, dtype=torch.float32)),
+    )
+
+
+def hc_head_torch(
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    *,
+    norm_eps: float,
+    hc_eps: float,
+) -> torch.Tensor:
+    shape, dtype = x.size(), x.dtype
+    x = x.flatten(-2).float()
+    rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + norm_eps)
+    mixes = F.linear(x, hc_fn) * rsqrt
+    pre = torch.sigmoid(mixes * hc_scale + hc_base) + hc_eps
+    y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=-2)
+    return y.to(dtype)
+
+
+class MqaAttentionBase(nn.Module):
+    """Shared DSV4 MQA parameters used by the bundled DSpark draft model.
+
+    The target model keeps the fork's existing ``MQALayer`` implementation.
+    This small base mirrors the upstream DSpark construction contract without
+    pulling the newer main-branch attention/runtime refactor into the fork.
+    """
+
+    def __init__(
+        self,
+        config: DeepSeekV4Config,
+        layer_id: int,
+        quant_config: Optional[QuantizationConfig],
+        prefix: str,
+        *,
+        attn_tp_rank: int,
+        attn_tp_size: int,
+        compress_ratio: int,
+        fuse_wqa_wkv: bool,
+        wo_a_fp8: bool,
+        wo_a_keeps_quant_config: bool,
+        wo_b_reduce_results: bool,
+        rope_original_seq_len: int,
+    ) -> None:
+        super().__init__()
+        self.attn_tp_rank = attn_tp_rank
+        self.attn_tp_size = attn_tp_size
+        self.layer_id = layer_id
+        self.hidden_size = config.hidden_size
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.qk_nope_head_dim = config.head_dim - config.qk_rope_head_dim
+        self.head_dim = self.qk_rope_head_dim + self.qk_nope_head_dim
+        self.rope_head_dim = config.qk_rope_head_dim
+        self.n_heads = config.num_attention_heads
+        self.n_local_heads = self.n_heads // attn_tp_size
+        self.n_groups = config.o_groups
+        self.n_local_groups = self.n_groups // attn_tp_size
+        self.q_lora_rank = config.q_lora_rank
+        self.o_lora_rank = config.o_lora_rank
+        self.eps = config.rms_norm_eps
+        self.softmax_scale = self.head_dim**-0.5
+        self.compress_ratio = compress_ratio
+
+        assert self.compress_ratio in (0, 4, 128)
+        assert self.head_dim == config.head_dim
+        assert config.num_key_value_heads == 1
+        assert not fuse_wqa_wkv, "Bundled DSpark uses separate Q and KV projections."
+
+        self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
+        self._attn_sink_local: Optional[torch.Tensor] = None
+        self.wq_a = ReplicatedLinear(
+            self.hidden_size,
+            self.q_lora_rank,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("wq_a", prefix),
+        )
+        self.wkv = ReplicatedLinear(
+            self.hidden_size,
+            self.head_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("wkv", prefix),
+        )
+        self.q_norm = RMSNorm(self.q_lora_rank, eps=self.eps)
+        self.wq_b = ColumnParallelLinear(
+            self.q_lora_rank,
+            self.n_heads * self.head_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("wq_b", prefix),
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
+        )
+        self.kv_norm = RMSNorm(self.head_dim, eps=self.eps)
+        wo_a_quant_config = quant_config if wo_a_keeps_quant_config else None
+        self.wo_a = ColumnParallelLinear(
+            self.n_heads * self.head_dim // self.n_groups,
+            self.n_groups * self.o_lora_rank,
+            bias=False,
+            quant_config=wo_a_quant_config,
+            prefix=add_prefix("wo_a", prefix),
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
+            **({} if wo_a_fp8 else {"params_dtype": torch.bfloat16}),
+        )
+        if wo_a_fp8:
+            assert hasattr(self.wo_a, "weight_scale_inv")
+            self.wo_a.weight_scale_inv.format_ue8m0 = True
+        self.wo_b = RowParallelLinear(
+            self.n_groups * self.o_lora_rank,
+            self.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            reduce_results=wo_b_reduce_results,
+            prefix=add_prefix("wo_b", prefix),
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
+        )
+
+        rope_theta, rope_scaling = get_rope_config(config)
+        scaling = rope_scaling or {}
+        rope_base = config.compress_rope_theta if compress_ratio else rope_theta
+        from sglang.srt.layers.deepseek_v4_rope import precompute_freqs_cis
+
+        freqs_cis = precompute_freqs_cis(
+            dim=self.qk_rope_head_dim,
+            seqlen=config.max_position_embeddings,
+            original_seq_len=rope_original_seq_len,
+            base=rope_base,
+            factor=scaling.get("factor", 1.0),
+            beta_fast=scaling.get("beta_fast", 32),
+            beta_slow=scaling.get("beta_slow", 1),
+        )
+        self.register_buffer("freqs_cis", freqs_cis, persistent=False)
+        self.freqs_cis: torch.Tensor
+
+    def _local_attn_sink(self) -> torch.Tensor:
+        if self.attn_tp_size == 1:
+            return self.attn_sink
+        if self._attn_sink_local is None:
+            rank = self.attn_tp_rank
+            num_heads = self.n_local_heads
+            padded_num_heads = 64 if num_heads <= 64 else self.n_heads
+            sink = self.attn_sink.new_zeros(padded_num_heads)
+            sink[:num_heads] = self.attn_sink[
+                rank * num_heads : (rank + 1) * num_heads
+            ]
+            self._attn_sink_local = sink
+        return self._attn_sink_local
 
 
 class MQALayer(nn.Module):
@@ -664,7 +833,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
-        self.self_attn = MQALayer(
+        self.self_attn = self._build_self_attn(
             config=config,
             layer_id=layer_id,
             quant_config=quant_config,
@@ -700,6 +869,25 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
         self.rms_norm_eps = config.rms_norm_eps
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+
+    def _build_self_attn(
+        self,
+        *,
+        config: DeepSeekV4Config,
+        layer_id: int,
+        quant_config: Optional[QuantizationConfig],
+        prefix: str,
+        alt_streams: Optional[List[torch.cuda.Stream]],
+        compress_ratio_override: Optional[int],
+    ) -> nn.Module:
+        return MQALayer(
+            config=config,
+            layer_id=layer_id,
+            quant_config=quant_config,
+            prefix=prefix,
+            alt_streams=alt_streams,
+            compress_ratio_override=compress_ratio_override,
+        )
 
     def hc_pre(
         self,
@@ -874,6 +1062,30 @@ class DeepseekV4DecoderLayer(nn.Module):
         if not norm_fused:
             hidden_states = self.post_attention_layernorm(hidden_states)
 
+        hidden_states = self._run_moe_ffn_dp_sync(
+            hidden_states,
+            forward_batch,
+            input_ids=input_ids,
+            input_ids_global=input_ids_global,
+        )
+
+        hidden_states = self.hc_post(hidden_states, residual, post, comb)
+
+        return hidden_states
+
+    def _run_moe_ffn_dp_sync(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        input_ids: Optional[torch.Tensor],
+        input_ids_global: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Run the fork's existing MoE/DP synchronization around the FFN.
+
+        Kept as a shared helper so the target and bundled DSpark decoder layers
+        use exactly the same attention-DP gather/scatter contract.
+        """
         _use_cp = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
         _use_tp_moe_gather = (
             not _use_cp
@@ -938,9 +1150,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             gathered = [torch.empty_like(t) for t in _a2a_scatter_chunks]
             attn_tp_all_gather(gathered, hidden_states.contiguous())
             hidden_states = torch.cat(gathered)
-
-        hidden_states = self.hc_post(hidden_states, residual, post, comb)
-
         return hidden_states
 
 
@@ -1000,6 +1209,10 @@ class DeepseekV4Model(nn.Module):
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
             self.cp_size = get_attention_cp_size()
+        self.dspark_layers_to_capture: Optional[List[int]] = None
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.embed_tokens
 
     def hc_head(
         self,
@@ -1073,6 +1286,17 @@ class DeepseekV4Model(nn.Module):
         # forks alt-streams; later per-layer calls become no-ops.
         forward_batch.attn_backend._maybe_upgrade_forward_metadata()
 
+        capture_dspark = self.dspark_layers_to_capture is not None
+        if capture_dspark and nsa_use_prefill_cp(forward_batch):
+            raise NotImplementedError(
+                "DSpark aux hidden-state capture is not supported together with "
+                "DeepSeek-V4 prefill context parallelism (attn_cp_size > 1). Disable one "
+                "of them: DSpark static-verify is CP-off for v1."
+            )
+        dspark_aux_hidden_states: List[torch.Tensor] = []
+
+        # Preserve the fork's original decoder-layer call and return contract.
+        # DSpark only observes selected completed layer outputs.
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states = layer(
@@ -1082,6 +1306,8 @@ class DeepseekV4Model(nn.Module):
                 input_ids=input_ids,
                 input_ids_global=input_ids_global,
             )
+            if capture_dspark and i in self.dspark_layers_to_capture:
+                dspark_aux_hidden_states.append(hidden_states.mean(dim=1))
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
         if self.pp_group.is_last_rank and nsa_use_prefill_cp(forward_batch):
@@ -1094,7 +1320,17 @@ class DeepseekV4Model(nn.Module):
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
-            return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
+            proxy_tensors = {"hidden_states": hidden_states.flatten(1)}
+            if capture_dspark:
+                if dspark_aux_hidden_states:
+                    proxy_tensors["dspark_aux_hidden_states"] = torch.cat(
+                        dspark_aux_hidden_states, dim=-1
+                    )
+                else:
+                    proxy_tensors["dspark_aux_hidden_states"] = hidden_states.new_empty(
+                        hidden_states.shape[0], 0
+                    )
+            return PPProxyTensors(proxy_tensors)
 
         pre_hc_head = hidden_states.flatten(1)
 
@@ -1102,6 +1338,9 @@ class DeepseekV4Model(nn.Module):
             hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
         )
         hidden_states = self.norm(hidden_states)
+
+        if capture_dspark:
+            return (hidden_states, pre_hc_head), dspark_aux_hidden_states
 
         return hidden_states, pre_hc_head
 
@@ -1162,6 +1401,22 @@ class DeepseekV4ForCausalLM(nn.Module):
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
 
+    def get_input_embeddings(self) -> nn.Module:
+        return self.model.get_input_embeddings()
+
+    def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
+        if layer_ids is None:
+            raise ValueError(
+                "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+        local_layer_ids = [
+            int(layer_id)
+            for layer_id in layer_ids
+            if self.model.start_layer <= int(layer_id) < self.model.end_layer
+        ]
+        self.capture_aux_hidden_states = bool(local_layer_ids)
+        self.model.dspark_layers_to_capture = local_layer_ids or None
+
     def determine_num_fused_shared_experts(self):
         self.num_fused_shared_experts = 0
         if get_global_server_args().disable_shared_experts_fusion:
@@ -1220,7 +1475,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             self.lm_head,
             forward_batch,
             aux_hidden_states,
-            hidden_states_before_norm=pre_hc_head,
+            hidden_states_before_norm=(
+                None if aux_hidden_states is not None else pre_hc_head
+            ),
         )
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
@@ -1700,6 +1957,59 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     )
 
     return result.to(torch.bfloat16)
+
+
+def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if getattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, False):
+        return tensor.clone().detach()
+    return tensor
+
+
+def _dequant_fp8_wo_a_streaming(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    """Dequantize DSpark/DSV4 WO-A pairs without materializing all weights."""
+
+    pending: dict[str, dict[str, torch.Tensor]] = {}
+    saw_wo_a_scale = False
+    emitted = False
+
+    for name, tensor in weights:
+        if name.endswith(".wo_a.weight"):
+            prefix = name[: -len(".weight")]
+            bucket = pending.setdefault(prefix, {})
+            scale = bucket.pop("scale", None)
+            if scale is not None:
+                pending.pop(prefix, None)
+                emitted = True
+                yield name, _dequant_fp8(tensor, scale)
+            else:
+                bucket["weight"] = _clone_if_runai_streamed_tensor(tensor)
+            continue
+
+        if name.endswith(".wo_a.scale"):
+            saw_wo_a_scale = True
+            prefix = name[: -len(".scale")]
+            bucket = pending.setdefault(prefix, {})
+            weight = bucket.pop("weight", None)
+            if weight is not None:
+                pending.pop(prefix, None)
+                emitted = True
+                yield prefix + ".weight", _dequant_fp8(weight, tensor)
+            else:
+                bucket["scale"] = _clone_if_runai_streamed_tensor(tensor)
+            continue
+
+        yield name, tensor
+
+    if emitted:
+        logger.info("Finished streaming dequant fp8 wo_a")
+    for prefix, bucket in pending.items():
+        if "weight" in bucket:
+            assert not saw_wo_a_scale, f"{prefix}.scale is missing"
+            yield prefix + ".weight", bucket["weight"]
+        if "scale" in bucket:
+            yield prefix + ".scale", bucket["scale"]
 
 
 def _dequant_fp8_wo_a(

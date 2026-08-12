@@ -65,6 +65,7 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
         server_args.speculative_draft_model_path,
         trust_remote_code=server_args.trust_remote_code,
     )
+    effective_algorithm = server_args.effective_speculative_algorithm
 
     # Validate --speculative-draft-window-size once, regardless of algorithm.
     # Consumed by DFLASH (compact draft KV cache) and Llama EAGLE-3 (drafter attention SWA).
@@ -75,18 +76,18 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
                 f"--speculative-draft-window-size must be positive, got {window_size}."
             )
         server_args.speculative_draft_window_size = window_size
-        if server_args.speculative_algorithm not in ("EAGLE3", "DFLASH"):
+        if effective_algorithm not in ("EAGLE3", "DFLASH"):
             logger.warning(
                 "--speculative-draft-window-size has no effect with "
                 "speculative_algorithm=%s (honored by Llama EAGLE-3 and DFLASH only).",
-                server_args.speculative_algorithm,
+                effective_algorithm,
             )
 
-    if server_args.speculative_algorithm is not None:
+    if effective_algorithm is not None:
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
         from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 
-        algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+        algo = SpeculativeAlgorithm.from_string(effective_algorithm)
 
         # TODO: move the per-algorithm validation below into spec module hooks.
         if isinstance(algo, CustomSpecAlgo) and algo.validate_server_args is not None:
@@ -98,13 +99,15 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
             f"speculative_algorithm == EAGLE, got {server_args.speculative_algorithm}."
         )
 
-    if server_args.speculative_algorithm == "DFLASH":
+    if effective_algorithm == "DFLASH":
         _handle_dflash(server_args)
-    elif server_args.speculative_algorithm == "FROZEN_KV_MTP":
+    elif effective_algorithm == "DSPARK":
+        _handle_dspark(server_args)
+    elif effective_algorithm == "FROZEN_KV_MTP":
         _handle_frozen_kv_mtp(server_args)
-    elif server_args.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
+    elif effective_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
         _handle_eagle_family(server_args)
-    elif server_args.speculative_algorithm == "NGRAM":
+    elif effective_algorithm == "NGRAM":
         _handle_ngram(server_args)
 
     if server_args.speculative_adaptive:
@@ -227,6 +230,224 @@ def _handle_dflash(server_args: "ServerArgs") -> None:
         server_args.enable_mixed_chunk = False
         logger.warning(
             "Mixed chunked prefill is disabled because of using dflash speculative decoding."
+        )
+
+
+def _target_checkpoint_bundles_dspark_draft(server_args: "ServerArgs") -> bool:
+    from sglang.srt.speculative.dspark_components.dspark_config import (
+        checkpoint_bundles_dspark_draft,
+    )
+
+    return checkpoint_bundles_dspark_draft(server_args.get_model_config().hf_config)
+
+
+def _handle_dspark(server_args: "ServerArgs") -> None:
+    if not server_args.device.startswith("cuda"):
+        raise ValueError("DSpark speculative decoding only supports CUDA device.")
+
+    if server_args.disaggregation_mode not in ("prefill", "decode"):
+        raise ValueError(
+            "This DeepSeek-V4 DSpark backport supports PD disaggregation only."
+        )
+    if server_args.disaggregation_transfer_backend != "mooncake":
+        raise ValueError(
+            "DeepSeek-V4 DSpark PD currently supports Mooncake only; "
+            f"got {server_args.disaggregation_transfer_backend!r}."
+        )
+    if server_args.attn_cp_size != 1:
+        raise ValueError(
+            "DeepSeek-V4 DSpark does not support context parallel in this "
+            f"backport (attn_cp_size={server_args.attn_cp_size})."
+        )
+    if server_args.disaggregation_mode == "decode" and server_args.pp_size != 1:
+        raise ValueError("DeepSeek-V4 DSpark decode requires pp_size == 1.")
+    if server_args.moe_a2a_backend != "none":
+        raise ValueError(
+            "DeepSeek-V4 DSpark currently requires --moe-a2a-backend none."
+        )
+    if server_args.speculative_moe_a2a_backend not in (None, "none"):
+        raise ValueError(
+            "DeepSeek-V4 DSpark does not support a separate MoE A2A backend."
+        )
+    if server_args.enforce_shared_experts_fusion:
+        raise ValueError(
+            "DeepSeek-V4 DSpark uses separate shared experts in this backport; "
+            "--enforce-shared-experts-fusion is not supported."
+        )
+    if server_args.enable_eic_cache:
+        raise ValueError("DeepSeek-V4 DSpark does not support EIC in this backport.")
+    if server_args.enable_hierarchical_cache:
+        if server_args.disaggregation_mode != "prefill":
+            raise ValueError("DSpark HiCache L2 is supported on the prefill node only.")
+        if server_args.hicache_storage_backend is not None:
+            raise ValueError("DeepSeek-V4 DSpark supports HiCache L2 only, not L3.")
+        if server_args.hicache_write_policy != "write_through":
+            raise ValueError(
+                "DeepSeek-V4 DSpark HiCache requires write_through policy."
+            )
+
+    if not server_args.disable_overlap_schedule:
+        server_args.disable_overlap_schedule = True
+        logger.warning("Overlap scheduling is disabled for DSpark.")
+
+    if server_args.enable_dp_attention:
+        if not server_args.enable_dp_lm_head:
+            raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
+        if server_args.moe_a2a_backend != "none":
+            raise ValueError(
+                "DSpark with dp attention only supports the built-in TP MoE "
+                f"(moe_a2a_backend='none'), got {server_args.moe_a2a_backend!r}."
+            )
+        if (
+            server_args.speculative_moe_a2a_backend is not None
+            and server_args.speculative_moe_a2a_backend != server_args.moe_a2a_backend
+        ):
+            raise ValueError(
+                "DSpark ignores --speculative-moe-a2a-backend; with dp attention it "
+                f"must match the target moe_a2a_backend={server_args.moe_a2a_backend!r} "
+                f"(got {server_args.speculative_moe_a2a_backend!r})."
+            )
+
+    bundles_dspark = _target_checkpoint_bundles_dspark_draft(server_args)
+    if not bundles_dspark:
+        raise ValueError(
+            "This backport supports only the DSpark draft bundled in the "
+            "DeepSeek-V4-Flash-0731 checkpoint."
+        )
+    if server_args.speculative_draft_model_path is None:
+        if bundles_dspark:
+            server_args.speculative_draft_model_path = server_args.model_path
+            server_args.speculative_draft_model_revision = server_args.revision
+            logger.info(
+                "DSpark draft weights are bundled in the target checkpoint; "
+                "defaulting --speculative-draft-model-path to --model-path (%s).",
+                server_args.model_path,
+            )
+    elif server_args.speculative_draft_model_path != server_args.model_path:
+        raise ValueError(
+            "Bundled DeepSeek-V4 DSpark must use the target checkpoint; do not "
+            "set a different --speculative-draft-model-path."
+        )
+    elif server_args.speculative_draft_model_revision not in (
+        None,
+        server_args.revision,
+    ):
+        raise ValueError(
+            "Bundled DeepSeek-V4 DSpark draft and target revisions must match."
+        )
+
+    if server_args.speculative_num_steps is None:
+        server_args.speculative_num_steps = 1
+    elif int(server_args.speculative_num_steps) != 1:
+        logger.warning(
+            "DSpark only supports speculative_num_steps == 1; overriding speculative_num_steps=%s to 1.",
+            server_args.speculative_num_steps,
+        )
+        server_args.speculative_num_steps = 1
+
+    if server_args.speculative_eagle_topk is None:
+        server_args.speculative_eagle_topk = 1
+    elif int(server_args.speculative_eagle_topk) != 1:
+        logger.warning(
+            "DSpark only supports speculative_eagle_topk == 1; overriding speculative_eagle_topk=%s to 1.",
+            server_args.speculative_eagle_topk,
+        )
+        server_args.speculative_eagle_topk = 1
+
+    gamma: Optional[int] = None
+    if server_args.speculative_dspark_block_size is not None:
+        if int(server_args.speculative_dspark_block_size) <= 0:
+            raise ValueError(
+                "DSpark requires --speculative-dspark-block-size to be positive, "
+                f"got {server_args.speculative_dspark_block_size}."
+            )
+        gamma = int(server_args.speculative_dspark_block_size)
+    else:
+        from sglang.srt.speculative.dspark_components.dspark_config import (
+            DEFAULT_DSPARK_GAMMA,
+            read_draft_checkpoint_gamma,
+        )
+
+        try:
+            gamma = read_draft_checkpoint_gamma(server_args=server_args)
+        except Exception as e:
+            logger.warning(
+                "Failed to read DSpark gamma from draft model config; "
+                "cannot cross-check --speculative-num-draft-tokens. Error: %s",
+                e,
+            )
+        if gamma is None and server_args.speculative_num_draft_tokens is None:
+            gamma = DEFAULT_DSPARK_GAMMA
+            logger.warning(
+                "DSpark gamma is not set; defaulting to %d.",
+                gamma,
+            )
+
+    if gamma is not None:
+        verify_window = int(gamma) + 1
+        if (
+            server_args.speculative_num_draft_tokens is not None
+            and int(server_args.speculative_num_draft_tokens) != verify_window
+        ):
+            raise ValueError(
+                "DSpark speculative_num_draft_tokens must equal gamma + 1 "
+                f"(= {verify_window} for gamma={gamma}), but got "
+                f"speculative_num_draft_tokens={server_args.speculative_num_draft_tokens}."
+            )
+        server_args.speculative_num_draft_tokens = verify_window
+
+    if server_args.speculative_num_draft_tokens is None:
+        raise ValueError(
+            "DSpark could not resolve speculative_num_draft_tokens; set "
+            "--speculative-dspark-block-size (= gamma)."
+        )
+    if int(server_args.speculative_num_draft_tokens) < 2:
+        raise ValueError(
+            "DSpark speculative_num_draft_tokens must be >= 2 (= gamma + 1), "
+            f"got {server_args.speculative_num_draft_tokens}."
+        )
+
+    if server_args.max_running_requests is None:
+        server_args.max_running_requests = 48
+        logger.warning(
+            "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+        )
+
+    if server_args.enable_mixed_chunk:
+        server_args.enable_mixed_chunk = False
+        logger.warning(
+            "Mixed chunked prefill is disabled because of using dspark speculative decoding."
+        )
+
+    from sglang.srt.speculative.ragged_verify import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
+    )
+
+    ragged_mode = read_ragged_verify_mode()
+    if ragged_mode is not RaggedVerifyMode.STATIC:
+        raise ValueError(
+            "DeepSeek-V4 DSpark currently requires "
+            "SGLANG_RAGGED_VERIFY_MODE=static."
+        )
+    if (
+        server_args.speculative_dspark_align_verify_tokens_to_graph_tier
+        and ragged_mode is not RaggedVerifyMode.COMPACT
+    ):
+        logger.warning(
+            "--speculative-dspark-align-verify-tokens-to-graph-tier only takes "
+            "effect with SGLANG_RAGGED_VERIFY_MODE=compact (got %r); it will be "
+            "a no-op.",
+            ragged_mode.value,
+        )
+    if (
+        server_args.speculative_dspark_sps_table_path
+        and ragged_mode is RaggedVerifyMode.STATIC
+    ):
+        logger.warning(
+            "--speculative-dspark-sps-table-path feeds the ragged-verify budget "
+            "scheduler, which is off under SGLANG_RAGGED_VERIFY_MODE=static; it "
+            "will be a no-op."
         )
 
 

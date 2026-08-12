@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from enum import Enum
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,17 @@ class KVCacheBuildResult:
     token_to_kv_pool_allocator: object
     disable_radix_cache: bool
     tree_cache: object
+
+
+class HiCacheDraftMode(str, Enum):
+    NONE = "none"
+    PACKED = "packed"
+
+
+@dataclass(frozen=True, slots=True)
+class HiCacheDraftPlan:
+    mode: HiCacheDraftMode = HiCacheDraftMode.NONE
+    device_pools: tuple[object, ...] = ()
 
 
 from typing import TYPE_CHECKING
@@ -56,6 +68,16 @@ def get_draft_kv_pool(
     draft worker, or (None, None) when no draft KV pool is available."""
     if draft_worker is None or spec_algorithm.is_ngram():
         return None, None
+    if (
+        spec_algorithm.is_dspark()
+        and draft_worker.is_lifecycle_only_pp_prefill_rank
+    ):
+        return None, None
+    if spec_algorithm.is_dspark():
+        return (
+            draft_worker.primary_draft_kv_pool,
+            draft_worker.draft_model_runner.model_config,
+        )
 
     if spec_algorithm.supports_spec_v2() and enable_overlap:
         if server_args.enable_multi_layer_eagle:
@@ -67,6 +89,64 @@ def get_draft_kv_pool(
     return (
         draft_worker.model_runner.token_to_kv_pool,
         draft_worker.model_config,
+    )
+
+
+def prepare_dspark_hicache_draft_plan(
+    *,
+    target_worker: "BaseTpWorker",
+    draft_worker: "BaseTpWorker",
+    spec_algorithm: "SpeculativeAlgorithm",
+    server_args: "ServerArgs",
+) -> HiCacheDraftPlan:
+    """Select the final-PP-stage packed DSpark SWA path.
+
+    This is intentionally DSV4-specific. Existing EAGLE/DFLASH HiCache
+    registration remains on the fork's established sidecar path.
+    """
+
+    target_runner = target_worker.model_runner
+    if (
+        not spec_algorithm.is_dspark()
+        or not server_args.enable_hierarchical_cache
+        or draft_worker is None
+        or draft_worker.is_lifecycle_only_pp_prefill_rank
+    ):
+        return HiCacheDraftPlan()
+    if server_args.disaggregation_mode != "prefill":
+        return HiCacheDraftPlan()
+    if target_runner.pp_size > 1 and target_runner.pp_rank != target_runner.pp_size - 1:
+        return HiCacheDraftPlan()
+
+    draft_runner = draft_worker.draft_model_runner
+    architectures = tuple(
+        getattr(draft_runner.model_config.hf_config, "architectures", ()) or ()
+    )
+    if "DeepseekV4ForCausalLMDSpark" not in architectures:
+        raise NotImplementedError(
+            "Packed DSpark HiCache only supports the bundled DeepSeek-V4 draft."
+        )
+
+    target_pool = target_runner.token_to_kv_pool
+    draft_pool = draft_runner.token_to_kv_pool
+    target_swa = target_pool.swa_kv_pool
+    draft_swa = draft_pool.swa_kv_pool
+    if target_pool.swa_page_size != draft_pool.swa_page_size:
+        raise ValueError("Target and DSpark draft SWA page sizes must match.")
+    if target_swa.bytes_per_page_padded != draft_swa.bytes_per_page_padded:
+        raise ValueError("Target and DSpark draft SWA page widths must match.")
+    if (
+        target_pool.full_to_swa_index_mapping
+        is not draft_pool.full_to_swa_index_mapping
+    ):
+        raise ValueError(
+            "Packed DSpark HiCache requires target and draft to share the "
+            "Full-to-SWA mapping."
+        )
+
+    return HiCacheDraftPlan(
+        mode=HiCacheDraftMode.PACKED,
+        device_pools=(draft_pool,),
     )
 
 
@@ -160,6 +240,7 @@ def build_kv_cache(
     pp_group: "GroupCoordinator",
     enable_hierarchical_cache: bool,
     enable_eic_cache: bool = False,
+    hicache_draft_plan: Optional[HiCacheDraftPlan] = None,
 ) -> "KVCacheBuildResult":
     sliding_window_size: Optional[int] = None
     full_tokens_per_layer: Optional[int] = None
@@ -271,6 +352,12 @@ def build_kv_cache(
         pp_size=ps.pp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
+        mtp_draft_device_pools=(
+            hicache_draft_plan.device_pools
+            if hicache_draft_plan is not None
+            and hicache_draft_plan.mode == HiCacheDraftMode.PACKED
+            else ()
+        ),
     )
 
     if effective_chunked_prefill_size is not None and disable_radix_cache:

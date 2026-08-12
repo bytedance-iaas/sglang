@@ -63,6 +63,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     input_to_float8,
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
+    requant_block_scale_ue8m0_for_deepgemm,
     requant_weight_ue8m0_inplace,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
@@ -852,20 +853,28 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             ), "cutlass_fp8 MoE requires SM90, SM100, or SM120 GPUs"
 
     @staticmethod
-    def is_deepgemm_moe_runner_backend_enabled() -> bool:
+    def is_deepgemm_moe_runner_backend_enabled(
+        moe_runner_backend=None, moe_a2a_backend=None
+    ) -> bool:
         """Check if MoE will actually use DeepGEMM runner for FP8."""
-        from sglang.srt.layers import deep_gemm_wrapper
         from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
-        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend is None:
+            moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_deep_gemm():
             return True
         if moe_runner_backend.is_auto():
-            return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and (
-                get_moe_a2a_backend().is_deepep()
-                or get_moe_a2a_backend().is_mooncake()
-                or get_moe_a2a_backend().is_nixl()
-            )
+            if moe_a2a_backend is None:
+                moe_a2a_backend = get_moe_a2a_backend()
+            if not (
+                moe_a2a_backend.is_deepep()
+                or moe_a2a_backend.is_mooncake()
+                or moe_a2a_backend.is_nixl()
+            ):
+                return False
+            from sglang.srt.layers import deep_gemm_wrapper
+
+            return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
         return False
 
     def create_weights(
@@ -1287,10 +1296,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         else:
             # For fp8 moe run with deepgemm, the expert weights and scales need be requantized to ue8m0
             from sglang.srt.layers import deep_gemm_wrapper
-            from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
-            from sglang.srt.model_loader.utils import (
-                should_deepgemm_weight_requant_ue8m0,
-            )
 
             # Check if MoE will actually use DeepGEMM runner
             will_use_deepgemm = self.is_deepgemm_moe_runner_backend_enabled()
@@ -1372,28 +1377,20 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 build_sm90_mega_moe_experts_weights(layer)
                 return
 
-            if (
-                not self.is_fp4_expert
-                and should_deepgemm_weight_requant_ue8m0(
-                    weight_block_size=getattr(
-                        self.quant_config, "weight_block_size", None
-                    ),
-                )
-                and will_use_deepgemm
-                and not layer.w13_weight_scale_inv.format_ue8m0
-            ):
-                assert isinstance(
-                    layer, DeepEPMoE
-                ), "DeepGemm MoE is only supported with DeepEPMoE"
+            if not self.is_fp4_expert:
                 weight_block_size = self.quant_config.weight_block_size
-                requant_weight_ue8m0_inplace(
-                    layer.w13_weight, layer.w13_weight_scale_inv, weight_block_size
-                )
-                requant_weight_ue8m0_inplace(
-                    layer.w2_weight, layer.w2_weight_scale_inv, weight_block_size
-                )
-                layer.w13_weight_scale_inv.format_ue8m0 = True
-                layer.w2_weight_scale_inv.format_ue8m0 = True
+                for weight, weight_scale in (
+                    (layer.w13_weight, layer.w13_weight_scale_inv),
+                    (layer.w2_weight, layer.w2_weight_scale_inv),
+                ):
+                    requant_block_scale_ue8m0_for_deepgemm(
+                        weight,
+                        weight_scale,
+                        weight_block_size,
+                        use_deepgemm_runner=will_use_deepgemm,
+                        output_dtype=torch.bfloat16,
+                        weight_shape=weight.shape[-2:],
+                    )
 
     def _process_mxfp8_moe_weights(self, layer: Module, quantize: bool = True) -> None:
 
@@ -1954,6 +1951,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_scale_e8m0=getattr(w2_scale, "scale_e8m0_data", None),
                 block_shape=block_shape,
                 is_fp4_experts=self.is_fp4_expert,
+                use_mxfp8=getattr(self.quant_config, "use_mxfp8", False),
             )
         elif (
             self.runner.runner_backend.is_flashinfer_trtllm()

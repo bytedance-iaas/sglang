@@ -18,6 +18,11 @@ class StateType(str, enum.Enum):
     MAMBA = "mamba"
     SWA = "swa"
     NSA = "nsa"
+    # DSV4 C128 compression state is transferred separately from SWA for
+    # bundled DSpark PD serving.  The fork keeps #601's Full-indexed state
+    # addressing, so this component must not be matched positionally with a
+    # request-scoped or draft SWA component.
+    C128_STATE = "c128_state"
 
 
 @dataclasses.dataclass
@@ -32,6 +37,7 @@ class KVArgs:
     kv_data_ptrs: List[int]
     kv_data_lens: List[int]
     kv_item_lens: List[int]
+    kv_layer_ids: List[int]
     aux_data_ptrs: List[int]
     aux_data_lens: List[int]
     aux_item_lens: List[int]
@@ -39,6 +45,7 @@ class KVArgs:
     state_data_ptrs: List[List[int]]
     state_data_lens: List[List[int]]
     state_item_lens: List[List[int]]
+    state_layer_ids: List[List[int]]
     # Per-tensor TP slice dim, used when prefill/decode attn_tp_size differ.
     state_dim_per_tensor: List[List[int]]
     ib_device: str

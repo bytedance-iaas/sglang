@@ -40,7 +40,11 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
@@ -234,6 +238,7 @@ class TpModelWorker(BaseTpWorker):
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         is_multi_layer_eagle: bool = False,
+        defer_device_graph_init: bool = False,
     ):
         # Parse args
         self.server_args = server_args
@@ -248,6 +253,7 @@ class TpModelWorker(BaseTpWorker):
         self.nccl_port = nccl_port
         self.is_draft_worker = is_draft_worker
         self.is_multi_layer_eagle = is_multi_layer_eagle
+        self.defer_device_graph_init = defer_device_graph_init
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.attn_cp_rank = attn_cp_rank
@@ -320,7 +326,7 @@ class TpModelWorker(BaseTpWorker):
         set_random_seed(self.random_seed)
 
         self.enable_overlap = not server_args.disable_overlap_schedule
-        self.enable_spec = server_args.speculative_algorithm is not None
+        self.enable_spec = server_args.effective_speculative_algorithm is not None
         self.hicache_layer_transfer_counter = None
 
     def _init_model_config(self):
@@ -362,6 +368,7 @@ class TpModelWorker(BaseTpWorker):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
             draft_model_idx=0 if self.is_multi_layer_eagle else None,
+            defer_device_graph_init=self.defer_device_graph_init,
         )
 
     def _init_multi_layer_eagle_model_runners(self):
@@ -388,6 +395,7 @@ class TpModelWorker(BaseTpWorker):
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     memory_pool_config=self.memory_pool_config,
                     draft_model_idx=i,
+                    defer_device_graph_init=self.defer_device_graph_init,
                 )
             )
 
@@ -451,6 +459,8 @@ class TpModelWorker(BaseTpWorker):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,
         skip_attn_backend_init=False,
+        *,
+        capture_hidden_mode: Optional[CaptureHiddenMode] = None,
     ) -> GenerationBatchResult:
         # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
         #               which requires preparing replay to always be in this function
@@ -460,10 +470,17 @@ class TpModelWorker(BaseTpWorker):
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(batch.hicache_consumer_index)
 
-            forward_batch = ForwardBatch.init_new(batch, self.model_runner)
+            forward_batch = ForwardBatch.init_new(
+                batch,
+                self.model_runner,
+                capture_hidden_mode=capture_hidden_mode,
+            )
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
+            assert (
+                capture_hidden_mode is None
+            ), "capture_hidden_mode override requires a ScheduleBatch input"
 
         if self.is_dllm():
             return self._forward_batch_generation_dllm(forward_batch)

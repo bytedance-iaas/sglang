@@ -249,13 +249,23 @@ def get_architecture_class_name(model_config: ModelConfig) -> str:
     return get_model_architecture(model_config)[1]
 
 
-def should_deepgemm_weight_requant_ue8m0(weight_block_size):
-    """Should we requant fp8 weights into UE8M0 format when loading the model"""
-    return (
+def should_deepgemm_weight_requant_ue8m0(
+    weight_block_size, output_dtype=None, weight_shape=None
+):
+    """Return whether DeepGEMM can consume a UE8M0-requantized weight."""
+    if not (
         deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
         and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         and weight_block_size is not None
-    )
+    ):
+        return False
+    if output_dtype is not None and output_dtype != torch.bfloat16:
+        return False
+    if weight_shape is not None and (
+        weight_shape[0] % 64 != 0 or weight_shape[1] % 128 != 0
+    ):
+        return False
+    return True
 
 
 def should_async_load(weight: torch.Tensor) -> bool:

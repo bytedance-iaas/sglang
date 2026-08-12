@@ -59,6 +59,7 @@ else:
 
 _MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
+_masked_standard_layout_memory_budget_bytes: Optional[int] = None
 
 
 def _fp4_e8m0_scale_supported(
@@ -95,6 +96,96 @@ def copy_list_to_gpu_no_ce(arr: List[int]):
     tensor_gpu = torch.empty_like(tensor_cpu, device="cuda")
     copy_to_gpu_no_ce(tensor_cpu, tensor_gpu)
     return tensor_gpu
+
+
+def set_masked_standard_layout_memory_budget(available_memory_bytes: int) -> int:
+    """Cache the masked-layout share of free non-static device memory."""
+    global _masked_standard_layout_memory_budget_bytes
+    fraction = envs.SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION.get()
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError(
+            "SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION must be in (0, 1]"
+        )
+    _masked_standard_layout_memory_budget_bytes = int(available_memory_bytes * fraction)
+    return _masked_standard_layout_memory_budget_bytes
+
+
+def _estimate_masked_standard_layout_peak_bytes(
+    runner_config: MoeRunnerConfig,
+    quant_info: DeepGemmMoeQuantInfo,
+    hidden_states: torch.Tensor,
+) -> int:
+    padded_m = (hidden_states.shape[0] // 256 + 1) * 256
+    activation_dtype = (
+        torch.bfloat16
+        if quant_info.w13_weight.dtype == torch.bfloat16
+        else torch.float8_e4m3fn
+    )
+    hidden_size = hidden_states.shape[1]
+    gateup_size = quant_info.w13_weight.shape[1]
+    gateup_row_bytes = gateup_size * torch.bfloat16.itemsize
+    down_output_row_bytes = quant_info.w2_weight.shape[1] * torch.bfloat16.itemsize
+    input_row_bytes = hidden_size * activation_dtype.itemsize
+    down_input_row_bytes = gateup_size // 2 * activation_dtype.itemsize
+
+    if activation_dtype == torch.bfloat16:
+        input_scale_row_bytes = 0
+        down_scale_row_bytes = 0
+    else:
+        block_k = quant_info.block_shape[1] if quant_info.block_shape else 128
+        packed_scales = quant_info.use_mxfp8 or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        scale_item_bytes = (
+            torch.uint8.itemsize if packed_scales else torch.float32.itemsize
+        )
+        input_scale_row_bytes = ceil_div(hidden_size, block_k) * scale_item_bytes
+        down_scale_row_bytes = ceil_div(gateup_size // 2, block_k) * scale_item_bytes
+
+    peak_row_bytes = max(
+        input_row_bytes + input_scale_row_bytes + gateup_row_bytes,
+        gateup_row_bytes + down_input_row_bytes + down_scale_row_bytes,
+        down_input_row_bytes + down_scale_row_bytes + down_output_row_bytes,
+    )
+    return runner_config.num_local_experts * padded_m * peak_row_bytes
+
+
+def _should_use_masked_standard_layout(
+    runner_config: MoeRunnerConfig,
+    quant_info: DeepGemmMoeQuantInfo,
+    hidden_states: torch.Tensor,
+) -> bool:
+    mode = envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.get().lower()
+    if mode not in ("auto", "masked", "compact"):
+        raise ValueError(
+            "SGLANG_DEEPGEMM_STANDARD_LAYOUT must be one of: auto, masked, compact"
+        )
+    if mode != "auto":
+        return mode == "masked"
+
+    global _masked_standard_layout_memory_budget_bytes
+    if _masked_standard_layout_memory_budget_bytes is None:
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+        if get_is_capture_mode():
+            return False
+        free_memory, _ = torch.cuda.mem_get_info(hidden_states.device)
+        set_masked_standard_layout_memory_budget(free_memory)
+
+    return (
+        _estimate_masked_standard_layout_peak_bytes(
+            runner_config, quant_info, hidden_states
+        )
+        <= _masked_standard_layout_memory_budget_bytes
+    )
+
+
+def _get_compact_all_tokens(
+    num_assignments: int, num_experts: int, block_e: int = 128
+) -> int:
+    """Return the maximum padded rows over all routings of the assignments."""
+    max_nonempty_experts = min(num_assignments, num_experts)
+    return block_e * (
+        max_nonempty_experts + (num_assignments - max_nonempty_experts) // block_e
+    )
 
 
 @dataclass
@@ -135,6 +226,7 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     block_shape: Optional[List[int]] = None
     # DSV4 mxfp4 layout flag; selects recipe_a=(1,128)/recipe_b=(1,32) downstream.
     is_fp4_experts: bool = False
+    use_mxfp8: bool = False
 
 
 class DeepGemmRunnerCore(MoeRunnerCore):
@@ -651,7 +743,11 @@ def pre_permute_standard_to_deep_gemm(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepGemmRunnerInput:
-    from sglang.srt.layers.moe.ep_moe.kernels import moe_ep_deepgemm_preprocess
+    from sglang.srt.layers.moe.ep_moe.kernels import (
+        ep_scatter,
+        fused_moe_dispatch_index,
+        moe_ep_deepgemm_preprocess,
+    )
 
     hidden_states, topk_output = (
         dispatch_output.hidden_states,
@@ -666,18 +762,145 @@ def pre_permute_standard_to_deep_gemm(
 
     topk_weights, topk_ids = topk_weights, topk_ids
 
-    # PreReorder
-    masked_m, expected_m, src2dst, hidden_states, hidden_states_scale = (
-        moe_ep_deepgemm_preprocess(
-            topk_ids,
-            runner_config.num_local_experts,
-            hidden_states,
-            runner_config.top_k,
-            quant_info.block_shape,
+    if _should_use_masked_standard_layout(runner_config, quant_info, hidden_states):
+        output_dtype = (
+            torch.bfloat16
+            if quant_info.w13_weight.dtype == torch.bfloat16
+            else torch.float8_e4m3fn
         )
-    )
+        masked_m, _, src2dst, hidden_states, hidden_states_scale = (
+            moe_ep_deepgemm_preprocess(
+                topk_ids,
+                runner_config.num_local_experts,
+                hidden_states,
+                runner_config.top_k,
+                quant_info.block_shape,
+                output_dtype=output_dtype,
+                use_mxfp8=quant_info.use_mxfp8,
+            )
+        )
+        expected_m = max(
+            1,
+            ceil_div(
+                hidden_states_shape[0] * runner_config.top_k,
+                runner_config.num_experts,
+            ),
+        )
 
-    dispose_tensor(hidden_states_ref)
+        if runner_config.inplace:
+            dispose_tensor(hidden_states_ref)
+
+        running_state["topk_ids"] = topk_ids
+        running_state["topk_weights"] = topk_weights
+        running_state["hidden_states_shape"] = hidden_states_shape
+        running_state["hidden_states_dtype"] = hidden_states_dtype
+        running_state["hidden_states_device"] = hidden_states_device
+        running_state["src2dst"] = src2dst
+
+        return DeepGemmRunnerInput(
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
+            use_masked_gemm=True,
+            masked_m=masked_m,
+            expected_m=expected_m,
+            masked_m_max_hint=getattr(dispatch_output, "masked_m_max_hint", None),
+            masked_m_sum_hint=getattr(dispatch_output, "masked_m_sum_hint", None),
+            active_expert_count_hint=getattr(
+                dispatch_output, "active_expert_count_hint", None
+            ),
+        )
+
+    block_e = 128
+    num_experts = runner_config.num_local_experts
+    num_assignments = topk_ids.numel()
+    all_tokens = _get_compact_all_tokens(num_assignments, num_experts, block_e)
+
+    tokens_per_expert, unused_src2dst = fused_moe_dispatch_index(
+        topk_ids, num_experts, 1
+    )
+    dispose_tensor(unused_src2dst)
+    valid_tokens_per_expert = tokens_per_expert
+    tokens_per_expert = (ceil_div(tokens_per_expert, block_e) * block_e).to(torch.int32)
+    tokens_per_expert[-1].add_(all_tokens - tokens_per_expert.sum())
+
+    hidden_size = hidden_states.size(1)
+    output_dtype = (
+        torch.bfloat16
+        if quant_info.w13_weight.dtype == torch.bfloat16
+        else torch.float8_e4m3fn
+    )
+    if output_dtype == torch.bfloat16:
+        packed_input_source = hidden_states
+        packed_input_source_scale = None
+        packed_input = torch.empty(
+            (all_tokens, hidden_size),
+            device=hidden_states_device,
+            dtype=torch.bfloat16,
+        )
+        packed_input_scale = torch.empty(
+            (all_tokens, 1), device=hidden_states_device, dtype=torch.float32
+        )
+    else:
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
+
+        block_k = quant_info.block_shape[1] if quant_info.block_shape else 128
+        packed_input_source, packed_input_source_scale = (
+            sglang_per_token_group_quant_fp8(
+                hidden_states,
+                block_k,
+                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            )
+        )
+        packed_input = torch.zeros(
+            (all_tokens, hidden_size),
+            device=hidden_states_device,
+            dtype=torch.float8_e4m3fn,
+        )
+        scale_width = hidden_size // block_k
+        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            scale_width = ceil_div(scale_width, 4)
+            packed_input_scale = torch.zeros(
+                (scale_width, all_tokens),
+                device=hidden_states_device,
+                dtype=packed_input_source_scale.dtype,
+            ).transpose(0, 1)
+        else:
+            packed_input_scale = torch.zeros(
+                (all_tokens, scale_width),
+                device=hidden_states_device,
+                dtype=packed_input_source_scale.dtype,
+            )
+
+    expert_start_loc = torch.empty(
+        num_experts, device=hidden_states_device, dtype=torch.int32
+    )
+    m_indices = torch.empty(all_tokens, device=hidden_states_device, dtype=torch.int32)
+    src2dst = torch.empty_like(topk_ids, dtype=torch.int32)
+    ep_scatter(
+        packed_input_source,
+        packed_input_source_scale,
+        topk_ids,
+        tokens_per_expert,
+        valid_tokens_per_expert,
+        expert_start_loc,
+        packed_input,
+        packed_input_scale,
+        m_indices,
+        src2dst,
+        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        quant_block_size=(quant_info.block_shape[1] if quant_info.block_shape else 128),
+    )
+    if packed_input_source is not hidden_states:
+        dispose_tensor(packed_input_source)
+    if packed_input_source_scale is not None:
+        dispose_tensor(packed_input_source_scale)
+
+    if runner_config.inplace:
+        dispose_tensor(hidden_states_ref)
 
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
@@ -685,18 +908,13 @@ def pre_permute_standard_to_deep_gemm(
     running_state["hidden_states_dtype"] = hidden_states_dtype
     running_state["hidden_states_device"] = hidden_states_device
     running_state["src2dst"] = src2dst
+    running_state["all_tokens"] = all_tokens
 
     return DeepGemmRunnerInput(
-        hidden_states=hidden_states,
-        hidden_states_scale=hidden_states_scale,
-        use_masked_gemm=True,
-        masked_m=masked_m,
-        expected_m=expected_m,
-        masked_m_max_hint=getattr(dispatch_output, "masked_m_max_hint", None),
-        masked_m_sum_hint=getattr(dispatch_output, "masked_m_sum_hint", None),
-        active_expert_count_hint=getattr(
-            dispatch_output, "active_expert_count_hint", None
-        ),
+        hidden_states=packed_input,
+        hidden_states_scale=packed_input_scale,
+        use_masked_gemm=False,
+        m_indices=m_indices,
     )
 
 
@@ -707,7 +925,7 @@ def post_permute_deep_gemm_to_standard(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> StandardCombineInput:
-    from sglang.srt.layers.moe.ep_moe.kernels import post_reorder_triton_kernel
+    from sglang.srt.layers.moe.ep_moe.kernels import post_reorder_deepgemm
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
     hidden_states_shape = running_state["hidden_states_shape"]
@@ -720,21 +938,23 @@ def post_permute_deep_gemm_to_standard(
     output = torch.empty(
         hidden_states_shape, dtype=hidden_states_dtype, device=hidden_states_device
     )
-    post_reorder_triton_kernel[(hidden_states_shape[0],)](
+    post_reorder_deepgemm(
         runner_output.hidden_states,
         output,
         src2dst,
         topk_ids,
         topk_weights,
         runner_config.top_k,
+        hidden_states_shape[0],
         hidden_states_shape[1],
-        BLOCK_SIZE=512,
+        (
+            runner_config.routed_scaling_factor
+            if runner_config.routed_scaling_factor is not None
+            else 1.0
+        ),
     )
 
     dispose_tensor(runner_output.hidden_states)
-
-    if runner_config.routed_scaling_factor is not None:
-        output *= runner_config.routed_scaling_factor
 
     return StandardCombineInput(
         hidden_states=output,
@@ -860,6 +1080,7 @@ def pre_permute_deepep_normal_to_deep_gemm(
         hidden_states_scale,
         topk_ids,
         num_recv_tokens_per_expert_gpu,
+        num_recv_tokens_per_expert_gpu,
         expert_start_loc,
         input_tensor,
         input_tensor_scale,
@@ -955,8 +1176,20 @@ def _varlen_deep_gemm_silu_mul_quant(
         dtype=torch.float8_e4m3fn,
     )
 
-    if envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get():
-        assert N % 4 == 0 and G % 4 == 0
+    # Match upstream's trait-driven dispatch: the DSV4 JIT kernel is required
+    # only for activation semantics that the generic masked quantizer cannot
+    # express.  A plain SiLU path must remain usable even when the environment
+    # enables JIT activation globally; in particular, TP8 gives DSV4 only two
+    # FP8 scale groups per rank and does not satisfy the JIT kernel geometry.
+    if swiglu_limit is not None or swizzle:
+        assert envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get(), (
+            "swiglu_limit / swizzle require "
+            "SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
+        )
+        assert N % 4 == 0 and G % 4 == 0 and D // 8 >= E, (
+            "DSV4 JIT activation requires N % 4 == 0, G % 4 == 0 and "
+            f"D // 8 >= num_experts, got N={N} G={G} D={D} E={E}"
+        )
         packed_ue8m0 = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         down_input_scale = torch.empty(
             (E, G // 4, N) if packed_ue8m0 else (E, N, G),
@@ -978,12 +1211,6 @@ def _varlen_deep_gemm_silu_mul_quant(
         if packed_ue8m0:
             down_input_scale = down_input_scale.transpose(-1, -2)
     else:
-        assert (
-            swiglu_limit is None
-        ), "swiglu_limit (DeepSeek V4) requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
-        assert (
-            not swizzle
-        ), "SGLANG_OPT_FIX_MEGA_MOE_MEMORY requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
         down_input_scale = torch.empty(
             (E, N, G),
             device=hidden_states_device,

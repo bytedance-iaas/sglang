@@ -43,6 +43,20 @@ def _make_layer_mapper(
     return mapper
 
 
+def _with_mtp_layer_mapping(
+    layer_mapping: dict[int, int],
+    *,
+    target_layer_num: int,
+    draft_layer_num: int,
+) -> dict[int, int]:
+    """Append packed draft layers after the stage-local target layers."""
+
+    return layer_mapping | {
+        target_layer_num + depth: target_layer_num + depth
+        for depth in range(draft_layer_num)
+    }
+
+
 def build_kv_host_pool(
     *,
     kv_pool: Any,
@@ -291,7 +305,16 @@ def build_deepseek_v4_hicache_stack(
             f"got {len(kvcache.swa_kv_pool.kv_buffer)} buffers for "
             f"{transfer_layer_num} local layers"
         )
-    swa_layer_mapping = {layer_id: layer_id for layer_id in range(transfer_layer_num)}
+    mtp_swa_device_buffers = [
+        buffer
+        for pool in params.mtp_draft_device_pools
+        for buffer in pool.swa_kv_pool.kv_buffer
+    ]
+    swa_layer_mapping = _with_mtp_layer_mapping(
+        {layer_id: layer_id for layer_id in range(transfer_layer_num)},
+        target_layer_num=transfer_layer_num,
+        draft_layer_num=len(mtp_swa_device_buffers),
+    )
 
     c4_layer_mapping = {}
     c128_layer_mapping = {}
@@ -322,7 +345,10 @@ def build_deepseek_v4_hicache_stack(
     logical_host_pool = LogicalHostPool(num_host_pages * page_size, page_size)
     swa_host_pool = DeepSeekV4PagedHostPool(
         pool_name=str(PoolName.SWA),
-        device_buffers=kvcache.swa_kv_pool.kv_buffer,
+        device_buffers=[
+            *kvcache.swa_kv_pool.kv_buffer,
+            *mtp_swa_device_buffers,
+        ],
         item_bytes=kvcache.swa_kv_pool.bytes_per_page_padded,
         num_host_pages=swa_num_host_pages,
         slot_page_size=kvcache.swa_page_size,
@@ -344,7 +370,7 @@ def build_deepseek_v4_hicache_stack(
             host_pool=swa_host_pool,
             device_pool=kvcache.swa_kv_pool,
             layer_mapping=swa_layer_mapping,
-            transfer_layer_num=transfer_layer_num,
+            transfer_layer_num=transfer_layer_num + len(mtp_swa_device_buffers),
             host_evict_fn=host_swa_evict_fn,
             device_evict_fn=device_swa_evict_fn,
             device_alloc_fn=swa_attn_allocator.alloc,
@@ -473,6 +499,8 @@ def build_deepseek_v4_hicache_stack(
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
     )
+    if mtp_swa_device_buffers:
+        cache_controller.set_mtp_draft_buffers(mtp_swa_device_buffers)
     return host_pool_group, cache_controller
 
 

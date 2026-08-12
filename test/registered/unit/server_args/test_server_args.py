@@ -49,6 +49,60 @@ class TestLoadBalanceMethod(unittest.TestCase):
         server_args = ServerArgs(model_path="dummy", disaggregation_mode="decode")
         self.assertEqual(server_args.load_balance_method, "round_robin")
 
+    def test_pd_prefill_can_materialize_dspark_for_decode_peer(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="prefill",
+            disaggregation_peer_speculative_algorithm="dspark",
+        )
+
+        self.assertIsNone(server_args.speculative_algorithm)
+        self.assertEqual(
+            server_args.disaggregation_peer_speculative_algorithm, "DSPARK"
+        )
+        self.assertEqual(server_args.effective_speculative_algorithm, "DSPARK")
+        self.assertTrue(server_args.uses_dspark_pd_state_layout())
+
+    def test_pd_peer_speculative_algorithm_is_prefill_only(self):
+        with self.assertRaisesRegex(ValueError, "only valid.*PD Prefill"):
+            ServerArgs(
+                model_path="dummy",
+                disaggregation_mode="decode",
+                disaggregation_peer_speculative_algorithm="DSPARK",
+            )
+
+    def test_pd_peer_speculative_algorithm_rejects_unsupported_algorithm(self):
+        with self.assertRaisesRegex(ValueError, "only supports.*DSPARK"):
+            ServerArgs(
+                model_path="dummy",
+                disaggregation_mode="prefill",
+                disaggregation_peer_speculative_algorithm="EAGLE",
+            )
+
+    def test_pd_peer_speculative_algorithm_rejects_local_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "algorithms disagree"):
+            ServerArgs(
+                model_path="dummy",
+                disaggregation_mode="prefill",
+                speculative_algorithm="EAGLE",
+                disaggregation_peer_speculative_algorithm="DSPARK",
+            )
+
+    def test_peer_dspark_runs_materialization_handler_without_local_algorithm(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="prefill",
+            disaggregation_peer_speculative_algorithm="DSPARK",
+        )
+
+        with patch(
+            "sglang.srt.arg_groups.speculative_hook._handle_dspark"
+        ) as handle_dspark:
+            handle_speculative_decoding(server_args)
+
+        handle_dspark.assert_called_once_with(server_args)
+        self.assertIsNone(server_args.speculative_algorithm)
+
     def test_pd_decode_radix_cache_rejects_hisparse(self):
         with self.assertRaises(ValueError) as context:
             ServerArgs(

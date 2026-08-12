@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -14,7 +14,11 @@ from sglang.srt.mem_cache.common import (
     alloc_token_slots,
     get_last_loc,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.speculative.dflash_utils import (
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
@@ -146,6 +150,11 @@ class DFlashDraftInput(SpecInput):
             )
 
 
+if TYPE_CHECKING:
+    from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+
+
 @dataclass
 class DFlashVerifyInput(SpecInput):
     """Inputs for a target-model verify forward in DFlash (spec-v1).
@@ -168,6 +177,8 @@ class DFlashVerifyInput(SpecInput):
 
     # Shape info for padding (e.g., DP attention / CUDA graph).
     num_tokens_per_batch: int = -1
+
+    ragged_verify_layout: Optional[RaggedVerifyLayout] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
@@ -251,6 +262,117 @@ class DFlashVerifyInput(SpecInput):
             else torch.empty((0,), dtype=torch.bool, device=batch.device)
         )
 
+    def prepare_for_dspark_verify(
+        self,
+        batch: ScheduleBatch,
+        target_worker: TpModelWorker,
+    ) -> tuple[ForwardBatch, bool]:
+        """Package a DSpark target verify with the fork's graph interfaces.
+
+        DSpark reserves and publishes ``batch.out_cache_loc`` before reaching
+        this adapter.  Unlike the legacy DFLASH helper above, this method must
+        not allocate cache slots or rewrite the request mapping.  It only
+        builds the ForwardBatch and prepares either graph replay or eager
+        attention metadata so the caller can forward with
+        ``skip_attn_backend_init=True``.
+        """
+
+        local_bs = int(batch.seq_lens.numel())
+        dp_rank = getattr(target_worker, "dp_rank", None)
+        tp_rank = getattr(target_worker, "tp_rank", None)
+
+        def shape(value) -> object:
+            return None if value is None else tuple(value.shape)
+
+        details = (
+            f"dp_rank={dp_rank}, tp_rank={tp_rank}, "
+            f"forward_mode={batch.forward_mode}, local_bs={local_bs}, "
+            f"draft_token_shape={shape(self.draft_token)}, "
+            f"seq_lens_shape={shape(batch.seq_lens)}, "
+            f"req_pool_indices_shape={shape(batch.req_pool_indices)}, "
+            f"out_cache_loc_shape={shape(batch.out_cache_loc)}, "
+            f"global_num_tokens={batch.global_num_tokens}, "
+            f"global_num_tokens_for_logprob="
+            f"{batch.global_num_tokens_for_logprob}"
+        )
+
+        def fail(reason: str) -> None:
+            raise RuntimeError(
+                f"Invalid DSpark target-verify contract ({reason}): {details}"
+            )
+
+        if not (
+            batch.forward_mode.is_idle()
+            or batch.forward_mode
+            in (ForwardMode.DECODE, ForwardMode.PREBUILT, ForwardMode.TARGET_VERIFY)
+        ):
+            fail("unsupported forward mode")
+        if batch.req_pool_indices is None or tuple(batch.req_pool_indices.shape) != (
+            local_bs,
+        ):
+            fail("req_pool_indices shape does not match local_bs")
+        if batch.req_pool_indices.dtype != torch.int64:
+            fail("req_pool_indices dtype must be int64")
+        if batch.out_cache_loc is None:
+            fail("out_cache_loc is None")
+        if self.draft_token.ndim != 1 or batch.out_cache_loc.ndim != 1:
+            fail("draft_token and out_cache_loc must be one-dimensional")
+        if self.draft_token.numel() != batch.out_cache_loc.numel():
+            fail("draft_token and out_cache_loc lengths differ")
+        if self.draft_token.dtype != torch.int64:
+            fail("draft_token dtype must be int64")
+        if batch.out_cache_loc.dtype != torch.int64:
+            fail("out_cache_loc dtype must be int64")
+        if not (
+            self.draft_token.device
+            == batch.out_cache_loc.device
+            == batch.seq_lens.device
+            == batch.req_pool_indices.device
+        ):
+            fail("verify tensors are on different devices")
+        if self.ragged_verify_layout is None:
+            expected_tokens = local_bs * int(self.draft_token_num)
+            if self.draft_token.numel() != expected_tokens:
+                fail(f"static verify requires {expected_tokens} tokens")
+
+        if target_worker.model_runner.server_args.enable_dp_attention:
+            if not batch.global_num_tokens:
+                fail("missing global_num_tokens for DP attention")
+            if batch.global_num_tokens_for_logprob is None:
+                fail("missing global_num_tokens_for_logprob for DP attention")
+            if len(batch.global_num_tokens) != len(
+                batch.global_num_tokens_for_logprob
+            ):
+                fail("global token metadata lengths differ")
+
+        batch.input_ids = self.draft_token
+        batch.spec_info = self
+        batch.forward_mode = (
+            ForwardMode.IDLE
+            if batch.forward_mode.is_idle()
+            else ForwardMode.TARGET_VERIFY
+        )
+        batch.capture_hidden_mode = self.capture_hidden_mode
+        batch.return_hidden_states_before_norm = False
+        verify_forward_batch = ForwardBatch.init_new(
+            batch, target_worker.model_runner
+        )
+
+        graph_runner = target_worker.model_runner.graph_runner
+        can_run_cuda_graph = bool(
+            verify_forward_batch.forward_mode.is_cuda_graph()
+            and graph_runner
+            and graph_runner.can_run(verify_forward_batch)
+        )
+        if can_run_cuda_graph:
+            graph_runner.replay_prepare(verify_forward_batch)
+        elif not batch.forward_mode.is_idle():
+            target_worker.model_runner.attn_backend.init_forward_metadata(
+                verify_forward_batch
+            )
+
+        return verify_forward_batch, can_run_cuda_graph
+
     def generate_attn_arg_prefill(
         self,
         req_pool_indices: torch.Tensor,
@@ -261,20 +383,29 @@ class DFlashVerifyInput(SpecInput):
         device = req_pool_indices.device
         bs = len(req_pool_indices)
 
-        qo_indptr = torch.arange(
-            0,
-            (bs + 1) * self.draft_token_num,
-            step=self.draft_token_num,
-            dtype=torch.int32,
-            device=device,
-        )
+        layout = self.ragged_verify_layout
+
+        if layout is None:
+            qo_indptr = torch.arange(
+                0,
+                (bs + 1) * self.draft_token_num,
+                step=self.draft_token_num,
+                dtype=torch.int32,
+                device=device,
+            )
+            verify_lens = self.draft_token_num
+            kv_indices_extra = self.draft_token_num * bs
+        else:
+            qo_indptr = layout.qo_indptr_device
+            verify_lens = layout.verify_lens
+            kv_indices_extra = layout.total_verify_tokens
 
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
-        paged_kernel_lens = paged_kernel_lens + self.draft_token_num
+        paged_kernel_lens = paged_kernel_lens + verify_lens
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
         kv_indices = torch.empty(
-            paged_kernel_lens_sum + self.draft_token_num * bs,
+            paged_kernel_lens_sum + kv_indices_extra,
             dtype=torch.int32,
             device=device,
         )

@@ -18,6 +18,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import (
+    FINISH_MATCHED_TOKEN,
     Req,
     ScheduleBatch,
 )
@@ -27,6 +28,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
@@ -570,12 +572,12 @@ class SchedulerBatchResultProcessor:
             logprob_pt += num_input_logprobs
         return logprob_pt
 
-    def _resolve_spec_overlap_tokens(
+    def _resolve_result_based_spec_tokens(
         self,
         result: GenerationBatchResult,
         batch: ScheduleBatch,
     ) -> List[List[int]]:
-        """Resolve the padding next token ids for speculative decoding with overlap."""
+        """Resolve padded accepted tokens returned by a result-based worker."""
         assert result.next_token_ids.is_cpu
         assert result.accept_lens.is_cpu
 
@@ -583,6 +585,17 @@ class SchedulerBatchResultProcessor:
         accept_lens = result.accept_lens.tolist()
         result.num_correct_drafts = sum(accept_lens) - len(batch.reqs)
         result.num_correct_drafts_per_req_cpu = [x - 1 for x in accept_lens]
+
+        block_accept_lens = (
+            result.block_accept_lens.tolist()
+            if result.block_accept_lens is not None
+            else None
+        )
+        result.num_block_accept_tokens = (
+            sum(block_accept_lens) if block_accept_lens else 0
+        )
+        cap_lens = result.cap_lens.tolist() if result.cap_lens is not None else None
+        result.num_cap_tokens = sum(cap_lens) if cap_lens else 0
 
         # Feed the adaptive controller now that accept_lens is on CPU,
         # instead of doing a synchronous GPU→CPU copy in the worker hot path.
@@ -596,21 +609,27 @@ class SchedulerBatchResultProcessor:
         assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
 
         for i, req in enumerate(batch.reqs):
-            predict_tokens.append(
-                next_token_ids[i * stride : i * stride + accept_lens[i]]
-            )
+            accept_tokens = next_token_ids[
+                i * stride : i * stride + accept_lens[i]
+            ]
+            predict_tokens.append(accept_tokens)
 
             if req.is_retracted:
                 # reset_for_retract() already zeroes committed/allocated KV.
                 continue
 
             if req.finished():
-                # -1 because prepare_for_decode pre-claimed the bonus slot.
-                req.kv_committed_len -= 1
+                if not batch.spec_algorithm.is_dspark():
+                    # Legacy EAGLE spec-v2 pre-claimed the bonus slot.
+                    req.kv_committed_len -= 1
                 continue
 
-            # -1 because prepare_for_decode pre-claimed the bonus slot.
-            req.kv_committed_len += accept_lens[i] - 1
+            if batch.spec_algorithm.is_dspark():
+                # DSpark reserves capacity but does not pre-commit any token.
+                req.kv_committed_len += len(accept_tokens)
+            else:
+                # Legacy EAGLE spec-v2 pre-claimed the bonus slot.
+                req.kv_committed_len += len(accept_tokens) - 1
             req.spec_verify_ct += 1
 
             num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
@@ -672,7 +691,10 @@ class SchedulerBatchResultProcessor:
 
         # Spec V1 handles output_ids, update_finish_state, grammar, and reasoning tokens
         # in the verify phase. Non-spec and V2 handle them here in post-processing.
-        is_spec_v1 = not batch.spec_algorithm.is_none() and not batch.is_spec_v2
+        is_spec_v1 = (
+            not batch.spec_algorithm.is_none()
+            and not batch.uses_result_based_spec
+        )
         for i, req in enumerate(batch.reqs):
             req: Req
 
@@ -756,9 +778,9 @@ class SchedulerBatchResultProcessor:
         next_token_ids: Union[torch.Tensor, List[int]],
     ) -> Tuple[Union[List[int], List[List[int]]], Optional[List[float]]]:
         next_token_logprobs = None
-        if batch.spec_algorithm.is_none() or batch.is_spec_v2:
-            if batch.is_spec_v2:
-                next_token_ids = self._resolve_spec_overlap_tokens(result, batch)
+        if batch.spec_algorithm.is_none() or batch.uses_result_based_spec:
+            if batch.uses_result_based_spec:
+                next_token_ids = self._resolve_result_based_spec_tokens(result, batch)
             elif isinstance(next_token_ids, list):
                 pass  # MLX path: already a list[int], skip torch round-trip
             else:
@@ -795,7 +817,7 @@ class SchedulerBatchResultProcessor:
     ) -> None:
         # Spec v1 handles logprobs inside its own worker.
         # Normalize: non-spec has 1 token, spec v2 has multiple.
-        if batch.is_spec_v2:
+        if batch.uses_result_based_spec:
             accepted_logprobs = next_token_logprobs[i]
             accepted_ids = next_token_id
             max_accept = len(accepted_logprobs)
@@ -836,7 +858,7 @@ class SchedulerBatchResultProcessor:
             if batch.spec_algorithm.is_none():
                 # Normal decode: single token
                 req.grammar.accept_token(next_token_id)
-            elif batch.is_spec_v2:
+            elif batch.uses_result_based_spec:
                 # Speculative decode: next_token_id is a list of accepted tokens
                 for token_id in next_token_id:
                     req.grammar.accept_token(token_id)
@@ -862,6 +884,14 @@ class SchedulerBatchResultProcessor:
             self.decode_offload_manager.offload_kv_cache(req)
 
         if req.finished():
+            if isinstance(self.draft_worker, BaseSpecWorker):
+                self.draft_worker.note_request_finished(
+                    rid=req.rid,
+                    natural_stop=isinstance(
+                        req.finished_reason, FINISH_MATCHED_TOKEN
+                    ),
+                )
+
             # delete feature to save memory
             if req.multimodal_inputs is not None and req.session is None:
                 req.multimodal_inputs.release_features()

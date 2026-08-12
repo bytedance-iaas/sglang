@@ -57,7 +57,8 @@ class HybridAttnBackend(AttentionBackend):
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.decode_backend.init_cuda_graph_state(max_bs, max_num_tokens)
         if (
-            self.model_runner.server_args.speculative_algorithm is not None
+            self.model_runner.server_args.effective_speculative_algorithm
+            is not None
             and self.model_runner.server_args.speculative_attention_mode == "prefill"
         ):
             # When speculative decoding is enabled, we need to initialize the backend

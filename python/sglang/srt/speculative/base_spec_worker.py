@@ -40,3 +40,7 @@ class BaseSpecWorker(ABC):
         controller without forcing a GPU→CPU sync in the worker hot path.
         """
         pass
+
+    def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
+        """Notify adaptive workers that a request no longer owns observer state."""
+        pass

@@ -84,6 +84,7 @@ def _make_model_runner(
 
     spec = MagicMock()
     spec.is_dflash.return_value = False
+    spec.is_dflash_family.return_value = False
     spec.is_none.return_value = True
     mr.spec_algorithm = spec
 
@@ -330,6 +331,88 @@ class TestFactory(unittest.TestCase):
 
             cfg = create_memory_pool_configurator(mr)
         self.assertIsInstance(cfg, HybridSWAPoolConfigurator)
+
+
+class TestDSV4DSparkDraftKvBudget(unittest.TestCase):
+    class _DSparkAlgorithm:
+        @staticmethod
+        def is_dspark():
+            return True
+
+        @staticmethod
+        def is_eagle():
+            return False
+
+    def test_uses_packed_draft_geometry_and_all_stages(self):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            get_dsv4_kv_bytes_per_token,
+        )
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        configurator = DSV4PoolConfigurator.__new__(DSV4PoolConfigurator)
+        configurator.swa_ratio = 0.1
+        configurator.num_layers_total = 64
+        configurator.bytes_per_full_token = 12345.0
+        runner = SimpleNamespace(
+            spec_algorithm=self._DSparkAlgorithm(),
+            dspark_draft_num_layers=3,
+            dspark_draft_cell_size_per_token=584,
+        )
+
+        packed_bytes = get_dsv4_kv_bytes_per_token(
+            qk_nope_head_dim=448,
+            qk_rope_head_dim=64,
+        )
+        self.assertEqual(packed_bytes, 584)
+        self.assertAlmostEqual(
+            configurator._get_draft_bytes_per_full_token(runner),
+            0.1 * 584 * 3,
+        )
+
+    def test_configurator_adds_exact_flat_draft_term(self):
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        runner = SimpleNamespace(
+            model_config=SimpleNamespace(
+                qk_nope_head_dim=448,
+                qk_rope_head_dim=64,
+                index_head_dim=128,
+                compress_ratios=[0, 0, 0],
+                window_size=128,
+            ),
+            server_args=SimpleNamespace(
+                swa_full_tokens_ratio=0.1,
+                speculative_algorithm="DSPARK",
+                effective_speculative_algorithm="DSPARK",
+                max_speculative_num_draft_tokens=6,
+            ),
+            enable_hisparse=False,
+            spec_algorithm=self._DSparkAlgorithm(),
+            dspark_draft_num_layers=3,
+            dspark_draft_cell_size_per_token=584,
+        )
+
+        configurator = DSV4PoolConfigurator(runner)
+        target_bytes = 0.1 * 584 * 3
+        draft_bytes = 0.1 * 584 * 3
+        self.assertAlmostEqual(
+            configurator.bytes_per_full_token,
+            target_bytes + draft_bytes,
+        )
+
+    def test_missing_dspark_geometry_fails_fast(self):
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        configurator = DSV4PoolConfigurator.__new__(DSV4PoolConfigurator)
+        configurator.swa_ratio = 0.1
+        runner = SimpleNamespace(
+            spec_algorithm=self._DSparkAlgorithm(),
+            dspark_draft_num_layers=3,
+            dspark_draft_cell_size_per_token=None,
+        )
+
+        with self.assertRaisesRegex(ValueError, "positive packed draft cell size"):
+            configurator._get_draft_bytes_per_full_token(runner)
 
 
 if __name__ == "__main__":

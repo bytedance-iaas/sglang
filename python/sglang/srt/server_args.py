@@ -554,6 +554,10 @@ class ServerArgs:
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
     speculative_dflash_block_size: Optional[int] = None
+    speculative_dspark_block_size: Optional[int] = None
+    speculative_dspark_sps_table_path: Optional[str] = None
+    speculative_dspark_confidence_sts_path: Optional[str] = None
+    speculative_dspark_align_verify_tokens_to_graph_tier: bool = False
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -566,6 +570,29 @@ class ServerArgs:
     speculative_adaptive: bool = False
     speculative_adaptive_config: Optional[str] = None
     speculative_skip_dp_mlp_sync: bool = False
+
+    @property
+    def effective_speculative_algorithm(self) -> Optional[str]:
+        """Algorithm required by this worker's runtime and cache layout.
+
+        A PD Prefill worker does not perform speculative decode, but it may
+        still need to materialize a bundled draft cache for a speculative
+        Decode peer.  Keep that peer capability separate from the local CLI
+        algorithm while exposing one resolved value to scheduler/model/cache
+        internals that must build the draft data plane.
+        """
+
+        if self.speculative_algorithm is not None:
+            return self.speculative_algorithm
+        if self.disaggregation_mode == "prefill":
+            return self.disaggregation_peer_speculative_algorithm
+        return None
+
+    def uses_dspark_pd_state_layout(self) -> bool:
+        return (
+            self.disaggregation_mode in ("prefill", "decode")
+            and self.effective_speculative_algorithm == "DSPARK"
+        )
 
     @cached_property
     def max_speculative_num_draft_tokens(self) -> Optional[int]:
@@ -794,6 +821,7 @@ class ServerArgs:
     # PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
     disaggregation_transfer_backend: str = "mooncake"
+    disaggregation_peer_speculative_algorithm: Optional[str] = None
     disaggregation_bootstrap_port: int = 8998
     disaggregation_ib_device: Optional[str] = None
     disaggregation_decode_enable_radix_cache: bool = False
@@ -1573,11 +1601,12 @@ class ServerArgs:
             if gpu_mem is not None and gpu_mem > 60 * 1024:
                 reserved_mem = max(reserved_mem, 10 * 1024)
 
-            if self.speculative_algorithm is not None:
-                if self.speculative_algorithm == "STANDALONE":
+            effective_spec_algorithm = self.effective_speculative_algorithm
+            if effective_spec_algorithm is not None:
+                if effective_spec_algorithm == "STANDALONE":
                     # standalonedraft model and cuda graphs
                     reserved_mem += 6 * 1024
-                elif self.speculative_algorithm != "NGRAM":
+                elif effective_spec_algorithm != "NGRAM":
                     # eagle draft models and cuda graphs
                     reserved_mem += 4 * 1024
 
@@ -1609,7 +1638,7 @@ class ServerArgs:
         # Handle disable_cuda_graph_padding as the first condition for both spec and non-spec
         if self.disable_cuda_graph_padding:
             capture_bs = list(range(1, self.cuda_graph_max_bs + 1))
-        elif self.speculative_algorithm is None:
+        elif self.effective_speculative_algorithm is None:
             # Normal case:
             capture_bs = (
                 [1, 2, 4, 8, 12]
@@ -3681,6 +3710,31 @@ class ServerArgs:
             return False
 
     def _handle_pd_disaggregation(self):
+        peer_spec_algorithm = self.disaggregation_peer_speculative_algorithm
+        if peer_spec_algorithm is not None:
+            peer_spec_algorithm = peer_spec_algorithm.upper()
+            self.disaggregation_peer_speculative_algorithm = peer_spec_algorithm
+            if self.disaggregation_mode != "prefill":
+                raise ValueError(
+                    "--disaggregation-peer-speculative-algorithm is only valid "
+                    "on a PD Prefill server."
+                )
+            if peer_spec_algorithm != "DSPARK":
+                raise ValueError(
+                    "This backport only supports a DSPARK speculative Decode "
+                    "peer; got "
+                    f"{peer_spec_algorithm!r}."
+                )
+            if (
+                self.speculative_algorithm is not None
+                and self.speculative_algorithm.upper() != peer_spec_algorithm
+            ):
+                raise ValueError(
+                    "The local and peer speculative algorithms disagree: "
+                    f"local={self.speculative_algorithm!r}, "
+                    f"peer={peer_spec_algorithm!r}."
+                )
+
         if self.disaggregation_mode == "decode":
             if self.disaggregation_decode_enable_radix_cache:
                 if self.enable_hisparse:
@@ -5446,7 +5500,7 @@ class ServerArgs:
             type=str,
             help=(
                 "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, "
-                "NGRAM, DFLASH. Or any name registered via "
+                "NGRAM, DFLASH, DSPARK. Or any name registered via "
                 "`SpeculativeAlgorithm.register`."
             ),
         )
@@ -5496,6 +5550,36 @@ class ServerArgs:
             type=int,
             help="DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
             default=ServerArgs.speculative_dflash_block_size,
+        )
+        parser.add_argument(
+            "--speculative-dspark-block-size",
+            type=int,
+            help=(
+                "DSPARK only. Draft block size gamma. The verify window is "
+                "gamma + 1. Omit to infer it from the bundled draft config."
+            ),
+            default=ServerArgs.speculative_dspark_block_size,
+        )
+        parser.add_argument(
+            "--speculative-dspark-sps-table-path",
+            type=str,
+            help="DSPARK only. Path to a pre-profiled SPS cost table.",
+            default=ServerArgs.speculative_dspark_sps_table_path,
+        )
+        parser.add_argument(
+            "--speculative-dspark-confidence-sts-path",
+            type=str,
+            help="DSPARK only. Optional confidence-head STS calibration file.",
+            default=ServerArgs.speculative_dspark_confidence_sts_path,
+        )
+        parser.add_argument(
+            "--speculative-dspark-align-verify-tokens-to-graph-tier",
+            action="store_true",
+            help=(
+                "DSPARK compact ragged verify only. Fill verify lengths to the "
+                "captured CUDA graph tier."
+            ),
+            default=ServerArgs.speculative_dspark_align_verify_tokens_to_graph_tier,
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",
@@ -6558,6 +6642,17 @@ class ServerArgs:
             default=ServerArgs.disaggregation_transfer_backend,
             choices=DISAGG_TRANSFER_BACKEND_CHOICES,
             help="The backend for disaggregation transfer. Default is mooncake.",
+        )
+        parser.add_argument(
+            "--disaggregation-peer-speculative-algorithm",
+            type=str,
+            default=ServerArgs.disaggregation_peer_speculative_algorithm,
+            help=(
+                "Speculative algorithm used by the PD Decode peer. On a Prefill "
+                "server this materializes the matching draft KV/state wire layout "
+                "without enabling local speculative decode. This backport supports "
+                "DSPARK only."
+            ),
         )
         parser.add_argument(
             "--disaggregation-bootstrap-port",

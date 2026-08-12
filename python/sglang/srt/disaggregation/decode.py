@@ -44,6 +44,9 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    get_dsv4_full_indexed_c128_state_indices,
+    get_transfer_draft_kv_layer_ids,
+    get_transfer_kv_layer_ids,
     get_kv_class,
     is_mla_backend,
     poll_and_all_reduce,
@@ -80,7 +83,7 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
-from sglang.srt.utils import get_num_new_pages
+from sglang.srt.utils import ceil_align, get_num_new_pages
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -474,6 +477,11 @@ class DecodePreallocQueue:
 
     def _prealloc_required_tokens(self, req: Req) -> Tuple[int, int]:
         full_len, swa_len = self._prealloc_kv_lens(req)
+        page_size = self.token_to_kv_pool_allocator.page_size
+        if page_size > 1:
+            # Match the allocator, which charges whole pages for both pools.
+            full_len = ceil_align(full_len, page_size)
+            swa_len = ceil_align(swa_len, page_size)
         return (
             full_len + self.num_reserved_decode_tokens,
             swa_len + self.num_reserved_decode_tokens,
@@ -498,12 +506,16 @@ class DecodePreallocQueue:
             kv_data_ptrs, kv_data_lens, kv_item_lens = (
                 self.token_to_kv_pool.get_contiguous_buf_infos()
             )
+        kv_layer_ids = get_transfer_kv_layer_ids(
+            self.token_to_kv_pool, len(kv_data_ptrs)
+        )
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
+            kv_layer_ids += get_transfer_draft_kv_layer_ids(len(draft_kv_data_ptrs))
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
@@ -511,6 +523,9 @@ class DecodePreallocQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        kv_args.kv_layer_ids = (
+            kv_layer_ids if len(kv_layer_ids) == len(kv_data_ptrs) else []
+        )
         # HiSparse Host pool has page_size=1; use it when hisparse is enabled
         kv_args.page_size = (
             1 if self.scheduler.enable_hisparse else self.token_to_kv_pool.page_size
@@ -1079,8 +1094,8 @@ class DecodePreallocQueue:
                 extra_reserved_reqs=len(preallocated_reqs) + 1,
             )
             if uses_swa_tail_prealloc:
-                # SWA budget uses simple decrement (no radix cache eviction in
-                # the SWA pool, so page-rounding drift is negligible).
+                # SWA has no radix cache eviction, so decrement its
+                # page-aligned requirement directly.
                 swa_allocatable_tokens -= swa_required
             decode_req.req.cache_protected_len = prefix_len
 
@@ -1141,6 +1156,13 @@ class DecodePreallocQueue:
                     kv_indices_full.cpu().numpy(), device_page_size
                 )
 
+            def _c128_state_payload():
+                return get_dsv4_full_indexed_c128_state_indices(
+                    self.req_to_token_pool.req_to_token,
+                    decode_req.req.req_pool_idx,
+                    seq_len,
+                )
+
             state_types = self.kv_manager.kv_args.state_types
             state_indices: Optional[List] = []
             for st in state_types:
@@ -1150,6 +1172,8 @@ class DecodePreallocQueue:
                     state_indices.append(_swa_payload())
                 elif st == StateType.NSA:
                     state_indices.append(_nsa_payload())
+                elif st == StateType.C128_STATE:
+                    state_indices.append(_c128_state_payload())
                 else:
                     state_indices.append(None)
 
