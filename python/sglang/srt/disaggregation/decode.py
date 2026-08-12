@@ -56,6 +56,7 @@ from sglang.srt.disaggregation.utils import (
     is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce,
+    poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_pp,
     poll_and_all_reduce_with_staging,
     prepare_abort,
@@ -2124,6 +2125,73 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             server_args=self.scheduler.server_args,
         )
 
+    def get_transferred_status_for_pp(self) -> Tuple[List[str], List[str]]:
+        """Inspect gate-ready transfer states with RID-keyed local consensus."""
+
+        if self.scheduler.enable_decode_hicache:
+            self._process_hicache_local_restores(self.queue)
+
+        if self.enable_staging:
+            for decode_req in self.queue:
+                if (
+                    decode_req.kv_receiver.require_staging
+                    and not self.staging_handler.is_done(decode_req)
+                ):
+                    self.staging_handler.advance_scatter(decode_req)
+
+        class GateAwarePoller:
+            def __init__(self, owner, decode_req):
+                self.owner = owner
+                self.decode_req = decode_req
+
+            def poll(self):
+                poll = self.decode_req.kv_receiver.poll()
+                if poll != KVPoll.Success:
+                    return poll
+                if (
+                    self.owner.enable_staging
+                    and self.decode_req.kv_receiver.require_staging
+                    and not self.owner.staging_handler.is_done(self.decode_req)
+                ):
+                    return KVPoll.Transferring
+                if (
+                    self.owner.scheduler.enable_decode_hicache
+                    and self.decode_req.hicache_restore_status
+                    == HiCacheRestoreResult.PENDING
+                ):
+                    return KVPoll.Transferring
+                if not _is_fake_transfer(
+                    self.decode_req.req, self.owner.scheduler.server_args
+                ):
+                    actual_room = self.owner.metadata_buffers.bootstrap_room[
+                        self.decode_req.metadata_buffer_index, 0
+                    ].item()
+                    if actual_room == 0:
+                        return KVPoll.Transferring
+                return poll
+
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [GateAwarePoller(self, decode_req) for decode_req in self.queue],
+            self.scheduler.attn_cp_cpu_group,
+            self.scheduler.attn_tp_cpu_group,
+            ordered_keys=[decode_req.req.rid for decode_req in self.queue],
+        )
+        success_rids: List[str] = []
+        failed_rids: List[str] = []
+        for decode_req, poll in zip(self.queue, polls):
+            hicache_status = decode_req.hicache_restore_status
+            if poll == KVPoll.Failed or (
+                self.scheduler.enable_decode_hicache
+                and hicache_status == HiCacheRestoreResult.FAILED
+            ):
+                failed_rids.append(decode_req.req.rid)
+            elif poll == KVPoll.Success and (
+                not self.scheduler.enable_decode_hicache
+                or hicache_status != HiCacheRestoreResult.PENDING
+            ):
+                success_rids.append(decode_req.req.rid)
+        return success_rids, failed_rids
+
     def _init_staging_handler(self, kv_manager):
         """Create staging handler from kv_manager. Must be called exactly once."""
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -2139,6 +2207,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self,
         rids_to_check: Optional[List[str]] = None,
         max_successes: Optional[int] = None,
+        pp_good_rids: Optional[List[str]] = None,
+        pp_bad_rids: Optional[List[str]] = None,
     ) -> List[Req]:
         """Commit completed transfers up to an optional admission budget.
 
@@ -2152,7 +2222,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if max_successes is not None:
             assert max_successes >= 0
 
-        if self.scheduler.enable_decode_hicache:
+        is_pp_mode = pp_good_rids is not None or pp_bad_rids is not None
+        if is_pp_mode and (pp_good_rids is None or pp_bad_rids is None):
+            raise ValueError("Both PP success and failure consensus are required")
+        if is_pp_mode and rids_to_check is not None:
+            raise ValueError("rids_to_check cannot be used with PP consensus")
+
+        if self.scheduler.enable_decode_hicache and not is_pp_mode:
             self._process_hicache_local_restores(
                 [
                     decode_req
@@ -2161,7 +2237,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ]
             )
 
-        if self.enable_staging:
+        if is_pp_mode:
+            polls = poll_and_all_reduce_pp(
+                (decode_req.req.rid for decode_req in self.queue),
+                KVPoll.Success,
+                pp_good_rids,
+                pp_bad_rids,
+            )
+        elif self.enable_staging:
             polls = self._poll_with_staging()
         else:
             polls = self._poll_with_metadata_gate()
@@ -2169,6 +2252,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         transferred_reqs = []
         indices_to_remove = set()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
+            if poll is None:
+                continue
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 

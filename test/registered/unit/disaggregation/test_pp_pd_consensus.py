@@ -10,7 +10,10 @@ maybe_stub_sgl_kernel()
 from sglang.srt.disaggregation.base import KVPoll  # noqa: E402
 from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue  # noqa: E402
 from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
+    _pp_acknowledge_release_status,
+    _pp_merge_pending_release_status,
     _pp_merge_transfer_status,
+    _pp_ready_release_status,
 )
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -73,6 +76,30 @@ class TestPPPDConsensus(CustomTestCase):
         self.assertEqual(
             [req.metadata_buffer_index for req in queue.queue],
             [-1, -1, -1],
+        )
+
+    def test_release_authority_waits_for_local_stage_and_acks_exactly_once(self):
+        pending = _pp_merge_pending_release_status(
+            pending=(["req-old"], []),
+            incoming=(["req-new", "req-failed"], ["req-failed"]),
+            committed_rids={"req-old"},
+        )
+
+        self.assertEqual(pending, (["req-new"], ["req-failed"]))
+        self.assertIsNone(
+            _pp_ready_release_status(pending, success_ready_rids=["other"])
+        )
+
+        ready = _pp_ready_release_status(
+            pending,
+            success_ready_rids=["req-new"],
+            failure_ready_rids=["req-failed"],
+        )
+        self.assertEqual(ready, pending)
+        self.assertIsNone(
+            _pp_acknowledge_release_status(
+                pending, ["req-new", "req-failed"]
+            )
         )
 
 
