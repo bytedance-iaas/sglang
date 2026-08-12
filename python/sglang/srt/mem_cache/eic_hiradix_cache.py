@@ -461,12 +461,29 @@ class EICHiRadixCache(RadixCache):
         # Backstop SWA slots not released by per-step eviction or FULL cleanup.
         if self.sliding_window_size is not None:
             if hasattr(self.token_to_kv_pool_allocator, "free_swa"):
-                self.token_to_kv_pool_allocator.free_swa(
-                    self.req_to_token_pool.req_to_token[
-                        req.req_pool_idx,
-                        req.swa_evicted_seqlen : kv_committed_len,
+                _swa_lo = req.swa_evicted_seqlen
+                _swa_hi = kv_committed_len
+                _prefix_len = len(req.prefix_indices)
+                # The EIC-loaded prefix's full indices live in req.prefix_indices,
+                # not req_to_token (which stays 0 for the loaded portion). Use
+                # prefix_indices for the in-prefix slice so the in-window SWA is
+                # actually freed; req_to_token would map to 0 and be dropped.
+                if _swa_hi <= _prefix_len:
+                    _swa_slots = req.prefix_indices[_swa_lo:_swa_hi]
+                elif _swa_lo < _prefix_len:
+                    _swa_slots = torch.cat(
+                        [
+                            req.prefix_indices[_swa_lo:_prefix_len],
+                            self.req_to_token_pool.req_to_token[
+                                req.req_pool_idx, _prefix_len:_swa_hi
+                            ],
+                        ]
+                    )
+                else:
+                    _swa_slots = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, _swa_lo:_swa_hi
                     ]
-                )
+                self.token_to_kv_pool_allocator.free_swa(_swa_slots)
 
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
