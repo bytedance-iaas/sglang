@@ -160,27 +160,70 @@ ENV LANG=en_US.UTF-8 \
     LC_ALL=en_US.UTF-8
 
 ########################################################
+# Shared Rust Toolchain
+########################################################
+# Both sglang-grpc and sgl-model-gateway require Rust 1.90. Install the
+# official standalone toolchain once so parallel stages do not each run
+# rustup and perform ungoverned nested downloads from static.rust-lang.org.
+FROM base AS rust_toolchain
+
+ARG RUST_DIST_SERVER=https://static.rust-lang.org
+ENV CARGO_NET_RETRY=5 \
+    CARGO_HTTP_TIMEOUT=120
+
+RUN set -eux; \
+    RUST_VERSION=1.90.0; \
+    case "$(uname -m)" in \
+        x86_64) \
+            RUST_TARGET=x86_64-unknown-linux-gnu; \
+            RUST_SHA256=e453bae1c68d02fe2eae065c5452d5731308164cd154154c6ee442d2fa590685 \
+            ;; \
+        aarch64) \
+            RUST_TARGET=aarch64-unknown-linux-gnu; \
+            RUST_SHA256=293f412e3412c3aa3398c78ebbdf898fa08eacad80c85a7332ce1a455504c5fc \
+            ;; \
+        *) \
+            echo "Unsupported architecture for Rust: $(uname -m)"; \
+            exit 1 \
+            ;; \
+    esac; \
+    RUST_ARCHIVE="rust-${RUST_VERSION}-${RUST_TARGET}.tar.gz"; \
+    curl --proto '=https' --tlsv1.2 --fail --show-error --location \
+        --retry 5 --retry-all-errors --retry-delay 2 \
+        -o "/tmp/${RUST_ARCHIVE}" \
+        "${RUST_DIST_SERVER}/dist/${RUST_ARCHIVE}"; \
+    echo "${RUST_SHA256}  /tmp/${RUST_ARCHIVE}" | sha256sum --check -; \
+    tar -xzf "/tmp/${RUST_ARCHIVE}" -C /tmp; \
+    "/tmp/rust-${RUST_VERSION}-${RUST_TARGET}/install.sh" \
+        --prefix=/usr/local --without=rust-docs; \
+    rm -rf "/tmp/${RUST_ARCHIVE}" \
+        "/tmp/rust-${RUST_VERSION}-${RUST_TARGET}"; \
+    test "$(rustc --version | awk '{print $2}')" = "${RUST_VERSION}"; \
+    rustc --version; \
+    cargo --version
+
+########################################################
 ########## PARALLEL BUILDER STAGES ####################
 ########################################################
 #
 # These stages run IN PARALLEL via BuildKit:
 #
-#   base
+#   base --> rust_toolchain
 #     |
 #     +-- torch_deps ------> deepep_builder (needs torch)
 #     |                  \-> flashinfer_cache (needs flashinfer)
 #     |
 #     +-- devtools_builder (independent)
-#     +-- gateway_builder  (independent, only needs gateway source)
+#     +-- gateway_builder  (independent, needs Rust + gateway source)
 #     |
 #     v
 #   framework (combines all artifacts)
 #
 
 ########################################################
-# PARALLEL STAGE 1: Torch/Deps Builder (starts from base)
+# PARALLEL STAGE 1: Torch/Deps Builder (starts from shared Rust toolchain)
 ########################################################
-FROM base AS torch_deps
+FROM rust_toolchain AS torch_deps
 
 ARG CUDA_VERSION
 ARG BUILD_TYPE
@@ -193,16 +236,6 @@ ARG DEEPGEMM_GITHUB_ARTIFACTORY
 ARG GITHUB_ARTIFACTORY
 
 WORKDIR /sgl-workspace
-
-# Rust toolchain for setuptools-rust extensions (e.g. sglang-grpc).
-# Requires >= 1.85 (edition 2024). Inherited by framework via FROM torch_deps.
-ENV PATH="/root/.cargo/bin:${PATH}"
-RUN curl --proto '=https' --tlsv1.2 --fail --show-error --location \
-        --retry 5 --retry-all-errors --retry-delay 2 \
-        -o /tmp/rustup-init.sh https://sh.rustup.rs \
-    && sh /tmp/rustup-init.sh -y --no-modify-path --profile minimal \
-    && rm /tmp/rustup-init.sh \
-    && rustc --version && cargo --version
 
 # Install sgl-kernel (from pre-built wheel)
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -435,17 +468,37 @@ RUN JUST_VERSION=1.42.4 \
     && /tools/just --version \
     && rm -f /tmp/just.tar.gz
 
-# Install oh-my-zsh and plugins
-RUN sh -c "$(curl --retry 3 --retry-delay 2 -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended \
-    && git clone --depth 1 https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-autosuggestions \
-    && git clone --depth 1 https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
+# Install oh-my-zsh and plugins without running a downloaded installer that
+# performs additional, unprotected network requests.
+RUN set -eux; \
+    clone_with_retry() { \
+        repo="$1"; \
+        dest="$2"; \
+        attempt=1; \
+        while [ "${attempt}" -le 5 ]; do \
+            rm -rf "${dest}"; \
+            if git clone --depth 1 "https://${GITHUB_ARTIFACTORY}/${repo}.git" "${dest}"; then \
+                return 0; \
+            fi; \
+            if [ "${attempt}" -eq 5 ]; then \
+                return 1; \
+            fi; \
+            sleep $((attempt * 2)); \
+            attempt=$((attempt + 1)); \
+        done; \
+    }; \
+    clone_with_retry ohmyzsh/ohmyzsh /root/.oh-my-zsh; \
+    clone_with_retry zsh-users/zsh-autosuggestions \
+        /root/.oh-my-zsh/custom/plugins/zsh-autosuggestions; \
+    clone_with_retry zsh-users/zsh-syntax-highlighting \
+        /root/.oh-my-zsh/custom/plugins/zsh-syntax-highlighting
 
 ########################################################
-# PARALLEL STAGE 5: Gateway Builder (starts from base)
+# PARALLEL STAGE 5: Gateway Builder (starts from shared Rust toolchain)
 ########################################################
 # Builds sgl-model-gateway in isolation so Python-only changes
 # don't trigger a full Rust recompilation.
-FROM base AS gateway_builder
+FROM rust_toolchain AS gateway_builder
 
 ARG GITHUB_ARTIFACTORY
 ARG BRANCH_TYPE
@@ -457,21 +510,15 @@ WORKDIR /build
 # Copy ONLY the gateway source (not the full repo)
 COPY sgl-model-gateway /build/sgl-model-gateway
 
-# Install Rust, build gateway binary and Python bindings, then clean up Rust toolchain
+# Build gateway binary and Python bindings, then clean up Cargo build caches.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    curl --proto '=https' --tlsv1.2 --fail --show-error --location \
-        --retry 5 --retry-all-errors --retry-delay 2 \
-        -o /tmp/rustup-init.sh https://sh.rustup.rs \
-    && sh /tmp/rustup-init.sh -y \
-    && rm /tmp/rustup-init.sh \
-    && export PATH="/root/.cargo/bin:${PATH}" \
-    && python3 -m pip install maturin \
+    python3 -m pip install maturin \
     && cd /build/sgl-model-gateway/bindings/python \
     && ulimit -n 65536 && maturin build --release --features vendored-openssl --out /build/gateway_wheels \
     && cd /build/sgl-model-gateway \
     && cargo build --release --bin sgl-model-gateway --features vendored-openssl \
     && cp target/release/sgl-model-gateway /build/sgl-model-gateway-bin \
-    && rm -rf /root/.cargo /root/.rustup /build/sgl-model-gateway/target /build/sgl-model-gateway/bindings/python/target
+    && rm -rf /root/.cargo /build/sgl-model-gateway/target /build/sgl-model-gateway/bindings/python/target
 
 ########################################################
 ########## Final Framework Image ######################
