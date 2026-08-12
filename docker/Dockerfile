@@ -197,18 +197,11 @@ WORKDIR /sgl-workspace
 # Rust toolchain for setuptools-rust extensions (e.g. sglang-grpc).
 # Requires >= 1.85 (edition 2024). Inherited by framework via FROM torch_deps.
 ENV PATH="/root/.cargo/bin:${PATH}"
-RUN case "$(uname -m)" in \
-        x86_64) RUSTUP_TARGET=x86_64-unknown-linux-gnu ;; \
-        aarch64) RUSTUP_TARGET=aarch64-unknown-linux-gnu ;; \
-        *) echo "Unsupported architecture for rustup: $(uname -m)" && exit 1 ;; \
-    esac \
-    && curl --proto '=https' --tlsv1.2 --fail --show-error --location \
+RUN curl --proto '=https' --tlsv1.2 --fail --show-error --location \
         --retry 5 --retry-all-errors --retry-delay 2 \
-        -o /tmp/rustup-init \
-        "https://static.rust-lang.org/rustup/dist/${RUSTUP_TARGET}/rustup-init" \
-    && chmod +x /tmp/rustup-init \
-    && /tmp/rustup-init -y --no-modify-path --profile minimal \
-    && rm /tmp/rustup-init \
+        -o /tmp/rustup-init.sh https://sh.rustup.rs \
+    && sh /tmp/rustup-init.sh -y --no-modify-path --profile minimal \
+    && rm /tmp/rustup-init.sh \
     && rustc --version && cargo --version
 
 # Install sgl-kernel (from pre-built wheel)
@@ -466,18 +459,11 @@ COPY sgl-model-gateway /build/sgl-model-gateway
 
 # Install Rust, build gateway binary and Python bindings, then clean up Rust toolchain
 RUN --mount=type=cache,target=/root/.cache/pip \
-    case "$(uname -m)" in \
-        x86_64) RUSTUP_TARGET=x86_64-unknown-linux-gnu ;; \
-        aarch64) RUSTUP_TARGET=aarch64-unknown-linux-gnu ;; \
-        *) echo "Unsupported architecture for rustup: $(uname -m)" && exit 1 ;; \
-    esac \
-    && curl --proto '=https' --tlsv1.2 --fail --show-error --location \
+    curl --proto '=https' --tlsv1.2 --fail --show-error --location \
         --retry 5 --retry-all-errors --retry-delay 2 \
-        -o /tmp/rustup-init \
-        "https://static.rust-lang.org/rustup/dist/${RUSTUP_TARGET}/rustup-init" \
-    && chmod +x /tmp/rustup-init \
-    && /tmp/rustup-init -y \
-    && rm /tmp/rustup-init \
+        -o /tmp/rustup-init.sh https://sh.rustup.rs \
+    && sh /tmp/rustup-init.sh -y \
+    && rm /tmp/rustup-init.sh \
     && export PATH="/root/.cargo/bin:${PATH}" \
     && python3 -m pip install maturin \
     && cd /build/sgl-model-gateway/bindings/python \
