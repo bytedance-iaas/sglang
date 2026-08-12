@@ -738,6 +738,7 @@ class TestDflashDraftKvBudget(unittest.TestCase):
         self.assertLess(_tokens(10240), _tokens(None))
 
     def test_dsv4_dspark_draft_uses_fixed_request_ring_budget(self):
+        """A request-scoped draft ring is a fixed cost, not a per-token cost."""
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 
         mr = _make_model_runner(

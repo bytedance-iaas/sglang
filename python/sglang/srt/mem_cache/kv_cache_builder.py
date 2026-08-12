@@ -5,7 +5,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -21,7 +21,22 @@ class KVCacheBuildResult:
     tree_cache: object
 
 
-from typing import TYPE_CHECKING
+def _resolve_radix_cache_config(
+    *,
+    disable_radix_cache: bool,
+    disable_for_multimodal_transformers: bool,
+    uses_request_scoped_draft_swa_ring: bool,
+    sliding_window_size: Optional[int],
+) -> tuple[bool, int]:
+    disable = disable_radix_cache or disable_for_multimodal_transformers
+    if not uses_request_scoped_draft_swa_ring:
+        return disable, 0
+    if sliding_window_size is None:
+        raise ValueError(
+            "A request-scoped draft SWA ring requires a sliding window size."
+        )
+    return disable, sliding_window_size
+
 
 from sglang.srt.configs.hybrid_arch import (
     hybrid_gdn_config,
@@ -189,18 +204,17 @@ def build_kv_cache(
         and not is_hip()
         and not is_npu()
     )
-    disable_radix_cache = (
-        server_args.disable_radix_cache
-        or (model_config.is_multimodal and uses_transformers_backend)
-        or uses_dsv4_dspark_draft_ring
-    )
-    if uses_dsv4_dspark_draft_ring and not server_args.disable_radix_cache:
-        logger.warning(
-            "Radix cache is disabled for CUDA DSV4 DSpark because the compact "
-            "draft SWA pool is request-scoped. Prefix reuse requires rebuilding "
-            "the draft SWA tail and is not supported yet."
+    disable_radix_cache, request_scoped_swa_reprefill_tail_tokens = (
+        _resolve_radix_cache_config(
+            disable_radix_cache=server_args.disable_radix_cache,
+            disable_for_multimodal_transformers=(
+                model_config.is_multimodal and uses_transformers_backend
+            ),
+            uses_request_scoped_draft_swa_ring=uses_dsv4_dspark_draft_ring,
+            sliding_window_size=sliding_window_size,
         )
-    elif disable_radix_cache and not server_args.disable_radix_cache:
+    )
+    if disable_radix_cache and not server_args.disable_radix_cache:
         logger.warning(
             "Radix cache is disabled for multimodal models with the "
             "Transformers backend to avoid multimodal prefix-cache mismatches."
@@ -257,6 +271,9 @@ def build_kv_cache(
         pp_size=ps.pp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
+        request_scoped_swa_reprefill_tail_tokens=(
+            request_scoped_swa_reprefill_tail_tokens
+        ),
         mtp_draft_device_pools=mtp_draft_device_pools,
     )
 
@@ -278,6 +295,16 @@ def build_kv_cache(
             tp_group=tp_group,
         )
     )
+    if (
+        request_scoped_swa_reprefill_tail_tokens
+        and not disable_radix_cache
+        and tree_cache.swa_reprefill_tail_tokens()
+        < request_scoped_swa_reprefill_tail_tokens
+    ):
+        raise RuntimeError(
+            f"{type(tree_cache).__name__} does not support request-scoped SWA "
+            "tail re-prefill."
+        )
 
     if enable_hierarchical_cache and hicache_draft_plan is not None:
         maybe_register_hicache_draft(

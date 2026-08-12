@@ -173,6 +173,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self._sliding_window_size = (
             params.sliding_window_size if self.is_swa_enabled else None
         )
+        self._request_scoped_swa_reprefill_tail_tokens = (
+            params.request_scoped_swa_reprefill_tail_tokens
+        )
         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
         # evictable leaves) and drives the components' tree-level hooks.
         self.tree_core = create_tree_core(
@@ -2072,21 +2075,18 @@ class UnifiedRadixCache(BasePrefixCache):
         return self._sliding_window_size
 
     def swa_reprefill_tail_tokens(self) -> int:
-        """
-        Only unified_kv + HiCache needs this: SWA lives in a per-request ring
-        (state_slot/pos), not content-stable and never offloaded to host, so a
-        reused prefix's trailing sliding window would read another request's
-        stale ring slots. Re-prefilling that window rewrites this request's ring
-        (what plain radix reuse does via its SWA match gate). 0 for every other
-        layout.
-        """
+        """Return the non-content-stable SWA tail that must be re-prefilled."""
         swa = self.components.get(ComponentType.SWA)
         unified_compress_only_hicache = (
             self.cache_controller is not None
             and swa is not None
             and not self.tree_core.has_swa_host_pool
         )
-        return swa.sliding_window_size if unified_compress_only_hicache else 0
+        hicache_tail = swa.sliding_window_size if unified_compress_only_hicache else 0
+        return max(
+            self._request_scoped_swa_reprefill_tail_tokens,
+            hicache_tail,
+        )
 
     def supports_swa(self) -> bool:
         return self.is_swa_enabled

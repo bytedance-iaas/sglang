@@ -718,7 +718,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             )
 
         self.bytes_per_full_token = self._get_bytes_per_full_token()
-        if self.is_speculative:
+        if self.is_speculative and not self.use_draft_swa_ring:
             # Reserve memory for the speculative draft worker by inflating
             # per-token bytes by (target+draft)/target. Equivalent to dflash's
             # scale_kv_cell_size_per_token_for_dflash but applied to
@@ -960,9 +960,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             )
 
         available_bytes_for_tokens = max(
-            available_bytes
-            - c128_state_fixed_bytes
-            - draft_swa_ring_fixed_bytes,
+            available_bytes - c128_state_fixed_bytes - draft_swa_ring_fixed_bytes,
             0,
         )
         full_token = int(available_bytes_for_tokens / self.bytes_per_full_token)
