@@ -141,6 +141,11 @@ def _resolve_dflash_aux_hidden_state(
                 target_num_layers,
             )
 
+        target_layer_ids = dflash_draft_config.resolve_target_layer_ids(
+            target_num_layers=int(target_num_layers),
+            draft_num_layers=int(draft_num_layers),
+        )
+
         if spec_algorithm.is_dspark():
             from sglang.srt.speculative.dspark_components.dspark_config import (
                 parse_dspark_draft_config,
@@ -156,20 +161,6 @@ def _resolve_dflash_aux_hidden_state(
                 )
             if dspark_draft_config.target_layer_ids is not None:
                 target_layer_ids = list(dspark_draft_config.target_layer_ids)
-                draft_num_layers = len(target_layer_ids)
-            else:
-                draft_num_layers = int(
-                    draft_model_config.num_nextn_predict_layers or 1
-                )
-                target_layer_ids = dflash_draft_config.resolve_target_layer_ids(
-                    target_num_layers=int(target_num_layers),
-                    draft_num_layers=draft_num_layers,
-                )
-        else:
-            target_layer_ids = dflash_draft_config.resolve_target_layer_ids(
-                target_num_layers=int(target_num_layers),
-                draft_num_layers=int(draft_num_layers),
-            )
 
         config.dflash_use_aux_hidden_state = True
         config.dflash_draft_num_layers = int(draft_num_layers)
