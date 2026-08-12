@@ -117,5 +117,5 @@ jobs:
             git -C /glm52/sglang diff --quiet -- .
             git -C /glm52/sglang diff --cached --quiet -- .
             test "$(readlink -f /sgl-workspace/sglang)" = /glm52/sglang
-            PYTHONPATH=/glm52/sglang/python python3 -c '\''import pathlib, sglang; assert pathlib.Path(sglang.__file__).resolve() == pathlib.Path("/glm52/sglang/python/sglang/__init__.py")'\''
+            PYTHONPATH=/glm52/sglang/python python3 -c '\''import importlib.machinery, pathlib; expected = pathlib.Path("/glm52/sglang/python/sglang/__init__.py"); actual = pathlib.Path(importlib.machinery.PathFinder.find_spec("sglang").origin).resolve(); assert actual == expected'\''
           ' -- "$SOURCE_COMMIT" "$SOURCE_TREE"

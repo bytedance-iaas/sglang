@@ -780,7 +780,7 @@ RUN set -eux; \
     test "$(git -C /glm52/sglang write-tree)" = "${SGLANG_SOURCE_TREE}"; \
     git -C /glm52/sglang diff --quiet -- .; \
     git -C /glm52/sglang diff --cached --quiet -- .; \
-    python3 -c 'import pathlib, sglang; expected = pathlib.Path("/glm52/sglang/python/sglang/__init__.py"); actual = pathlib.Path(sglang.__file__).resolve(); print(f"SGLANG_IMPORT_FILE={actual}"); assert actual == expected'
+    PYTHONPATH=/glm52/sglang/python python3 -c 'import importlib.machinery, pathlib; expected = pathlib.Path("/glm52/sglang/python/sglang/__init__.py"); actual = pathlib.Path(importlib.machinery.PathFinder.find_spec("sglang").origin).resolve(); print(f"SGLANG_SPEC_ORIGIN={actual}"); assert actual == expected'
 
 ENV SGLANG_SOURCE_ROOT=/glm52/sglang \
     SGLANG_SOURCE_COMMIT=${SGLANG_BUILD_COMMIT} \
