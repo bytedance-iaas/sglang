@@ -46,37 +46,54 @@ use crate::{
     },
 };
 
-/// A body wrapper that holds a token and returns it when the body is fully consumed or dropped.
-/// This ensures that for streaming responses, the token is only returned after the entire
-/// stream has been sent to the client.
-pub struct TokenGuardBody {
-    inner: Body,
-    /// The token bucket to return tokens to. Uses Option so we can take() on drop.
-    token_bucket: Option<Arc<TokenBucket>>,
-    /// Number of tokens to return.
+/// An owned concurrency permit that returns its tokens when dropped.
+///
+/// The permit is created immediately after token acquisition so cancellation is safe even
+/// before a response body is constructed. It can also be transferred through the request queue;
+/// if the receiver has gone away, dropping the failed send returns the tokens automatically.
+struct TokenPermit {
+    token_bucket: Arc<TokenBucket>,
     tokens: f64,
 }
 
-impl TokenGuardBody {
-    /// Create a new TokenGuardBody that will return tokens when dropped.
-    pub fn new(inner: Body, token_bucket: Arc<TokenBucket>, tokens: f64) -> Self {
+impl TokenPermit {
+    fn new(token_bucket: Arc<TokenBucket>, tokens: f64) -> Self {
         Self {
-            inner,
-            token_bucket: Some(token_bucket),
+            token_bucket,
             tokens,
         }
     }
 }
 
-impl Drop for TokenGuardBody {
+impl Drop for TokenPermit {
     fn drop(&mut self) {
-        if let Some(bucket) = self.token_bucket.take() {
-            debug!(
-                "TokenGuardBody: stream ended, returning {} tokens to bucket",
-                self.tokens
-            );
-            // Use lock-free sync return - no runtime needed, guaranteed token return
-            bucket.return_tokens_sync(self.tokens);
+        debug!(
+            "TokenPermit: request ended, returning {} tokens to bucket",
+            self.tokens
+        );
+        // Use lock-free sync return - no runtime needed, guaranteed token return
+        self.token_bucket.return_tokens_sync(self.tokens);
+    }
+}
+
+/// A body wrapper that holds a permit until the body is fully consumed or dropped.
+/// This ensures that for streaming responses, the token is only returned after the entire
+/// stream has been sent to the client.
+pub struct TokenGuardBody {
+    inner: Body,
+    _permit: TokenPermit,
+}
+
+impl TokenGuardBody {
+    /// Create a new TokenGuardBody that will return tokens when dropped.
+    pub fn new(inner: Body, token_bucket: Arc<TokenBucket>, tokens: f64) -> Self {
+        Self::from_permit(inner, TokenPermit::new(token_bucket, tokens))
+    }
+
+    fn from_permit(inner: Body, permit: TokenPermit) -> Self {
+        Self {
+            inner,
+            _permit: permit,
         }
     }
 }
@@ -383,7 +400,7 @@ pub struct QueuedRequest {
     /// Time when the request was queued
     queued_at: Instant,
     /// Channel to send the permit back when acquired
-    permit_tx: oneshot::Sender<Result<(), StatusCode>>,
+    permit_tx: oneshot::Sender<Result<TokenPermit, StatusCode>>,
 }
 
 /// Queue metrics for monitoring
@@ -434,7 +451,8 @@ impl QueueProcessor {
             if self.token_bucket.try_acquire(1.0).await.is_ok() {
                 // Got token immediately
                 debug!("Queue: acquired token immediately for queued request");
-                let _ = queued.permit_tx.send(Ok(()));
+                let permit = TokenPermit::new(self.token_bucket.clone(), 1.0);
+                let _ = queued.permit_tx.send(Ok(permit));
             } else {
                 // Need to wait for token
                 let token_bucket = self.token_bucket.clone();
@@ -447,7 +465,8 @@ impl QueueProcessor {
                         .is_ok()
                     {
                         debug!("Queue: acquired token after waiting");
-                        let _ = queued.permit_tx.send(Ok(()));
+                        let permit = TokenPermit::new(token_bucket, 1.0);
+                        let _ = queued.permit_tx.send(Ok(permit));
                     } else {
                         warn!("Queue: request timed out waiting for token");
                         let _ = queued.permit_tx.send(Err(StatusCode::REQUEST_TIMEOUT));
@@ -534,13 +553,14 @@ pub async fn concurrency_limit_middleware(
     if token_bucket.try_acquire(1.0).await.is_ok() {
         debug!("Acquired token immediately");
         Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
+        let permit = TokenPermit::new(token_bucket, 1.0);
         let response = next.run(request).await;
 
         // Wrap the response body with TokenGuardBody to return token when stream ends
         // This ensures that for streaming responses, the token is only returned
         // after the entire stream has been sent to the client.
         let (parts, body) = response.into_parts();
-        let guarded_body = TokenGuardBody::new(body, token_bucket, 1.0);
+        let guarded_body = TokenGuardBody::from_permit(body, permit);
         Response::from_parts(parts, Body::new(guarded_body))
     } else {
         // No tokens available, try to queue if enabled
@@ -565,7 +585,7 @@ pub async fn concurrency_limit_middleware(
 
                     // Wait for token from queue processor
                     match permit_rx.await {
-                        Ok(Ok(())) => {
+                        Ok(Ok(permit)) => {
                             debug!("Acquired token from queue");
                             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
                             // Dequeue for embeddings
@@ -577,7 +597,7 @@ pub async fn concurrency_limit_middleware(
 
                             // Wrap the response body with TokenGuardBody to return token when stream ends
                             let (parts, body) = response.into_parts();
-                            let guarded_body = TokenGuardBody::new(body, token_bucket, 1.0);
+                            let guarded_body = TokenGuardBody::from_permit(body, permit);
                             Response::from_parts(parts, Body::new(guarded_body))
                         }
                         Ok(Err(status)) => {
@@ -982,6 +1002,30 @@ pub async fn wasm_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_queue_processor_returns_permit_when_receiver_is_dropped() {
+        let token_bucket = Arc::new(TokenBucket::new(1, 0));
+        let (limiter, processor) =
+            ConcurrencyLimiter::new(Some(token_bucket.clone()), 1, Duration::from_secs(1));
+        let queue_tx = limiter.queue_tx.as_ref().unwrap().clone();
+        let (permit_tx, permit_rx) = oneshot::channel();
+
+        drop(permit_rx);
+        queue_tx
+            .send(QueuedRequest {
+                queued_at: Instant::now(),
+                permit_tx,
+            })
+            .await
+            .unwrap();
+        drop(queue_tx);
+        drop(limiter);
+
+        processor.unwrap().run().await;
+
+        assert_eq!(token_bucket.available_tokens().await, 1.0);
+    }
 
     #[test]
     fn test_normalize_path_no_ids() {

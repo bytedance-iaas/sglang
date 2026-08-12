@@ -260,4 +260,67 @@ mod rate_limiting_tests {
 
         ctx.shutdown().await;
     }
+
+    /// Test that cancelling a request before response headers does not leak a pure-concurrency
+    /// token. This covers the window between token acquisition and response body construction.
+    #[tokio::test]
+    async fn test_cancelled_request_returns_pure_concurrency_token() {
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .round_robin_policy()
+            .host("127.0.0.1")
+            .port(3404)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(1)
+            .rate_limit_tokens_per_second(0)
+            .queue_size(0)
+            .queue_timeout_secs(1)
+            .build_unchecked();
+
+        let ctx =
+            AppTestContext::new_with_config(config, vec![TestWorkerConfig::slow(19304, 500)]).await;
+        let app = ctx.create_app().await;
+        let token_bucket = ctx.app_context.rate_limiter.as_ref().unwrap().clone();
+        let payload = json!({"text": "cancel me", "stream": false});
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let request_task = tokio::spawn(app.oneshot(req));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if token_bucket.available_tokens().await == 0.0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request did not acquire the concurrency token");
+
+        request_task.abort();
+        assert!(
+            request_task.await.unwrap_err().is_cancelled(),
+            "request task completed instead of being cancelled"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if token_bucket.available_tokens().await == 1.0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled request leaked its concurrency token");
+
+        ctx.shutdown().await;
+    }
 }
