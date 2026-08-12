@@ -367,6 +367,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 FROM torch_deps AS flashinfer_cache
 
 ARG CUDA_VERSION
+ARG GITHUB_ARTIFACTORY
 ARG INSTALL_FLASHINFER_JIT_CACHE
 ARG FLASHINFER_VERSION
 
@@ -380,12 +381,21 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
     && mkdir -p /flashinfer_jit_output \
-    # flashinfer-cubin is CUDA-version-agnostic, unlike jit-cache, so its index-url has no cu${CUINDEX} suffix
-    && python3 -m pip install flashinfer-cubin==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl \
+    && CUBIN_WHEEL="flashinfer_cubin-${FLASHINFER_VERSION}-py3-none-any.whl" \
+    && curl --retry 12 --retry-all-errors --retry-delay 5 --connect-timeout 30 --max-time 600 -fsSL \
+        -o "/tmp/${CUBIN_WHEEL}" \
+        "https://${GITHUB_ARTIFACTORY}/flashinfer-ai/flashinfer/releases/download/v${FLASHINFER_VERSION}/${CUBIN_WHEEL}" \
+    && python3 -m pip install --no-deps "/tmp/${CUBIN_WHEEL}" \
+    && rm "/tmp/${CUBIN_WHEEL}" \
     && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_cubin /flashinfer_jit_output/ \
     && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_cubin-*.dist-info /flashinfer_jit_output/ \
     && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
-        python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} \
+        JIT_WHEEL="flashinfer_jit_cache-${FLASHINFER_VERSION}+cu${CUINDEX}-cp39-abi3-manylinux_2_28_$(uname -m).whl" \
+        && curl --retry 12 --retry-all-errors --retry-delay 5 --connect-timeout 30 --max-time 600 -fsSL \
+            -o "/tmp/${JIT_WHEEL}" \
+            "https://${GITHUB_ARTIFACTORY}/flashinfer-ai/flashinfer/releases/download/v${FLASHINFER_VERSION}/${JIT_WHEEL}" \
+        && python3 -m pip install --no-deps "/tmp/${JIT_WHEEL}" \
+        && rm "/tmp/${JIT_WHEEL}" \
         && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_jit_cache /flashinfer_jit_output/ \
         && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_jit_cache-*.dist-info /flashinfer_jit_output/ ; \
     fi
