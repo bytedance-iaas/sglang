@@ -92,9 +92,17 @@ def free_swa_out_of_window_slots(
         ) * page_size
 
     if new_swa_evicted_seqlen > req.swa_evicted_seqlen:
-        free_slots = req_to_token_pool.req_to_token[
-            req.req_pool_idx, req.swa_evicted_seqlen : new_swa_evicted_seqlen
-        ]
+        lo = req.swa_evicted_seqlen
+        hi = new_swa_evicted_seqlen
+        # EIC loads the prefix asynchronously: the loaded full indices land in
+        # req.prefix_indices (via _finalize_load_admit), NOT in req_to_token
+        # (which stays 0 for the loaded portion). Use prefix_indices so the
+        # out-of-window SWA is actually freed; req_to_token would map to 0 and
+        # be silently dropped by free_swa's >= page_size filter.
+        if release_cache_protected_prefix and hi <= len(req.prefix_indices):
+            free_slots = req.prefix_indices[lo:hi]
+        else:
+            free_slots = req_to_token_pool.req_to_token[req.req_pool_idx, lo:hi]
         token_to_kv_pool_allocator.free_swa(free_slots)
         req.swa_evicted_seqlen = new_swa_evicted_seqlen
 
