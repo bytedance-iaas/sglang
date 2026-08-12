@@ -2283,6 +2283,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         retracted_reqs = []
+        reqs_to_abort: List[Req] = []
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        can_snapshot_decode_kv = bool(
+            getattr(kv_pool, "supports_decode_retraction_cpu_snapshot", True)
+        )
         first_iter = True
         while first_iter or (
             not self.check_decode_mem(selected_indices=sorted_indices)
@@ -2294,11 +2299,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             first_iter = False
             idx = sorted_indices.pop()
             req = self.reqs[idx]
-            retracted_reqs.append(req)
             # release memory and don't insert into the tree because we need the space instantly
-            self.release_req(idx, len(sorted_indices), server_args)
+            if (
+                server_args.disaggregation_mode == "decode"
+                and not can_snapshot_decode_kv
+            ):
+                self._mark_unsupported_decode_retraction_abort(req, kv_pool)
+                self.release_req(
+                    idx,
+                    len(sorted_indices),
+                    server_args,
+                    offload_kv_cache=False,
+                )
+                reqs_to_abort.append(req)
+            else:
+                self.release_req(idx, len(sorted_indices), server_args)
+                retracted_reqs.append(req)
 
-        reqs_to_abort: List[Req] = []
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
         ):
@@ -2312,7 +2329,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
             reqs_to_abort.append(last_req)
-            self.release_req(last_idx, 0, server_args)
+            self.release_req(
+                last_idx,
+                0,
+                server_args,
+                offload_kv_cache=can_snapshot_decode_kv,
+            )
             logger.warning(
                 "retract_decode: aborted last request %s due to OOM", last_req.rid
             )
@@ -2326,13 +2348,45 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         return retracted_reqs, new_estimate_ratio, reqs_to_abort
 
-    def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
+    def _mark_unsupported_decode_retraction_abort(self, req: Req, kv_pool) -> None:
+        allocator = self.token_to_kv_pool_allocator
+        available = allocator.available_size()
+        full_available = (
+            allocator.full_available_size()
+            if hasattr(allocator, "full_available_size")
+            else available
+        )
+        swa_available = (
+            allocator.swa_available_size()
+            if hasattr(allocator, "swa_available_size")
+            else available
+        )
+        message = (
+            "Request aborted during PD decode memory retraction because "
+            f"{type(kv_pool).__name__} does not support CPU KV snapshots. "
+            f"rid={req.rid}, seq_len={req.seqlen}, "
+            f"full_available={full_available}, swa_available={swa_available}."
+        )
+        req.to_finish = FINISH_ABORT(
+            message,
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+        logger.error(message)
+
+    def release_req(
+        self,
+        idx: int,
+        remaing_req_count: int,
+        server_args: ServerArgs,
+        *,
+        offload_kv_cache: bool = True,
+    ):
         req = self.reqs[idx]
 
         if self.hisparse_coordinator is not None and not req.finished():
             self.hisparse_coordinator.retract_req(req)
 
-        if server_args.disaggregation_mode == "decode":
+        if server_args.disaggregation_mode == "decode" and offload_kv_cache:
             req.offload_kv_cache(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             )

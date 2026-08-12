@@ -380,6 +380,11 @@ class DeepSeekV4LayerItem(NamedTuple):
 
 class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
+    # DSV4 owns multiple coupled KV/state pools whose request snapshot format
+    # is not implemented in this fork. PD decode retraction must fail the
+    # selected request instead of falling through to KVCache.get_cpu_copy().
+    supports_decode_retraction_cpu_snapshot = False
+
     def __init__(
         self,
         max_num_reqs: int,
