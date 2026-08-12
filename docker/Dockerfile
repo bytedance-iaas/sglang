@@ -135,7 +135,8 @@ fi
 
 # GDRCopy installation
 RUN mkdir -p /tmp/gdrcopy && cd /tmp \
-    && curl --retry 3 --retry-delay 2 -fsSL -o v${GDRCOPY_VERSION}.tar.gz \
+    && curl --retry 12 --retry-all-errors --retry-delay 5 \
+        --connect-timeout 30 -fsSL -o v${GDRCOPY_VERSION}.tar.gz \
         https://${GITHUB_ARTIFACTORY}/NVIDIA/gdrcopy/archive/refs/tags/v${GDRCOPY_VERSION}.tar.gz \
     && tar -xzf v${GDRCOPY_VERSION}.tar.gz && rm v${GDRCOPY_VERSION}.tar.gz \
     && cd gdrcopy-${GDRCOPY_VERSION}/packages \
