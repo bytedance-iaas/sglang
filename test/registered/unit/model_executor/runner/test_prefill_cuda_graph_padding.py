@@ -4,7 +4,10 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.attention.dsa.utils import prepare_dsa_cache_seqlens
+from sglang.srt.layers.attention.dsa.utils import (
+    cal_padded_tokens,
+    prepare_dsa_cache_seqlens,
+)
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -55,6 +58,29 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         runner = self._make_runner()
 
         self.assertTrue(runner.can_run_graph(self._make_forward_batch(8)))
+
+    @patch("sglang.srt.layers.cp.padding.get_cp_padding_align_size")
+    @patch("sglang.srt.layers.attention.dsa.utils.get_parallel")
+    def test_dsa_metadata_applies_attention_tp_alignment(
+        self, get_parallel, get_cp_padding_align_size
+    ):
+        get_parallel.return_value = SimpleNamespace(
+            attn_cp_size=1, attn_cp_rank=0, attn_tp_size=4
+        )
+        get_cp_padding_align_size.return_value = 1
+        dp_padding_mode = SimpleNamespace(is_max_len=lambda: False)
+        forward_batch = SimpleNamespace(
+            attn_cp_metadata=None,
+            dp_padding_mode=dp_padding_mode,
+            global_num_tokens_cpu=[1],
+            is_extend_in_batch=False,
+            forward_mode=ForwardMode.DECODE,
+        )
+
+        with patch(
+            "sglang.srt.layers.cp.utils.is_cp_v2_active", return_value=False
+        ):
+            self.assertEqual(cal_padded_tokens(forward_batch), 4)
 
     @patch("sglang.srt.layers.attention.dsa.utils.cal_padded_tokens", return_value=16)
     @patch("sglang.srt.layers.attention.dsa.utils.get_parallel")
