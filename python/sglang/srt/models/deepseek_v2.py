@@ -441,6 +441,7 @@ class DeepseekV2MoE(nn.Module):
         alt_stream: Optional[torch.cuda.Stream] = None,
         is_nextn: bool = False,
         is_deepseek_v4: bool = False,
+        num_fused_shared_experts_override: Optional[int] = None,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -451,11 +452,23 @@ class DeepseekV2MoE(nn.Module):
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
         )
-        _fusion_disabled = get_global_server_args().disable_shared_experts_fusion
+        if num_fused_shared_experts_override is None:
+            _fusion_disabled = get_global_server_args().disable_shared_experts_fusion
+            num_fused_shared_experts = 0 if _fusion_disabled else n_shared_experts
+        else:
+            num_fused_shared_experts = int(num_fused_shared_experts_override)
+            if num_fused_shared_experts not in (0, n_shared_experts):
+                raise ValueError(
+                    "num_fused_shared_experts_override must be either 0 or "
+                    f"n_shared_experts={n_shared_experts}, got "
+                    f"{num_fused_shared_experts}."
+                )
 
-        # num_fused_shared_experts drives weight remapping in deepseek_weight_loader:
-        # mlp.shared_experts → mlp.experts.256 when > 0.
-        self.num_fused_shared_experts = 0 if _fusion_disabled else n_shared_experts
+        # num_fused_shared_experts drives weight remapping in
+        # deepseek_weight_loader: mlp.shared_experts → mlp.experts.256 when > 0.
+        # DSV4 passes an explicit per-runner value so constructing a draft cannot
+        # mutate or inherit the target runner's process-global decision.
+        self.num_fused_shared_experts = num_fused_shared_experts
 
         # DeepEP shared expert fusion: shared expert is fused into the same MoE kernel
         # as a local expert at the home EP rank. Expert layout is expanded from 256

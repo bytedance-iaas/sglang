@@ -38,6 +38,7 @@ class DeepseekV4ModelNextN(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        num_fused_shared_experts: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -88,6 +89,7 @@ class DeepseekV4ModelNextN(nn.Module):
             prefix=add_prefix(layer_name, prefix),
             alt_streams=None,
             compress_ratio_override=COMPRESS_RATIO_NEXTN_LAYER,
+            num_fused_shared_experts=num_fused_shared_experts,
         )
 
         self.shared_head = nn.Module()
@@ -179,7 +181,10 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         self.determine_num_fused_shared_experts()
 
         self.model = DeepseekV4ModelNextN(
-            config, quant_config, prefix=add_prefix("model", prefix)
+            config,
+            quant_config,
+            prefix=add_prefix("model", prefix),
+            num_fused_shared_experts=self.num_fused_shared_experts,
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,

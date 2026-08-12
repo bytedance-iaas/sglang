@@ -149,13 +149,13 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "Mooncake only"):
             _handle_dspark(server_args)
 
-    def test_shared_expert_fusion_is_rejected_at_startup(self):
+    def test_shared_expert_fusion_is_allowed_for_dspark(self):
         server_args = _make_dspark_server_args(
             model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
         )
         server_args.enforce_shared_experts_fusion = True
-        with self.assertRaisesRegex(ValueError, "separate shared experts"):
-            _handle_dspark(server_args)
+        _handle_dspark(server_args)
+        self.assertTrue(server_args.enforce_shared_experts_fusion)
 
 
 if __name__ == "__main__":
