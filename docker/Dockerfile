@@ -187,7 +187,7 @@ WORKDIR /sgl-workspace
 # Rust toolchain for setuptools-rust extensions (e.g. sglang-grpc).
 # Requires >= 1.85 (edition 2024). Inherited by framework via FROM torch_deps.
 ENV PATH="/root/.cargo/bin:${PATH}"
-RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
+RUN curl --proto '=https' --tlsv1.2 --retry 12 --retry-all-errors --retry-delay 5 -sSf https://sh.rustup.rs \
         | sh -s -- -y --no-modify-path --profile minimal \
     && rustc --version && cargo --version
 
@@ -304,7 +304,7 @@ RUN set -eux; \
       sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
       cd .. ; \
     else \
-        curl --retry 3 --retry-delay 2 -fsSL -o ${DEEPEP_COMMIT}.zip \
+        curl --retry 12 --retry-all-errors --retry-delay 5 -fsSL -o ${DEEPEP_COMMIT}.zip \
             https://${GITHUB_ARTIFACTORY}/deepseek-ai/DeepEP/archive/${DEEPEP_COMMIT}.zip && \
         unzip -q ${DEEPEP_COMMIT}.zip && rm ${DEEPEP_COMMIT}.zip && mv DeepEP-${DEEPEP_COMMIT} DeepEP && cd DeepEP && \
         sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
@@ -404,15 +404,15 @@ RUN --mount=type=cache,target=/var/cache/apt,id=devtools-apt \
     && rm -rf /var/lib/apt/lists/*
 
 # Download CLI tools (each in its own layer for parallel downloads)
-RUN curl --retry 3 --retry-delay 2 -LSso /tools/diff-so-fancy \
+RUN curl --retry 12 --retry-all-errors --retry-delay 5 -LSso /tools/diff-so-fancy \
         https://${GITHUB_ARTIFACTORY}/so-fancy/diff-so-fancy/releases/download/v1.4.4/diff-so-fancy \
     && chmod +x /tools/diff-so-fancy
 
-RUN curl --retry 3 --retry-delay 2 -LSso /tools/clang-format \
+RUN curl --retry 12 --retry-all-errors --retry-delay 5 -LSso /tools/clang-format \
         https://${GITHUB_ARTIFACTORY}/muttleyxd/clang-tools-static-binaries/releases/download/master-32d3ac78/clang-format-16_linux-amd64 \
     && chmod +x /tools/clang-format
 
-RUN curl --retry 3 --retry-delay 2 -fsSL -o /tmp/clangd.zip \
+RUN curl --retry 12 --retry-all-errors --retry-delay 5 -fsSL -o /tmp/clangd.zip \
         https://${GITHUB_ARTIFACTORY}/clangd/clangd/releases/download/18.1.3/clangd-linux-18.1.3.zip \
     && unzip -q /tmp/clangd.zip -d /tmp \
     && cp /tmp/clangd_18.1.3/bin/* /tools/ \
@@ -422,19 +422,19 @@ RUN curl --retry 3 --retry-delay 2 -fsSL -o /tmp/clangd.zip \
 RUN CMAKE_VERSION=3.31.1 \
     && ARCH=$(uname -m) \
     && CMAKE_INSTALLER="cmake-${CMAKE_VERSION}-linux-${ARCH}" \
-    && curl --retry 3 --retry-delay 2 -fsSL -o "/tmp/${CMAKE_INSTALLER}.tar.gz" \
+    && curl --retry 12 --retry-all-errors --retry-delay 5 -fsSL -o "/tmp/${CMAKE_INSTALLER}.tar.gz" \
         "https://${GITHUB_ARTIFACTORY}/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${CMAKE_INSTALLER}.tar.gz" \
     && tar -xzf "/tmp/${CMAKE_INSTALLER}.tar.gz" -C /tmp \
     && cp -r "/tmp/${CMAKE_INSTALLER}/bin/"* /tools/ \
     && mkdir -p /tools/share && cp -r "/tmp/${CMAKE_INSTALLER}/share/"* /tools/share/ \
     && rm -rf "/tmp/${CMAKE_INSTALLER}" "/tmp/${CMAKE_INSTALLER}.tar.gz"
 
-RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://just.systems/install.sh | \
+RUN curl --proto '=https' --tlsv1.2 --retry 12 --retry-all-errors --retry-delay 5 -sSf https://just.systems/install.sh | \
     sed "s|https://github.com|https://${GITHUB_ARTIFACTORY}|g" | \
     bash -s -- --tag 1.42.4 --to /tools
 
 # Install oh-my-zsh and plugins
-RUN sh -c "$(curl --retry 3 --retry-delay 2 -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended \
+RUN sh -c "$(curl --retry 12 --retry-all-errors --retry-delay 5 -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended \
     && git clone --depth 1 https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-autosuggestions \
     && git clone --depth 1 https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
 
@@ -457,7 +457,7 @@ COPY sgl-model-gateway /build/sgl-model-gateway
 
 # Install Rust, build gateway binary and Python bindings, then clean up Rust toolchain
 RUN --mount=type=cache,target=/root/.cache/pip \
-    curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    curl --proto '=https' --tlsv1.2 --retry 12 --retry-all-errors --retry-delay 5 -sSf https://sh.rustup.rs | sh -s -- -y \
     && export PATH="/root/.cargo/bin:${PATH}" \
     && python3 -m pip install maturin \
     && cd /build/sgl-model-gateway/bindings/python \
