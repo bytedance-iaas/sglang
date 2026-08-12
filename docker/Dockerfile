@@ -745,6 +745,33 @@ LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
       ai.sglang.build.url="${SGLANG_BUILD_URL}" \
       ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
 
+# GLM 5.2 W4A8 validation requires the complete, immutable source checkout at
+# /glm52/sglang. Keep the normal workspace path as a compatibility symlink so
+# the editable install created by framework_final continues to resolve without
+# reinstalling or mutating tracked source at container startup.
+FROM framework_final AS glm52_w4a8_integrated
+
+ARG SGLANG_BUILD_COMMIT
+ARG SGLANG_SOURCE_TREE
+
+RUN set -eux; \
+    test -n "${SGLANG_BUILD_COMMIT}"; \
+    test -n "${SGLANG_SOURCE_TREE}"; \
+    mkdir -p /glm52; \
+    mv /sgl-workspace/sglang /glm52/sglang; \
+    ln -s /glm52/sglang /sgl-workspace/sglang; \
+    test "$(git -C /glm52/sglang rev-parse HEAD)" = "${SGLANG_BUILD_COMMIT}"; \
+    test "$(git -C /glm52/sglang write-tree)" = "${SGLANG_SOURCE_TREE}"; \
+    git -C /glm52/sglang diff --quiet -- .; \
+    git -C /glm52/sglang diff --cached --quiet -- .; \
+    python3 -c 'import pathlib, sglang; expected = pathlib.Path("/glm52/sglang/python/sglang/__init__.py"); actual = pathlib.Path(sglang.__file__).resolve(); print(f"SGLANG_IMPORT_FILE={actual}"); assert actual == expected'
+
+ENV SGLANG_SOURCE_ROOT=/glm52/sglang \
+    SGLANG_SOURCE_COMMIT=${SGLANG_BUILD_COMMIT} \
+    SGLANG_SOURCE_TREE=${SGLANG_SOURCE_TREE}
+
+WORKDIR /glm52/sglang
+
 ########################################################
 ########## Runtime Image ##############################
 ########################################################

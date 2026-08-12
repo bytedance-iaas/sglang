@@ -1,0 +1,121 @@
+name: Build GLM 5.2 W4A8 Integrated Image
+
+on:
+  workflow_call:
+    inputs:
+      image_tag:
+        description: Immutable task image tag
+        required: true
+        type: string
+
+concurrency:
+  group: glm52-w4a8-integrated-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'bytedance-iaas/sglang'
+    environment: prod
+    runs-on: x64-docker-build-node
+    env:
+      IMAGE_REPO: iaas-gpu-cn-beijing.cr.volces.com/serving/sglang
+      REGISTRY_HOST: iaas-gpu-cn-beijing.cr.volces.com
+      VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
+      VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
+    steps:
+      - name: Delete huge unnecessary tools folder
+        run: rm -rf /opt/hostedtoolcache
+
+      - name: Cleanup workspace
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+
+      - name: Checkout exact task branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Compute source provenance
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain --untracked-files=no)"
+          source_commit="$(git rev-parse HEAD)"
+          source_tree="$(git write-tree)"
+          echo "source_commit=${source_commit}" >> "$GITHUB_OUTPUT"
+          echo "source_tree=${source_tree}" >> "$GITHUB_OUTPUT"
+          printf 'SOURCE_COMMIT=%s\nSOURCE_TREE=%s\n' \
+            "$source_commit" "$source_tree"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=host
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["127.0.0.1:5000"]
+
+      - name: Login to Volcengine CR
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$VOLCENGINE_CR_USERNAME"
+          test -n "$VOLCENGINE_CR_PASSWORD"
+          echo "$VOLCENGINE_CR_PASSWORD" | docker login "$REGISTRY_HOST" \
+            --username "$VOLCENGINE_CR_USERNAME" --password-stdin
+
+      - name: Build and publish immutable integrated image
+        id: image
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
+          SOURCE_TREE: ${{ steps.source.outputs.source_tree }}
+        run: |
+          set -euo pipefail
+          image_ref="${IMAGE_REPO}:${{ inputs.image_tag }}"
+          build_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          docker buildx build \
+            --target glm52_w4a8_integrated \
+            --platform linux/amd64 \
+            --file docker/Dockerfile \
+            --build-arg CUDA_VERSION=13.0.1 \
+            --build-arg BUILD_TYPE=all \
+            --build-arg BRANCH_TYPE=local \
+            --build-arg GRACE_BLACKWELL=0 \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            --build-arg CMAKE_BUILD_PARALLEL_LEVEL="$(nproc)" \
+            --build-arg SGLANG_BUILD_COMMIT="$SOURCE_COMMIT" \
+            --build-arg SGLANG_SOURCE_TREE="$SOURCE_TREE" \
+            --build-arg SGLANG_BUILD_URL="$build_url" \
+            --build-arg SGLANG_IMAGE_TAG="$image_ref" \
+            --build-arg HTTP_PROXY=http://100.68.162.211:3128 \
+            --build-arg HTTPS_PROXY=http://100.68.162.211:3128 \
+            --build-arg NO_PROXY=localhost,127.0.0.1,.ivolces.com,.volceapi.com,.byted.org,iaas-gpu-cn-beijing.cr.volces.com \
+            --metadata-file /tmp/glm52-w4a8-image-metadata.json \
+            --push \
+            --tag "$image_ref" \
+            .
+          digest="$(python3 -c 'import json; print(json.load(open("/tmp/glm52-w4a8-image-metadata.json"))["containerimage.digest"])')"
+          test -n "$digest"
+          echo "image_ref=${image_ref}" >> "$GITHUB_OUTPUT"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          printf 'IMAGE_REF=%s\nIMAGE_DIGEST=%s\n' "$image_ref" "$digest"
+
+      - name: Verify published digest and provenance
+        shell: bash
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.image_ref }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
+          SOURCE_TREE: ${{ steps.source.outputs.source_tree }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect "${IMAGE_REF}@${IMAGE_DIGEST}"
+          docker run --rm "${IMAGE_REF}@${IMAGE_DIGEST}" bash -ceu '
+            test "$(git -C /glm52/sglang rev-parse HEAD)" = "$1"
+            test "$(git -C /glm52/sglang write-tree)" = "$2"
+            git -C /glm52/sglang diff --quiet -- .
+            git -C /glm52/sglang diff --cached --quiet -- .
+            test "$(readlink -f /sgl-workspace/sglang)" = /glm52/sglang
+            PYTHONPATH=/glm52/sglang/python python3 -c '\''import pathlib, sglang; assert pathlib.Path(sglang.__file__).resolve() == pathlib.Path("/glm52/sglang/python/sglang/__init__.py")'\''
+          ' -- "$SOURCE_COMMIT" "$SOURCE_TREE"
