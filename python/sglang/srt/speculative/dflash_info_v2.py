@@ -58,6 +58,14 @@ class DFlashDraftInputV2(SpecInput):
         if bs == 0:
             return
 
+        # DFLASH/DSpark bypasses ScheduleBatch's ordinary decode preparation,
+        # so it owns the per-step SWA maintenance clock. Evict before ticking
+        # to preserve the first-iteration safety gate used by overlap-capable
+        # speculative paths.
+        batch.maybe_evict_swa()
+        for req in batch.reqs:
+            req.decode_batch_idx += 1
+
         # Result-based speculative decoding bypasses ScheduleBatch's ordinary
         # decode preparation.  Accumulate the tokens committed by the previous
         # verify step here so frequency/presence/repetition penalties observe
