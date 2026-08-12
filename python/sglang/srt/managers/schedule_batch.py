@@ -2685,8 +2685,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 if self.forward_mode.is_decode():
                     # We set evict_swa condition here with two reasons:
                     # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.
-                    # 2. Evict swa every eviction_interval tokens to reduce the overhead.
-                    if req.decode_batch_idx % eviction_interval == 1:
+                    # 2. Evict after enough tokens have slid out of the window.
+                    # Gating on token progress instead of decode iterations also
+                    # handles speculative steps that accept multiple tokens.
+                    if (
+                        req.decode_batch_idx >= 1
+                        and req.seqlen - 1 - sliding_window_size
+                        >= req.swa_evicted_seqlen + eviction_interval
+                    ):
                         self._evict_swa(req, req.seqlen - 1)
 
                     # Once the decode position has moved past the sliding window,
