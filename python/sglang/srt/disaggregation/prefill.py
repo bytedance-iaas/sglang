@@ -428,16 +428,6 @@ class PrefillBootstrapQueue:
                 pp_good_rids,
                 pp_bad_rids,
             )
-            uncovered = [i for i, poll in enumerate(polls) if poll is None]
-            if uncovered:
-                local_polls = poll_and_all_reduce_attn_cp_tp_group(
-                    [self.queue[i].disagg_kv_sender for i in uncovered],
-                    self.scheduler.attn_cp_cpu_group,
-                    self.scheduler.attn_tp_cpu_group,
-                )
-                for i, local_poll in zip(uncovered, local_polls):
-                    if local_poll == KVPoll.Failed:
-                        polls[i] = KVPoll.Failed
         else:
             polls = poll_and_all_reduce_attn_cp_tp_group(
                 [req.disagg_kv_sender for req in self.queue],
@@ -500,6 +490,7 @@ class PrefillBootstrapQueue:
             [req.disagg_kv_sender for req in self.queue],
             self.scheduler.attn_cp_cpu_group,
             self.scheduler.attn_tp_cpu_group,
+            ordered_keys=[req.rid for req in self.queue],
         )
         metadata_credits = (
             self.req_to_metadata_buffer_idx_allocator.available_size()
@@ -897,6 +888,7 @@ class SchedulerDisaggregationPrefillMixin:
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
+            ordered_keys=[req.rid for req in self.disagg_prefill_inflight_queue],
         )
 
         undone_reqs: List[Req] = []
@@ -1026,18 +1018,29 @@ class SchedulerDisaggregationPrefillMixin:
         self: Scheduler,
     ) -> Tuple[List[str], List[str]]:
         """
-        Used by PP, inspect terminal transfer states without popping requests.
+        Used by PP, advance optimistic bootstrap and inspect terminal transfer
+        states without popping transfer-complete requests.
         """
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
+            ordered_keys=[req.rid for req in self.disagg_prefill_inflight_queue],
         )
 
         success_rids: List[str] = []
         failed_rids: List[str] = []
 
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+            if req.pending_bootstrap:
+                if poll == KVPoll.Failed:
+                    # Keep the request until PPlast forms authoritative failure
+                    # consensus and the result circles back through every stage.
+                    failed_rids.append(req.rid)
+                elif poll == KVPoll.WaitingForInput and not should_force_retry(req):
+                    assert self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
+                    self.send_kv_chunk(req, last_chunk=True)
+                continue
             if poll == KVPoll.Success:
                 success_rids.append(req.rid)
             elif poll == KVPoll.Failed:

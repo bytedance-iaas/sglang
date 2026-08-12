@@ -48,6 +48,9 @@ if TYPE_CHECKING:
 
 PPTransferStatus = Tuple[List[str], List[str]]
 PPReleasePayload = Union[List[str], PPTransferStatus]
+PP_COMMITTED_RELEASE_CACHE_SIZE = 16384
+PP_PENDING_RELEASE_MAX_RIDS = 4096
+PP_PENDING_RELEASE_MAX_WAIT_SECONDS = 600
 
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
@@ -89,6 +92,117 @@ def _pp_merge_transfer_status(
         failed_set = set(failed)
         success = [rid for rid in success if rid not in failed_set]
     return success, failed
+
+
+def _pp_merge_pending_release_status(
+    pending: Optional[PPTransferStatus],
+    incoming: Optional[PPTransferStatus],
+    committed_rids: set[str],
+) -> Optional[PPTransferStatus]:
+    """Retain authoritative release RIDs until they exist on this PP stage."""
+    if incoming is None:
+        return pending
+
+    pending_success, pending_failed = pending or ([], [])
+    incoming_success, incoming_failed = incoming
+    failed = _pp_ordered_union(pending_failed, incoming_failed)
+    success = _pp_ordered_union(pending_success, incoming_success)
+
+    failed_set = set(failed)
+    success = [
+        rid
+        for rid in success
+        if rid not in failed_set and rid not in committed_rids
+    ]
+    failed = [rid for rid in failed if rid not in committed_rids]
+    if not success and not failed:
+        return None
+    return success, failed
+
+
+def _pp_ready_release_status(
+    pending: Optional[PPTransferStatus],
+    *,
+    success_ready_rids: List[str],
+    failure_ready_rids: Optional[List[str]] = None,
+) -> Optional[PPTransferStatus]:
+    """Select pending authority RIDs whose local request state is now present."""
+    if pending is None:
+        return None
+    pending_success, pending_failed = pending
+    success_ready = set(success_ready_rids)
+    failure_ready = set(
+        success_ready_rids if failure_ready_rids is None else failure_ready_rids
+    )
+    ready_success = [rid for rid in pending_success if rid in success_ready]
+    ready_failed = [rid for rid in pending_failed if rid in failure_ready]
+    if not ready_success and not ready_failed:
+        return None
+    return ready_success, ready_failed
+
+
+def _pp_acknowledge_release_status(
+    pending: Optional[PPTransferStatus],
+    acknowledged_rids: List[str],
+) -> Optional[PPTransferStatus]:
+    """Remove only authority RIDs proven consumed by the local queue."""
+    if pending is None or not acknowledged_rids:
+        return pending
+    acknowledged = set(acknowledged_rids)
+    success, failed = pending
+    remaining = (
+        [rid for rid in success if rid not in acknowledged],
+        [rid for rid in failed if rid not in acknowledged],
+    )
+    if not remaining[0] and not remaining[1]:
+        return None
+    return remaining
+
+
+def _pp_remember_committed_release_rids(
+    committed_order: deque[str],
+    committed_rids: set[str],
+    rids: List[str],
+) -> None:
+    """Bound duplicate-authority suppression for a long-running scheduler."""
+    for rid in rids:
+        if rid in committed_rids:
+            continue
+        while len(committed_order) >= PP_COMMITTED_RELEASE_CACHE_SIZE:
+            committed_rids.discard(committed_order.popleft())
+        committed_order.append(rid)
+        committed_rids.add(rid)
+
+
+def _pp_validate_pending_release_status(
+    pending: Optional[PPTransferStatus],
+    first_seen_at: Dict[str, float],
+) -> None:
+    """Fail loudly instead of retaining missing PP-stage request state forever."""
+    pending_rids = [] if pending is None else pending[0] + pending[1]
+    active_rids = set(pending_rids)
+    for rid in list(first_seen_at):
+        if rid not in active_rids:
+            del first_seen_at[rid]
+    now = time.monotonic()
+    for rid in pending_rids:
+        first_seen_at.setdefault(rid, now)
+    if len(pending_rids) > PP_PENDING_RELEASE_MAX_RIDS:
+        raise RuntimeError(
+            "PP pending release authority exceeded "
+            f"{PP_PENDING_RELEASE_MAX_RIDS} RIDs"
+        )
+    overdue_rids = [
+        rid
+        for rid in pending_rids
+        if now - first_seen_at[rid] > PP_PENDING_RELEASE_MAX_WAIT_SECONDS
+    ]
+    if overdue_rids:
+        raise RuntimeError(
+            "PP pending release authority waited over "
+            f"{PP_PENDING_RELEASE_MAX_WAIT_SECONDS}s for local request state; "
+            f"sample_rids={overdue_rids[:8]}"
+        )
 
 
 @dataclass
@@ -263,6 +377,10 @@ class SchedulerPPMixin:
         consensus_bootstrapped_rids: Optional[List[str]] = None
         transferred_rids: PPTransferStatus = ([], [])
         release_rids: Optional[PPTransferStatus] = None
+        pending_release_status: Optional[PPTransferStatus] = None
+        pending_release_first_seen_at: Dict[str, float] = {}
+        committed_release_order: deque[str] = deque()
+        committed_release_rids: set[str] = set()
         send_bootstrapped_work = []
         send_transfer_work = []
         send_consensus_bootstrapped_work = []
@@ -370,7 +488,54 @@ class SchedulerPPMixin:
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
                 if tmbs[next_mb_id] is not None:
-                    self.process_disagg_prefill_inflight_queue(next_release_rids)
+                    pending_release_status = _pp_merge_pending_release_status(
+                        pending_release_status,
+                        next_release_rids,
+                        committed_release_rids,
+                    )
+                    _pp_validate_pending_release_status(
+                        pending_release_status, pending_release_first_seen_at
+                    )
+                    if pending_release_status is not None:
+                        local_prefill_rids = [
+                            req.rid for req in self.disagg_prefill_inflight_queue
+                        ]
+                        ready_release_status = _pp_ready_release_status(
+                            pending_release_status,
+                            success_ready_rids=[
+                                req.rid
+                                for req in self.disagg_prefill_inflight_queue
+                                if not req.pending_bootstrap
+                            ],
+                            failure_ready_rids=local_prefill_rids,
+                        )
+                    else:
+                        ready_release_status = None
+                    if ready_release_status is not None:
+                        self.process_disagg_prefill_inflight_queue(
+                            ready_release_status
+                        )
+                        remaining_local_rids = {
+                            req.rid for req in self.disagg_prefill_inflight_queue
+                        }
+                        acknowledged_rids = [
+                            rid
+                            for rid in ready_release_status[0]
+                            + ready_release_status[1]
+                            if rid not in remaining_local_rids
+                        ]
+                        pending_release_status = _pp_acknowledge_release_status(
+                            pending_release_status, acknowledged_rids
+                        )
+                        _pp_remember_committed_release_rids(
+                            committed_release_order,
+                            committed_release_rids,
+                            acknowledged_rids,
+                        )
+                        _pp_validate_pending_release_status(
+                            pending_release_status,
+                            pending_release_first_seen_at,
+                        )
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
@@ -411,7 +576,11 @@ class SchedulerPPMixin:
         tmbs = [None] * self.pp_loop_size
         consensus_retract_rids: Optional[List[str]] = None
         consensus_prealloc_rids: Optional[List[str]] = None
-        release_rids: Optional[List[str]] = None  # consensus transferred rids
+        release_rids: Optional[PPTransferStatus] = None
+        pending_release_status: Optional[PPTransferStatus] = None
+        pending_release_first_seen_at: Dict[str, float] = {}
+        committed_release_order: deque[str] = deque()
+        committed_release_rids: set[str] = set()
         send_retract_work = []
         send_prealloc_work = []
         send_transfer_work = []
@@ -542,9 +711,49 @@ class SchedulerPPMixin:
 
                 if tmbs[next_mb_id] is not None:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
-                    next_release_rids = self.process_decode_transfer_queue(
-                        next_release_rids
+                    pending_release_status = _pp_merge_pending_release_status(
+                        pending_release_status,
+                        next_release_rids,
+                        committed_release_rids,
                     )
+                    _pp_validate_pending_release_status(
+                        pending_release_status, pending_release_first_seen_at
+                    )
+                    if pending_release_status is not None:
+                        local_decode_rids = [
+                            decode_req.req.rid
+                            for decode_req in self.disagg_decode_transfer_queue.queue
+                        ]
+                        ready_release_status = _pp_ready_release_status(
+                            pending_release_status,
+                            success_ready_rids=local_decode_rids,
+                        )
+                    else:
+                        ready_release_status = None
+                    if ready_release_status is not None:
+                        self.process_decode_transfer_queue(ready_release_status)
+                        remaining_local_rids = {
+                            decode_req.req.rid
+                            for decode_req in self.disagg_decode_transfer_queue.queue
+                        }
+                        acknowledged_rids = [
+                            rid
+                            for rid in ready_release_status[0]
+                            + ready_release_status[1]
+                            if rid not in remaining_local_rids
+                        ]
+                        pending_release_status = _pp_acknowledge_release_status(
+                            pending_release_status, acknowledged_rids
+                        )
+                        _pp_remember_committed_release_rids(
+                            committed_release_order,
+                            committed_release_rids,
+                            acknowledged_rids,
+                        )
+                        _pp_validate_pending_release_status(
+                            pending_release_status,
+                            pending_release_first_seen_at,
+                        )
                 self._pp_commit_comm_work(send_release_work)
 
                 # post-process the coming microbatch
@@ -1671,28 +1880,21 @@ class SchedulerPPMixin:
         bad_rids = list(set(bad_rids) | set(aborted_rids))
         return good_rids, bad_rids
 
-    def _pp_pd_get_decode_transferred_ids(self: Scheduler):
+    def _pp_pd_get_decode_transferred_ids(self: Scheduler) -> PPTransferStatus:
         # get the current stage transfer success
+        current_status = (
+            self.disagg_decode_transfer_queue.get_transferred_status_for_pp()
+        )
         if self.pp_group.is_first_rank:
-            transferred_rids = self.get_rids(
-                self.disagg_decode_transfer_queue.queue,
-                False,
-                [KVPoll.Success, KVPoll.Failed],
-            )
+            transferred_rids = current_status
         # if other ranks, do intersection with the previous rank's transferred rids
         else:
             # 2 (Release): Receive the transferred rids from the previous rank
             # 1. recv previous stage's transferred reqs info
-            prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
-            # 2. get the current stage's transferred reqs info
-            curr_transferred_rids = self.get_rids(
-                self.disagg_decode_transfer_queue.queue,
-                False,
-                [KVPoll.Success, KVPoll.Failed],
-            )
-            # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
-            transferred_rids = list(
-                set(prev_transferred_rids) & set(curr_transferred_rids)
+            previous_status = self._pp_recv_pyobj_from_prev_stage()
+            transferred_rids = _pp_merge_transfer_status(
+                previous=previous_status,
+                current=current_status,
             )
         return transferred_rids
 
@@ -1723,22 +1925,27 @@ class SchedulerPPMixin:
             self.disagg_decode_transfer_queue.extend(good_reqs)
             return [
                 [req.req.rid for req in good_reqs],
-                [req.req.rid for req in failed_reqs],
+                _pp_ordered_union(
+                    bad_consensus_prealloc_rids,
+                    [req.req.rid for req in failed_reqs],
+                ),
             ]
         return None
 
     def process_decode_transfer_queue(
-        self: Scheduler, release_rids: Optional[List[str]]
+        self: Scheduler, release_status: Optional[PPTransferStatus]
     ):
-        if release_rids is not None:
+        if release_status is not None:
+            good_rids, bad_rids = release_status
             released_reqs = self.disagg_decode_transfer_queue.pop_transferred(
-                release_rids
+                pp_good_rids=good_rids,
+                pp_bad_rids=bad_rids,
             )
             if self.enable_hisparse:
                 for req in released_reqs:
                     self.admit_hisparse_request_direct(req)
             self.waiting_queue.extend(released_reqs)
-            return [req.rid for req in released_reqs]
+            return release_status
         return None
 
 
