@@ -105,8 +105,8 @@ class TargetHiddenKvInjector:
         state_slot: Optional[torch.Tensor] = None,
         final_pos: Optional[torch.Tensor] = None,
     ) -> None:
-        if is_unified_kv_triton():
-            swa_loc = self._unified_inject_loc(
+        if is_unified_kv_triton() or pool.uses_draft_swa_ring:
+            swa_loc = self._ring_inject_loc(
                 pool=pool,
                 positions=positions,
                 cache_loc_2d=cache_loc_2d,
@@ -134,7 +134,7 @@ class TargetHiddenKvInjector:
                 pool=pool,
             )
 
-    def _unified_inject_loc(
+    def _ring_inject_loc(
         self,
         *,
         pool,
@@ -144,7 +144,7 @@ class TargetHiddenKvInjector:
         state_slot: Optional[torch.Tensor],
         final_pos: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Ring row for target-hidden injection under unified_kv.
+        """Ring row for target-hidden injection.
 
         loc = state_slot * ring + pos % ring, with two skip (-1) rules:
           * SWA window: only the last ``win`` tokens per req land in the ring;
@@ -154,11 +154,15 @@ class TargetHiddenKvInjector:
         """
         if state_slot is None:
             raise RuntimeError(
-                "unified_kv target-hidden injection requires state_slot "
+                "DSV4 ring target-hidden injection requires state_slot "
                 "(per-token draft req_pool_indices)."
             )
-        ring = pool.unified_swa_ring_size
-        win = pool.unified_swa_window
+        if pool.uses_draft_swa_ring:
+            ring = pool.draft_swa_ring_stride
+            win = pool.draft_swa_window
+        else:
+            ring = pool.unified_swa_ring_size
+            win = pool.unified_swa_window
         pos = positions.to(torch.int64)
         loc = state_slot.to(torch.int64) * ring + pos % ring
         if final_pos is not None:
@@ -188,14 +192,19 @@ class TargetHiddenKvInjector:
         if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
             if hidden_strided.numel() == 0:
                 return
-            if is_unified_kv_triton():
+            if is_unified_kv_triton() or pool.uses_draft_swa_ring:
+                ring_stride = (
+                    pool.draft_swa_ring_stride
+                    if pool.uses_draft_swa_ring
+                    else pool.unified_swa_ring_size
+                )
                 inject_layout = build_unified_commit_inject_layout(
                     req_pool_indices=batch.req_pool_indices,
                     prefix_lens=prefix_lens,
                     block_pos_offsets=self._block_pos_offsets[:stride],
                     commit_lens=commit_lens,
                     stride=stride,
-                    ring_stride=pool.unified_swa_ring_size,
+                    ring_stride=ring_stride,
                 )
             else:
                 inject_layout = BuildCommitInjectLayout.execute(

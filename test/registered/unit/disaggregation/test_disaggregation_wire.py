@@ -25,6 +25,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     get_dsv4_c128_state_indices,
+    get_dsv4_draft_swa_ring_page_indices,
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
@@ -389,6 +390,7 @@ def _buf_infos(*ptrs):
 def _make_dsv4_target(*, unified, mapping=None):
     pool = object.__new__(DeepSeekV4TokenToKVPool)
     pool._unified_kv = unified
+    pool.uses_draft_swa_ring = False
     pool.page_size = 256
     pool.sliding_window = 128
     pool.full_to_swa_index_mapping = mapping
@@ -403,9 +405,11 @@ def _make_dsv4_target(*, unified, mapping=None):
     return pool
 
 
-def _make_dsv4_draft(*, unified, mapping=None):
+def _make_dsv4_draft(*, unified, mapping=None, compact_ring=False):
     pool = object.__new__(DeepSeekV4TokenToKVPool)
     pool._unified_kv = unified
+    pool.uses_draft_swa_ring = compact_ring
+    pool.draft_swa_pages_per_req = 1
     pool.compression_ratios = [0]
     pool.page_size = 256
     pool.sliding_window = 128
@@ -445,11 +449,24 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
                 [StateType.SWA, StateType.SWA_RING, StateType.SWA_RING],
                 [[11], [12]],
             ),
+            (
+                "compact_ring",
+                _make_dsv4_target(unified=False, mapping=torch.arange(16)),
+                _make_dsv4_draft(
+                    unified=False,
+                    mapping=torch.arange(16),
+                    compact_ring=True,
+                ),
+                [StateType.SWA, StateType.SWA_RING],
+                [[11]],
+            ),
         ]
 
         for name, target, draft, expected_types, target_ptrs in cases:
             with self.subTest(name=name):
-                if draft._unified_kv:
+                if draft.uses_draft_swa_ring:
+                    expected_infos = draft.get_draft_swa_ring_buf_infos()
+                elif draft._unified_kv:
                     expected_infos = draft.get_unified_swa_ring_buf_infos()
                 else:
                     expected_infos = draft.get_state_buf_infos()
@@ -462,6 +479,22 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
                 self.assertEqual(kv_args.state_data_ptrs[-1], expected_infos[0])
                 self.assertEqual(kv_args.state_data_lens[-1], expected_infos[1])
                 self.assertEqual(kv_args.state_item_lens[-1], expected_infos[2])
+
+    def test_compact_ring_pages_are_request_scoped(self):
+        np.testing.assert_array_equal(
+            get_dsv4_draft_swa_ring_page_indices(7, pages_per_req=2),
+            np.array([14, 15], dtype=np.int32),
+        )
+
+    def test_compact_ring_locs_do_not_depend_on_full_token_mapping(self):
+        pool = object.__new__(DeepSeekV4TokenToKVPool)
+        pool.uses_draft_swa_ring = True
+        pool.draft_swa_ring_stride = 256
+        locs = pool.get_draft_swa_ring_loc(
+            req_pool_indices=torch.tensor([2, 9]),
+            positions=torch.tensor([513, 513]),
+        )
+        torch.testing.assert_close(locs, torch.tensor([513, 2305]))
 
 
 if __name__ == "__main__":

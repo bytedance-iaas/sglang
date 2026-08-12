@@ -51,6 +51,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     _is_fake_transfer,
     get_dsv4_c128_state_indices,
+    get_dsv4_draft_swa_ring_page_indices,
     get_kv_class,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
@@ -1197,6 +1198,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 return kv_to_page_indices(kv_indices_full, device_page_size)
 
             def _swa_ring_payload():
+                draft_pool = self.draft_token_to_kv_pool
+                if (
+                    isinstance(draft_pool, DeepSeekV4TokenToKVPool)
+                    and draft_pool.uses_draft_swa_ring
+                ):
+                    return get_dsv4_draft_swa_ring_page_indices(
+                        int(decode_req.req.req_pool_idx),
+                        draft_pool.draft_swa_pages_per_req,
+                    )
                 # Mirror of prefill _swa_ring_payload using this side's req_pool_idx.
                 # Same window positions and order -> positional match with prefill.
                 ring_stride = self.token_to_kv_pool.unified_swa_ring_size

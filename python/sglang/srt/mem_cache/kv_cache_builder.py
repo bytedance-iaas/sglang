@@ -5,7 +5,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -21,7 +21,22 @@ class KVCacheBuildResult:
     tree_cache: object
 
 
-from typing import TYPE_CHECKING
+def _resolve_radix_cache_config(
+    *,
+    disable_radix_cache: bool,
+    disable_for_multimodal_transformers: bool,
+    uses_request_scoped_draft_swa_ring: bool,
+    sliding_window_size: Optional[int],
+) -> tuple[bool, int]:
+    disable = disable_radix_cache or disable_for_multimodal_transformers
+    if not uses_request_scoped_draft_swa_ring:
+        return disable, 0
+    if sliding_window_size is None:
+        raise ValueError(
+            "A request-scoped draft SWA ring requires a sliding window size."
+        )
+    return disable, sliding_window_size
+
 
 from sglang.srt.configs.hybrid_arch import (
     hybrid_gdn_config,
@@ -30,13 +45,18 @@ from sglang.srt.configs.hybrid_arch import (
     linear_attn_model_spec,
     mamba2_config,
 )
-from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    ModelImpl,
+    is_deepseek_dsa,
+    is_deepseek_v4,
+)
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_hip, is_npu
 
 if TYPE_CHECKING:
 
@@ -178,8 +198,21 @@ def build_kv_cache(
     req_to_token_pool, token_to_kv_pool_allocator = tp_worker.get_memory_pool()
     mtp_draft_device_pools = tp_worker.model_runner.mtp_draft_device_pools
 
-    disable_radix_cache = server_args.disable_radix_cache or (
-        model_config.is_multimodal and uses_transformers_backend
+    uses_dsv4_dspark_draft_ring = (
+        spec_algorithm.is_dspark()
+        and is_deepseek_v4(model_config.hf_config)
+        and not is_hip()
+        and not is_npu()
+    )
+    disable_radix_cache, request_scoped_swa_reprefill_tail_tokens = (
+        _resolve_radix_cache_config(
+            disable_radix_cache=server_args.disable_radix_cache,
+            disable_for_multimodal_transformers=(
+                model_config.is_multimodal and uses_transformers_backend
+            ),
+            uses_request_scoped_draft_swa_ring=uses_dsv4_dspark_draft_ring,
+            sliding_window_size=sliding_window_size,
+        )
     )
     if disable_radix_cache and not server_args.disable_radix_cache:
         logger.warning(
@@ -238,6 +271,9 @@ def build_kv_cache(
         pp_size=ps.pp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
+        request_scoped_swa_reprefill_tail_tokens=(
+            request_scoped_swa_reprefill_tail_tokens
+        ),
         mtp_draft_device_pools=mtp_draft_device_pools,
     )
 
@@ -259,6 +295,16 @@ def build_kv_cache(
             tp_group=tp_group,
         )
     )
+    if (
+        request_scoped_swa_reprefill_tail_tokens
+        and not disable_radix_cache
+        and tree_cache.swa_reprefill_tail_tokens()
+        < request_scoped_swa_reprefill_tail_tokens
+    ):
+        raise RuntimeError(
+            f"{type(tree_cache).__name__} does not support request-scoped SWA "
+            "tail re-prefill."
+        )
 
     if enable_hierarchical_cache and hicache_draft_plan is not None:
         maybe_register_hicache_draft(

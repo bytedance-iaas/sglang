@@ -1297,11 +1297,12 @@ class Scheduler(
                 transfer_backend=self.transfer_backend,
             )
 
-        draft_token_to_kv_pool = (
+        self.draft_token_to_kv_pool = (
             self.draft_worker.primary_draft_kv_pool
             if self.draft_worker is not None
             else None
         )
+        draft_token_to_kv_pool = self.draft_token_to_kv_pool
 
         if self.spec_algorithm.carries_draft_hidden_states():
             # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer

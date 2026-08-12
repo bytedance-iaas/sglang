@@ -14,6 +14,7 @@ from sglang.srt.utils import ceil_align
 class DsparkWindowGather(msgspec.Struct, frozen=True):
     num_q: int
     bs: int
+    prefix_lens: torch.Tensor
     context_lens: torch.Tensor
     req_pool_indices_per_request: torch.Tensor
     offsets: torch.Tensor
@@ -123,6 +124,66 @@ class BuildDsparkSwaPageIndices:
         )
 
 
+class BuildDsparkSwaRingIndices:
+    @classmethod
+    def execute(cls, *args, **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
+        if inputs_on_cuda(*args, **kwargs):
+            return cls.triton(*args, **kwargs)
+        return cls.torch(*args, **kwargs)
+
+    @classmethod
+    def torch(
+        cls,
+        *,
+        req_pool_indices_per_request: torch.Tensor,
+        offsets: torch.Tensor,
+        invalid: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        context_lens: torch.Tensor,
+        block_size: int,
+        swa_window: int,
+        ring_stride: int,
+        page_index_aligned_size: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return build_dspark_swa_ring_indices(
+            req_pool_indices_per_request=req_pool_indices_per_request,
+            offsets=offsets,
+            invalid=invalid,
+            prefix_lens=prefix_lens,
+            context_lens=context_lens,
+            block_size=block_size,
+            swa_window=swa_window,
+            ring_stride=ring_stride,
+            page_index_aligned_size=page_index_aligned_size,
+        )
+
+    @classmethod
+    def triton(
+        cls,
+        *,
+        req_pool_indices_per_request: torch.Tensor,
+        offsets: torch.Tensor,
+        invalid: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        context_lens: torch.Tensor,
+        block_size: int,
+        swa_window: int,
+        ring_stride: int,
+        page_index_aligned_size: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        del invalid
+        return build_dspark_swa_ring_indices_triton(
+            req_pool_indices_per_request=req_pool_indices_per_request,
+            offsets=offsets,
+            prefix_lens=prefix_lens,
+            context_lens=context_lens,
+            block_size=block_size,
+            swa_window=swa_window,
+            ring_stride=ring_stride,
+            page_index_aligned_size=page_index_aligned_size,
+        )
+
+
 def compute_dspark_window_gather(
     *,
     seq_lens_casual: torch.Tensor,
@@ -155,6 +216,7 @@ def compute_dspark_window_gather(
     return DsparkWindowGather(
         num_q=num_q,
         bs=bs,
+        prefix_lens=prefix_lens,
         context_lens=context_lens,
         req_pool_indices_per_request=req_pool_indices_per_request,
         offsets=offsets,
@@ -166,6 +228,7 @@ def compute_dspark_window_gather(
 def _window_gather_kernel(
     seq_lens_casual_ptr,
     req_pool_rep_ptr,
+    prefix_lens_ptr,
     context_lens_ptr,
     req_pool_out_ptr,
     offsets_ptr,
@@ -177,6 +240,7 @@ def _window_gather_kernel(
     i = tl.program_id(0)
     ft = i * block_size
     prefix = tl.load(seq_lens_casual_ptr + ft).to(tl.int64) - 1
+    tl.store(prefix_lens_ptr + i, prefix.to(tl.int32))
     tl.store(context_lens_ptr + i, tl.minimum(prefix, swa_window).to(tl.int32))
     tl.store(req_pool_out_ptr + i, tl.load(req_pool_rep_ptr + ft))
     col = tl.arange(0, W_BLOCK)
@@ -202,6 +266,7 @@ def compute_dspark_window_gather_triton(
     bs = num_q // block_size
     device = seq_lens_casual.device
     req_pool_indices_repeated = req_pool_indices_repeated.to(device=device).contiguous()
+    prefix_lens = torch.empty(bs, dtype=torch.int32, device=device)
     context_lens = torch.empty(bs, dtype=torch.int32, device=device)
     req_pool_out = torch.empty(bs, dtype=req_pool_indices_repeated.dtype, device=device)
     offsets = torch.empty((bs, swa_window), dtype=torch.int64, device=device)
@@ -210,6 +275,7 @@ def compute_dspark_window_gather_triton(
     _window_gather_kernel[(bs,)](
         seq_lens_casual,
         req_pool_indices_repeated,
+        prefix_lens,
         context_lens,
         req_pool_out,
         offsets,
@@ -221,6 +287,7 @@ def compute_dspark_window_gather_triton(
     return DsparkWindowGather(
         num_q=num_q,
         bs=bs,
+        prefix_lens=prefix_lens,
         context_lens=context_lens,
         req_pool_indices_per_request=req_pool_out,
         offsets=offsets,
@@ -284,6 +351,63 @@ def build_dspark_swa_page_indices(
         .reshape(bs * block_size)
         .contiguous()
         .to(torch.int32)
+    )
+    return swa_page_indices, swa_topk_lengths
+
+
+def build_dspark_swa_ring_indices(
+    *,
+    req_pool_indices_per_request: torch.Tensor,
+    offsets: torch.Tensor,
+    invalid: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_size: int,
+    swa_window: int,
+    ring_stride: int,
+    page_index_aligned_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if offsets.ndim != 2 or offsets.shape[1] != swa_window:
+        raise ValueError(
+            "offsets must be [bs, swa_window]; "
+            f"got shape={tuple(offsets.shape)} (swa_window={swa_window})."
+        )
+    bs = offsets.shape[0]
+    device = offsets.device
+    req_base = (
+        req_pool_indices_per_request.to(device=device, dtype=torch.int64).unsqueeze(1)
+        * ring_stride
+    )
+    window_swa_locs = (
+        req_base + offsets.to(torch.int64) % ring_stride
+    ).to(torch.int32)
+    window_swa_locs.masked_fill_(invalid, -1)
+
+    block_positions = prefix_lens.to(device=device, dtype=torch.int64).unsqueeze(
+        1
+    ) + torch.arange(block_size, device=device, dtype=torch.int64).unsqueeze(0)
+    block_swa_locs = (req_base + block_positions % ring_stride).to(torch.int32)
+    target_width = ceil_align(swa_window + block_size, page_index_aligned_size)
+    swa_page_indices = _compact_dspark_window_then_block(
+        window_swa_locs=window_swa_locs,
+        block_swa_locs=block_swa_locs,
+        context_lens=context_lens.to(device=device, dtype=torch.int32),
+        target_width=target_width,
+        block_size=block_size,
+        swa_window=swa_window,
+    )
+    swa_page_indices = (
+        swa_page_indices.view(bs, 1, target_width)
+        .expand(bs, block_size, target_width)
+        .reshape(bs * block_size, target_width)
+        .contiguous()
+    )
+    swa_topk_lengths = (
+        (context_lens.to(device=device, dtype=torch.int32) + block_size)
+        .view(bs, 1)
+        .expand(bs, block_size)
+        .reshape(bs * block_size)
+        .contiguous()
     )
     return swa_page_indices, swa_topk_lengths
 
@@ -407,6 +531,94 @@ def build_dspark_swa_page_indices_triton(
         block_size,
         target_width,
         TW_BLOCK=TW_BLOCK,
+    )
+    return swa_page_indices, swa_topk_lengths
+
+
+@triton.jit
+def _swa_ring_indices_kernel(
+    req_pool_ptr,
+    offsets_ptr,
+    prefix_lens_ptr,
+    context_lens_ptr,
+    out_ptr,
+    topk_ptr,
+    swa_window,
+    block_size,
+    ring_stride,
+    target_width,
+    TW_BLOCK: tl.constexpr,
+):
+    q = tl.program_id(0)
+    i = q // block_size
+    context_len = tl.load(context_lens_ptr + i)
+    req_pool_idx = tl.load(req_pool_ptr + i).to(tl.int64)
+    req_base = req_pool_idx * ring_stride
+    k = tl.arange(0, TW_BLOCK)
+    mask = k < target_width
+
+    in_window = k < context_len
+    src_col = tl.minimum(
+        tl.maximum((swa_window - context_len) + k, 0), swa_window - 1
+    )
+    window_pos = tl.load(
+        offsets_ptr + i * swa_window + src_col,
+        mask=mask & in_window,
+        other=0,
+    ).to(tl.int64)
+    window_loc = req_base + window_pos % ring_stride
+
+    in_block = (k >= context_len) & (k < context_len + block_size)
+    block_col = tl.maximum(k - context_len, 0)
+    prefix_len = tl.load(prefix_lens_ptr + i).to(tl.int64)
+    block_loc = req_base + (prefix_len + block_col) % ring_stride
+
+    value = tl.where(in_window, window_loc, tl.where(in_block, block_loc, -1))
+    tl.store(out_ptr + q * target_width + k, value.to(tl.int32), mask=mask)
+    tl.store(topk_ptr + q, (context_len + block_size).to(tl.int32))
+
+
+def build_dspark_swa_ring_indices_triton(
+    *,
+    req_pool_indices_per_request: torch.Tensor,
+    offsets: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_size: int,
+    swa_window: int,
+    ring_stride: int,
+    page_index_aligned_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if offsets.ndim != 2 or offsets.shape[1] != swa_window:
+        raise ValueError(
+            "offsets must be [bs, swa_window]; "
+            f"got shape={tuple(offsets.shape)} (swa_window={swa_window})."
+        )
+    bs = offsets.shape[0]
+    device = offsets.device
+    req_pool = req_pool_indices_per_request.to(device=device).contiguous()
+    offsets = offsets.to(device=device, dtype=torch.int64).contiguous()
+    prefix_lens = prefix_lens.to(device=device, dtype=torch.int32).contiguous()
+    context_lens = context_lens.to(device=device, dtype=torch.int32).contiguous()
+    target_width = ceil_align(swa_window + block_size, page_index_aligned_size)
+    num_q = bs * block_size
+    swa_page_indices = torch.empty(
+        (num_q, target_width), dtype=torch.int32, device=device
+    )
+    swa_topk_lengths = torch.empty(num_q, dtype=torch.int32, device=device)
+    width_block = triton.next_power_of_2(target_width)
+    _swa_ring_indices_kernel[(num_q,)](
+        req_pool,
+        offsets,
+        prefix_lens,
+        context_lens,
+        swa_page_indices,
+        swa_topk_lengths,
+        swa_window,
+        block_size,
+        ring_stride,
+        target_width,
+        TW_BLOCK=width_block,
     )
     return swa_page_indices, swa_topk_lengths
 

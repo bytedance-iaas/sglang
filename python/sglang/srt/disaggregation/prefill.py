@@ -44,6 +44,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_dsv4_c128_state_indices,
+    get_dsv4_draft_swa_ring_page_indices,
     get_kv_class,
     is_aborted,
     is_dsv4_c128_online_enabled,
@@ -1219,6 +1220,14 @@ class SchedulerDisaggregationPrefillMixin:
                 return kv_to_page_indices(kv_indices_full, page_size)
 
             def _swa_ring_payload():
+                draft_pool = self.draft_token_to_kv_pool
+                if (
+                    isinstance(draft_pool, DeepSeekV4TokenToKVPool)
+                    and draft_pool.uses_draft_swa_ring
+                ):
+                    return get_dsv4_draft_swa_ring_page_indices(
+                        int(req.req_pool_idx), draft_pool.draft_swa_pages_per_req
+                    )
                 # Unified_kv SWA ring rows (req_pool_idx*ring_stride + pos%ring_stride)
                 # for the last `window` positions, in ascending position order so
                 # decode (its own req_pool_idx) matches positionally.

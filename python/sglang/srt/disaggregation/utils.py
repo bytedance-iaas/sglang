@@ -97,6 +97,16 @@ def get_dsv4_c128_state_indices(
     return np.array([page], dtype=np.int32)
 
 
+def get_dsv4_draft_swa_ring_page_indices(
+    req_pool_idx: int, pages_per_req: int
+) -> np.ndarray:
+    """Return storage-page indices for one request-scoped draft SWA ring."""
+    start_page = int(req_pool_idx) * pages_per_req
+    return np.arange(
+        start_page, start_page + pages_per_req, dtype=np.int32
+    )
+
+
 class DisaggregationMode(Enum):
     NULL = "null"
     PREFILL = "prefill"
@@ -1191,12 +1201,26 @@ def setup_state_kv_args(
             raise RuntimeError(
                 "DSV4 draft state transfer expects SWA-only NextN layers"
             )
-        if token_to_kv_pool._unified_kv != draft_token_to_kv_pool._unified_kv:
+        uses_draft_swa_ring = draft_token_to_kv_pool.uses_draft_swa_ring
+        if (
+            not uses_draft_swa_ring
+            and token_to_kv_pool._unified_kv
+            != draft_token_to_kv_pool._unified_kv
+        ):
             raise RuntimeError(
                 "DSV4 target and draft pools must use the same unified-KV mode"
             )
 
-        if token_to_kv_pool._unified_kv:
+        if uses_draft_swa_ring:
+            if draft_token_to_kv_pool._unified_kv:
+                raise RuntimeError(
+                    "Compact DSV4 draft SWA ring requires paged CUDA storage."
+                )
+            draft_ptrs, draft_lens, draft_item_lens = (
+                draft_token_to_kv_pool.get_draft_swa_ring_buf_infos()
+            )
+            draft_state_type = StateType.SWA_RING
+        elif token_to_kv_pool._unified_kv:
             target_geometry = (
                 token_to_kv_pool.unified_swa_window,
                 token_to_kv_pool.unified_swa_ring_size,
@@ -1222,7 +1246,7 @@ def setup_state_kv_args(
                 is not draft_token_to_kv_pool.full_to_swa_index_mapping
             ):
                 raise RuntimeError(
-                    "DSV4 target and draft pools must share the SWA index mapping"
+                    "Paged DSV4 target and draft pools must share the SWA index mapping"
                 )
             target_geometry = (
                 token_to_kv_pool.page_size,

@@ -22,7 +22,7 @@ from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.runtime_context import get_exec, get_spec
-from sglang.srt.utils import ceil_div, is_hip
+from sglang.srt.utils import ceil_align, ceil_div, is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -488,7 +488,24 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         enable_hisparse: bool = False,
         online_mtp_max_draft_tokens: int = 0,
         num_req_slots: Optional[int] = None,
+        draft_swa_verify_width: int = 0,
     ):
+        resolved_num_req_slots = (
+            num_req_slots if num_req_slots is not None else max_num_reqs + 1
+        )
+        self.uses_draft_swa_ring = draft_swa_verify_width > 0
+        self.draft_swa_window = sliding_window
+        self.draft_swa_ring_stride = 0
+        self.draft_swa_pages_per_req = 0
+        if self.uses_draft_swa_ring:
+            self.draft_swa_ring_stride = ceil_align(
+                sliding_window + draft_swa_verify_width, swa_page_size
+            )
+            self.draft_swa_pages_per_req = (
+                self.draft_swa_ring_stride // swa_page_size
+            )
+            swa_size = resolved_num_req_slots * self.draft_swa_ring_stride
+
         super().__init__(
             swa_size,
             page_size,
@@ -512,9 +529,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # SWA ring needs one slot per addressable req_pool_idx. PD decode inflates
         # req_to_token past max_num_reqs (pre-alloc), so the caller passes the real
         # capacity; sizing as max_num_reqs+1 overflows ("length out of range").
-        self.num_req_slots = (
-            num_req_slots if num_req_slots is not None else max_num_reqs + 1
-        )
+        self.num_req_slots = resolved_num_req_slots
         self.c4_size = c4_size
         self.c4_logical_size = c4_logical_size
         self.c128_size = c128_size
@@ -662,6 +677,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return self.unified_kv_pool.get_unified_kv(layer_id - self._stage_start)
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
+        if self.uses_draft_swa_ring:
+            raise RuntimeError(
+                "DSV4 draft SWA ring is request-position addressed and must not "
+                "register the target full-to-SWA mapping."
+            )
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
 
     def get_ring_size(self, compress_ratio: int) -> int:
@@ -669,8 +689,36 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return get_compress_state_ring_size(compress_ratio, is_speculative)
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
+        if self.uses_draft_swa_ring:
+            raise RuntimeError(
+                "DSV4 draft SWA ring requires req_pool_indices and positions."
+            )
         assert self.full_to_swa_index_mapping is not None
         return self.full_to_swa_index_mapping[kv_indices]
+
+    def get_draft_swa_ring_loc(
+        self, req_pool_indices: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        if not self.uses_draft_swa_ring:
+            raise RuntimeError("DSV4 draft SWA ring is not enabled.")
+        return (
+            req_pool_indices.to(torch.int64) * self.draft_swa_ring_stride
+            + positions.to(torch.int64) % self.draft_swa_ring_stride
+        )
+
+    def get_draft_swa_ring_buf_infos(
+        self,
+    ) -> Tuple[List[int], List[int], List[int]]:
+        if not self.uses_draft_swa_ring:
+            return [], [], []
+        data_ptrs: List[int] = []
+        data_lens: List[int] = []
+        item_lens: List[int] = []
+        for buf in self.swa_kv_pool.kv_buffer:
+            data_ptrs.append(buf.data_ptr())
+            data_lens.append(buf.nbytes)
+            item_lens.append(buf[0].nbytes)
+        return data_ptrs, data_lens, item_lens
 
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []

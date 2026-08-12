@@ -30,12 +30,14 @@ from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
 )
 from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
+    BuildCausalSwaRingIndices,
     BuildPageTablePositions,
     ExpandPrefillCausally,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     BuildBlockSeqLensCausal,
     BuildDsparkSwaPageIndices,
+    BuildDsparkSwaRingIndices,
     ComputeDsparkWindowGather,
 )
 from sglang.srt.environ import envs
@@ -589,6 +591,7 @@ class DeepseekV4AttnBackend(
 
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
         self.is_draft_runner = model_runner.is_draft_worker
+        self.uses_draft_swa_ring = self.token_to_kv_pool.uses_draft_swa_ring
         self._verify_mask = None
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
@@ -1160,8 +1163,9 @@ class DeepseekV4AttnBackend(
                     self.speculative_num_steps,
                 )[self.speculative_step_id]
             metadata.core_attn_metadata.swa_out_cache_loc = (
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
-                    torch.int32
+                self._get_swa_out_cache_loc(
+                    forward_batch=forward_batch,
+                    out_cache_loc=out_cache_loc,
                 )
             )
 
@@ -1615,9 +1619,47 @@ class DeepseekV4AttnBackend(
             and cached.shape[0] == out_cache_loc.shape[0]
         ):
             return cached
+        if self.uses_draft_swa_ring:
+            swa_loc = self._get_swa_out_cache_loc(
+                forward_batch=forward_batch,
+                out_cache_loc=out_cache_loc,
+            )
+            if isinstance(self.forward_metadata, DSV4Metadata):
+                self.forward_metadata.core_attn_metadata.swa_out_cache_loc = swa_loc
+            return swa_loc
         return self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
             torch.int32
         )
+
+    def _get_swa_out_cache_loc(
+        self, *, forward_batch: ForwardBatch, out_cache_loc: torch.Tensor
+    ) -> torch.Tensor:
+        if not self.uses_draft_swa_ring:
+            return self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                out_cache_loc
+            ).to(torch.int32)
+        if forward_batch.forward_mode.is_idle():
+            return torch.zeros_like(out_cache_loc, dtype=torch.int32)
+
+        if not isinstance(self.forward_metadata, DSV4Metadata):
+            raise RuntimeError(
+                "DSV4 draft SWA ring store requires causal positions metadata."
+            )
+        core = self.forward_metadata.core_attn_metadata
+        positions = core.positions_casual[: out_cache_loc.shape[0]]
+        req_pool_indices = forward_batch.req_pool_indices
+        if out_cache_loc.shape[0] % req_pool_indices.shape[0] != 0:
+            raise RuntimeError(
+                "DSV4 draft SWA ring requires a uniform token width per request: "
+                f"num_tokens={out_cache_loc.shape[0]}, "
+                f"num_reqs={req_pool_indices.shape[0]}."
+            )
+        tokens_per_req = out_cache_loc.shape[0] // req_pool_indices.shape[0]
+        req_pool_indices_repeated = req_pool_indices.repeat_interleave(tokens_per_req)
+        return self.token_to_kv_pool.get_draft_swa_ring_loc(
+            req_pool_indices=req_pool_indices_repeated,
+            positions=positions,
+        ).to(torch.int32)
 
     def store_cache(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
@@ -2017,6 +2059,15 @@ class DeepseekV4AttnBackend(
                 out_loc=out_loc,
                 block_size=dspark_block_size,
             )
+        elif self.uses_draft_swa_ring:
+            swa_page_indices = BuildCausalSwaRingIndices.execute(
+                req_pool_indices_repeated=req_pool_indices_repeated,
+                seq_lens_casual=seq_lens_casual,
+                swa_window=SWA_WINDOW,
+                ring_stride=self.token_to_kv_pool.draft_swa_ring_stride,
+                page_index_aligned_size=PAGE_INDEX_ALIGNED_SIZE,
+            )
+            swa_topk_lengths = prep.swa_topk_lengths
         else:
             swa_page_indices = BuildCausalSwaPageIndices.execute(
                 req_to_token=self.req_to_token,
@@ -2069,18 +2120,33 @@ class DeepseekV4AttnBackend(
             swa_window=SWA_WINDOW,
         )
 
-        swa_page_indices, swa_topk_lengths = BuildDsparkSwaPageIndices.execute(
-            req_to_token=self.req_to_token,
-            full_to_swa_mapping=self.token_to_kv_pool.full_to_swa_index_mapping,
-            req_pool_indices_per_request=gather.req_pool_indices_per_request,
-            offsets=gather.offsets,
-            invalid=gather.invalid,
-            out_loc=out_loc[: gather.num_q],
-            context_lens=gather.context_lens,
-            block_size=block_size,
-            swa_window=SWA_WINDOW,
-            page_index_aligned_size=PAGE_INDEX_ALIGNED_SIZE,
-        )
+        if self.uses_draft_swa_ring:
+            swa_page_indices, swa_topk_lengths = (
+                BuildDsparkSwaRingIndices.execute(
+                    req_pool_indices_per_request=gather.req_pool_indices_per_request,
+                    offsets=gather.offsets,
+                    invalid=gather.invalid,
+                    prefix_lens=gather.prefix_lens,
+                    context_lens=gather.context_lens,
+                    block_size=block_size,
+                    swa_window=SWA_WINDOW,
+                    ring_stride=self.token_to_kv_pool.draft_swa_ring_stride,
+                    page_index_aligned_size=PAGE_INDEX_ALIGNED_SIZE,
+                )
+            )
+        else:
+            swa_page_indices, swa_topk_lengths = BuildDsparkSwaPageIndices.execute(
+                req_to_token=self.req_to_token,
+                full_to_swa_mapping=self.token_to_kv_pool.full_to_swa_index_mapping,
+                req_pool_indices_per_request=gather.req_pool_indices_per_request,
+                offsets=gather.offsets,
+                invalid=gather.invalid,
+                out_loc=out_loc[: gather.num_q],
+                context_lens=gather.context_lens,
+                block_size=block_size,
+                swa_window=SWA_WINDOW,
+                page_index_aligned_size=PAGE_INDEX_ALIGNED_SIZE,
+            )
         return swa_page_indices, swa_topk_lengths
 
 
