@@ -230,6 +230,7 @@ class TestDSparkResultContract(unittest.TestCase):
         )
         req = SimpleNamespace(
             rid="overflow",
+            decode_batch_idx=0,
             kv_committed_len=10,
             kv_allocated_len=10,
             output_ids=[1],
@@ -249,6 +250,7 @@ class TestDSparkResultContract(unittest.TestCase):
             device=torch.device("cpu"),
             tree_cache=object(),
             req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            maybe_evict_swa=Mock(),
         )
 
         with (
@@ -269,6 +271,8 @@ class TestDSparkResultContract(unittest.TestCase):
 
         alloc.assert_not_called()
         assign.assert_not_called()
+        batch.maybe_evict_swa.assert_called_once_with()
+        self.assertEqual(req.decode_batch_idx, 1)
         self.assertEqual(req.kv_allocated_len, 10)
 
     def test_dspark_prepare_accumulates_penalty_token(self):
@@ -281,6 +285,7 @@ class TestDSparkResultContract(unittest.TestCase):
         )
         req = SimpleNamespace(
             rid="penalty",
+            decode_batch_idx=0,
             kv_committed_len=10,
             kv_allocated_len=22,
             output_ids=[7],
@@ -302,6 +307,7 @@ class TestDSparkResultContract(unittest.TestCase):
             device=torch.device("cpu"),
             seq_lens_cpu=None,
             seq_lens_sum=0,
+            maybe_evict_swa=Mock(),
         )
 
         with patch(
@@ -312,6 +318,8 @@ class TestDSparkResultContract(unittest.TestCase):
 
         penalty_tokens = penalizer.cumulate_output_tokens.call_args.args[0]
         self.assertEqual(penalty_tokens.tolist(), [7])
+        batch.maybe_evict_swa.assert_called_once_with()
+        self.assertEqual(req.decode_batch_idx, 1)
 
 
 if __name__ == "__main__":
