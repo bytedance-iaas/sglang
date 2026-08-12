@@ -33,7 +33,9 @@ only construction, per-modality feature extraction and weight loading.
 """
 
 import logging
+import os
 import re
+import time
 from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
@@ -53,9 +55,18 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.gemma4_causal import Gemma4TextModel, pp_filter_load_weight
 from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
-from sglang.srt.utils import add_prefix
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import add_prefix, get_compiler_backend
 
 logger = logging.getLogger(__name__)
+_VIDEO_TIMING_ENABLED = os.getenv("SGLANG_GEMMA4_VIDEO_TIMING", "0") == "1"
+
+# Below this many valid patch rows the padding-free "opt" projection is a net
+# loss: the extra flatten/gather/split glue is not amortised over so few rows
+# (measured on H20 — 1 small image = 66 rows regressed ~0.88x, while a single
+# 32-frame video = 2112 rows already gained). Gate on ROW count, not item count.
+_GEMMA4_MM_OPT_MIN_ROWS = int(os.getenv("SGLANG_GEMMA4_MM_OPT_MIN_ROWS", "256"))
+
 
 
 class Gemma4UnifiedVisionEmbedder(nn.Module):
@@ -125,6 +136,71 @@ class Gemma4UnifiedMultimodalEmbedder(nn.Module):
         inputs_embeds = inputs_embeds.to(self.embedding_projection.weight.dtype)
         normed = self.embedding_pre_projection_norm(inputs_embeds)
         return self.embedding_projection(normed)
+
+
+def _project_patches_flat(
+    vision_embedder: "Gemma4UnifiedVisionEmbedder",
+    embed_vision: "Gemma4UnifiedMultimodalEmbedder",
+    rows: torch.Tensor,   # (N, patch_dim) — VALID patch rows only (padding removed)
+    x_ids: torch.Tensor,  # (N,) long — factorized posemb x coord, all >= 0
+    y_ids: torch.Tensor,  # (N,) long — factorized posemb y coord, all >= 0
+) -> torch.Tensor:
+    """Row-independent vision projection on a FLAT ``(N, D) -> (N, hidden)`` batch.
+
+    This is ``Gemma4UnifiedVisionEmbedder.forward`` + ``embed_vision.forward``
+    inlined and rewritten for two wins that hold because every op (LN / Linear /
+    posemb / RMSNorm) is per-row:
+
+      * The caller passes only VALID rows (padding already dropped), so the two
+        GEMMs never spend FLOPs on patches that get discarded afterwards.
+      * The factorized-2D posemb is two 1-D ``index_select``s that are added
+        (``pos[x, 0] + pos[y, 1]``) instead of the padded-gather-then-reduce
+        ``(pos_embedding[clamped, axes] * valid).sum(-2)``, which materialises an
+        ``(N, 2, E)`` tensor. For valid rows the two are identical; this halves
+        that path's memory traffic and removes the reduction kernel.
+
+    Kept as a free function of ``(modules, tensors)`` with static rank/dtypes so it
+    can be wrapped verbatim by ``torch.compile`` (see ``_get_compiled_projector``)
+    without dragging module ``__call__`` machinery into the graph.
+    """
+    ve, mm = vision_embedder, embed_vision
+    hidden = ve.patch_ln1(rows.to(ve.patch_dense.weight.dtype))
+    hidden = ve.patch_dense(hidden)
+    hidden = ve.patch_ln2(hidden)
+
+    pos = ve.pos_embedding[:, 0, :].index_select(0, x_ids) + ve.pos_embedding[
+        :, 1, :
+    ].index_select(0, y_ids)
+    hidden = hidden + pos
+    hidden = ve.pos_norm(hidden)
+
+    hidden = hidden.to(mm.embedding_projection.weight.dtype)
+    hidden = mm.embedding_pre_projection_norm(hidden)
+    return mm.embedding_projection(hidden)
+
+
+_COMPILED_PROJECTOR = None
+
+
+def _get_compiled_projector():
+    """Lazily ``torch.compile`` the flat projector, honouring the server's global
+    ``--enable-torch-compile`` (return ``None`` = run eager otherwise).
+
+    ``dynamic=True`` is required: the packed valid-row count ``N`` varies per batch
+    (and is data-dependent after padding-drop), so a static compile would recompile
+    on every new ``N``. Using ``get_compiler_backend()`` keeps the backend correct
+    across CUDA / NPU / OOT platforms, matching the other compiled models.
+    """
+    global _COMPILED_PROJECTOR
+    if not get_global_server_args().enable_torch_compile:
+        return None
+    if _COMPILED_PROJECTOR is None:
+        _COMPILED_PROJECTOR = torch.compile(
+            _project_patches_flat,
+            dynamic=True,
+            backend=get_compiler_backend(),
+        )
+    return _COMPILED_PROJECTOR
 
 
 class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
@@ -329,62 +405,38 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
                 key = (int(pv.shape[-2]), int(pv.shape[-1]))
                 groups.setdefault(key, []).append((slot, pv, pp))
 
-        # Pass 2: one packed vision_embedder/embed_vision call per shape group.
-        projection_calls = 0
-        packed_batch_units = 0
-        for key, units in groups.items():
-            pv_cat = torch.cat([pv for _, pv, _ in units], dim=0)  # (sumB, P, D)
-            pp_cat = torch.cat([pp for _, _, pp in units], dim=0)  # (sumB, P, 2)
+        # Pass 2: project the collected shape groups. Two equivalent strategies —
+        # the padding-free "opt" path (drop padding before the GEMMs + posemb as
+        # two 1-D gathers, optionally torch.compile'd) is the default, but it adds
+        # flatten/gather/split glue that only pays off past a row-count threshold.
+        # Below it we fall back to the original per-shape batched path, which is a
+        # net win for tiny inputs (e.g. a single small image). Gate on total PADDED
+        # rows (CPU-only from shapes, no device sync).
+        total_padded_rows = sum(
+            int(pv.shape[0]) * int(pv.shape[1])
+            for units in groups.values()
+            for _, pv, _ in units
+        )
+        use_opt = total_padded_rows >= _GEMMA4_MM_OPT_MIN_ROWS
 
-            logger.info(
-                "[Gemma4VisionPackTrace] stage=projection_input modality=%s "
-                "call_index=%d group_key=%s units=%d input_shape=%s position_shape=%s "
-                "source_device=%s batch_units=%d",
-                modality,
-                projection_calls,
-                key,
-                len(units),
-                tuple(pv_cat.shape),
-                tuple(pp_cat.shape),
-                pv_cat.device,
-                pv_cat.shape[0],
+        if use_opt:
+            projection_calls, packed_batch_units = self._project_groups_opt(
+                groups, results, modality
             )
-
-            embedded = self.vision_embedder(pv_cat, pp_cat)  # (sumB, P, mm_embed_dim)
-            projected = self.embed_vision(embedded)  # (sumB, P, hidden)
-            projection_calls += 1
-            packed_batch_units += int(pv_cat.shape[0])
-
-            # Split the packed output back per unit (by each unit's batch size),
-            # then drop padding patches (position_ids == -1 on both axes) per unit.
-            split_sizes = [int(pv.shape[0]) for _, pv, _ in units]
-            projected_units = torch.split(projected, split_sizes, dim=0)
-            valid_tokens = 0
-            for (slot, _, pp), proj_unit in zip(units, projected_units):
-                padding_mask = (pp == -1).all(dim=-1)  # (B, P)
-                kept = proj_unit[~padding_mask]
-                results[slot] = kept
-                valid_tokens += int(kept.shape[0])
-
-            logger.info(
-                "[Gemma4VisionPackTrace] stage=projection_output modality=%s "
-                "call_index=%d group_key=%s embedded_shape=%s projected_shape=%s "
-                "valid_tokens=%d",
-                modality,
-                projection_calls - 1,
-                key,
-                tuple(embedded.shape),
-                tuple(projected.shape),
-                valid_tokens,
+        else:
+            projection_calls, packed_batch_units = self._project_groups_packed(
+                groups, results, modality
             )
 
         logger.info(
             "[Gemma4VisionPackTrace] stage=embed_pack modality=%s groups=%d "
-            "packed_batch_units=%d projection_calls=%d",
+            "packed_batch_units=%d projection_calls=%d path=%s total_padded_rows=%d",
             modality,
             len(groups),
             packed_batch_units,
             projection_calls,
+            "opt" if use_opt else "packed",
+            total_padded_rows,
         )
 
         all_embeds = [r for r in results if r is not None]
@@ -397,6 +449,125 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
             tuple(output.shape),
         )
         return output
+
+    def _project_groups_packed(
+        self, groups: dict, results: List[Optional[torch.Tensor]], modality: str
+    ) -> Tuple[int, int]:
+        """Original per-shape batched projection (fallback for tiny inputs).
+
+        One ``vision_embedder``/``embed_vision`` call per ``(num_patches, patch_dim)``
+        group over the padded ``(sumB, P, D)`` tensor, then split back per unit and
+        drop padding rows. Numerically identical to the opt path; preferred only
+        when total rows are below ``_GEMMA4_MM_OPT_MIN_ROWS`` (the flatten/gather
+        glue of the opt path is not amortised for such small batches).
+        """
+        projection_calls = 0
+        packed_batch_units = 0
+        for key, units in groups.items():
+            timing_started = None
+            if _VIDEO_TIMING_ENABLED and modality == "video":
+                torch.cuda.synchronize(units[0][1].device)
+                timing_started = time.perf_counter()
+            pv_cat = torch.cat([pv for _, pv, _ in units], dim=0)  # (sumB, P, D)
+            pp_cat = torch.cat([pp for _, _, pp in units], dim=0)  # (sumB, P, 2)
+
+            embedded = self.vision_embedder(pv_cat, pp_cat)  # (sumB, P, mm_embed_dim)
+            projected = self.embed_vision(embedded)  # (sumB, P, hidden)
+            projection_calls += 1
+            packed_batch_units += int(pv_cat.shape[0])
+
+            # Split back per unit (by batch size), drop padding rows per unit.
+            split_sizes = [int(pv.shape[0]) for _, pv, _ in units]
+            projected_units = torch.split(projected, split_sizes, dim=0)
+            valid_tokens = 0
+            for (slot, _, pp), proj_unit in zip(units, projected_units):
+                padding_mask = (pp == -1).all(dim=-1)  # (B, P)
+                kept = proj_unit[~padding_mask]
+                results[slot] = kept
+                valid_tokens += int(kept.shape[0])
+
+            if timing_started is not None:
+                torch.cuda.synchronize(pv_cat.device)
+                logger.info(
+                    "[Gemma4VideoTiming] step=17_vision_projection path=packed "
+                    "elapsed_ms=%.3f calls=1 videos=%d batch_units=%d group_key=%s "
+                    "valid_tokens=%d",
+                    (time.perf_counter() - timing_started) * 1000,
+                    len(units),
+                    int(pv_cat.shape[0]),
+                    key,
+                    valid_tokens,
+                )
+        return projection_calls, packed_batch_units
+
+    def _project_groups_opt(
+        self, groups: dict, results: List[Optional[torch.Tensor]], modality: str
+    ) -> Tuple[int, int]:
+        """Padding-free projection: drop padding before the GEMMs, project valid
+        rows only, split back per slot. Optionally runs the flat core under
+        torch.compile. Numerically equivalent to ``_project_groups_packed`` (the
+        projection is row-independent), but avoids wasted-padding FLOPs and, by
+        gathering once globally, avoids the per-item mask/split of the packed path.
+
+        The ``(num_patches, patch_dim)`` grouping from pass 1 no longer matters for
+        compute — after flattening, any ``P`` with the same ``patch_dim`` D packs
+        into ONE call — but we keep it so each unit's valid-row count (hence its
+        output slice) is recoverable without a device sync per unit.
+        """
+        projector = _get_compiled_projector() or _project_patches_flat
+
+        # Re-bucket the shape groups by patch_dim D only, preserving slot order.
+        # For each unit: flatten (B, P, .) -> (B*P, .), compute a validity mask, and
+        # DEFER the gather so it batches across every unit sharing D.
+        buckets: dict = {}  # D -> dict(pv[], pp[], valid[], slots[])
+        for units in groups.values():
+            for slot, pv, pp in units:
+                pv_flat = pv.reshape(-1, pv.shape[-1])       # (B*P, D)
+                pp_flat = pp.reshape(-1, pp.shape[-1])       # (B*P, 2)
+                valid = ~(pp_flat == -1).all(dim=-1)         # (B*P,)
+                D = int(pv_flat.shape[-1])
+                b = buckets.setdefault(D, dict(pv=[], pp=[], valid=[], slots=[]))
+                b["pv"].append(pv_flat)
+                b["pp"].append(pp_flat)
+                b["valid"].append(valid)
+                b["slots"].append(slot)
+
+        projection_calls = 0
+        packed_batch_units = 0
+        for _D, b in buckets.items():
+            timing_started = None
+            if _VIDEO_TIMING_ENABLED and modality == "video":
+                torch.cuda.synchronize(b["pv"][0].device)
+                timing_started = time.perf_counter()
+
+            pv_all = torch.cat(b["pv"], dim=0)               # (TotalRows, D)
+            pp_all = torch.cat(b["pp"], dim=0)               # (TotalRows, 2)
+            valid_all = torch.cat(b["valid"], dim=0)         # (TotalRows,)
+
+            rows = pv_all[valid_all]                         # ONE gather -> (N, D)
+            ids = pp_all[valid_all].long()                   # (N, 2), all >= 0
+            projected = projector(
+                self.vision_embedder, self.embed_vision, rows, ids[:, 0], ids[:, 1]
+            )
+            projection_calls += 1
+            packed_batch_units += int(rows.shape[0])
+
+            # Per-slot valid counts via ONE host sync for the whole bucket, then
+            # split (a view; rows stayed in slot order because we cat'd in order).
+            counts = torch.stack([v.sum() for v in b["valid"]]).tolist()
+            for slot, unit in zip(b["slots"], torch.split(projected, counts, dim=0)):
+                results[slot] = unit
+
+            if timing_started is not None:
+                torch.cuda.synchronize(rows.device)
+                logger.info(
+                    "[Gemma4VideoTiming] step=17_vision_projection path=opt "
+                    "elapsed_ms=%.3f calls=1 valid_rows=%d units=%d",
+                    (time.perf_counter() - timing_started) * 1000,
+                    int(rows.shape[0]),
+                    len(b["slots"]),
+                )
+        return projection_calls, packed_batch_units
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         return self._embed_patches(items, "image_position_ids")

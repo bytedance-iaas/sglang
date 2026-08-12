@@ -1736,7 +1736,11 @@ def _normalize_video_input(
         return None
 
 
-def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
+def load_video(
+    video_file: Union[str, bytes, VideoData],
+    use_gpu: bool = True,
+    dimension_order: str = "NHWC",
+):
     if isinstance(video_file, VideoData):
         # preprocess_kwargs is consumed by the multimodal processor, not here.
         video_file = video_file.url
@@ -1749,7 +1753,11 @@ def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
         raise ValueError(f"Unsupported video input type: {type(video_file)}")
 
     device = "cuda" if use_gpu else "cpu"
-    return VideoDecoderWrapper(source, device=device)
+    return VideoDecoderWrapper(
+        source,
+        device=device,
+        dimension_order=dimension_order,
+    )
 
 
 def sample_video_frames(video, *, desired_fps: int, max_frames: int) -> list[int]:

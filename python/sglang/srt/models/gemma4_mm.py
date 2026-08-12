@@ -659,10 +659,15 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 )
             logger.info(
                 "[Gemma4VisionPackTrace] stage=prefill_batch batch_size=%d "
-                "mm_requests=%d items_per_request=%s dispatcher=request_serial",
+                "mm_requests=%d items_per_request=%s dispatcher=%s",
                 forward_batch.batch_size,
                 len(per_request_items),
                 per_request_items,
+                (
+                    "batch_precompute"
+                    if envs.SGLANG_GEMMA4_MM_BATCH_PACK.get()
+                    else "request_serial"
+                ),
             )
 
         # general_mm_embed_routine already handles PP: it skips the embedding

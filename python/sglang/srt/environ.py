@@ -716,6 +716,9 @@ class Envs:
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
+    # Gemma4-only video preprocessing fast path: NVDEC tensor output plus a
+    # fused CUDA post-resize processor. Disabled by default for safe rollout.
+    SGLANG_GEMMA4_VIDEO_FAST_PATH = EnvBool(False)
 
     # VLM Item CUDA IPC Transport
     SGLANG_USE_CUDA_IPC_TRANSPORT = EnvBool(False)

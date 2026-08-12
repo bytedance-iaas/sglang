@@ -5,6 +5,7 @@ import dataclasses
 import multiprocessing as mp
 import os
 import re
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
@@ -43,6 +44,9 @@ _is_xpu = is_xpu()
 
 SGL_USE_CUDA_IPC = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get()
 _IPC_POOL_HANDLE_CACHE = envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
+_GEMMA4_VIDEO_TIMING_ENABLED = (
+    os.getenv("SGLANG_GEMMA4_VIDEO_TIMING", "0") == "1"
+)
 
 
 @dataclasses.dataclass
@@ -180,6 +184,11 @@ class MultimodalSpecialTokens:
 class BaseMultimodalProcessor(ABC):
     models = []
     gpu_image_decode = True  # Enable GPU decoding by default
+    # Video decoding remains CPU/NHWC unless a model processor explicitly opts
+    # into a device-preserving tensor path. This also makes the old accidental
+    # ``frame_count_limit -> use_gpu`` positional binding explicit.
+    gpu_video_decode = False
+    video_decode_dimension_order = "NHWC"
 
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
@@ -479,7 +488,27 @@ class BaseMultimodalProcessor(ABC):
                     if feature_name in result and isinstance(
                         result[feature_name], torch.Tensor
                     ):
-                        result[feature_name] = result[feature_name].to("cpu")
+                        feature = result[feature_name]
+                        if (
+                            _GEMMA4_VIDEO_TIMING_ENABLED
+                            and feature_name == "pixel_values_videos"
+                        ):
+                            if feature.is_cuda:
+                                torch.cuda.synchronize(feature.device)
+                            started = time.perf_counter()
+                            result[feature_name] = feature.to("cpu")
+                            if feature.is_cuda:
+                                torch.cuda.synchronize(feature.device)
+                            logger.info(
+                                "[Gemma4VideoTiming] "
+                                "step=14_pixel_values_d2h elapsed_ms=%.3f "
+                                "bytes=%d source_device=%s",
+                                (time.perf_counter() - started) * 1000,
+                                feature.numel() * feature.element_size(),
+                                feature.device,
+                            )
+                        else:
+                            result[feature_name] = feature.to("cpu")
 
         return result
 
@@ -546,7 +575,11 @@ class BaseMultimodalProcessor(ABC):
                 img.load()
                 return img
             elif modality == Modality.VIDEO:
-                return load_video(data, frame_count_limit)
+                return load_video(
+                    data,
+                    use_gpu=cls.gpu_video_decode,
+                    dimension_order=cls.video_decode_dimension_order,
+                )
             elif modality == Modality.AUDIO:
                 return load_audio(data, audio_sample_rate)
 
@@ -1199,7 +1232,16 @@ class BaseMultimodalProcessor(ABC):
         )
 
         input_ids = ret["input_ids"].flatten()
+        collect_started = time.perf_counter()
         collected_items = self.collect_mm_items_from_processor_output(ret)
+        if _GEMMA4_VIDEO_TIMING_ENABLED and videos:
+            logger.info(
+                "[Gemma4VideoTiming] step=15a_collect_items elapsed_ms=%.3f "
+                "video_count=%d collected_items=%d",
+                (time.perf_counter() - collect_started) * 1000,
+                len(videos),
+                len(collected_items),
+            )
 
         return collected_items, input_ids, ret
 
@@ -1426,6 +1468,9 @@ class BaseMultimodalProcessor(ABC):
                 add_special_tokens=True,
             ).input_ids.flatten()
 
+        has_video_items = any(item.is_video() for item in all_collected_items)
+        finalize_items_started = time.perf_counter()
+
         # Add offsets to all items
         for mm_item in all_collected_items:
             if mm_item.offsets is not None:
@@ -1442,6 +1487,14 @@ class BaseMultimodalProcessor(ABC):
         from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
 
         all_collected_items = get_new_expanded_mm_items(all_collected_items)
+
+        if _GEMMA4_VIDEO_TIMING_ENABLED and has_video_items:
+            logger.info(
+                "[Gemma4VideoTiming] step=15b_offsets_split elapsed_ms=%.3f "
+                "expanded_items=%d",
+                (time.perf_counter() - finalize_items_started) * 1000,
+                len(all_collected_items),
+            )
 
         for item in all_collected_items:
             if item.format in (

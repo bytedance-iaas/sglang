@@ -4,7 +4,9 @@ Multi-modality utils
 
 import copy
 import hashlib
+import os
 import pickle
+import time
 from abc import abstractmethod
 from collections import defaultdict
 from multiprocessing import shared_memory
@@ -36,6 +38,9 @@ from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 from sglang.utils import logger
 
 _is_npu = is_npu()
+_GEMMA4_VIDEO_TIMING_ENABLED = (
+    os.getenv("SGLANG_GEMMA4_VIDEO_TIMING", "0") == "1"
+)
 
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
 # to ensure consistent logging behavior across the codebase. This prevents issues with log
@@ -503,7 +508,25 @@ def _move_items_to_device(
     """Move item features to the target device (in-place, non-blocking)."""
     for item in items:
         if isinstance(item.feature, torch.Tensor) and item.feature.device != device:
-            item.feature = item.feature.to(device, non_blocking=True)
+            feature = item.feature
+            if _GEMMA4_VIDEO_TIMING_ENABLED and item.is_video():
+                target_device = torch.device(device)
+                if target_device.type == "cuda":
+                    torch.cuda.synchronize(target_device)
+                started = time.perf_counter()
+                item.feature = feature.to(device, non_blocking=True)
+                if target_device.type == "cuda":
+                    torch.cuda.synchronize(target_device)
+                logger.info(
+                    "[Gemma4VideoTiming] step=16_pixel_values_h2d "
+                    "elapsed_ms=%.3f bytes=%d source_device=%s target_device=%s",
+                    (time.perf_counter() - started) * 1000,
+                    feature.numel() * feature.element_size(),
+                    feature.device,
+                    target_device,
+                )
+            else:
+                item.feature = feature.to(device, non_blocking=True)
 
 
 def _get_chunked_embedding_full(
