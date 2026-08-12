@@ -431,9 +431,12 @@ RUN CMAKE_VERSION=3.31.1 \
     && mkdir -p /tools/share && cp -r "/tmp/${CMAKE_INSTALLER}/share/"* /tools/share/ \
     && rm -rf "/tmp/${CMAKE_INSTALLER}" "/tmp/${CMAKE_INSTALLER}.tar.gz"
 
-RUN curl --proto '=https' --tlsv1.2 --retry 12 --retry-all-errors --retry-delay 5 -sSf https://just.systems/install.sh | \
-    sed "s|https://github.com|https://${GITHUB_ARTIFACTORY}|g" | \
-    bash -s -- --tag 1.42.4 --to /tools
+RUN JUST_TARGET="$(uname -m)-unknown-linux-musl" \
+    && curl --retry 12 --retry-all-errors --retry-delay 5 -fsSL \
+        -o /tmp/just.tar.gz \
+        "https://${GITHUB_ARTIFACTORY}/casey/just/releases/download/1.42.4/just-1.42.4-${JUST_TARGET}.tar.gz" \
+    && tar -xzf /tmp/just.tar.gz -C /tools just \
+    && rm /tmp/just.tar.gz
 
 # Install oh-my-zsh and plugins
 RUN sh -c "$(curl --retry 12 --retry-all-errors --retry-delay 5 -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended \
