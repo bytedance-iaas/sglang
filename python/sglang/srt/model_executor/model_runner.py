@@ -300,6 +300,11 @@ class ModelRunner:
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        # Some draft-model forwards use a different uniform token width than
+        # the target verify block.  The owning speculative worker may set this
+        # before CUDA-graph initialization once it has resolved the checkpoint
+        # contract (for example, DSpark bonus-anchor forwards gamma + 1 rows).
+        self._decode_num_tokens_per_req_override: Optional[int] = None
         self.capture_tail_hooks = []
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
@@ -749,6 +754,8 @@ class ModelRunner:
         self, *, num_draft_tokens: Optional[int] = None
     ) -> int:
         """Logits rows per decode batch slot."""
+        if self._decode_num_tokens_per_req_override is not None:
+            return self._decode_num_tokens_per_req_override
         if self.spec_algorithm.is_speculative():
             return resolve_num_tokens_per_req(
                 phase="target_verify",

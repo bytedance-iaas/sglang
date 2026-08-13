@@ -1,6 +1,9 @@
 import unittest
 from types import SimpleNamespace
 
+import torch
+
+from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.dspark_components.dspark_config import (
     parse_dspark_draft_config,
 )
@@ -230,6 +233,31 @@ class TestDraftBlockWidth(CustomTestCase):
                 # The sampled-token output buffer stays gamma-wide regardless
                 # -- only the input hidden_states/input_ids width changes.
                 self.assertEqual(sampler.out.shape, (4 * 7,))
+
+    def test_model_runner_uses_resolved_draft_forward_width_override(self):
+        runner = ModelRunner.__new__(ModelRunner)
+        runner._decode_num_tokens_per_req_override = 8
+        self.assertEqual(
+            runner.decode_num_tokens_per_req(num_draft_tokens=8),
+            8,
+        )
+
+    def test_sampler_rejects_graph_padding_folded_into_hidden_width(self):
+        sampler = DsparkDraftSampler(
+            model=_dummy_draft_model(),
+            gamma=7,
+            max_bs=10,
+            device="cpu",
+            bonus_anchor=True,
+            folded_sampling=False,
+        )
+        # This is the exact shape that previously became [56, 6720] after
+        # view(8, 8, -1): a graph captured at gamma=7 produced 70 rows, while
+        # the bonus-anchor sampler expected width=8.
+        malformed_hidden = torch.empty((70, 6144))
+        malformed_input_ids = torch.empty((70,), dtype=torch.long)
+        with self.assertRaisesRegex(RuntimeError, "capture/replay width mismatch"):
+            sampler(malformed_hidden, malformed_input_ids)
 
 
 if __name__ == "__main__":

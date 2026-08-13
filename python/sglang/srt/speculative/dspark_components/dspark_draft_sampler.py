@@ -100,7 +100,22 @@ class DsparkDraftSampler:
         self.greedy_mask[:bs].copy_((sampling_info.top_ks <= 1).view(-1)[:bs])
 
     def __call__(self, hidden_states, input_ids):
+        if hidden_states.shape[0] % self.draft_width != 0:
+            raise RuntimeError(
+                "DSpark draft sampler hidden row count must be divisible by "
+                f"draft_width={self.draft_width}, got "
+                f"shape={tuple(hidden_states.shape)}. "
+                "This indicates a draft CUDA Graph capture/replay width mismatch."
+            )
         bs = hidden_states.shape[0] // self.draft_width
+        expected_input_rows = bs * self.draft_width
+        if input_ids.numel() != expected_input_rows:
+            raise RuntimeError(
+                "DSpark draft sampler input row count must match hidden rows, "
+                f"got input_ids.numel()={input_ids.numel()}, "
+                f"hidden_rows={hidden_states.shape[0]}, "
+                f"draft_width={self.draft_width}."
+            )
         hidden_3d = hidden_states.view(bs, self.draft_width, -1)
         draft_hidden = (
             hidden_3d[:, 1:, :].contiguous() if self.bonus_anchor else hidden_3d

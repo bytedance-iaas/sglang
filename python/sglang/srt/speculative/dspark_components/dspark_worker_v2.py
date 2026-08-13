@@ -146,6 +146,15 @@ class DSparkWorkerV2(BaseSpecWorker):
         # eager (DraftBlockProposer) and CUDA-graph-folded (DsparkDraftSampler)
         # draft-sampling paths below.
         self._bonus_anchor = runtime_config.bonus_anchor
+        self._draft_forward_width = self.gamma + int(self._bonus_anchor)
+        # The target verifies gamma + 1 rows for both checkpoint conventions,
+        # but the draft forward is gamma-wide for legacy anchor-first models
+        # and gamma + 1-wide for bonus-anchor models.  ModelRunner cannot infer
+        # this from the target-side CLI width alone, so publish the resolved
+        # checkpoint contract before graph/buffer initialization.
+        self.draft_model_runner._decode_num_tokens_per_req_override = (
+            self._draft_forward_width
+        )
         if self.ps.tp_rank == 0 and self._bonus_anchor:
             logger.info(
                 "DSpark draft checkpoint uses the bonus-anchor "
@@ -156,12 +165,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         if self.ps.tp_rank == 0:
             logger.info(
                 "Initialized DSpark draft runner. attention_backend=%s, model=%s, "
-                "gamma=%s, verify_num_draft_tokens=%s, mask_token_id=%s, "
+                "gamma=%s, verify_num_draft_tokens=%s, draft_forward_width=%s, "
+                "mask_token_id=%s, "
                 "markov_head=%s",
                 bundle.resolved_attention_backend,
                 self.draft_model.__class__.__name__,
                 self.gamma,
                 self.verify_num_draft_tokens,
+                self._draft_forward_width,
                 self._mask_token_id,
                 type(self.draft_model.markov_head).__name__,
             )
@@ -170,7 +181,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             length=self.verify_num_draft_tokens, device=self.device
         )
         self._draft_block_spec_info = make_draft_block_spec_info(
-            draft_token_num=int(self.gamma), device=self.device
+            draft_token_num=int(self._draft_forward_width), device=self.device
         )
 
         target_model = self.target_worker.model_runner.model
