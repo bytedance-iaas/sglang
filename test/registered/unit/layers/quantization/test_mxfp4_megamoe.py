@@ -260,8 +260,7 @@ class TestMxfp4PackedLoaderContract(CustomTestCase):
 
         with (
             mock.patch(
-                "sglang.srt.layers.quantization.compressed_tensors.schemes."
-                "compressed_tensors_w4a8_mxfp4_moe.get_moe_a2a_backend",
+                "sglang.srt.layers.moe.utils.get_moe_a2a_backend",
                 return_value=backend,
             ),
             mock.patch(
