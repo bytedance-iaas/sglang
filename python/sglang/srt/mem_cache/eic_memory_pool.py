@@ -1747,11 +1747,23 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
         full_indices = full_allocator.alloc(need_size)
         if full_indices is None:
             return None
-        swa_indices = swa_allocator.alloc(need_size)
+        # Hybrid-SWA models only retain the trailing sliding-window KV; the
+        # prefix SWA is evicted. Allocating `need_size` SWA slots would exhaust
+        # the (small) SWA pool for long prefixes. Cap the SWA allocation at the
+        # retained window (one page for DSV4) and alias the full span onto it
+        # via a modulo mapping -- later pages overwrite earlier ones, which is
+        # correct since only the tail SWA is live.
+        swa_window = getattr(self.device_pool, "swa_window_size", need_size)
+        num_swa = min(need_size, max(swa_window, self.page_size))
+        swa_indices = swa_allocator.alloc(num_swa)
         if swa_indices is None:
             full_allocator.free(full_indices)
             return None
-        allocator.set_full_to_swa_mapping(full_indices, swa_indices)
+        # full_to_swa_index_mapping[full_indices[i]] = swa_indices[i % num_swa]
+        swa_indices_aliased = swa_indices[
+            torch.arange(len(full_indices), device=full_indices.device) % num_swa
+        ]
+        allocator.set_full_to_swa_mapping(full_indices, swa_indices_aliased)
         return full_indices
 
     def _build_pool_transfers(self, full_indices: torch.Tensor):
