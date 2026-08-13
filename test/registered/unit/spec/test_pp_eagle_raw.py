@@ -186,6 +186,7 @@ class TestEaglePPLastRankDraftOwnership(unittest.TestCase):
             worker.spec_v2_attn_backends,
             (target.model_runner.attn_backend,),
         )
+        self.assertIs(worker.war_fastpath_runner, target.model_runner)
         worker.init_cuda_graphs()
 
     @patch(

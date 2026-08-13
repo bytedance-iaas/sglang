@@ -1124,7 +1124,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
     @property
     def war_fastpath_runner(self):
         # Per the base contract: the step's last shared-buffer-reading phase is
-        # draft_extend, which runs on the draft runner.
+        # draft_extend, which runs on the draft runner. Non-last PP ranks do not
+        # own a draft worker and finish their step in the target runner.
+        if self._draft_worker is None:
+            return self._target_worker.model_runner
         return self._draft_worker.draft_runner
 
     @property
