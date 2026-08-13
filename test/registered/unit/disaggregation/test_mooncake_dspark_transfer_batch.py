@@ -26,6 +26,7 @@ class TestMooncakeDSparkTransferBatch(unittest.TestCase):
             state_data_ptrs=[[200], [300], [400]],
             state_item_lens=[[8], [16], [8]],
         )
+        manager._validate_envelope_kv_layout = MagicMock()
         manager._transfer_data = MagicMock(return_value=0)
         return manager
 
@@ -45,6 +46,8 @@ class TestMooncakeDSparkTransferBatch(unittest.TestCase):
             dst_state_indices=[[11], [12], [7]],
         )
         registration = SimpleNamespace(
+            dst_kv_item_len=4,
+            dst_attn_tp_size=1,
             dst_kv_layer_ids=[40],
             dst_state_types=[
                 StateType.SWA,
@@ -64,6 +67,7 @@ class TestMooncakeDSparkTransferBatch(unittest.TestCase):
         )
 
         self.assertEqual(result, (0, 2))
+        manager._validate_envelope_kv_layout.assert_called_once_with([500], 4, 1)
         manager._transfer_data.assert_called_once_with(
             "session",
             [
