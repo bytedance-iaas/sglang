@@ -218,12 +218,11 @@ struct RegisterTopK {
     if (!need_tiebreak) return;
 
     // Phase 4: Tie-breaking within the threshold bin.
-    // Assume num_ties <= kBlockSize (at most 1 block of ties).
-    // Each thread takes one tied element, computes its rank (number of
-    // elements with strictly higher score, breaking exact float ties by
-    // original index), and writes to output if rank < topk_remain.
+    // Each thread takes one tied element (or more via the block-level fallback
+    // when num_ties > kBlockSize), computes its rank (number of elements with
+    // strictly higher score, breaking exact float ties by original index), and
+    // writes to output if rank < topk_remain.
     __syncthreads();
-    static_assert(kMaxTies <= kBlockSize);
 
     const uint32_t num_ties = min(num_equal, kMaxTies);
     const uint32_t topk_remain = K - num_above;
@@ -295,7 +294,14 @@ struct RegisterTopK {
 
   SGL_DEVICE static void transform(const TransformParams params) {
     __syncthreads();
-    if (const auto tx = threadIdx.x; tx < K) params.transform(tx);
+    // Page-translate K entries; loop kPerBlock chunks when K > kBlockSize.
+    constexpr uint32_t kPerBlock = (K + kBlockSize - 1) / kBlockSize;
+    const auto tx = threadIdx.x;
+#pragma unroll
+    for (uint32_t i = 0; i < kPerBlock; ++i) {
+      const uint32_t idx = tx + i * kBlockSize;
+      if (idx < K) params.transform(idx);
+    }
   }
 };
 
