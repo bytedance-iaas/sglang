@@ -44,6 +44,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMxInt4MoE,
     CompressedTensorsW4A4Fp4,
     CompressedTensorsW4A4Nvfp4MoE,
+    CompressedTensorsW4A8Mxfp4MoE,
     CompressedTensorsW4AFP8MoE,
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Fp8MoE,
@@ -58,6 +59,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     NPUCompressedTensorsW8A8Int8DynamicMoE,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
+    MXFP4_PACK_QUANTIZED_FORMAT,
     find_matched_target,
     is_activation_quantization_format,
     should_ignore_layer,
@@ -178,10 +180,28 @@ class CompressedTensorsConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):
-            # Detect MXFP4 before the scheme-based path: MXFP4 uses a
-            # dedicated FusedMoEMethodBase (Mxfp4MoEMethod) that already
-            # handles all MoE backends, bypassing the scheme abstraction.
+            # GLM-5.2 mxfp4-pack-quantized checkpoints use `*_weight_packed`
+            # loader names and require the dedicated scheme to preserve that
+            # ABI. Other MXFP4 models keep using the generic method.
             if self._is_mxfp4_moe(layer_name=prefix):
+                scheme_dict = self._get_fused_moe_scheme_dict(layer, prefix)
+                if scheme_dict is not None and self._is_mxfp4a8_fp8(
+                    scheme_dict.get("weights"),
+                    scheme_dict.get("input_activations"),
+                    scheme_dict.get("format"),
+                ):
+                    logger.info_once(
+                        "Using CompressedTensorsW4A8Mxfp4MoE for "
+                        "mxfp4-pack-quantized MoE"
+                    )
+                    layer.scheme = CompressedTensorsW4A8Mxfp4MoE(
+                        self,
+                        scheme_dict.get("weights"),
+                        scheme_dict.get("input_activations"),
+                        scheme_dict.get("format"),
+                    )
+                    return CompressedTensorsFusedMoEMethod(self)
+
                 from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
                 logger.info_once(
@@ -592,6 +612,32 @@ class CompressedTensorsConfig(QuantizationConfig):
                 return True
         return False
 
+    def _is_mxfp4a8_fp8(
+        self,
+        weight_quant: BaseModel,
+        input_quant: BaseModel,
+        format: Optional[str] = None,
+    ) -> bool:
+        """Match packed E2M1 group-32 weights with dynamic token FP8 acts."""
+        if weight_quant is None or input_quant is None:
+            return False
+
+        quant_format = format if format is not None else self.quant_format
+        return (
+            quant_format == MXFP4_PACK_QUANTIZED_FORMAT
+            and weight_quant.num_bits == 4
+            and weight_quant.type == QuantizationType.FLOAT
+            and weight_quant.strategy == QuantizationStrategy.GROUP.value
+            and weight_quant.group_size == 32
+            and weight_quant.symmetric
+            and not weight_quant.dynamic
+            and input_quant.num_bits == 8
+            and input_quant.type == QuantizationType.FLOAT
+            and input_quant.strategy == QuantizationStrategy.TOKEN.value
+            and input_quant.symmetric
+            and input_quant.dynamic
+        )
+
     def _is_dynamic_token_w4(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
@@ -713,22 +759,9 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         raise NotImplementedError("No compressed-tensors compatible scheme was found.")
 
-    def get_moe_scheme(
-        self, layer: torch.nn.Module, layer_name: Optional[str] = None
-    ) -> Optional[CompressedTensorsMoEScheme]:
-        """
-        compressed-tensors supports non uniform in the following way:
-
-        targets of config_groups: There can be N config_groups which each
-            have a quantization scheme. Each config_group has a list of targets
-            which can be a full layer_name, a regex for a layer_name, or
-            an nn.Module name.
-
-        Detect whether a layer_name is found in any target and
-        use the quantization scheme corresponding to the matched target
-        to select the CompressedTensorsMoEScheme used for infernece.
-        """
-
+    def _get_fused_moe_scheme_dict(
+        self, layer: torch.nn.Module, layer_name: str
+    ) -> Optional[Dict[str, Any]]:
         # FusedMoE was made by combining multiple Linears so need to
         # make sure quantization config for Linear can target it
         self._add_fused_moe_to_target_scheme_map()
@@ -747,13 +780,40 @@ class CompressedTensorsConfig(QuantizationConfig):
                 "quantization scheme but found multiple"
             )
 
+        return scheme_dict
+
+    def get_moe_scheme(
+        self, layer: torch.nn.Module, layer_name: Optional[str] = None
+    ) -> Optional[CompressedTensorsMoEScheme]:
+        """
+        compressed-tensors supports non uniform in the following way:
+
+        targets of config_groups: There can be N config_groups which each
+            have a quantization scheme. Each config_group has a list of targets
+            which can be a full layer_name, a regex for a layer_name, or
+            an nn.Module name.
+
+        Detect whether a layer_name is found in any target and
+        use the quantization scheme corresponding to the matched target
+        to select the CompressedTensorsMoEScheme used for infernece.
+        """
+        assert layer_name is not None
+        scheme_dict = self._get_fused_moe_scheme_dict(layer, layer_name)
+
         if scheme_dict is None:  # ignored layer
             return None
 
         weight_quant = scheme_dict.get("weights")
         input_quant = scheme_dict.get("input_activations")
 
-        if self._is_wNa16_group_channel(weight_quant, input_quant):
+        if self._is_mxfp4a8_fp8(weight_quant, input_quant, scheme_dict.get("format")):
+            # Must precede broad dynamic-token W4 predicates: this checkpoint
+            # has a distinct packed-weight loader ABI and SM90 FP4 runtime.
+            logger.info_once("Using CompressedTensorsW4A8Mxfp4MoE")
+            return CompressedTensorsW4A8Mxfp4MoE(
+                self, weight_quant, input_quant, scheme_dict.get("format")
+            )
+        elif self._is_wNa16_group_channel(weight_quant, input_quant):
             if not _is_npu:
                 if (
                     self._is_mxint4a16(weight_quant, input_quant)

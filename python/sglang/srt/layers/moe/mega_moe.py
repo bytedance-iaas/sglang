@@ -27,6 +27,7 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 from sglang.srt.layers.moe.mega_moe_sm90 import (
+    is_sm90_fp4_mega_moe_available,
     is_sm90_fp8_mega_moe_available,
     run_sm90_mega_routed,
 )
@@ -106,7 +107,10 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
         return False
     if _device_sm == 90:
-        if not is_sm90_fp8_mega_moe_available(moe.experts):
+        if not (
+            is_sm90_fp8_mega_moe_available(moe.experts)
+            or is_sm90_fp4_mega_moe_available(moe.experts)
+        ):
             return False
     if get_is_capture_mode():
         return True
@@ -117,7 +121,16 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     else:
         max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
-    return max_tokens_per_rank <= cap
+    if max_tokens_per_rank > cap:
+        if getattr(moe.experts, "_mega_moe_sm90_fp4_weights", False):
+            raise RuntimeError(
+                "SM90 FP4 MegaMoE has no compatible grouped-GEMM fallback. "
+                f"max_tokens_per_rank={max_tokens_per_rank} exceeds "
+                "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
+                f"{cap}; raise the cap or reduce the active batch."
+            )
+        return False
+    return True
 
 
 def forward_mega_moe(

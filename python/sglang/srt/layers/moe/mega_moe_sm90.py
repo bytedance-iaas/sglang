@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""SM90 FP8 Mega-MoE forward path and expert-weight prep."""
+"""SM90 FP8/FP4 Mega-MoE forward paths and expert-weight preparation."""
 
 from __future__ import annotations
 
@@ -42,6 +42,20 @@ def is_sm90_fp8_mega_moe_available(experts) -> bool:
     )
 
 
+def is_sm90_fp4_mega_moe_available(experts) -> bool:
+    if _device_sm != 90:
+        return False
+    try:
+        import deep_gemm
+    except ImportError:
+        return False
+    return (
+        hasattr(deep_gemm, "fp8_fp4_mega_moe")
+        and hasattr(deep_gemm, "mega_moe_pre_dispatch_sm90")
+        and getattr(experts, "_mega_moe_sm90_fp4_weights", False)
+    )
+
+
 def run_sm90_mega_routed(
     moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
@@ -51,6 +65,18 @@ def run_sm90_mega_routed(
     num_tokens: int,
 ) -> torch.Tensor:
     import deep_gemm
+
+    use_fp4_weights = getattr(moe.experts, "_mega_moe_sm90_fp4_weights", False)
+
+    # Both SM90 kernels use FP8 activations with per-128 scales. Enabling FP4
+    # activations changes the symmetric-buffer layout and would silently feed
+    # incompatible scales to either SM90 kernel.
+    if envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get():
+        raise RuntimeError(
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS is incompatible with "
+            "SM90 MegaMoE. H20 uses FP8 activations for both FP8 and FP4 "
+            "weights; disable the flag or use an SM100 path."
+        )
 
     if moe.experts.should_fuse_routed_scaling_factor_in_topk:
         routed_scaling_factor = 1.0
@@ -75,16 +101,28 @@ def run_sm90_mega_routed(
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
-    deep_gemm.fp8_mega_moe(
-        y,
-        moe.experts.mega_l1_weights,
-        moe.experts.mega_l2_weights,
-        buf,
-        recipe=(128, 128, 128),
-        activation="swiglu",
-        activation_clamp=getattr(moe.config, "swiglu_limit", None),
-        fast_math=True,
-    )
+    if use_fp4_weights:
+        deep_gemm.fp8_fp4_mega_moe(
+            y,
+            moe.experts.mega_l1_weights,
+            moe.experts.mega_l2_weights,
+            buf,
+            recipe=(1, 1, 32),
+            activation="swiglu",
+            activation_clamp=getattr(moe.config, "swiglu_limit", None),
+            fast_math=True,
+        )
+    else:
+        deep_gemm.fp8_mega_moe(
+            y,
+            moe.experts.mega_l1_weights,
+            moe.experts.mega_l2_weights,
+            buf,
+            recipe=(128, 128, 128),
+            activation="swiglu",
+            activation_clamp=getattr(moe.config, "swiglu_limit", None),
+            fast_math=True,
+        )
     y = y[:num_tokens]
 
     return y
@@ -176,4 +214,51 @@ def build_sm90_mega_moe_experts_weights(experts) -> None:
         experts.mega_l2_weights = l2_pair
 
     experts._mega_moe_sm90_fp8_weights = True
+    experts._mega_moe_weights_built = True
+
+
+def build_sm90_fp4_mega_moe_experts_weights(experts) -> None:
+    """Transform packed E2M1 weights and raw per-32 E8M0 scales for H20."""
+    if getattr(experts, "_mega_moe_weights_built", False):
+        return
+
+    from deep_gemm import transform_weights_for_mega_moe_sm90_fp4
+
+    w13 = experts.w13_weight.data
+    w13_sf_fp32 = experts.w13_weight_scale_inv.data
+    w2 = experts.w2_weight.data
+    w2_sf_fp32 = experts.w2_weight_scale_inv.data
+
+    assert w13.dtype in (torch.int8, torch.uint8)
+    assert w2.dtype in (torch.int8, torch.uint8)
+    assert w13_sf_fp32.dtype == torch.float32
+    assert w2_sf_fp32.dtype == torch.float32
+
+    l1_pair, l2_pair = transform_weights_for_mega_moe_sm90_fp4(
+        (w13, w13_sf_fp32), (w2, w2_sf_fp32)
+    )
+
+    if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
+        # The FP4 MegaMoE layout cannot serve as a generic grouped-GEMM
+        # fallback. Replace the checkpoint-layout parameters so KV sizing can
+        # reclaim them, then make the request path fail closed on a cap miss.
+        experts.w13_weight.data = l1_pair[0]
+        experts.w2_weight.data = l2_pair[0]
+        experts.w13_weight_scale_inv.data = l1_pair[1]
+        experts.w2_weight_scale_inv.data = l2_pair[1]
+        experts.w13_weight_scale_inv.format_ue8m0 = True
+        experts.w2_weight_scale_inv.format_ue8m0 = True
+        experts.mega_l1_weights = (
+            experts.w13_weight.data,
+            experts.w13_weight_scale_inv.data,
+        )
+        experts.mega_l2_weights = (
+            experts.w2_weight.data,
+            experts.w2_weight_scale_inv.data,
+        )
+    else:
+        experts.mega_l1_weights = l1_pair
+        experts.mega_l2_weights = l2_pair
+
+    experts._mega_moe_sm90_fp4_weights = True
     experts._mega_moe_weights_built = True
