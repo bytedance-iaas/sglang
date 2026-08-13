@@ -527,6 +527,8 @@ class EaglePPVerifyInputRaw(SpecInput):
         try:
             if self.accept_index is not None and other.accept_index is not None:
                 self.accept_index = self.accept_index + other.accept_index
+            else:
+                self.accept_index = None
             self.draft_tokens = self.draft_tokens + other.draft_tokens
             self.bonus_tokens = self.bonus_tokens + other.bonus_tokens
             self.top_scores_index = self.top_scores_index + other.top_scores_index

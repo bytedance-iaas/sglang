@@ -81,6 +81,27 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     )
 
 
+def _pp_snapshot_graph_output_tensors(
+    tensor_dict: Dict[str, torch.Tensor], can_run_cuda_graph: bool
+) -> Dict[str, torch.Tensor]:
+    """Detach async PP sends from CUDA-graph-owned output buffers."""
+    if not can_run_cuda_graph:
+        return tensor_dict
+
+    def clone_tensors(value):
+        if torch.is_tensor(value):
+            return value.clone()
+        if isinstance(value, list):
+            return [clone_tensors(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(clone_tensors(item) for item in value)
+        if isinstance(value, dict):
+            return {key: clone_tensors(item) for key, item in value.items()}
+        return value
+
+    return {key: clone_tensors(value) for key, value in tensor_dict.items()}
+
+
 def _pp_ordered_intersection(left: List[str], right: List[str]) -> List[str]:
     right_set = set(right)
     return [rid for rid in left if rid in right_set]
@@ -301,6 +322,13 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                if not self.pp_group.is_last_rank and cur_batch:
+                    with torch.profiler.record_function(
+                        "send_proxy_dict_to_next_stage"
+                    ):
+                        self.send_proxy_work = self._pp_send_proxy_after_launch(
+                            result.pp_hidden_states_proxy_tensors.tensors
+                        )
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -316,20 +344,6 @@ class SchedulerPPMixin:
                             next_batch_result,
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
-                if not self.pp_group.is_last_rank:
-                    if cur_batch:
-                        self.device_module.current_stream().wait_event(
-                            self.launch_event
-                        )
-                        with torch.profiler.record_function(
-                            "send_proxy_dict_to_next_stage"
-                        ):
-                            self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                                result.pp_hidden_states_proxy_tensors.tensors,
-                                async_send=True,
-                                msg_type="proxy",
-                            )
-
                 self.pp_outputs = next_pp_outputs
 
             # When the server is idle, self-check and re-init some states
@@ -1198,6 +1212,16 @@ class SchedulerPPMixin:
             p2p_work.work.wait()
         work.clear()
 
+    def _pp_send_proxy_after_launch(
+        self: Scheduler, tensor_dict: Dict[str, torch.Tensor]
+    ) -> List[P2PWork]:
+        self.schedule_stream.wait_event(self.launch_event)
+        return self._pp_send_dict_to_next_stage(
+            tensor_dict,
+            async_send=True,
+            msg_type="proxy",
+        )
+
     def _pp_commit_send_output_work_and_preprocess_output_tensors(
         self: Scheduler,
         next_first_rank_mb_id: int,
@@ -1609,6 +1633,12 @@ class SchedulerPPMixin:
                 mb_metadata[mb_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
                 )
+                output_tensors = None
+                if self.pp_group.is_last_rank:
+                    output_tensors = _pp_snapshot_graph_output_tensors(
+                        self._pp_prepare_tensor_dict(result, cur_batch),
+                        result.can_run_cuda_graph,
+                    )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())
                 if self.pp_group.is_last_rank:
@@ -1616,9 +1646,7 @@ class SchedulerPPMixin:
                     last_rank_comm_queue.append(
                         (
                             event,
-                            PPProxyTensors(
-                                self._pp_prepare_tensor_dict(result, cur_batch)
-                            ),
+                            PPProxyTensors(output_tensors),
                         )
                     )
         return result, event

@@ -8799,6 +8799,19 @@ class ServerArgs:
             assert (
                 self.disable_overlap_schedule
             ), "Pipeline parallelism is not compatible with overlap schedule"
+            if self.speculative_algorithm is not None:
+                assert self.speculative_algorithm.upper() == "EAGLE", (
+                    "Pipeline parallel speculative decoding currently supports "
+                    "only the EAGLE algorithm"
+                )
+                assert self.speculative_eagle_topk in (None, 1), (
+                    "Pipeline parallel EAGLE currently supports only "
+                    "--speculative-eagle-topk 1"
+                )
+                assert not self.speculative_adaptive, (
+                    "Pipeline parallel EAGLE does not support adaptive "
+                    "speculative decoding"
+                )
             assert self.min_free_slots_delay is None, (
                 "--min-free-slots-delay is not supported with pipeline "
                 "parallelism: allocatable slots per microbatch are bounded by "
@@ -8833,7 +8846,7 @@ class ServerArgs:
         if self.speculative_algorithm is not None:
             assert (
                 not self.enable_mixed_chunk
-            ), "enable_mixed_chunk is required for speculative decoding"
+            ), "enable_mixed_chunk is not supported for speculative decoding"
 
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
