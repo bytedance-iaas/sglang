@@ -45,8 +45,10 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
+    pack_state_types,
     resolve_dcp_dst_entry_indices,
     resolve_state_component_dst_index,
+    unpack_state_types,
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
@@ -140,6 +142,7 @@ class KVArgsRegisterInfo:
     dst_state_dim_per_tensor: List[List[int]]
     dst_kv_layer_ids: List[int]
     dst_state_layer_ids: List[List[int]]
+    dst_state_types: List[StateType] = dataclasses.field(default_factory=list)
     dst_dcp_size: int = 1
     dst_dcp_rank: int = 0
     requires_dcp_relayout: bool = False
@@ -176,6 +179,7 @@ class KVArgsRegisterInfo:
                 if len(msg) > 13 and msg[13] != b""
                 else []
             ),
+            dst_state_types=unpack_state_types(msg[18]) if len(msg) > 18 else [],
             staging_base_ptr=(
                 struct.unpack("Q", msg[14])[0]
                 if len(msg) > 14 and len(msg[14]) == 8
@@ -2552,6 +2556,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
             packed_state_layer_ids = pack_int_lists(
                 self.kv_mgr.kv_args.state_layer_ids, "I"
             )
+            packed_state_types = pack_state_types(self.kv_mgr.kv_args.state_types)
             packed_kv_layer_ids = b"".join(
                 struct.pack("I", layer_id)
                 for layer_id in self.kv_mgr.kv_args.kv_layer_ids
@@ -2604,6 +2609,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             staging_total_size_str,
                             dst_dcp_size,
                             dst_dcp_rank,
+                            packed_state_types,
                         ]
                     )
             except zmq.ZMQError:
