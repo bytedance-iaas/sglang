@@ -8773,6 +8773,32 @@ class ServerArgs:
                 "(DeepSeek-V4 non-EP DP TBO path)."
             )
 
+    def _check_pipeline_parallel_args(self):
+        if self.pp_size <= 1:
+            return
+
+        assert (
+            self.disable_overlap_schedule
+        ), "Pipeline parallelism is not compatible with overlap schedule"
+        if self.speculative_algorithm is not None:
+            assert self.speculative_algorithm.upper() == "EAGLE", (
+                "Pipeline parallel speculative decoding currently supports "
+                "only the EAGLE algorithm"
+            )
+            assert self.speculative_eagle_topk in (None, 1), (
+                "Pipeline parallel EAGLE currently supports only "
+                "--speculative-eagle-topk 1"
+            )
+            assert not self.speculative_adaptive, (
+                "Pipeline parallel EAGLE does not support adaptive "
+                "speculative decoding"
+            )
+        assert self.min_free_slots_delay is None, (
+            "--min-free-slots-delay is not supported with pipeline "
+            "parallelism: allocatable slots per microbatch are bounded by "
+            "pp-max-micro-batch-size, so the threshold may never be reached"
+        )
+
     def check_server_args(self):
         # Check parallel size constraints
         if self.ep_join_mode != "scale":
@@ -8795,28 +8821,7 @@ class ServerArgs:
             "Remove --disable-cuda-graph-padding or --enable-torch-compile."
         )
 
-        if self.pp_size > 1:
-            assert (
-                self.disable_overlap_schedule
-            ), "Pipeline parallelism is not compatible with overlap schedule"
-            if self.speculative_algorithm is not None:
-                assert self.speculative_algorithm.upper() == "EAGLE", (
-                    "Pipeline parallel speculative decoding currently supports "
-                    "only the EAGLE algorithm"
-                )
-                assert self.speculative_eagle_topk in (None, 1), (
-                    "Pipeline parallel EAGLE currently supports only "
-                    "--speculative-eagle-topk 1"
-                )
-                assert not self.speculative_adaptive, (
-                    "Pipeline parallel EAGLE does not support adaptive "
-                    "speculative decoding"
-                )
-            assert self.min_free_slots_delay is None, (
-                "--min-free-slots-delay is not supported with pipeline "
-                "parallelism: allocatable slots per microbatch are bounded by "
-                "pp-max-micro-batch-size, so the threshold may never be reached"
-            )
+        self._check_pipeline_parallel_args()
 
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention

@@ -26,6 +26,7 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
     check_equal_or_regex_match,
     should_ignore_layer,
 )
+from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.test.test_utils import CustomTestCase
 
 EXPERTS_LAYER = "model.language_model.layers.0.mlp.experts"
@@ -93,6 +94,26 @@ WNA16_GROUP = {
     "input_activations": None,
 }
 
+GLM52_MXFP4_GROUP = {
+    "format": "mxfp4-pack-quantized",
+    "targets": ["Linear"],
+    "weights": {
+        "num_bits": 4,
+        "type": "float",
+        "symmetric": True,
+        "strategy": "group",
+        "group_size": 32,
+        "dynamic": False,
+    },
+    "input_activations": {
+        "num_bits": 8,
+        "type": "float",
+        "symmetric": True,
+        "strategy": "token",
+        "dynamic": True,
+    },
+}
+
 
 def _mixed_precision_config(*groups, ignore=()):
     """Groups disagree, so compressed-tensors writes format="mixed-precision"."""
@@ -148,6 +169,39 @@ class TestIgnoreListPrefixMatching(CustomTestCase):
         self.assertTrue(check_equal_or_regex_match(GATE_PROJ, [GATE_PROJ]))
         self.assertTrue(check_equal_or_regex_match(GATE_PROJ, ["re:.*gate_proj$"]))
         self.assertFalse(check_equal_or_regex_match(GATE_PROJ, ["re:.*down_proj$"]))
+
+    def test_deepseek_fused_dense_mlp_inherits_checkpoint_ignore(self):
+        ignore = ["re:.*\\.mlp\\.(up_proj|gate_proj|down_proj)(?:\\..*)?$"]
+        fused_layer = "model.layers.0.mlp.gate_up_proj"
+
+        self.assertFalse(should_ignore_layer(fused_layer, ignore=ignore))
+        self.assertTrue(
+            should_ignore_layer(
+                fused_layer,
+                ignore=ignore,
+                fused_mapping=DeepseekV2ForCausalLM.packed_modules_mapping,
+            )
+        )
+
+    def test_glm52_mxfp4_fused_dense_mlp_stays_unquantized(self):
+        ignore = ["re:.*\\.mlp\\.(up_proj|gate_proj|down_proj)(?:\\..*)?$"]
+        config = {
+            "quant_method": "compressed-tensors",
+            "format": "mxfp4-pack-quantized",
+            "config_groups": {"config_group_0": GLM52_MXFP4_GROUP},
+            "ignore": ignore,
+        }
+        quant_config = CompressedTensorsConfig.from_config(config)
+        quant_config.update_packed_modules_mapping(
+            DeepseekV2ForCausalLM.packed_modules_mapping
+        )
+
+        self.assertIsNone(
+            quant_config.get_linear_scheme(
+                torch.nn.Module(), layer_name="model.layers.0.mlp.gate_up_proj"
+            )
+        )
+        self.assertTrue(quant_config._is_mxfp4_moe("model.layers.0.mlp.experts"))
 
 
 class TestMixedPrecisionFormat(CustomTestCase):

@@ -3,6 +3,10 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
 from sglang.srt.managers.scheduler_pp_mixin import (
     SchedulerPPMixin,
     _pp_snapshot_graph_output_tensors,
@@ -25,9 +29,7 @@ class TestSchedulerPPCudaGraphOutput(unittest.TestCase):
             ),
         )
 
-        actual_work = SchedulerPPMixin._pp_send_proxy_after_launch(
-            scheduler, payload
-        )
+        actual_work = SchedulerPPMixin._pp_send_proxy_after_launch(scheduler, payload)
 
         self.assertIs(actual_work, expected_work)
         self.assertEqual(calls[0], ("wait", launch_event))
