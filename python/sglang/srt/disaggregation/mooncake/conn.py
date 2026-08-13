@@ -961,9 +961,7 @@ class MooncakeKVManager(CommonKVManager):
         if self.enable_custom_mem_pool or not self.is_mla_backend:
             return None
 
-        component_index = self._find_draft_swa_component_index(
-            prefill_state_indices
-        )
+        component_index = self._find_draft_swa_component_index(prefill_state_indices)
         if component_index is None:
             return None
 
@@ -980,11 +978,9 @@ class MooncakeKVManager(CommonKVManager):
             target_rank_registration_info.dst_state_types,
             component_index,
         )
-        if (
-            dst_component_index
-            >= len(target_rank_registration_info.dst_state_data_ptrs)
-            or dst_component_index >= len(req.dst_state_indices)
-        ):
+        if dst_component_index >= len(
+            target_rank_registration_info.dst_state_data_ptrs
+        ) or dst_component_index >= len(req.dst_state_indices):
             return -1, component_index
 
         src_state_indices = list(prefill_state_indices[component_index])

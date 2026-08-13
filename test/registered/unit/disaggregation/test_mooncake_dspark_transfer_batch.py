@@ -32,9 +32,7 @@ class TestMooncakeDSparkTransferBatch(unittest.TestCase):
 
     def test_only_repeated_swa_has_a_draft_component(self):
         manager = self._manager()
-        self.assertEqual(
-            manager._find_draft_swa_component_index([[1], [2], [3]]), 2
-        )
+        self.assertEqual(manager._find_draft_swa_component_index([[1], [2], [3]]), 2)
 
         manager.kv_args.state_types = [StateType.SWA, StateType.C128_STATE]
         self.assertIsNone(manager._find_draft_swa_component_index([[1], [2]]))
