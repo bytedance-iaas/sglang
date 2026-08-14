@@ -514,6 +514,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.topk,
             self.speculative_num_steps,
         )
+        if not hasattr(self, "_spec_diag_draft_logs"):
+            self._spec_diag_draft_logs = 0
+        if self._spec_diag_draft_logs < 8:
+            logger.warning(
+                "GLM52_SPEC_DIAG draft mode=%s raw_bs=%s graph=%s "
+                "dp_graph=%s seed=%s spec_compatible=%s global_tokens=%s",
+                forward_batch.forward_mode.name,
+                forward_batch.batch_size,
+                can_run_decode_cuda_graph,
+                forward_batch.can_run_dp_cuda_graph,
+                draft_input.dsa_topk_indices is not None,
+                draft_input.cuda_graph_compatible,
+                forward_batch.original_global_num_tokens_cpu,
+            )
+            self._spec_diag_draft_logs += 1
         if (
             can_run_decode_cuda_graph
             and not forward_batch.forward_mode.is_idle()

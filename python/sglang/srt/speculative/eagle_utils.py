@@ -45,6 +45,7 @@ _is_xpu = is_xpu()
 _is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
+_spec_diag_verify_logs = 0
 
 if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel import (
@@ -493,6 +494,7 @@ def eagle_prepare_for_verify(
     batch: ScheduleBatch,
     target_worker: TpModelWorker,
 ):
+    global _spec_diag_verify_logs
     from sglang.kernels.ops.speculative.cache_locs import (
         assign_extend_cache_locs_uniform_func,
     )
@@ -584,6 +586,21 @@ def eagle_prepare_for_verify(
     # Non-cuda-graph: defer init to forward_extend, which runs after
     # `_forward_raw -> prepare_mlp_sync_batch` pads the batch. Initing
     # here would use pre-pad shapes and trip DSv4 indexer shape match.
+
+    if _spec_diag_verify_logs < 8:
+        logger.warning(
+            "GLM52_SPEC_DIAG verify mode=%s raw_bs=%s input_tokens=%s graph=%s "
+            "dp_graph=%s padding=%s global_tokens=%s original_global_tokens=%s",
+            verify_forward_batch.forward_mode.name,
+            verify_forward_batch.batch_size,
+            verify_forward_batch.input_ids.numel(),
+            can_run_cuda_graph,
+            verify_forward_batch.can_run_dp_cuda_graph,
+            verify_forward_batch.dp_padding_mode,
+            verify_forward_batch.global_num_tokens_cpu,
+            verify_forward_batch.original_global_num_tokens_cpu,
+        )
+        _spec_diag_verify_logs += 1
 
     return verify_forward_batch, can_run_cuda_graph
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -37,6 +38,8 @@ if TYPE_CHECKING:
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
+logger = logging.getLogger(__name__)
+_spec_diag_sync_logs = 0
 
 
 def _spec_input_cuda_graph_compatible(local_batch: Optional[ScheduleBatch]) -> bool:
@@ -248,6 +251,7 @@ def prepare_mlp_sync_batch_raw(
     offload_tags: set[str],
     dwdp: bool = False,
 ):
+    global _spec_diag_sync_logs
     # Check if other DP workers have running batches
     if (
         local_batch is None
@@ -387,6 +391,18 @@ def prepare_mlp_sync_batch_raw(
         _update_gather_batch(
             batch_to_gather, mlp_sync_info, require_mlp_tp_gather, skip_all_gather
         )
+        if _spec_diag_sync_logs < 8:
+            logger.warning(
+                "GLM52_SPEC_DIAG sync local_mode=%s emitted_mode=%s "
+                "local_tokens=%s global_tokens=%s graph=%s spec_compatible=%s",
+                None if local_batch is None else local_batch.forward_mode.name,
+                batch_to_gather.forward_mode.name,
+                num_tokens,
+                mlp_sync_info.global_num_tokens,
+                mlp_sync_info.can_run_decode_cuda_graph,
+                _spec_input_cuda_graph_compatible(local_batch),
+            )
+            _spec_diag_sync_logs += 1
 
     # Set on `local_batch`, not `batch_to_gather`: for PREBUILT batches the
     # scheduler's `last_batch` is the prebuilt batch, not its inner idle batch.
