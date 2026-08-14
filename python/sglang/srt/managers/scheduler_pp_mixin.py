@@ -53,6 +53,7 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
         envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get()
         and batch is not None
         and batch.forward_mode == ForwardMode.EXTEND
+        and batch.spec_algorithm.is_none()
         and len(batch.reqs) == 1
         and not batch.contains_last_prefill_chunk
         and not batch.return_logprob
@@ -1042,18 +1043,28 @@ class SchedulerPPMixin:
                 # Tail-drafted chain for the next verify round (root = bonus).
                 tensor_dict["spec_next_chain"] = result.next_verify_chain
 
-        # The draft extend only runs on the last stage, but every rank needs its
-        # output: process_batch_result_disagg_prefill reads it off the relayed
-        # result to fill the PD aux buffers.
-        draft_input = result.next_draft_input
         if (
-            batch.forward_mode.is_extend()
-            and draft_input is not None
-            and draft_input.topk_p is not None
+            not batch.spec_algorithm.is_none()
+            and batch.forward_mode.is_extend()
+            and result.next_draft_input is not None
+            and result.next_draft_input.topk_p is not None
         ):
-            tensor_dict["draft_topk_p"] = draft_input.topk_p.contiguous()
-            tensor_dict["draft_topk_index"] = draft_input.topk_index.contiguous()
-            tensor_dict["draft_hidden_states"] = draft_input.hidden_states.contiguous()
+            # PD + PP + MTP: the last PP stage owns the authoritative draft
+            # seed produced by draft-extend-for-prefill. Relay the seed through
+            # the existing PP output ring so every PP stage can attach it to
+            # the request metadata sent to the decode group.
+            draft_input = result.next_draft_input
+            tensor_dict["spec_prefill_topk_p"] = draft_input.topk_p.contiguous()
+            tensor_dict["spec_prefill_topk_index"] = (
+                draft_input.topk_index.contiguous()
+            )
+            tensor_dict["spec_prefill_hidden_states"] = (
+                draft_input.hidden_states.contiguous()
+            )
+            if draft_input.dsa_topk_indices is not None:
+                tensor_dict["spec_prefill_dsa_topk_indices"] = (
+                    draft_input.dsa_topk_indices.contiguous()
+                )
 
         if batch.return_logprob:
             logprob_dict = get_logprob_dict_from_result(result)
@@ -1062,9 +1073,8 @@ class SchedulerPPMixin:
                 **logprob_dict,
             }
 
-        # PP + spec: the last PP rank serializes the draft tree so non-last ranks
-        # can rebuild EagleVerifyInput on the next iter. Carried as plain Python
-        # lists alongside the tensor payload.
+        # PP + spec decode: the last PP rank serializes the draft tree so
+        # non-last ranks can rebuild EagleVerifyInput on the next iteration.
         if result.pp_verify_input_raw:
             tensor_dict.update(result.pp_verify_input_raw.to_tensor_dict())
 
@@ -1181,7 +1191,10 @@ class SchedulerPPMixin:
         pp_outputs: PPProxyTensors,
     ):
         from sglang.srt.managers.scheduler import GenerationBatchResult
-        from sglang.srt.speculative.eagle_info import EaglePPVerifyInputRaw
+        from sglang.srt.speculative.eagle_info import (
+            EagleDraftInput,
+            EaglePPVerifyInputRaw,
+        )
 
         logits_output = None
         extend_input_len_per_req = None
@@ -1197,17 +1210,28 @@ class SchedulerPPMixin:
         batch.input_ids = next_token_ids
         next_draft_input = None
 
-        if "draft_topk_p" in pp_outputs.tensors:
-            from sglang.srt.speculative.eagle_info import EagleDraftInput
-
-            # Rebuild the draft proposal the last stage put on the ring.
-            # Rebinding batch.spec_info to this exact object preserves the
+        if not self.spec_algorithm.is_none() and "pp_spec_output" in pp_outputs.tensors:
+            # PP+spec decode path: rebuild the raw tree produced by the last
+            # PP stage. This is the existing #31139 path.
+            batch.spec_info = EaglePPVerifyInputRaw.from_pp_outputs(pp_outputs)
+        elif not self.spec_algorithm.is_none() and batch.forward_mode.is_extend():
+            # Prefill PP + PD + EAGLE (#33584): rebuild the draft proposal the
+            # last PP stage put on the output ring. The same object must be
+            # installed on both batch and result to satisfy the #30677
             # ownership invariant in process_batch_result_disagg_prefill.
+            if "spec_prefill_hidden_states" not in pp_outputs.tensors:
+                raise AssertionError(
+                    "PP+PD+MTP prefill result is missing the relayed "
+                    "next_draft_input seed"
+                )
             next_draft_input = EagleDraftInput(
-                topk_p=pp_outputs["draft_topk_p"],
-                topk_index=pp_outputs["draft_topk_index"],
-                hidden_states=pp_outputs["draft_hidden_states"],
+                topk_p=pp_outputs["spec_prefill_topk_p"],
+                topk_index=pp_outputs["spec_prefill_topk_index"],
+                hidden_states=pp_outputs["spec_prefill_hidden_states"],
                 bonus_tokens=next_token_ids,
+                dsa_topk_indices=pp_outputs.tensors.get(
+                    "spec_prefill_dsa_topk_indices"
+                ),
                 num_tokens_per_req=1,
                 num_tokens_for_logprob_per_req=1,
             )
@@ -1217,28 +1241,7 @@ class SchedulerPPMixin:
                 RelayPayload.from_draft_input(next_draft_input),
             )
             batch.input_ids = None
-        elif not self.spec_algorithm.is_none() and "pp_spec_output" in pp_outputs.tensors:
-            # Spec-v2 decode path: the last PP rank produced draft tokens for
-            # this iter; rebuild the raw draft tree so _build_verify_input_from_pp_raw
-            # can construct EagleVerifyInput on this rank.
-            batch.spec_info = EaglePPVerifyInputRaw.from_pp_outputs(pp_outputs)
-        elif not self.spec_algorithm.is_none() and batch.forward_mode.is_extend():
-            if batch.contains_last_prefill_chunk:
-                # The last PP rank produces no draft tokens for prefill batches;
-                # build a dummy draft for the first decode step.
-                batch.spec_info = EaglePPVerifyInputRaw.build_dummy_for_decode(
-                    batch, self.server_args.speculative_num_draft_tokens
-                )
-            else:
-                # Chunked prefill middle chunk: its next_token_ids is a
-                # placeholder that no consumer reads (the next iter is another
-                # extend and resolve_forward_inputs sources input_ids from the
-                # prefill staging copy). Do nothing here.
-                pass
         else:
-            # PP rank 0 also relays into output_tokens_buf so the next iter's
-            # resolve_forward_inputs finds these tokens for the decode portion
-            # of mixed-chunk batches (which gather via mix_running_indices).
             self.future_map.stash(
                 batch.req_pool_indices, RelayPayload(bonus_tokens=next_token_ids)
             )
