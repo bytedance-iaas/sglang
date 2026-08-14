@@ -28,6 +28,7 @@ ScheduleBatch -> ForwardBatch
 from __future__ import annotations
 
 import hashlib
+import logging
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
@@ -72,6 +73,8 @@ if TYPE_CHECKING:
 # Warn-once flag for the deprecated skip_attn_backend_init kwarg; see
 # ForwardBatch.apply_deprecated_skip_attn_backend_init.
 _skip_attn_backend_init_warned = False
+_spec_idle_materialization_logs = 0
+logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 
@@ -1271,6 +1274,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
+        global _spec_idle_materialization_logs
         from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 
         # Local imports: module-level CP helper imports here are circular (#27014).
@@ -1482,6 +1486,23 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # padding
         self._pad_inputs_to_size(model_runner, num_tokens, bs)
+        if (
+            self._original_forward_mode is not None
+            and self._original_forward_mode.is_idle()
+            and self.spec_info is not None
+            and not self.spec_info.is_draft_input()
+            and _spec_idle_materialization_logs < 8
+        ):
+            logger.warning(
+                "GLM52_SPEC_DIAG materialized_idle mode=%s padding=%s "
+                "batch_size=%s input_tokens=%s num_token_non_padded_cpu=%s",
+                self.forward_mode.name,
+                dp_padding_mode.name,
+                self.batch_size,
+                self.input_ids.numel(),
+                self.num_token_non_padded_cpu,
+            )
+            _spec_idle_materialization_logs += 1
         self.global_num_tokens_cpu = global_num_tokens
         global_num_tokens_pinned = torch.tensor(global_num_tokens, pin_memory=True)
         self.global_num_tokens_gpu.copy_(global_num_tokens_pinned, non_blocking=True)
