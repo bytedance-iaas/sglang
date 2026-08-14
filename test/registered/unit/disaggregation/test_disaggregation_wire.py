@@ -162,6 +162,12 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             reqs=[self._make_req(seed) for seed in seeds],
             device="cpu",
             enable_overlap=False,
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    index_share_for_mtp_iteration=True,
+                    index_topk=2048,
+                )
+            ),
         )
         server_args = SimpleNamespace(
             speculative_eagle_topk=1,
@@ -174,6 +180,7 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             batch, server_args, last_tokens, None
         )
         self.assertTrue(torch.equal(draft_input.dsa_topk_indices, torch.stack(seeds)))
+        self.assertTrue(draft_input.cuda_graph_compatible)
 
         for invalid_seed in (
             None,
@@ -184,6 +191,14 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
                 batch, server_args, last_tokens, None
             )
             self.assertIsNone(draft_input.dsa_topk_indices)
+            self.assertFalse(draft_input.cuda_graph_compatible)
+
+        batch.model_config.hf_config.index_share_for_mtp_iteration = False
+        draft_input = build_eagle_disagg_draft_input(
+            batch, server_args, last_tokens, None
+        )
+        self.assertIsNone(draft_input.dsa_topk_indices)
+        self.assertTrue(draft_input.cuda_graph_compatible)
 
     def test_future_map_initializes_seed_buffer_after_seedless_payload(self):
         future_map = object.__new__(FutureMap)
