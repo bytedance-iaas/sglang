@@ -3,8 +3,8 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt import envs
 from sglang.srt.disaggregation.utils import MetadataBuffers
+from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_pp_mixin import (
     PPBatchMetadata,
     SchedulerPPMixin,
