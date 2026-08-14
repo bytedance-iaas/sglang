@@ -1,9 +1,11 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
 
+from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.disaggregation.common.utils import (
     group_concurrent_contiguous,
@@ -15,6 +17,7 @@ from sglang.srt.disaggregation.common.utils import (
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     get_dsv4_c128_state_indices,
+    poll_and_all_reduce_attn_cp_tp_group,
     setup_state_kv_args,
     summarize_pd_bootstrap_tensor,
 )
@@ -29,6 +32,30 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestDisaggregationWire(unittest.TestCase):
+    @patch("sglang.srt.disaggregation.utils.dist.get_world_size", return_value=2)
+    @patch("sglang.srt.disaggregation.utils.dist.all_gather")
+    def test_rank_local_queue_mismatch_defers_positional_poll(
+        self, all_gather, _get_world_size
+    ):
+        def emulate_rank_mismatch(output_tensors, input_tensor, group):
+            for output_tensor in output_tensors:
+                output_tensor.copy_(input_tensor)
+            if group == "attn-tp":
+                output_tensors[1][0] += 1
+
+        all_gather.side_effect = emulate_rank_mismatch
+        poller = Mock()
+
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [poller],
+            "attn-cp",
+            "attn-tp",
+            ordered_keys=["request-a"],
+        )
+
+        self.assertEqual(polls, [KVPoll.Bootstrapping])
+        poller.poll.assert_not_called()
+
     def test_pd_bootstrap_summary_preserves_bytes_and_metadata(self):
         value = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
         summary = summarize_pd_bootstrap_tensor(value)
