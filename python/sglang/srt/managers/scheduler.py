@@ -2233,7 +2233,7 @@ class Scheduler(
             min(
                 max_new_tokens,
                 self.max_req_len - input_len - 1,
-                self.max_total_num_tokens * self.server_args.dcp_size
+                token_capacity * self.server_args.dcp_size
                 - paged_input_len
                 - self.page_size
                 - 1,

@@ -5,11 +5,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.disaggregation.utils import (
-    summarize_dsa_topk_seed,
-    summarize_pd_bootstrap_tensor,
-)
-from sglang.srt.environ import envs
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.eagle_info import EagleDraftInput

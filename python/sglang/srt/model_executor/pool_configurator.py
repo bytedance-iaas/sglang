@@ -240,6 +240,23 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 element_size = torch._utils._element_size(
                     DSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
+                indexer_layers = effective_num_layers
+                compact_mask = None
+                if (
+                    effective_num_layers == num_layers
+                    and not kvc.server_args.enable_hisparse
+                ):
+                    compact_mask = dsa_compact_indexer_layer_mask(
+                        model_config.hf_config,
+                        num_layers,
+                        kvc.layer_info.start_layer,
+                        kvc.layer_info.end_layer,
+                        is_draft_worker=kvc.is_draft_worker,
+                    )
+                if compact_mask is not None:
+                    # Real buffers plus one shared alias. This must match the
+                    # actual pool allocation so the saved VRAM becomes KV capacity.
+                    indexer_layers = sum(compact_mask) + 1
                 indexer_ratio = 1
                 if kvc.server_args.enable_hisparse:
                     from sglang.srt.mem_cache.sparsity import parse_hisparse_config
@@ -249,7 +266,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     ).host_to_device_ratio
                 cell_size += int(
                     indexer_size_per_token
-                    * effective_num_layers
+                    * indexer_layers
                     * element_size
                     * indexer_ratio
                 )
