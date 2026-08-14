@@ -997,9 +997,7 @@ class MooncakeKVManager(CommonKVManager):
             )
             layer_ptr_pairs = [
                 (src_k_ptrs[i], dst_k_ptrs[i]) for i in range(layers_current_pp_stage)
-            ] + [
-                (src_v_ptrs[i], dst_v_ptrs[i]) for i in range(layers_current_pp_stage)
-            ]
+            ] + [(src_v_ptrs[i], dst_v_ptrs[i]) for i in range(layers_current_pp_stage)]
 
         # Calculate precise byte offset and length for the sub-slice within the token
         src_head_slice_offset = src_head_start_offset * bytes_per_head_slice_to_send
