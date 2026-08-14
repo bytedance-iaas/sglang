@@ -1242,6 +1242,12 @@ class SchedulerPPMixin:
                 self.attn_tp_cpu_group,
                 src=self.attn_tp_group.ranks[0],
             )
+            # A blocking broadcast only guarantees that each caller's local
+            # work has completed. The source rank can enter the next Gloo
+            # collective while a peer is still receiving the payload, which
+            # lets the next PP poll all-reduce pair with this broadcast. Keep
+            # every attention-TP scheduler on the same control-plane phase.
+            torch.distributed.barrier(group=self.attn_tp_cpu_group)
 
         if self.ps.attn_cp_size > 1:
             data = broadcast_pyobj(
@@ -1250,6 +1256,7 @@ class SchedulerPPMixin:
                 self.attn_cp_cpu_group,
                 src=self.attn_cp_group.ranks[0],
             )
+            torch.distributed.barrier(group=self.attn_cp_cpu_group)
 
         return data
 

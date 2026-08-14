@@ -92,6 +92,7 @@ class TestPPCPRankOffsets(unittest.TestCase):
         scheduler.attn_cp_group = _fake_group()
         scheduler.attn_cp_cpu_group = _fake_group()
         calls = []
+        barriers = []
 
         def fake_point_to_point_pyobj(data, rank, group, src, dst, **kwargs):
             calls.append((rank, src, dst, kwargs.get("async_send", False)))
@@ -106,6 +107,10 @@ class TestPPCPRankOffsets(unittest.TestCase):
                 "sglang.srt.managers.scheduler_pp_mixin.broadcast_pyobj",
                 side_effect=lambda data, *args, **kwargs: data,
             ),
+            patch(
+                "sglang.srt.managers.scheduler_pp_mixin.torch.distributed.barrier",
+                side_effect=lambda *, group: barriers.append(group),
+            ),
         ):
             self.assertEqual(
                 scheduler._pp_send_pyobj_to_next_stage(["data"], async_send=True),
@@ -119,6 +124,10 @@ class TestPPCPRankOffsets(unittest.TestCase):
                 (12, 12, 4, True),
                 (12, 4, 12, False),
             ],
+        )
+        self.assertEqual(
+            barriers,
+            [scheduler.attn_tp_cpu_group, scheduler.attn_cp_cpu_group],
         )
 
 
