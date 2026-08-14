@@ -240,7 +240,7 @@ def _device_coordinator(
     coordinator = object.__new__(HiSparseCoordinator)
     coordinator.page_size = 1
     coordinator.padded_buffer_size = buffer_capacity
-    coordinator.mem_pool_device = SimpleNamespace(size=device_capacity)
+    coordinator.mem_pool_device = SimpleNamespace(size=device_capacity, page_size=1)
     coordinator.req_to_device_buffer = torch.zeros(
         (4, buffer_capacity), dtype=torch.int64
     )
@@ -341,6 +341,7 @@ def test_shared_hisparse_allocator_capacity_counts_one_mirrored_buffer():
 def _residency_coordinator():
     coordinator = object.__new__(HiSparseCoordinator)
     coordinator._residency_states = {}
+    coordinator._ever_resident_requests = set()
     coordinator._last_residency_transition_step = {}
     coordinator._decode_step = 0
     coordinator._promotion_count = 0
