@@ -416,6 +416,16 @@ class MetadataBuffers:
         item_lens = [buf[0].nbytes for buf in bufs]
         return ptrs, data_lens, item_lens
 
+    def get_spec_only_aux_indices(self) -> List[int]:
+        """Return positions of MTP-only fields in get_buf_infos()."""
+        offset = 6
+        if self.enable_sampling_mask:
+            offset += 3
+        indices = [offset, offset + 1, offset + 2]
+        if self.output_dsa_topk_indices is not None:
+            indices.append(offset + 3)
+        return indices
+
     def get_buf(self, idx: int):
         sampling_mask_len = None
         sampling_mask_idx = None

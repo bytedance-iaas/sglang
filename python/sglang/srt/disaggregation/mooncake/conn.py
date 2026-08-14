@@ -1047,7 +1047,20 @@ class MooncakeKVManager(CommonKVManager):
         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
         prefill_aux_item_lens = self.kv_args.aux_item_lens
 
+        skip_spec_aux = (
+            self.pp_size is not None
+            and self.pp_size > 1
+            and self.pp_rank != self.pp_size - 1
+        )
+        spec_aux_set = (
+            set(getattr(self.kv_args, "spec_aux_indices", ()) or ())
+            if skip_spec_aux
+            else frozenset()
+        )
+
         for i, dst_aux_ptr in enumerate(dst_aux_ptrs):
+            if i in spec_aux_set:
+                continue
             length = prefill_aux_item_lens[i]
             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
             dst_addr = dst_aux_ptrs[i] + length * req.dst_aux_index
@@ -1064,7 +1077,20 @@ class MooncakeKVManager(CommonKVManager):
         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
         prefill_aux_item_lens = self.kv_args.aux_item_lens
 
+        skip_spec_aux = (
+            self.pp_size is not None
+            and self.pp_size > 1
+            and self.pp_rank != self.pp_size - 1
+        )
+        spec_aux_set = (
+            set(getattr(self.kv_args, "spec_aux_indices", ()) or ())
+            if skip_spec_aux
+            else frozenset()
+        )
+
         for i in range(len(prefill_aux_ptrs)):
+            if i in spec_aux_set:
+                continue
             length = prefill_aux_item_lens[i]
             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
             data = AuxDataCodec.serialize_data_from_buffer(src_addr, length)
