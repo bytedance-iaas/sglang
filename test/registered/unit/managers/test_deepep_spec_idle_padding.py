@@ -9,7 +9,7 @@ from sglang.srt.managers.scheduler_components.dp_attn import _update_gather_batc
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     _should_force_symmetric_spec_deepep_padding,
-    _should_materialize_idle_target_verify,
+    _should_materialize_idle_spec_deepep,
     requires_symmetric_spec_deepep_lockstep,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -77,12 +77,12 @@ class TestDeepEPSpecIdlePadding(CustomTestCase):
         self.assertEqual(batch.global_num_tokens, [0])
         self.assertEqual(batch.global_num_tokens_for_logprob, [0])
 
-    def test_idle_verify_materializes_only_under_symmetric_padding(self):
+    def test_idle_spec_materializes_only_under_symmetric_padding(self):
         verify_info = SimpleNamespace(is_draft_input=lambda: False)
         draft_info = SimpleNamespace(is_draft_input=lambda: True)
 
         self.assertTrue(
-            _should_materialize_idle_target_verify(
+            _should_materialize_idle_spec_deepep(
                 forward_mode=ForwardMode.IDLE,
                 spec_info=verify_info,
                 dp_padding_mode=DpPaddingMode.MAX_LEN,
@@ -92,16 +92,23 @@ class TestDeepEPSpecIdlePadding(CustomTestCase):
         for spec_info, padding, num_tokens in (
             (verify_info, DpPaddingMode.SUM_LEN, 6),
             (verify_info, DpPaddingMode.MAX_LEN, 0),
-            (draft_info, DpPaddingMode.MAX_LEN, 6),
         ):
             self.assertFalse(
-                _should_materialize_idle_target_verify(
+                _should_materialize_idle_spec_deepep(
                     forward_mode=ForwardMode.IDLE,
                     spec_info=spec_info,
                     dp_padding_mode=padding,
                     num_tokens=num_tokens,
                 )
             )
+        self.assertTrue(
+            _should_materialize_idle_spec_deepep(
+                forward_mode=ForwardMode.IDLE,
+                spec_info=draft_info,
+                dp_padding_mode=DpPaddingMode.MAX_LEN,
+                num_tokens=1,
+            )
+        )
 
     def test_sparse_eagle_verify_forces_symmetric_deepep_padding(self):
         algorithm = SimpleNamespace(is_eagle=lambda: True)
@@ -118,7 +125,7 @@ class TestDeepEPSpecIdlePadding(CustomTestCase):
                     global_num_tokens=[0, 6, 6, 0, 0, 0, 0, 0],
                 )
             )
-            self.assertFalse(
+            self.assertTrue(
                 _should_force_symmetric_spec_deepep_padding(
                     spec_algorithm=algorithm,
                     spec_info=draft_info,
@@ -127,7 +134,7 @@ class TestDeepEPSpecIdlePadding(CustomTestCase):
                 )
             )
 
-    def test_only_mixed_active_idle_verify_requires_lockstep(self):
+    def test_only_mixed_active_idle_spec_requires_lockstep(self):
         batch = SimpleNamespace(
             forward_mode=ForwardMode.TARGET_VERIFY,
             spec_algorithm=SimpleNamespace(is_eagle=lambda: True),
@@ -135,6 +142,10 @@ class TestDeepEPSpecIdlePadding(CustomTestCase):
             dp_padding_mode=DpPaddingMode.MAX_LEN,
             original_global_num_tokens_cpu=[0, 1, 0, 0],
         )
+        self.assertTrue(requires_symmetric_spec_deepep_lockstep(batch))
+
+        batch.forward_mode = ForwardMode.DECODE
+        batch.spec_info = SimpleNamespace(is_draft_input=lambda: True)
         self.assertTrue(requires_symmetric_spec_deepep_lockstep(batch))
 
         batch.original_global_num_tokens_cpu = [1, 1, 1, 1]
