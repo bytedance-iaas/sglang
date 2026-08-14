@@ -10,6 +10,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     _should_force_symmetric_spec_deepep_padding,
     _should_materialize_idle_target_verify,
+    requires_symmetric_spec_deepep_lockstep,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -125,6 +126,21 @@ class TestDeepEPSpecIdlePadding(CustomTestCase):
                     global_num_tokens=[0, 1, 1, 0, 0, 0, 0, 0],
                 )
             )
+
+    def test_only_mixed_active_idle_verify_requires_lockstep(self):
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            spec_algorithm=SimpleNamespace(is_eagle=lambda: True),
+            spec_info=SimpleNamespace(is_draft_input=lambda: False),
+            dp_padding_mode=DpPaddingMode.MAX_LEN,
+            original_global_num_tokens_cpu=[0, 1, 0, 0],
+        )
+        self.assertTrue(requires_symmetric_spec_deepep_lockstep(batch))
+
+        batch.original_global_num_tokens_cpu = [1, 1, 1, 1]
+        self.assertFalse(requires_symmetric_spec_deepep_lockstep(batch))
+        batch.original_global_num_tokens_cpu = [0, 0, 0, 0]
+        self.assertFalse(requires_symmetric_spec_deepep_lockstep(batch))
 
 
 if __name__ == "__main__":
