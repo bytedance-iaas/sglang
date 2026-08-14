@@ -14,7 +14,7 @@ from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa:
 from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
     SchedulerPPMixin,
     _pp_attention_dp_control_ranks,
-    _pp_fence_scheduler_iteration,
+    _pp_fence_scheduler_phase,
 )
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -143,8 +143,8 @@ class TestPPCPRankOffsets(unittest.TestCase):
         with patch(
             "sglang.srt.managers.scheduler_pp_mixin.torch.distributed.barrier"
         ) as barrier:
-            _pp_fence_scheduler_iteration(fence_group)
-            _pp_fence_scheduler_iteration(None)
+            _pp_fence_scheduler_phase(fence_group)
+            _pp_fence_scheduler_phase(None)
 
         barrier.assert_called_once_with(group=fence_group)
 
