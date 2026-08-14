@@ -57,6 +57,7 @@ class TestDeepEPSpecIdlePadding(CustomTestCase):
                 batch,
                 sync_info,
                 require_mlp_tp_gather=False,
+                draft_require_mlp_tp_gather=None,
             )
 
         self.assertEqual(batch.global_num_tokens, [6, 0, 6, 6])
@@ -72,6 +73,7 @@ class TestDeepEPSpecIdlePadding(CustomTestCase):
                 batch,
                 sync_info,
                 require_mlp_tp_gather=False,
+                draft_require_mlp_tp_gather=None,
             )
 
         self.assertEqual(batch.global_num_tokens, [0])
