@@ -119,6 +119,51 @@ def test_pp_control_ring_last_stage_returns_typed_noop():
     assert _pp_unpack_control_ring_message(originated, "release") == (False, None)
 
 
+def test_pp_linear_payload_is_forwarded_before_following_control_phase():
+    events = []
+    previous_work = [object()]
+    next_work = [object()]
+    scheduler = SimpleNamespace(
+        pp_group=SimpleNamespace(is_last_rank=False),
+        _pp_commit_comm_work=Mock(
+            side_effect=lambda work: events.append(("commit", work))
+        ),
+        _pp_send_pyobj_to_next_stage=Mock(
+            side_effect=lambda payload, async_send: events.append(
+                ("send", payload, async_send)
+            )
+            or next_work
+        ),
+    )
+
+    result = SchedulerPPMixin._pp_forward_stage_payload(
+        scheduler, previous_work, ["request"]
+    )
+
+    assert result is next_work
+    assert events == [
+        ("commit", previous_work),
+        ("send", ["request"], True),
+    ]
+
+
+def test_pp_last_stage_consumes_linear_payload_without_forwarding():
+    previous_work = [object()]
+    scheduler = SimpleNamespace(
+        pp_group=SimpleNamespace(is_last_rank=True),
+        _pp_commit_comm_work=Mock(),
+        _pp_send_pyobj_to_next_stage=Mock(),
+    )
+
+    result = SchedulerPPMixin._pp_forward_stage_payload(
+        scheduler, previous_work, ["request"]
+    )
+
+    assert result == []
+    scheduler._pp_commit_comm_work.assert_called_once_with(previous_work)
+    scheduler._pp_send_pyobj_to_next_stage.assert_not_called()
+
+
 def test_pp_prefill_rebuilds_one_authoritative_draft_input():
     topk_p = torch.randn(2, 1)
     topk_index = torch.tensor([[3], [7]], dtype=torch.int64)
