@@ -151,14 +151,14 @@ def test_head_sliced_transfer_pairs_target_and_draft_by_peer_layer_ids():
     manager = SimpleNamespace(
         kv_args=SimpleNamespace(
             engine_rank=0,
-            kv_item_lens=[16, 16, 16],
+            kv_item_lens=[32, 32, 32],
             page_size=1,
-            total_kv_head_num=2,
+            total_kv_head_num=16,
             kv_head_num=2,
             kv_data_ptrs=[100, 200, 300],
             kv_layer_ids=[7, 31, 60],
         ),
-        attn_tp_size=1,
+        attn_tp_size=8,
         pp_size=2,
         engine=_RecordingEngine(),
     )
@@ -173,7 +173,7 @@ def test_head_sliced_transfer_pairs_target_and_draft_by_peer_layer_ids():
             dst_kv_ptrs=dst_ptrs,
             dst_kv_indices=np.array([0], dtype=np.int32),
             dst_tp_rank=0,
-            dst_attn_tp_size=2,
+            dst_attn_tp_size=16,
             dst_kv_item_len=16,
             executor=executor,
             dst_layer_ids=dst_ids,
@@ -181,9 +181,9 @@ def test_head_sliced_transfer_pairs_target_and_draft_by_peer_layer_ids():
 
     assert rc == 0
     assert sorted(manager.engine.transfers) == [
-        (100, 2000, 8),
-        (200, 3000, 8),
-        (300, 5000, 8),
+        (100, 2000, 16),
+        (200, 3000, 16),
+        (300, 5000, 16),
     ]
 
 
