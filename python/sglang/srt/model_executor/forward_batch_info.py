@@ -585,6 +585,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Gate for reusing the first MTP draft step's indexer topk across steps;
     # the carried topk lives on spec_info (see EagleDraftInput.dsa_topk_indices).
     reuse_dsa_topk_indices: Optional[bool] = False
+    # Sparse EAGLE + DeepEP ranks may carry one synthetic draft row solely to
+    # enter the same MoE collectives as active peers. It has no request KV and
+    # must not run DSA attention.
+    symmetric_spec_deepep_dummy: bool = False
 
     minimax_m3_precached_sparse_layers: Optional[Set[int]] = None
 
