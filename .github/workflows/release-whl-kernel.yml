@@ -28,12 +28,107 @@ on:
         description: "PR number to build from (e.g. 12345)"
         type: string
         required: false
+  # Reusable entry point for the DeepSeek V4 nightly (defined on ep_main). The
+  # nightly checks out this branch's source, so the build logic that follows the
+  # sgl-kernel/ layout must live here and be versioned with the source, instead
+  # of ep_main chasing this branch's directory structure.
+  workflow_call:
+    inputs:
+      checkout_ref:
+        description: "Git ref to build from"
+        required: true
+        type: string
+      python_version:
+        description: "Python version passed to sgl-kernel/build.sh"
+        required: false
+        type: string
+        default: "3.10"
+      cuda_version:
+        description: "CUDA version passed to sgl-kernel/build.sh"
+        required: true
+        type: string
+      arch:
+        description: "Optional architecture override passed to sgl-kernel/build.sh"
+        required: false
+        type: string
+        default: ""
+      artifact_name:
+        description: "Uploaded artifact name"
+        required: true
+        type: string
+      runner:
+        description: "Runner label for the wheel build"
+        required: false
+        type: string
+        default: "x64-kernel-build-node"
+      build_jobs:
+        description: "BUILD_JOBS passed to sgl-kernel/build.sh"
+        required: false
+        type: string
+        default: "64"
+      nvcc_threads:
+        description: "NVCC_THREADS passed to sgl-kernel/build.sh"
+        required: false
+        type: string
+        default: "8"
+      use_ccache:
+        description: "USE_CCACHE passed to sgl-kernel/build.sh"
+        required: false
+        type: string
+        default: "1"
 
 concurrency:
-  group: release-sglang-kernels-${{ github.ref }}
+  group: release-sglang-kernels-${{ github.ref }}-${{ inputs.artifact_name || github.event.inputs.target || 'standalone' }}
   cancel-in-progress: true
 
 jobs:
+  # workflow_call entry point for the DeepSeek V4 nightly. Runs only when invoked
+  # with an artifact_name (i.e. via workflow_call); the on-branch push/dispatch
+  # matrix jobs below leave inputs.artifact_name empty and are unaffected.
+  build-wheel:
+    if: ${{ inputs.artifact_name != '' }}
+    runs-on: ${{ inputs.runner }}
+    steps:
+      # Self-hosted build nodes retain the workspace across jobs. Prior builds
+      # leave root-owned artifacts under sgl-kernel/build/ that actions/checkout
+      # cannot remove, causing EACCES on rmdir. Wipe them via a throwaway root
+      # container before checkout recreates the workspace.
+      - name: Clean workspace (remove root-owned files from prior runs)
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
+            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: "recursive"
+          ref: ${{ inputs.checkout_ref || github.ref }}
+
+      - name: Set up Python ${{ inputs.python_version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Build wheels
+        run: |
+          cd sgl-kernel
+          chmod +x ./build.sh
+          if [ -n "${{ inputs.arch }}" ]; then
+            ./build.sh "${{ inputs.python_version }}" "${{ inputs.cuda_version }}" "${{ inputs.arch }}"
+          else
+            ./build.sh "${{ inputs.python_version }}" "${{ inputs.cuda_version }}"
+          fi
+        env:
+          BUILD_JOBS: ${{ inputs.build_jobs }}
+          NVCC_THREADS: ${{ inputs.nvcc_threads }}
+          USE_CCACHE: ${{ inputs.use_ccache }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: sgl-kernel/dist/*
+          if-no-files-found: error
+
   # cu130 is the PyPI-released variant; cu129 wheels are published only to the
   # sgl-project/whl index (consumed via `pip install ...+cu129` for the legacy
   # cuda 12.9 path), not to PyPI.
