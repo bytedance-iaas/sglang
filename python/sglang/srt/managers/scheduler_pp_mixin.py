@@ -63,8 +63,8 @@ def _pp_attention_dp_control_ranks(ps, tp_ranks: List[int]) -> List[int]:
     return tp_ranks[group_start:group_end]
 
 
-def _pp_fence_scheduler_iteration(group) -> None:
-    """Fence PP scheduler iterations on a control-only process group."""
+def _pp_fence_scheduler_phase(group) -> None:
+    """Fence PP scheduler phases on a control-only process group."""
     if group is not None:
         torch.distributed.barrier(group=group)
 
@@ -408,7 +408,7 @@ class SchedulerPPMixin:
                 # dedicated group keeps those iterations aligned without
                 # allowing this fence to pair with request, cache, or transfer
                 # collectives on the attention TP/CP groups.
-                _pp_fence_scheduler_iteration(self.pp_disagg_scheduler_fence_group)
+                _pp_fence_scheduler_phase(self.pp_disagg_scheduler_fence_group)
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
@@ -429,10 +429,12 @@ class SchedulerPPMixin:
                 bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
                 bmbs[mb_id] = bootstrapped_rids
                 self._pp_commit_comm_work(send_bootstrapped_work)
+                _pp_fence_scheduler_phase(self.pp_disagg_scheduler_fence_group)
 
                 transferred_rids = self._pp_pd_get_prefill_transferred_ids()
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
+                _pp_fence_scheduler_phase(self.pp_disagg_scheduler_fence_group)
 
                 self.process_prefill_chunk(
                     last_batch=self.last_batch, running_batch=self.running_batch
@@ -1102,12 +1104,18 @@ class SchedulerPPMixin:
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
         # communicate pre-consensus bootstrapp reqs
         if self.pp_group.is_first_rank:
+            _pp_fence_scheduler_phase(self.pp_disagg_scheduler_fence_group)
             good_bootstrapped_rids, bad_bootstrapped_rids = (
                 self.disagg_prefill_bootstrap_queue.get_ready_bootstrapped_rids_for_pp()
             )
         else:
             # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
             prev_bootstrapped_rids = self._pp_recv_pyobj_from_prev_stage()
+            # PP leaders block on the inter-stage receive while their attention
+            # peers only participate in the local broadcast. Fence on the
+            # control-only group before any rank enters the bootstrap poll
+            # all-reduce on the shared attention group.
+            _pp_fence_scheduler_phase(self.pp_disagg_scheduler_fence_group)
             prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
                 prev_bootstrapped_rids
             )
