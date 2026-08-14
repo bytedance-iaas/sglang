@@ -532,6 +532,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # query just like an active DP rank.
             forward_batch._original_forward_mode = forward_batch.forward_mode
             forward_batch.forward_mode = ForwardMode.DECODE
+            forward_batch.symmetric_spec_deepep_dummy = True
             forward_batch.batch_size = 1
             forward_batch._pad_inputs_to_size(self.draft_runner, 1, 1)
             forward_batch.out_cache_loc = forward_batch.out_cache_loc.new_zeros(
