@@ -1,5 +1,6 @@
 """Regression tests for PP-prefill hybrid KV transfer with speculative KV."""
 
+import concurrent.futures
 from types import SimpleNamespace
 
 import numpy as np
@@ -11,6 +12,7 @@ from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
     build_transfer_entry_pairs,
 )
+from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
 
@@ -134,3 +136,58 @@ def test_mooncake_prefers_exact_ids_over_positional_mha_slicing():
     ]
     assert rc == 0
     assert manager.blocks == expected
+
+
+class _RecordingEngine:
+    def __init__(self):
+        self.transfers = []
+
+    def batch_transfer_sync(self, session, src, dst, lengths):
+        self.transfers.append((src[0], dst[0], lengths[0]))
+        return 0
+
+
+def test_head_sliced_transfer_pairs_target_and_draft_by_peer_layer_ids():
+    manager = SimpleNamespace(
+        kv_args=SimpleNamespace(
+            engine_rank=0,
+            kv_item_lens=[16, 16, 16],
+            page_size=1,
+            total_kv_head_num=2,
+            kv_head_num=2,
+            kv_data_ptrs=[100, 200, 300],
+            kv_layer_ids=[7, 31, 60],
+        ),
+        attn_tp_size=1,
+        pp_size=2,
+        engine=_RecordingEngine(),
+    )
+    dst_ptrs = [1000, 2000, 3000, 4000, 5000]
+    dst_ids = [3, 7, 31, 47, 60]
+
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        rc = MooncakeKVManager.send_kvcache_slice(
+            manager,
+            mooncake_session_id="session",
+            prefill_kv_indices=np.array([0], dtype=np.int32),
+            dst_kv_ptrs=dst_ptrs,
+            dst_kv_indices=np.array([0], dtype=np.int32),
+            dst_tp_rank=0,
+            dst_attn_tp_size=2,
+            dst_kv_item_len=16,
+            executor=executor,
+            dst_layer_ids=dst_ids,
+        )
+
+    assert rc == 0
+    assert sorted(manager.engine.transfers) == [
+        (100, 2000, 8),
+        (200, 3000, 8),
+        (300, 5000, 8),
+    ]
+
+
+def test_single_stage_draft_ignores_target_pp_partition(monkeypatch):
+    monkeypatch.setenv("SGLANG_PP_LAYER_PARTITION", "30,30")
+
+    assert get_pp_indices(num_hidden_layers=60, pp_rank=0, pp_size=1) == (0, 60)
