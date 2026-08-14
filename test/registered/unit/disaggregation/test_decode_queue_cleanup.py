@@ -250,7 +250,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         self.assertEqual(scheduler.hisparse_direct_admission_capacity(), 2)
 
-    def test_hisparse_direct_admission_capacity_sums_shared_allocator_demand(self):
+    def test_hisparse_direct_admission_capacity_counts_mirrored_slot_once(self):
         scheduler = Scheduler.__new__(Scheduler)
         shared_physical_allocator = SimpleNamespace(
             available_size=MagicMock(return_value=18_624)
@@ -268,8 +268,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.hisparse_coordinator = coordinator(6_208)
         scheduler.draft_hisparse_coordinator = coordinator(6_208)
 
-        # One request consumes two buffers from the same physical pool.
-        self.assertEqual(scheduler.hisparse_direct_admission_capacity(), 1)
+        # Target and draft mirror one numerical slot namespace. Their KV tensors
+        # are distinct, but a shared allocator must reserve the slot only once.
+        self.assertEqual(scheduler.hisparse_direct_admission_capacity(), 3)
         shared_physical_allocator.available_size.assert_called_once_with()
 
     def test_retracted_decode_requests_keep_scheduler_non_idle(self):

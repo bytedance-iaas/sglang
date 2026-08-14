@@ -37,7 +37,7 @@ class TestDSAPaddedTokens(CustomTestCase):
                 return_value=_PerRankPadding(),
             ),
             patch(
-                "sglang.srt.layers.utils.cp_utils.get_cp_padding_align_size",
+                "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
                 return_value=1,
             ),
         ):
