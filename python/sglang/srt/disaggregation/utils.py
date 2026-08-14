@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import random
 from collections import deque
@@ -71,6 +72,38 @@ def get_dsa_seed_metadata_dim(hf_config) -> int:
     if not getattr(hf_config, "index_share_for_mtp_iteration", False):
         return 0
     return get_dsa_index_topk(hf_config)
+
+
+def summarize_dsa_topk_seed(seed: Optional[torch.Tensor]) -> str:
+    """Return a compact, deterministic seed summary for opt-in diagnostics."""
+    if seed is None:
+        return "none"
+    flat = seed.detach().reshape(-1).to(device="cpu", dtype=torch.int64)
+    if flat.numel() == 0:
+        return f"shape={tuple(seed.shape)} dtype={seed.dtype} empty"
+    digest = hashlib.sha256(flat.numpy().tobytes()).hexdigest()[:16]
+    sample_width = min(4, flat.numel())
+    head = flat[:sample_width].tolist()
+    tail = flat[-sample_width:].tolist()
+    return (
+        f"shape={tuple(seed.shape)} dtype={seed.dtype} "
+        f"min={flat.min().item()} max={flat.max().item()} "
+        f"negative={(flat < 0).sum().item()} sha256={digest} "
+        f"head={head} tail={tail}"
+    )
+
+
+def summarize_pd_bootstrap_tensor(value: Optional[torch.Tensor]) -> str:
+    """Return an exact byte-level summary for opt-in PD EAGLE diagnostics."""
+    if value is None:
+        return "none"
+    contiguous = value.detach().contiguous().to(device="cpu")
+    flat = contiguous.view(torch.uint8).reshape(-1)
+    digest = hashlib.sha256(flat.numpy().tobytes()).hexdigest()[:16]
+    return (
+        f"shape={tuple(value.shape)} dtype={value.dtype} "
+        f"nbytes={value.nbytes} sha256={digest}"
+    )
 
 
 def is_dsv4_c128_online_enabled() -> bool:
