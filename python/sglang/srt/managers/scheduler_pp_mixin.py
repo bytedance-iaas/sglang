@@ -331,6 +331,9 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
+                    # Keep prep and process on the same live slot object: the
+                    # disagg-prefill MTP path installs one authoritative
+                    # EagleDraftInput on both batch and result.
                     d2h_event.synchronize()
                     self._pp_process_batch_result(
                         self.mbs[next_mb_id],
@@ -1055,9 +1058,7 @@ class SchedulerPPMixin:
             # the request metadata sent to the decode group.
             draft_input = result.next_draft_input
             tensor_dict["spec_prefill_topk_p"] = draft_input.topk_p.contiguous()
-            tensor_dict["spec_prefill_topk_index"] = (
-                draft_input.topk_index.contiguous()
-            )
+            tensor_dict["spec_prefill_topk_index"] = draft_input.topk_index.contiguous()
             tensor_dict["spec_prefill_hidden_states"] = (
                 draft_input.hidden_states.contiguous()
             )
