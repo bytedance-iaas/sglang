@@ -228,9 +228,7 @@ class PrefillBootstrapQueue:
             else getattr(self.token_to_kv_pool, "end_layer", None)
         )
 
-        draft_kv_pool = (
-            self.draft_token_to_kv_pool if transfer_draft_cache else None
-        )
+        draft_kv_pool = self.draft_token_to_kv_pool if transfer_draft_cache else None
         num_draft_entries = 0
         if draft_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are

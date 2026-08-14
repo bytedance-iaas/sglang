@@ -30,12 +30,13 @@ def _hybrid_pool(*, start_layer=0, layer_ids=None):
 def test_hybrid_stage_start_is_full_attention_relative():
     cfg = SimpleNamespace(full_attention_layer_ids=_full_attention_ids())
 
-    assert _transfer_start_layer(
-        pool=_hybrid_pool(start_layer=30), hf_text_config=cfg
-    ) == 7
-    assert _transfer_start_layer(
-        pool=_hybrid_pool(start_layer=0), hf_text_config=cfg
-    ) == 0
+    assert (
+        _transfer_start_layer(pool=_hybrid_pool(start_layer=30), hf_text_config=cfg)
+        == 7
+    )
+    assert (
+        _transfer_start_layer(pool=_hybrid_pool(start_layer=0), hf_text_config=cfg) == 0
+    )
 
 
 def test_draft_entries_use_reserved_layer_band():
@@ -122,8 +123,7 @@ def test_mooncake_prefers_exact_ids_over_positional_mha_slicing():
     )
 
     expected = [
-        (src_ptrs[i], dst_ptrs[7 + i], item_lens[i])
-        for i in range(len(stage_ids))
+        (src_ptrs[i], dst_ptrs[7 + i], item_lens[i]) for i in range(len(stage_ids))
     ] + [
         (
             src_ptrs[len(stage_ids) + i],
