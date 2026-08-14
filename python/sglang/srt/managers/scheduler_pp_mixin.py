@@ -48,6 +48,8 @@ _PP_DISAGG_SCHEDULER_FENCE_PHASES = (
     "bootstrap_poll",
     "bootstrap_done",
     "transfer_done",
+    "prefill_plan_done",
+    "mlp_sync_done",
 )
 
 if TYPE_CHECKING:
@@ -455,7 +457,13 @@ class SchedulerPPMixin:
                 prefill_plan = self.get_new_batch_prefill(self.running_batch)
                 batch = prefill_plan.batch_to_run
                 self.running_batch = prefill_plan.running_batch
+                _pp_fence_scheduler_phase(
+                    self.pp_disagg_scheduler_fence_groups["prefill_plan_done"]
+                )
                 batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
+                _pp_fence_scheduler_phase(
+                    self.pp_disagg_scheduler_fence_groups["mlp_sync_done"]
+                )
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
