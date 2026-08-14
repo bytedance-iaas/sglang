@@ -141,8 +141,8 @@ class TestDeepEPSpecIdlePadding(CustomTestCase):
             dp_padding_mode=DpPaddingMode.MAX_LEN,
             original_global_num_tokens_cpu=[0, 1, 0, 0],
         )
-        active_extend_batch = SimpleNamespace(
-            forward_mode=ForwardMode.EXTEND, **shared
+        active_draft_extend_batch = SimpleNamespace(
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2, **shared
         )
         dummy_decode_batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
@@ -152,14 +152,16 @@ class TestDeepEPSpecIdlePadding(CustomTestCase):
             forward_mode=ForwardMode.TARGET_VERIFY, **shared
         )
 
-        self.assertTrue(requires_symmetric_spec_deepep_lockstep(active_extend_batch))
+        self.assertTrue(
+            requires_symmetric_spec_deepep_lockstep(active_draft_extend_batch)
+        )
         self.assertTrue(requires_symmetric_spec_deepep_lockstep(dummy_decode_batch))
         self.assertTrue(requires_symmetric_spec_deepep_lockstep(target_verify_batch))
 
         for unsupported_mode in (
             ForwardMode.MIXED,
             ForwardMode.IDLE,
-            ForwardMode.DRAFT_EXTEND_V2,
+            ForwardMode.EXTEND,
             ForwardMode.PREBUILT,
             ForwardMode.SPLIT_PREFILL,
             ForwardMode.DLLM_EXTEND,
@@ -169,10 +171,14 @@ class TestDeepEPSpecIdlePadding(CustomTestCase):
             )
             self.assertFalse(requires_symmetric_spec_deepep_lockstep(unsupported_batch))
 
-        active_extend_batch.original_global_num_tokens_cpu = [1, 1, 1, 1]
-        self.assertFalse(requires_symmetric_spec_deepep_lockstep(active_extend_batch))
-        active_extend_batch.original_global_num_tokens_cpu = [0, 0, 0, 0]
-        self.assertFalse(requires_symmetric_spec_deepep_lockstep(active_extend_batch))
+        active_draft_extend_batch.original_global_num_tokens_cpu = [1, 1, 1, 1]
+        self.assertFalse(
+            requires_symmetric_spec_deepep_lockstep(active_draft_extend_batch)
+        )
+        active_draft_extend_batch.original_global_num_tokens_cpu = [0, 0, 0, 0]
+        self.assertFalse(
+            requires_symmetric_spec_deepep_lockstep(active_draft_extend_batch)
+        )
 
 
 if __name__ == "__main__":
