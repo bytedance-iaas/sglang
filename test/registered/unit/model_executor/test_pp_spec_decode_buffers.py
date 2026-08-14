@@ -4,11 +4,22 @@ import unittest
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner.base_runner import _allocate_decode_buffers
 from sglang.srt.model_executor.runner_utils.buffers import DecodeInputBuffers
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+
+class TestPPSpecEnvironment(unittest.TestCase):
+    def test_gate_is_registered_and_disabled_by_default(self):
+        envs.SGLANG_ENABLE_PP_SPEC.clear()
+        self.assertFalse(envs.SGLANG_ENABLE_PP_SPEC.get())
+
+    def test_gate_parses_explicit_opt_in(self):
+        with envs.SGLANG_ENABLE_PP_SPEC.override("1"):
+            self.assertTrue(envs.SGLANG_ENABLE_PP_SPEC.get())
 
 
 class TestPPSpecDecodeBuffers(unittest.TestCase):
