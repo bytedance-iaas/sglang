@@ -95,6 +95,23 @@ def _elastic_should_preserve_local_token_counts(
     return uneven_token_count
 
 
+def _should_materialize_idle_target_verify(
+    *,
+    forward_mode: ForwardMode,
+    spec_info: Optional[SpecInput],
+    dp_padding_mode: DpPaddingMode,
+    num_tokens: int,
+) -> bool:
+    """Whether an idle speculative rank needs real rows for symmetric MoE A2A."""
+    return (
+        forward_mode.is_idle()
+        and dp_padding_mode.is_max_len()
+        and num_tokens > 0
+        and spec_info is not None
+        and not spec_info.is_draft_input()
+    )
+
+
 class ForwardMode(IntEnum):
     # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
     # It is also called "prefill" in common terminology.
@@ -1338,10 +1355,22 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 hybrid_ssm
                 and self.spec_info is not None
                 and not self.spec_info.is_draft_input()
+            ) or _should_materialize_idle_target_verify(
+                forward_mode=self.forward_mode,
+                spec_info=self.spec_info,
+                dp_padding_mode=dp_padding_mode,
+                num_tokens=num_tokens,
             ):
                 if self.forward_mode.is_idle():
                     self._original_forward_mode = self.forward_mode
                     self.forward_mode = ForwardMode.TARGET_VERIFY
+                    # DeepEP low-latency must dispatch a real dummy row here.
+                    # Leaving this at the original zero marks every padded top-k
+                    # row invalid, recreating the zero-token handshake that the
+                    # symmetric padding is meant to avoid.
+                    if self.num_token_non_padded is not None:
+                        self.num_token_non_padded.fill_(num_tokens)
+                    self.num_token_non_padded_cpu = num_tokens
                 # Invert the spec_scale_global_num_tokens scaling.
                 bs = self.batch_size = num_tokens // self.spec_info.num_tokens_per_req
             elif self.is_extend_in_batch and dp_padding_mode.is_max_len():
