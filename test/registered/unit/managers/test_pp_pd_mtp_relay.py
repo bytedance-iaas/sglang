@@ -3,12 +3,15 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt import envs
 from sglang.srt.disaggregation.utils import MetadataBuffers
 from sglang.srt.managers.scheduler_pp_mixin import (
     PPBatchMetadata,
     SchedulerPPMixin,
+    _pp_can_skip_output_comm,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec_from_config,
 )
@@ -34,6 +37,21 @@ class _ProxyOutputs:
 
     def __getitem__(self, key):
         return self.tensors[key]
+
+
+def test_mtp_middle_chunk_skips_unused_pp_output_ring():
+    batch = SimpleNamespace(
+        spec_algorithm=_SpecAlgorithm(),
+        forward_mode=ForwardMode.EXTEND,
+        reqs=[SimpleNamespace(rid="r0")],
+        contains_last_prefill_chunk=False,
+        return_logprob=False,
+    )
+
+    with patch.object(
+        envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM, "get", return_value=True
+    ):
+        assert _pp_can_skip_output_comm(batch)
 
 
 def test_pp_prefill_rebuilds_one_authoritative_draft_input():
