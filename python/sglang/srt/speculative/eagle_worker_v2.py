@@ -41,6 +41,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    _should_force_symmetric_spec_deepep_padding,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner import (
@@ -515,6 +516,27 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.topk,
             self.speculative_num_steps,
         )
+        if (
+            forward_batch.forward_mode.is_idle()
+            and forward_batch.original_global_num_tokens_cpu is not None
+            and _should_force_symmetric_spec_deepep_padding(
+                spec_algorithm=forward_batch.spec_algorithm,
+                spec_info=forward_batch.spec_info,
+                is_extend_in_batch=forward_batch.is_extend_in_batch,
+                global_num_tokens=forward_batch.original_global_num_tokens_cpu,
+            )
+        ):
+            # Give DSA one real dummy request before its eager metadata is
+            # planned. The later MLP-sync pass may align the token buffer to
+            # attn_tp_size, but DSA still operates on this single rank-local
+            # query just like an active DP rank.
+            forward_batch._original_forward_mode = forward_batch.forward_mode
+            forward_batch.forward_mode = ForwardMode.DECODE
+            forward_batch.batch_size = 1
+            forward_batch._pad_inputs_to_size(self.draft_runner, 1, 1)
+            if forward_batch.num_token_non_padded is not None:
+                forward_batch.num_token_non_padded.fill_(1)
+            forward_batch.num_token_non_padded_cpu = 1
         if (
             can_run_decode_cuda_graph
             and not forward_batch.forward_mode.is_idle()
@@ -1271,15 +1293,31 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 capture_hidden_mode=capture_mode,
                 vocab_size=self.target_worker.model_config.vocab_size,
             )
-            with (
-                self.draft_worker.draft_tp_context(
-                    self.draft_worker.draft_runner.tp_group
-                ),
-                speculative_moe_backend_context(),
-                speculative_moe_a2a_backend_context(),
-                spec_stage_span("draft"),
+            if (
+                batch.global_num_tokens is not None
+                and _should_force_symmetric_spec_deepep_padding(
+                    spec_algorithm=batch.spec_algorithm,
+                    spec_info=batch.spec_info,
+                    is_extend_in_batch=batch.is_extend_in_batch,
+                    global_num_tokens=batch.global_num_tokens,
+                )
             ):
-                verify_input = self.draft_worker.draft(batch)
+                with (
+                    self.draft_worker.draft_tp_context(
+                        self.draft_worker.draft_runner.tp_group
+                    ),
+                    speculative_moe_backend_context(),
+                    speculative_moe_a2a_backend_context(),
+                    spec_stage_span("draft"),
+                ):
+                    verify_input = self.draft_worker.draft(batch)
+            else:
+                verify_input = EagleVerifyInput.create_idle_input(
+                    self.topk,
+                    self.speculative_num_steps,
+                    self.speculative_num_draft_tokens,
+                    device=self.device,
+                )
         elif self._pp_enabled:
             # Under PP the verify input is built from the raw draft tree relayed
             # from the last PP rank of the previous iteration.
