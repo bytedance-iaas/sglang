@@ -112,6 +112,33 @@ def _should_materialize_idle_target_verify(
     )
 
 
+def _should_force_symmetric_spec_deepep_padding(
+    *,
+    spec_algorithm: Optional[SpeculativeAlgorithm],
+    spec_info: Optional[SpecInput],
+    is_extend_in_batch: bool,
+    global_num_tokens: List[int],
+) -> bool:
+    """Keep EAGLE verify ranks in one DeepEP low-latency handshake geometry."""
+    if (
+        spec_algorithm is None
+        or not spec_algorithm.is_eagle()
+        or spec_info is None
+        or spec_info.is_draft_input()
+        or len(global_num_tokens) <= 1
+        or min(global_num_tokens) > 0
+        or max(global_num_tokens) == 0
+    ):
+        return False
+
+    from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
+
+    return (
+        get_moe_a2a_backend().is_deepep()
+        and get_deepep_mode().resolve(is_extend_in_batch).is_low_latency()
+    )
+
+
 class ForwardMode(IntEnum):
     # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
     # It is also called "prefill" in common terminology.
@@ -1276,6 +1303,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
         )
+        if _should_force_symmetric_spec_deepep_padding(
+            spec_algorithm=self.spec_algorithm,
+            spec_info=self.spec_info,
+            is_extend_in_batch=self.is_extend_in_batch,
+            global_num_tokens=global_num_tokens,
+        ):
+            # The generic cost heuristic chooses SUM_LEN when only a few DP
+            # ranks are active.  DeepEP low-latency target verification cannot
+            # use that sparse geometry: zero-token ranks finish locally while
+            # active peers wait for their device-side handshake.
+            dp_padding_mode = DpPaddingMode.MAX_LEN
         if _elastic_should_preserve_local_token_counts(
             model_runner=model_runner,
             dp_padding_mode=dp_padding_mode,

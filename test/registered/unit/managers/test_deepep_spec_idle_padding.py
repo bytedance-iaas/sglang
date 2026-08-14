@@ -8,6 +8,7 @@ from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.managers.scheduler_components.dp_attn import _update_gather_batch
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
+    _should_force_symmetric_spec_deepep_padding,
     _should_materialize_idle_target_verify,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -98,6 +99,30 @@ class TestDeepEPSpecIdlePadding(CustomTestCase):
                     spec_info=spec_info,
                     dp_padding_mode=padding,
                     num_tokens=num_tokens,
+                )
+            )
+
+    def test_sparse_eagle_verify_forces_symmetric_deepep_padding(self):
+        algorithm = SimpleNamespace(is_eagle=lambda: True)
+        verify_info = SimpleNamespace(is_draft_input=lambda: False)
+        draft_info = SimpleNamespace(is_draft_input=lambda: True)
+        backend_patch, mode_patch = _deepep_low_latency_patches()
+
+        with backend_patch, mode_patch:
+            self.assertTrue(
+                _should_force_symmetric_spec_deepep_padding(
+                    spec_algorithm=algorithm,
+                    spec_info=verify_info,
+                    is_extend_in_batch=False,
+                    global_num_tokens=[0, 6, 6, 0, 0, 0, 0, 0],
+                )
+            )
+            self.assertFalse(
+                _should_force_symmetric_spec_deepep_padding(
+                    spec_algorithm=algorithm,
+                    spec_info=draft_info,
+                    is_extend_in_batch=False,
+                    global_num_tokens=[0, 1, 1, 0, 0, 0, 0, 0],
                 )
             )
 
