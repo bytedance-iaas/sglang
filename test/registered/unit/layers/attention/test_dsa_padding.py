@@ -19,6 +19,7 @@ class TestDSAPaddedTokens(CustomTestCase):
         forward_batch = SimpleNamespace(
             global_num_tokens_cpu=[4],
             is_extend_in_batch=False,
+            dp_padding_mode=_PerRankPadding(),
             forward_mode=SimpleNamespace(
                 is_context_parallel_extend=lambda: False,
             ),
@@ -31,11 +32,6 @@ class TestDSAPaddedTokens(CustomTestCase):
 
         with (
             patch.object(utils, "get_parallel", return_value=parallel),
-            patch.object(
-                utils.DpPaddingMode,
-                "get_dp_padding_mode",
-                return_value=_PerRankPadding(),
-            ),
             patch(
                 "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
                 return_value=1,
