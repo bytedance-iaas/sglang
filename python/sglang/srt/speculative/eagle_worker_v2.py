@@ -520,7 +520,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             and self.seed_dsa_topk_from_draft_extend
             and draft_input.dsa_topk_indices is None
         ):
-            can_run_decode_cuda_graph = False
+            # PD prefill does not run the draft model, so the first decode step
+            # has no DSA seed.  Falling back to eager only on the non-idle DP
+            # ranks would diverge from idle ranks that remain on the captured
+            # path, and the differently padded MoE collectives can deadlock.
+            # Keep every rank on the same graph path; the graph's zero seed is
+            # the existing representation for an absent first-step seed.
+            draft_input.dsa_topk_indices = torch.zeros(
+                (draft_input.hidden_states.shape[0], self.dsa_index_topk),
+                dtype=torch.int32,
+                device=draft_input.hidden_states.device,
+            )
 
         n_inner = self.speculative_num_steps - 1
         canary_outside_ctx = (

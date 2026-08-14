@@ -148,7 +148,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
 
-    def test_missing_seed_cuda_graph_fallback(self):
+    def test_missing_seed_keeps_cuda_graph_ranks_aligned(self):
         graph_result = (
             [],
             torch.zeros((1, 1), dtype=torch.long, device=DEVICE),
@@ -165,7 +165,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         )
 
         for seed_enabled, seed_present, expect_graph in (
-            (True, False, False),
+            (True, False, True),
             (True, True, True),
             (False, False, True),
         ):
@@ -182,10 +182,12 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 worker.topk = 1
                 worker.speculative_num_steps = 1
                 worker.speculative_num_draft_tokens = 2
+                worker.server_args = SimpleNamespace(pp_size=1)
                 worker.device = DEVICE
                 worker.tree_mask_mode = None
                 worker.seed_dsa_topk_from_draft_extend = seed_enabled
                 worker.index_share_for_mtp_iteration = True
+                worker.dsa_index_topk = 4
                 forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
                 worker.draft_forward = MagicMock(return_value=graph_result)
                 attn_backend = SimpleNamespace(
@@ -197,8 +199,9 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 )
                 draft_input = SimpleNamespace(
                     bonus_tokens=torch.zeros((1,), dtype=torch.long, device=DEVICE),
+                    hidden_states=torch.zeros((1, 8), device=DEVICE),
                     dsa_topk_indices=(
-                        torch.ones((1, 1), dtype=torch.int32, device=DEVICE)
+                        torch.ones((1, 4), dtype=torch.int32, device=DEVICE)
                         if seed_present
                         else None
                     ),
@@ -221,6 +224,14 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
 
                 self.assertEqual(worker.cuda_graph_runner.execute.called, expect_graph)
                 self.assertEqual(worker.draft_forward.called, not expect_graph)
+                if seed_enabled and not seed_present:
+                    self.assertEqual(
+                        tuple(draft_input.dsa_topk_indices.shape), (1, 4)
+                    )
+                    self.assertEqual(draft_input.dsa_topk_indices.dtype, torch.int32)
+                    self.assertEqual(
+                        torch.count_nonzero(draft_input.dsa_topk_indices).item(), 0
+                    )
 
     def test_preserves_initialized_backend_when_draft_extend_backend_is_unset(self):
         worker = object.__new__(EagleDraftWorker)
