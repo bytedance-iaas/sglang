@@ -9,6 +9,8 @@ from sglang.srt.managers.scheduler_pp_mixin import (
     PPBatchMetadata,
     SchedulerPPMixin,
     _pp_can_skip_output_comm,
+    _pp_pack_control_ring_message,
+    _pp_unpack_control_ring_message,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -48,6 +50,69 @@ def test_mtp_middle_chunk_skips_unused_pp_output_ring():
         envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM, "get", return_value=True
     ):
         assert _pp_can_skip_output_comm(batch)
+
+
+def test_pp_control_ring_forwards_valid_empty_payload():
+    events = []
+    payload = [[], []]
+    incoming = _pp_pack_control_ring_message("bootstrap", True, payload)
+    scheduler = SimpleNamespace(
+        pp_group=SimpleNamespace(is_last_rank=False),
+        _pp_recv_pyobj_from_prev_stage=Mock(
+            side_effect=lambda: events.append("recv") or incoming
+        ),
+        _pp_send_pyobj_to_next_stage=Mock(
+            side_effect=lambda message, async_send: events.append("send") or [object()]
+        ),
+        _pp_commit_comm_work=Mock(side_effect=lambda work: events.append("commit")),
+    )
+    process_payload = Mock(side_effect=lambda value: events.append("process") or value)
+
+    result = SchedulerPPMixin._pp_run_control_ring_phase(
+        scheduler,
+        phase="bootstrap",
+        origin_has_payload=False,
+        origin_payload=None,
+        process_payload=process_payload,
+    )
+
+    assert result == payload
+    assert events == ["recv", "process", "send", "commit"]
+    forwarded = scheduler._pp_send_pyobj_to_next_stage.call_args.args[0]
+    assert _pp_unpack_control_ring_message(forwarded, "bootstrap") == (
+        True,
+        payload,
+    )
+
+
+def test_pp_control_ring_last_stage_returns_typed_noop():
+    events = []
+    incoming = _pp_pack_control_ring_message("release", False, None)
+    scheduler = SimpleNamespace(
+        pp_group=SimpleNamespace(is_last_rank=True),
+        _pp_recv_pyobj_from_prev_stage=Mock(
+            side_effect=lambda: events.append("recv") or incoming
+        ),
+        _pp_send_pyobj_to_next_stage=Mock(
+            side_effect=lambda message, async_send: events.append("send") or [object()]
+        ),
+        _pp_commit_comm_work=Mock(side_effect=lambda work: events.append("commit")),
+    )
+    process_payload = Mock()
+
+    result = SchedulerPPMixin._pp_run_control_ring_phase(
+        scheduler,
+        phase="release",
+        origin_has_payload=False,
+        origin_payload=([], []),
+        process_payload=process_payload,
+    )
+
+    assert result is None
+    assert events == ["send", "recv", "commit"]
+    process_payload.assert_not_called()
+    originated = scheduler._pp_send_pyobj_to_next_stage.call_args.args[0]
+    assert _pp_unpack_control_ring_message(originated, "release") == (False, None)
 
 
 def test_pp_prefill_rebuilds_one_authoritative_draft_input():

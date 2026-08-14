@@ -6,7 +6,7 @@ import time
 from array import array
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -56,10 +56,33 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 PPTransferStatus = Tuple[List[str], List[str]]
-PPReleasePayload = Union[List[str], PPTransferStatus]
 PP_COMMITTED_RELEASE_CACHE_SIZE = 16384
 PP_PENDING_RELEASE_MAX_RIDS = 4096
 PP_PENDING_RELEASE_MAX_WAIT_SECONDS = 600
+PP_CONTROL_RING_MESSAGE_MARKER = "sglang_pp_control_ring_v1"
+
+
+def _pp_pack_control_ring_message(phase: str, has_payload: bool, payload):
+    return (
+        PP_CONTROL_RING_MESSAGE_MARKER,
+        phase,
+        has_payload,
+        payload if has_payload else None,
+    )
+
+
+def _pp_unpack_control_ring_message(message, expected_phase: str):
+    if (
+        not isinstance(message, tuple)
+        or len(message) != 4
+        or message[0] != PP_CONTROL_RING_MESSAGE_MARKER
+        or message[1] != expected_phase
+        or not isinstance(message[2], bool)
+    ):
+        raise RuntimeError(
+            f"Invalid PP control-ring message for phase {expected_phase}: {message!r}"
+        )
+    return message[2], message[3]
 
 
 def _pp_attention_dp_control_ranks(ps, tp_ranks: List[int]) -> List[int]:
@@ -397,17 +420,13 @@ class SchedulerPPMixin:
         # PD additional state initialization
         bmbs = [None] * self.pp_loop_size
         tmbs = [None] * self.pp_loop_size
-        consensus_bootstrapped_rids: Optional[List[str]] = None
         transferred_rids: PPTransferStatus = ([], [])
-        release_rids: Optional[PPTransferStatus] = None
         pending_release_status: Optional[PPTransferStatus] = None
         pending_release_first_seen_at: Dict[str, float] = {}
         committed_release_order: deque[str] = deque()
         committed_release_rids: set[str] = set()
         send_bootstrapped_work = []
         send_transfer_work = []
-        send_consensus_bootstrapped_work = []
-        send_release_work = []
 
         while True:
             server_is_idle = True
@@ -496,57 +515,26 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                # The last stage originates each consensus message before it
-                # waits for the message to complete the PP ring. Every other
-                # stage must receive that message before forwarding it. Sending
-                # a stale value before the receive deadlocks PP=2: the last
-                # stage waits for a forward that the first stage never posts.
-                if self.pp_group.is_last_rank:
-                    (
-                        send_consensus_bootstrapped_work,
-                        consensus_bootstrapped_rids,
-                    ) = self._pp_pd_send_consensus_bootstrapped_ids(
-                        bmbs,
-                        next_first_rank_mb_id,
-                        consensus_bootstrapped_rids,
-                        bootstrapped_rids,
-                    )
-                    send_release_work, release_rids = (
-                        self._pp_pd_send_consensus_release_ids(
-                            tmbs,
-                            next_first_rank_mb_id,
-                            release_rids,
-                            transferred_rids,
-                        )
-                    )
-
-                if bmbs[next_mb_id] is not None:
-                    next_consensus_bootstrapped_rids = (
-                        self._pp_recv_pyobj_from_prev_stage()
-                    )
-                    next_consensus_bootstrapped_rids = self.process_bootstrapped_queue(
-                        next_consensus_bootstrapped_rids
-                    )
-                    if not self.pp_group.is_last_rank:
-                        send_consensus_bootstrapped_work, _ = (
-                            self._pp_pd_send_consensus_bootstrapped_ids(
-                                bmbs,
-                                next_first_rank_mb_id,
-                                next_consensus_bootstrapped_rids,
-                                bootstrapped_rids,
-                            )
-                        )
-                self._pp_commit_comm_work(send_consensus_bootstrapped_work)
-                if tmbs[next_mb_id] is not None:
-                    next_release_rids = self._pp_recv_pyobj_from_prev_stage()
-                    if not self.pp_group.is_last_rank:
-                        send_release_work, _ = self._pp_pd_send_consensus_release_ids(
-                            tmbs,
-                            next_first_rank_mb_id,
-                            next_release_rids,
-                            transferred_rids,
-                        )
-                self._pp_commit_comm_work(send_release_work)
+                # These phases share an untagged P2P group, so every PP stage
+                # must participate exactly once and in the same order. A typed
+                # no-op keeps warmup/idle slot skew from cross-matching phases.
+                next_consensus_bootstrapped_rids = self._pp_run_control_ring_phase(
+                    phase="prefill_bootstrap_consensus",
+                    origin_has_payload=(
+                        self.pp_group.is_last_rank
+                        and bmbs[next_first_rank_mb_id] is not None
+                    ),
+                    origin_payload=bootstrapped_rids,
+                    process_payload=self.process_bootstrapped_queue,
+                )
+                next_release_rids = self._pp_run_control_ring_phase(
+                    phase="prefill_release_consensus",
+                    origin_has_payload=(
+                        self.pp_group.is_last_rank
+                        and tmbs[next_first_rank_mb_id] is not None
+                    ),
+                    origin_payload=transferred_rids,
+                )
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
@@ -556,7 +544,7 @@ class SchedulerPPMixin:
                     )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
-                if tmbs[next_mb_id] is not None:
+                if next_release_rids is not None:
                     pending_release_status = _pp_merge_pending_release_status(
                         pending_release_status,
                         next_release_rids,
@@ -623,9 +611,6 @@ class SchedulerPPMixin:
                         )
 
                 self.pp_outputs = next_pp_outputs
-                release_rids = next_release_rids
-                consensus_bootstrapped_rids = next_consensus_bootstrapped_rids
-
                 self.running_batch.batch_is_full = False
 
             # When the server is idle, self-check and re-init some states
@@ -640,9 +625,6 @@ class SchedulerPPMixin:
         rmbs = [None] * self.pp_loop_size
         pmbs = [None] * self.pp_loop_size
         tmbs = [None] * self.pp_loop_size
-        consensus_retract_rids: Optional[List[str]] = None
-        consensus_prealloc_rids: Optional[List[str]] = None
-        release_rids: Optional[PPTransferStatus] = None
         pending_release_status: Optional[PPTransferStatus] = None
         pending_release_first_seen_at: Dict[str, float] = {}
         committed_release_order: deque[str] = deque()
@@ -650,9 +632,6 @@ class SchedulerPPMixin:
         send_retract_work = []
         send_prealloc_work = []
         send_transfer_work = []
-        send_consensus_retract_work = []
-        send_consensus_prealloc_work = []
-        send_release_work = []
 
         while True:
             server_is_idle = True
@@ -732,80 +711,37 @@ class SchedulerPPMixin:
                         )
                     )
 
-                # The last stage starts each ring. Non-last stages forward the
-                # value only after receiving it below.
-                if self.pp_group.is_last_rank:
-                    send_consensus_retract_work, consensus_retract_rids = (
-                        self._pp_pd_send_consensus_bootstrapped_ids(
-                            rmbs,
-                            next_first_rank_mb_id,
-                            consensus_retract_rids,
-                            retract_rids,
-                        )
-                    )
-
-                    send_consensus_prealloc_work, consensus_prealloc_rids = (
-                        self._pp_pd_send_consensus_bootstrapped_ids(
-                            pmbs,
-                            next_first_rank_mb_id,
-                            consensus_prealloc_rids,
-                            prealloc_rids,
-                        )
-                    )
-
-                    send_release_work, release_rids = (
-                        self._pp_pd_send_consensus_release_ids(
-                            tmbs,
-                            next_first_rank_mb_id,
-                            release_rids,
-                            transferred_rids,
-                        )
-                    )
+                next_consensus_retract_rids = self._pp_run_control_ring_phase(
+                    phase="decode_retract_consensus",
+                    origin_has_payload=(
+                        self.pp_group.is_last_rank
+                        and rmbs[next_first_rank_mb_id] is not None
+                    ),
+                    origin_payload=retract_rids,
+                    process_payload=self.process_retract_queue,
+                )
+                next_consensus_prealloc_rids = self._pp_run_control_ring_phase(
+                    phase="decode_prealloc_consensus",
+                    origin_has_payload=(
+                        self.pp_group.is_last_rank
+                        and pmbs[next_first_rank_mb_id] is not None
+                    ),
+                    origin_payload=prealloc_rids,
+                    process_payload=self.process_prealloc_queue,
+                )
+                next_release_rids = self._pp_run_control_ring_phase(
+                    phase="decode_release_consensus",
+                    origin_has_payload=(
+                        self.pp_group.is_last_rank
+                        and tmbs[next_first_rank_mb_id] is not None
+                    ),
+                    origin_payload=transferred_rids,
+                )
 
                 if get_disagg().disaggregation_decode_enable_offload_kvcache:
                     self.decode_offload_manager.check_offload_progress()
 
-                if rmbs[next_mb_id] is not None:
-                    next_consensus_retract_rids = self._pp_recv_pyobj_from_prev_stage()
-                    next_consensus_retract_rids = self.process_retract_queue(
-                        next_consensus_retract_rids
-                    )
-                    if not self.pp_group.is_last_rank:
-                        send_consensus_retract_work, _ = (
-                            self._pp_pd_send_consensus_bootstrapped_ids(
-                                rmbs,
-                                next_first_rank_mb_id,
-                                next_consensus_retract_rids,
-                                retract_rids,
-                            )
-                        )
-                self._pp_commit_comm_work(send_consensus_retract_work)
-
-                if pmbs[next_mb_id] is not None:
-                    next_consensus_prealloc_rids = self._pp_recv_pyobj_from_prev_stage()
-                    next_consensus_prealloc_rids = self.process_prealloc_queue(
-                        next_consensus_prealloc_rids
-                    )
-                    if not self.pp_group.is_last_rank:
-                        send_consensus_prealloc_work, _ = (
-                            self._pp_pd_send_consensus_bootstrapped_ids(
-                                pmbs,
-                                next_first_rank_mb_id,
-                                next_consensus_prealloc_rids,
-                                prealloc_rids,
-                            )
-                        )
-                self._pp_commit_comm_work(send_consensus_prealloc_work)
-
-                if tmbs[next_mb_id] is not None:
-                    next_release_rids = self._pp_recv_pyobj_from_prev_stage()
-                    if not self.pp_group.is_last_rank:
-                        send_release_work, _ = self._pp_pd_send_consensus_release_ids(
-                            tmbs,
-                            next_first_rank_mb_id,
-                            next_release_rids,
-                            transferred_rids,
-                        )
+                if next_release_rids is not None:
                     pending_release_status = _pp_merge_pending_release_status(
                         pending_release_status,
                         next_release_rids,
@@ -848,8 +784,6 @@ class SchedulerPPMixin:
                             pending_release_status,
                             pending_release_first_seen_at,
                         )
-                self._pp_commit_comm_work(send_release_work)
-
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     if not self.mbs[next_mb_id].forward_mode.is_prebuilt():
@@ -884,10 +818,6 @@ class SchedulerPPMixin:
                         )
 
                 self.pp_outputs = next_pp_outputs
-                release_rids = next_release_rids
-                consensus_retract_rids = next_consensus_retract_rids
-                consensus_prealloc_rids = next_consensus_prealloc_rids
-
                 self.running_batch.batch_is_full = False
 
             # When the server is idle, self-check and re-init some states
@@ -1239,50 +1169,32 @@ class SchedulerPPMixin:
             )
         return transferred_rids
 
-    def _pp_pd_send_consensus_bootstrapped_ids(
+    def _pp_run_control_ring_phase(
         self: Scheduler,
-        bmbs: List[List[str]],
-        next_first_rank_mb_id: int,
-        consensus_bootstrapped_rids: List[str],
-        bootstrapped_rids: List[str],
+        phase: str,
+        origin_has_payload: bool,
+        origin_payload,
+        process_payload: Optional[Callable] = None,
     ):
-        # 3 (Release): send the release rids from last stage to the first stage
-        send_consensus_bootstrapped_work = []
+        """Run one unconditional, typed consensus phase around the PP ring."""
+        send_work = []
         if self.pp_group.is_last_rank:
-            if bmbs[next_first_rank_mb_id] is not None:
-                consensus_bootstrapped_rids = bootstrapped_rids
-                send_consensus_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
-                    consensus_bootstrapped_rids, async_send=True
-                )
-        # 4 (Release): send the release rids from non last rank to the next rank
-        else:
-            if consensus_bootstrapped_rids is not None:
-                send_consensus_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
-                    consensus_bootstrapped_rids, async_send=True
-                )
-        return send_consensus_bootstrapped_work, consensus_bootstrapped_rids
+            message = _pp_pack_control_ring_message(
+                phase, origin_has_payload, origin_payload
+            )
+            send_work = self._pp_send_pyobj_to_next_stage(message, async_send=True)
 
-    def _pp_pd_send_consensus_release_ids(
-        self: Scheduler,
-        tmbs: List[Optional[PPReleasePayload]],
-        next_first_rank_mb_id: int,
-        release_rids: Optional[PPReleasePayload],
-        transferred_rids: PPReleasePayload,
-    ):
-        send_release_work = []
-        if self.pp_group.is_last_rank:
-            if tmbs[next_first_rank_mb_id] is not None:
-                release_rids = transferred_rids
-                send_release_work = self._pp_send_pyobj_to_next_stage(
-                    release_rids, async_send=True
-                )
-        # 4 (Release): send the release rids from non last rank to the next rank
-        else:
-            if release_rids is not None:
-                send_release_work = self._pp_send_pyobj_to_next_stage(
-                    release_rids, async_send=True
-                )
-        return send_release_work, release_rids
+        message = self._pp_recv_pyobj_from_prev_stage()
+        has_payload, payload = _pp_unpack_control_ring_message(message, phase)
+        if has_payload and process_payload is not None:
+            payload = process_payload(payload)
+        message = _pp_pack_control_ring_message(phase, has_payload, payload)
+
+        if not self.pp_group.is_last_rank:
+            send_work = self._pp_send_pyobj_to_next_stage(message, async_send=True)
+
+        self._pp_commit_comm_work(send_work)
+        return payload if has_payload else None
 
     def _pp_commit_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
         for p2p_work in work:
