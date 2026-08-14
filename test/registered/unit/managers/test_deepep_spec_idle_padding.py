@@ -135,23 +135,44 @@ class TestDeepEPSpecIdlePadding(CustomTestCase):
             )
 
     def test_only_mixed_active_idle_spec_requires_lockstep(self):
-        batch = SimpleNamespace(
-            forward_mode=ForwardMode.TARGET_VERIFY,
+        shared = dict(
             spec_algorithm=SimpleNamespace(is_eagle=lambda: True),
             spec_info=SimpleNamespace(is_draft_input=lambda: False),
             dp_padding_mode=DpPaddingMode.MAX_LEN,
             original_global_num_tokens_cpu=[0, 1, 0, 0],
         )
-        self.assertTrue(requires_symmetric_spec_deepep_lockstep(batch))
+        active_extend_batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND, **shared
+        )
+        dummy_decode_batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            **{**shared, "spec_info": SimpleNamespace(is_draft_input=lambda: True)},
+        )
+        target_verify_batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY, **shared
+        )
 
-        batch.forward_mode = ForwardMode.DECODE
-        batch.spec_info = SimpleNamespace(is_draft_input=lambda: True)
-        self.assertTrue(requires_symmetric_spec_deepep_lockstep(batch))
+        self.assertTrue(requires_symmetric_spec_deepep_lockstep(active_extend_batch))
+        self.assertTrue(requires_symmetric_spec_deepep_lockstep(dummy_decode_batch))
+        self.assertTrue(requires_symmetric_spec_deepep_lockstep(target_verify_batch))
 
-        batch.original_global_num_tokens_cpu = [1, 1, 1, 1]
-        self.assertFalse(requires_symmetric_spec_deepep_lockstep(batch))
-        batch.original_global_num_tokens_cpu = [0, 0, 0, 0]
-        self.assertFalse(requires_symmetric_spec_deepep_lockstep(batch))
+        for unsupported_mode in (
+            ForwardMode.MIXED,
+            ForwardMode.IDLE,
+            ForwardMode.DRAFT_EXTEND_V2,
+            ForwardMode.PREBUILT,
+            ForwardMode.SPLIT_PREFILL,
+            ForwardMode.DLLM_EXTEND,
+        ):
+            unsupported_batch = SimpleNamespace(
+                forward_mode=unsupported_mode, **shared
+            )
+            self.assertFalse(requires_symmetric_spec_deepep_lockstep(unsupported_batch))
+
+        active_extend_batch.original_global_num_tokens_cpu = [1, 1, 1, 1]
+        self.assertFalse(requires_symmetric_spec_deepep_lockstep(active_extend_batch))
+        active_extend_batch.original_global_num_tokens_cpu = [0, 0, 0, 0]
+        self.assertFalse(requires_symmetric_spec_deepep_lockstep(active_extend_batch))
 
 
 if __name__ == "__main__":
