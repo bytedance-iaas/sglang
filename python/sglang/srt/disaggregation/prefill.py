@@ -481,9 +481,7 @@ class PrefillBootstrapQueue:
             self.scheduler.attn_tp_cpu_group,
             ordered_keys=[req.rid for req in self.queue],
         )
-        metadata_credits = (
-            self.req_to_metadata_buffer_idx_allocator.available_size()
-        )
+        metadata_credits = self.req_to_metadata_buffer_idx_allocator.available_size()
 
         for req, poll in zip(self.queue, polls):
             if poll == KVPoll.Failed:
