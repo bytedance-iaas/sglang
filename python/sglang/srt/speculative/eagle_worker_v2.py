@@ -533,6 +533,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             forward_batch.forward_mode = ForwardMode.DECODE
             forward_batch.batch_size = 1
             forward_batch._pad_inputs_to_size(self.draft_runner, 1, 1)
+            forward_batch.out_cache_loc = forward_batch.out_cache_loc.new_zeros(
+                self.topk * self.speculative_num_steps
+            )
             if forward_batch.num_token_non_padded is not None:
                 forward_batch.num_token_non_padded.fill_(1)
             forward_batch.num_token_non_padded_cpu = 1
