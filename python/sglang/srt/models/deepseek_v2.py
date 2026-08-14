@@ -51,6 +51,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed import (
     divide,
+    get_moe_ep_group,
     get_pp_group,
     tensor_model_parallel_all_reduce,
 )
@@ -148,7 +149,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    PPProxyTensors,
+    requires_symmetric_spec_deepep_lockstep,
+)
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
@@ -1449,6 +1454,14 @@ class DeepseekV2MoE(nn.Module):
             post_combine_hook_handle = (
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
+
+        if requires_symmetric_spec_deepep_lockstep(forward_batch):
+            # Materialized idle ranks skip the expensive DSA attention work and
+            # can otherwise launch several low-latency DeepEP generations ahead
+            # of active ranks.  DeepEP's device handshake is not a host barrier;
+            # keep the sparse verify round in layer order.  Fully active decode
+            # batches never enter this path.
+            get_moe_ep_group().barrier()
 
         final_hidden_states = self.experts(
             hidden_states=hidden_states,

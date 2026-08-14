@@ -142,6 +142,24 @@ def _should_force_symmetric_spec_deepep_padding(
     )
 
 
+def requires_symmetric_spec_deepep_lockstep(forward_batch: ForwardBatch) -> bool:
+    """Whether eager DeepEP verify dispatches must stay host-side lockstep."""
+    original_counts = forward_batch.original_global_num_tokens_cpu
+    return (
+        forward_batch.forward_mode.is_target_verify()
+        and forward_batch.spec_algorithm is not None
+        and forward_batch.spec_algorithm.is_eagle()
+        and forward_batch.spec_info is not None
+        and not forward_batch.spec_info.is_draft_input()
+        and forward_batch.dp_padding_mode is not None
+        and forward_batch.dp_padding_mode.is_max_len()
+        and original_counts is not None
+        and len(original_counts) > 1
+        and min(original_counts) == 0
+        and max(original_counts) > 0
+    )
+
+
 class ForwardMode(IntEnum):
     # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
     # It is also called "prefill" in common terminology.
