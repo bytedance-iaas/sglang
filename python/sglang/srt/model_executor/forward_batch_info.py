@@ -147,6 +147,7 @@ def requires_symmetric_spec_deepep_lockstep(forward_batch: ForwardBatch) -> bool
         (
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode == ForwardMode.EXTEND
         )
         and forward_batch.spec_algorithm is not None
         and forward_batch.spec_algorithm.is_eagle()
