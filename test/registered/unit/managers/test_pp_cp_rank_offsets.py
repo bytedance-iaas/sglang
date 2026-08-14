@@ -12,6 +12,7 @@ from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa:
     SchedulerRequestReceiver,
 )
 from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
+    _PP_DISAGG_SCHEDULER_FENCE_PHASES,
     SchedulerPPMixin,
     _pp_attention_dp_control_ranks,
     _pp_fence_scheduler_phase,
@@ -139,14 +140,19 @@ class TestPPCPRankOffsets(unittest.TestCase):
         self.assertEqual(dp0_ranks, [24, 25, 26, 27])
         self.assertEqual(set(dp0_ranks).intersection(dp1_ranks), set())
 
-        fence_group = object()
+        fence_groups = {phase: object() for phase in _PP_DISAGG_SCHEDULER_FENCE_PHASES}
         with patch(
             "sglang.srt.managers.scheduler_pp_mixin.torch.distributed.barrier"
         ) as barrier:
-            _pp_fence_scheduler_phase(fence_group)
+            for phase in _PP_DISAGG_SCHEDULER_FENCE_PHASES:
+                _pp_fence_scheduler_phase(fence_groups[phase])
             _pp_fence_scheduler_phase(None)
 
-        barrier.assert_called_once_with(group=fence_group)
+        self.assertEqual(
+            [call.kwargs["group"] for call in barrier.call_args_list],
+            [fence_groups[phase] for phase in _PP_DISAGG_SCHEDULER_FENCE_PHASES],
+        )
+        self.assertEqual(len(set(fence_groups.values())), 4)
 
 
 if __name__ == "__main__":

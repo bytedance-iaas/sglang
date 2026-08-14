@@ -43,6 +43,13 @@ from sglang.srt.utils.common import get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
 
+_PP_DISAGG_SCHEDULER_FENCE_PHASES = (
+    "iteration_start",
+    "bootstrap_poll",
+    "bootstrap_done",
+    "transfer_done",
+)
+
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
@@ -405,10 +412,12 @@ class SchedulerPPMixin:
             for mb_id in range(self.pp_loop_size):
                 # PP leaders perform rank-local P2P work while their attention
                 # peers can otherwise enter the next scheduler iteration. A
-                # dedicated group keeps those iterations aligned without
-                # allowing this fence to pair with request, cache, or transfer
-                # collectives on the attention TP/CP groups.
-                _pp_fence_scheduler_phase(self.pp_disagg_scheduler_fence_group)
+                # A phase-specific group keeps those iterations aligned
+                # without allowing this fence to pair with either business
+                # collectives or another scheduler phase.
+                _pp_fence_scheduler_phase(
+                    self.pp_disagg_scheduler_fence_groups["iteration_start"]
+                )
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
@@ -429,12 +438,16 @@ class SchedulerPPMixin:
                 bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
                 bmbs[mb_id] = bootstrapped_rids
                 self._pp_commit_comm_work(send_bootstrapped_work)
-                _pp_fence_scheduler_phase(self.pp_disagg_scheduler_fence_group)
+                _pp_fence_scheduler_phase(
+                    self.pp_disagg_scheduler_fence_groups["bootstrap_done"]
+                )
 
                 transferred_rids = self._pp_pd_get_prefill_transferred_ids()
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
-                _pp_fence_scheduler_phase(self.pp_disagg_scheduler_fence_group)
+                _pp_fence_scheduler_phase(
+                    self.pp_disagg_scheduler_fence_groups["transfer_done"]
+                )
 
                 self.process_prefill_chunk(
                     last_batch=self.last_batch, running_batch=self.running_batch
@@ -1101,7 +1114,9 @@ class SchedulerPPMixin:
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
         # communicate pre-consensus bootstrapp reqs
         if self.pp_group.is_first_rank:
-            _pp_fence_scheduler_phase(self.pp_disagg_scheduler_fence_group)
+            _pp_fence_scheduler_phase(
+                self.pp_disagg_scheduler_fence_groups["bootstrap_poll"]
+            )
             good_bootstrapped_rids, bad_bootstrapped_rids = (
                 self.disagg_prefill_bootstrap_queue.get_ready_bootstrapped_rids_for_pp()
             )
@@ -1112,7 +1127,9 @@ class SchedulerPPMixin:
             # peers only participate in the local broadcast. Fence on the
             # control-only group before any rank enters the bootstrap poll
             # all-reduce on the shared attention group.
-            _pp_fence_scheduler_phase(self.pp_disagg_scheduler_fence_group)
+            _pp_fence_scheduler_phase(
+                self.pp_disagg_scheduler_fence_groups["bootstrap_poll"]
+            )
             prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
                 prev_bootstrapped_rids
             )

@@ -253,6 +253,7 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
 )
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_pp_mixin import (
+    _PP_DISAGG_SCHEDULER_FENCE_PHASES,
     SchedulerPPMixin,
     _pp_attention_dp_control_ranks,
 )
@@ -1055,16 +1056,19 @@ class Scheduler(
         self.attn_cp_cpu_group = self.attn_cp_group.cpu_group
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
-        self.pp_disagg_scheduler_fence_group = None
+        self.pp_disagg_scheduler_fence_groups = {}
         if get_disagg().disaggregation_mode == "prefill" and self.ps.pp_size > 1:
             control_ranks = _pp_attention_dp_control_ranks(self.ps, self.tp_group.ranks)
-            self.pp_disagg_scheduler_fence_group = create_custom_parallel_group(
-                control_ranks, backend="gloo"
-            )
-            logger.info(
-                "Initialized PP disaggregation scheduler fence group: ranks=%s",
-                control_ranks,
-            )
+            for phase in _PP_DISAGG_SCHEDULER_FENCE_PHASES:
+                self.pp_disagg_scheduler_fence_groups[phase] = (
+                    create_custom_parallel_group(control_ranks, backend="gloo")
+                )
+                logger.info(
+                    "Initialized PP disaggregation scheduler fence group: "
+                    "phase=%s ranks=%s",
+                    phase,
+                    control_ranks,
+                )
 
         # NOTE: dp_tp_* are request/data-plane coordination groups (not tensor collectives).
         # When DP attention is enabled, scope to the attention-TP group; otherwise use
