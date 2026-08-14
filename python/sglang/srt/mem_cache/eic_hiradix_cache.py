@@ -461,12 +461,29 @@ class EICHiRadixCache(RadixCache):
         # Backstop SWA slots not released by per-step eviction or FULL cleanup.
         if self.sliding_window_size is not None:
             if hasattr(self.token_to_kv_pool_allocator, "free_swa"):
-                self.token_to_kv_pool_allocator.free_swa(
-                    self.req_to_token_pool.req_to_token[
-                        req.req_pool_idx,
-                        req.swa_evicted_seqlen : kv_committed_len,
+                _swa_lo = req.swa_evicted_seqlen
+                _swa_hi = kv_committed_len
+                _prefix_len = len(req.prefix_indices)
+                # The EIC-loaded prefix's full indices live in req.prefix_indices,
+                # not req_to_token (which stays 0 for the loaded portion). Use
+                # prefix_indices for the in-prefix slice so the in-window SWA is
+                # actually freed; req_to_token would map to 0 and be dropped.
+                if _swa_hi <= _prefix_len:
+                    _swa_slots = req.prefix_indices[_swa_lo:_swa_hi]
+                elif _swa_lo < _prefix_len:
+                    _swa_slots = torch.cat(
+                        [
+                            req.prefix_indices[_swa_lo:_prefix_len],
+                            self.req_to_token_pool.req_to_token[
+                                req.req_pool_idx, _prefix_len:_swa_hi
+                            ],
+                        ]
+                    )
+                else:
+                    _swa_slots = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, _swa_lo:_swa_hi
                     ]
-                )
+                self.token_to_kv_pool_allocator.free_swa(_swa_slots)
 
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
@@ -750,10 +767,12 @@ class EICHiRadixCache(RadixCache):
         # tree only; degrading to loaded=0 re-converges at FINAL instead.
         d, hh = st["d"], st["hh"]
         node = st["best_match_node"]
+        quota = span - d
+        swa_ok = self._swa_headroom_ok(quota)
         if (
-            span - d >= max(self.load_back_threshold, 1)
+            quota >= max(self.load_back_threshold, 1)
             and node is not None
-            and self._swa_headroom_ok(span - d)
+            and swa_ok
         ):
             node = self._clip_host_chain(node, d + hh - span, span - d)
             if node is not None:
@@ -771,21 +790,19 @@ class EICHiRadixCache(RadixCache):
             self._queue_report(st, self._KIND_FINAL, d)
 
     def _swa_headroom_ok(self, quota):
-        # A hybrid-SWA load allocates quota SWA slots that are released only
-        # when the admitted req actually batches (maybe_evict_swa) -- but the
-        # adder budgets fresh SWA for that batch without knowing about them.
-        # Unbounded kicks can therefore drain the (small) SWA pool to zero and
-        # deadlock admission outright: loads hold all SWA, batching would
-        # release it, batching needs SWA. Keep half the pool clear of load-back
-        # allocations. Per-stage headroom may diverge; an asymmetric kick-skip
-        # just degrades that stage's report to device-only, which the FINAL
-        # verdict reconciles (same class as the alloc-failure degrade).
+        # A hybrid-SWA load retains only the trailing sliding-window SWA KV;
+        # the prefix SWA is overwritten (see alloc_device_indices). So the SWA
+        # pool consumption is min(quota, max(sliding_window, page)), not the
+        # full quota.
         swa = getattr(
             self.cache_controller.mem_pool_device_allocator, "swa_attn_allocator", None
         )
         if swa is None:
             return True
-        return swa.available_size() >= quota + swa.size // 2
+        swa_window = self.sliding_window_size or 0
+        swa_needed = min(quota, max(swa_window, self.page_size))
+        avail = swa.available_size()
+        return avail >= swa_needed + swa.size // 2
 
     def _clip_host_chain(self, node, excess, quota):
         # Cut the evicted chain `excess` tokens above its bottom so the load
@@ -1484,11 +1501,11 @@ class EICPagedHiRadixCache(EICHiRadixCache):
 
     def init_hyper_params(self, config):
         super().init_hyper_params(config)
-        self.load_remote_threshold = max(
-            config.get("load_remote_threshold", 100), self.page_size
-        )
+        floor = 1 << 14  # 16K tokens
+        cfg_val = config.get("load_remote_threshold", floor)
+        self.load_remote_threshold = max(cfg_val, floor)
         logger.info(
-            f"EICPagedHiRadixCache load_remote_threshold set to {self.load_remote_threshold}"
+            f"EICPagedHiRadixCache load_remote_threshold set to {self.load_remote_threshold} (cfg_val={cfg_val}, floor={floor})"
         )
         self.eic_check_max_num = config.get("eic_check_max_num", -1)
         logger.info(
@@ -1710,7 +1727,6 @@ class EICPagedHiRadixCache(EICHiRadixCache):
                 continue
             if _need_calculate_hash(last_node, self.page_size):
                 self._calculate_content_hash(last_node)
-            self.match_req_set[req.rid] = None
             prev_hash = last_node.content_hash[-1] if last_node.content_hash else None
             fetches.append((slot, last_node, evict_len, req_key[prefix_len:], prev_hash))
             eic_keys += (len(req_key) - prefix_len) // self.page_size
@@ -1728,12 +1744,20 @@ class EICPagedHiRadixCache(EICHiRadixCache):
             if len(lens) == len(fetches):
                 for (slot, *_), n in zip(fetches, lens):
                     len_tensor[slot] = n
-        self._reduce_min(len_tensor)
+            # TP ranks share tree state, so an empty fetches list is rank-uniform
+            # and the reduce below would be a no-op on an all-zero tensor.
+            self._reduce_min(len_tensor)
 
         for slot, last_node, evict_len, compute_key, _ in fetches:
             eic_len = int(len_tensor[slot])
             if eic_len + evict_len >= self.load_remote_threshold:
                 self._insert_remote_node(last_node, compute_key[:eic_len])
+                # Only mark as matched when we actually admitted a remote prefix.
+                # A miss (eic_len == 0) must be retried: the async write may not
+                # have landed yet, or a sibling rank's write may still be in
+                # flight. Permanently skipping it would strand the request.
+                req = waiting_queue[slot]
+                self.match_req_set[req.rid] = None
 
     def match_prefix(self, params: MatchPrefixParams):
         key = params.key
