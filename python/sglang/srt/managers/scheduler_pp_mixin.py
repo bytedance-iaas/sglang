@@ -452,20 +452,24 @@ class SchedulerPPMixin:
 
                 recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
-
-                if not self.pp_group.is_last_rank:
-                    self._pp_commit_comm_work(self.send_req_work)
+                self.send_req_work = self._pp_forward_stage_payload(
+                    self.send_req_work, recv_reqs
+                )
 
                 bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
                 bmbs[mb_id] = bootstrapped_rids
-                self._pp_commit_comm_work(send_bootstrapped_work)
+                send_bootstrapped_work = self._pp_forward_stage_payload(
+                    send_bootstrapped_work, bootstrapped_rids
+                )
                 _pp_fence_scheduler_phase(
                     self.pp_disagg_scheduler_fence_groups["bootstrap_done"]
                 )
 
                 transferred_rids = self._pp_pd_get_prefill_transferred_ids()
-                self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
+                send_transfer_work = self._pp_forward_stage_payload(
+                    send_transfer_work, transferred_rids
+                )
                 _pp_fence_scheduler_phase(
                     self.pp_disagg_scheduler_fence_groups["transfer_done"]
                 )
@@ -591,15 +595,6 @@ class SchedulerPPMixin:
                             pending_release_first_seen_at,
                         )
                 if not self.pp_group.is_last_rank:
-                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
-                    )
-                    send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
-                        bootstrapped_rids, async_send=True
-                    )
-                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
-                        transferred_rids, async_send=True
-                    )
                     if cur_batch:
                         self.device_module.current_stream().wait_event(
                             self.launch_event
@@ -650,22 +645,28 @@ class SchedulerPPMixin:
 
                 recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
-
-                if not self.pp_group.is_last_rank:
-                    self._pp_commit_comm_work(self.send_req_work)
+                self.send_req_work = self._pp_forward_stage_payload(
+                    self.send_req_work, recv_reqs
+                )
 
                 # reaching consensus through PP ranks
                 retract_rids = self._pp_pd_get_retract_ids(mb_id)
                 rmbs[mb_id] = retract_rids
-                self._pp_commit_comm_work(send_retract_work)
+                send_retract_work = self._pp_forward_stage_payload(
+                    send_retract_work, retract_rids
+                )
 
                 prealloc_rids = self._pp_pd_get_prealloc_ids()
                 pmbs[mb_id] = prealloc_rids
-                self._pp_commit_comm_work(send_prealloc_work)
+                send_prealloc_work = self._pp_forward_stage_payload(
+                    send_prealloc_work, prealloc_rids
+                )
 
                 transferred_rids = self._pp_pd_get_decode_transferred_ids()
                 tmbs[mb_id] = transferred_rids
-                self._pp_commit_comm_work(send_transfer_work)
+                send_transfer_work = self._pp_forward_stage_payload(
+                    send_transfer_work, transferred_rids
+                )
 
                 # get batch to run and proxy tensors if needed
                 plan = self.get_next_disagg_decode_batch_to_run(
@@ -795,18 +796,6 @@ class SchedulerPPMixin:
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
                 if not self.pp_group.is_last_rank:
-                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
-                    )
-                    send_retract_work = self._pp_send_pyobj_to_next_stage(
-                        retract_rids, async_send=True
-                    )
-                    send_prealloc_work = self._pp_send_pyobj_to_next_stage(
-                        prealloc_rids, async_send=True
-                    )
-                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
-                        transferred_rids, async_send=True
-                    )
                     if cur_batch and not cur_batch.forward_mode.is_prebuilt():
                         self.device_module.current_stream().wait_event(
                             self.launch_event
@@ -1195,6 +1184,15 @@ class SchedulerPPMixin:
 
         self._pp_commit_comm_work(send_work)
         return payload if has_payload else None
+
+    def _pp_forward_stage_payload(
+        self: Scheduler, previous_work: List[P2PWork], payload
+    ) -> List[P2PWork]:
+        """Forward a linear PP payload before entering any wraparound ring."""
+        self._pp_commit_comm_work(previous_work)
+        if self.pp_group.is_last_rank:
+            return []
+        return self._pp_send_pyobj_to_next_stage(payload, async_send=True)
 
     def _pp_commit_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
         for p2p_work in work:
