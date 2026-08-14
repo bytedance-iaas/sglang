@@ -1127,8 +1127,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     break
                 if (
                     self.scheduler.enable_priority_scheduling
-                    and decode_req.req.priority
-                    != memory_blocked_reqs[0].req.priority
+                    and decode_req.req.priority != memory_blocked_reqs[0].req.priority
                 ):
                     break
 
@@ -1201,8 +1200,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                 if (
                     fit_first
-                    and decode_req.admission_bypass_count
-                    < admission_max_bypasses
+                    and decode_req.admission_bypass_count < admission_max_bypasses
                 ):
                     memory_blocked_reqs.append(decode_req)
                     continue
@@ -1212,8 +1210,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                 if (
                     fit_first
-                    and decode_req.admission_bypass_count
-                    < admission_max_bypasses
+                    and decode_req.admission_bypass_count < admission_max_bypasses
                 ):
                     memory_blocked_reqs.append(decode_req)
                     continue
@@ -1237,8 +1234,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                     if (
                         fit_first
-                        and decode_req.admission_bypass_count
-                        < admission_max_bypasses
+                        and decode_req.admission_bypass_count < admission_max_bypasses
                     ):
                         memory_blocked_reqs.append(decode_req)
                         continue

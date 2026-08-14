@@ -110,9 +110,7 @@ def _pp_merge_pending_release_status(
 
     failed_set = set(failed)
     success = [
-        rid
-        for rid in success
-        if rid not in failed_set and rid not in committed_rids
+        rid for rid in success if rid not in failed_set and rid not in committed_rids
     ]
     failed = [rid for rid in failed if rid not in committed_rids]
     if not success and not failed:
@@ -512,16 +510,13 @@ class SchedulerPPMixin:
                     else:
                         ready_release_status = None
                     if ready_release_status is not None:
-                        self.process_disagg_prefill_inflight_queue(
-                            ready_release_status
-                        )
+                        self.process_disagg_prefill_inflight_queue(ready_release_status)
                         remaining_local_rids = {
                             req.rid for req in self.disagg_prefill_inflight_queue
                         }
                         acknowledged_rids = [
                             rid
-                            for rid in ready_release_status[0]
-                            + ready_release_status[1]
+                            for rid in ready_release_status[0] + ready_release_status[1]
                             if rid not in remaining_local_rids
                         ]
                         pending_release_status = _pp_acknowledge_release_status(
@@ -738,8 +733,7 @@ class SchedulerPPMixin:
                         }
                         acknowledged_rids = [
                             rid
-                            for rid in ready_release_status[0]
-                            + ready_release_status[1]
+                            for rid in ready_release_status[0] + ready_release_status[1]
                             if rid not in remaining_local_rids
                         ]
                         pending_release_status = _pp_acknowledge_release_status(

@@ -221,9 +221,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         transferred = queue.pop_transferred(max_successes=2)
 
-        self.assertEqual(
-            [req.rid for req in transferred], ["success-0", "success-1"]
-        )
+        self.assertEqual([req.rid for req in transferred], ["success-0", "success-1"])
         self.assertEqual([entry.req.rid for entry in queue.queue], ["success-2"])
         self.assertEqual(queue._commit_transfer_to_req.call_count, 2)
         self.assertEqual(
@@ -273,10 +271,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertEqual(scheduler.hisparse_direct_admission_capacity(), 3)
         shared_physical_allocator.available_size.assert_called_once_with()
 
-    @patch(
-        "sglang.srt.disaggregation.decode."
-        "poll_and_all_reduce_attn_cp_tp_group"
-    )
+    @patch("sglang.srt.disaggregation.decode." "poll_and_all_reduce_attn_cp_tp_group")
     def test_pp_transfer_success_ignores_hicache_state_when_hicache_disabled(
         self, mock_poll
     ):
