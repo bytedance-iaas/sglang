@@ -977,6 +977,50 @@ def build_transfer_entry_pairs(
     return [(i, i) for i in range(n_src)]
 
 
+def build_kv_layer_ids(
+    *,
+    token_to_kv_pool,
+    draft_token_to_kv_pool,
+    num_draft_entries: int,
+    num_hidden_layers: int,
+) -> List[int]:
+    """Return one global layer id for every registered target and draft entry."""
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+    if not isinstance(token_to_kv_pool, HybridLinearKVPool):
+        return []
+    layer_ids = token_to_kv_pool.get_kv_layer_ids()
+    if draft_token_to_kv_pool is None:
+        return layer_ids
+
+    draft_ids = _draft_entry_layer_ids(
+        pool=draft_token_to_kv_pool, num_entries=num_draft_entries
+    )
+    band_index = {lid: i for i, lid in enumerate(dict.fromkeys(draft_ids))}
+    return layer_ids + [num_hidden_layers + band_index[lid] for lid in draft_ids]
+
+
+def _draft_entry_layer_ids(*, pool, num_entries: int) -> List[int]:
+    """Return one draft-local layer id per registered draft KV entry."""
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+    if isinstance(pool, HybridLinearKVPool):
+        ids = pool.get_kv_layer_ids()
+    else:
+        if pool.layer_num <= 0 or num_entries % pool.layer_num != 0:
+            raise RuntimeError(
+                "Draft KV buffers must register a whole number of per-layer "
+                f"groups: entries={num_entries}, layers={pool.layer_num}"
+            )
+        ids = list(range(pool.layer_num)) * (num_entries // pool.layer_num)
+    if len(ids) != num_entries:
+        raise RuntimeError(
+            "Draft KV layer ids must cover every registered entry: "
+            f"ids={len(ids)}, entries={num_entries}"
+        )
+    return ids
+
+
 def resolve_dcp_dst_entry_indices(
     src_layer_ids: List[int],
     dst_layer_ids: List[int],

@@ -278,7 +278,9 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
-from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
+from sglang.srt.speculative.eagle_utils import (
+    get_draft_recurrent_hidden_state_spec_from_config,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -1380,16 +1382,20 @@ class Scheduler(
             server_args=self.server_args,
         )
 
-        if (
-            self.spec_algorithm.carries_draft_hidden_states()
-            and self.draft_worker.draft_worker is not None
-        ):
-            # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
-            # worker, so a single accessor covers both shapes. Non-last PP
-            # ranks have no draft worker, so fall through to the default.
-            draft_runner = self.draft_worker.draft_worker.draft_runner
+        if self.spec_algorithm.carries_draft_hidden_states():
+            # The draft runs only on the last Prefill PP stage, but the PD
+            # metadata wire schema must be identical on every stage. Derive it
+            # from config instead of a stage-local draft runner.
+            draft_model_config = ModelConfig.from_server_args(
+                self.server_args,
+                model_path=self.server_args.speculative_draft_model_path,
+                model_revision=self.server_args.speculative_draft_model_revision,
+                is_draft_model=True,
+            )
             disagg_hidden_size, disagg_hidden_states_dtype = (
-                get_draft_recurrent_hidden_state_spec(draft_runner)
+                get_draft_recurrent_hidden_state_spec_from_config(
+                    draft_model_config, self.spec_algorithm
+                )
             )
         else:
             disagg_hidden_size = 16  # minimal padding size for RDMA

@@ -479,13 +479,27 @@ def get_draft_input_from_target_hidden_dim(model_runner: ModelRunner) -> int:
     return target_hidden * num_aux
 
 
+def get_draft_recurrent_hidden_state_spec_from_config(
+    model_config, spec_algorithm
+) -> tuple[Optional[int], Optional[torch.dtype]]:
+    """Return the draft hidden-state wire schema without requiring a runner.
+
+    Prefill pipeline stages that do not host the draft still allocate PD
+    metadata buffers, so every stage must derive the same width and dtype from
+    the draft config rather than from a stage-local draft runner.
+    """
+    if spec_algorithm.is_standalone():
+        return None, None
+    return model_config.spec_hidden_size, model_config.dtype
+
+
 def get_draft_recurrent_hidden_state_spec(
     model_runner: ModelRunner,
 ) -> tuple[Optional[int], Optional[torch.dtype]]:
     """Return hidden_states width/dtype carried between draft decode steps."""
-    if model_runner.spec_algorithm.is_standalone():
-        return None, None
-    return model_runner.model_config.spec_hidden_size, model_runner.model_config.dtype
+    return get_draft_recurrent_hidden_state_spec_from_config(
+        model_runner.model_config, model_runner.spec_algorithm
+    )
 
 
 def eagle_prepare_for_verify(

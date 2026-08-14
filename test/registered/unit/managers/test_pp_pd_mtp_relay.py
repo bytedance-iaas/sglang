@@ -9,6 +9,9 @@ from sglang.srt.managers.scheduler_pp_mixin import (
     SchedulerPPMixin,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.speculative.eagle_utils import (
+    get_draft_recurrent_hidden_state_spec_from_config,
+)
 
 
 class _SpecAlgorithm:
@@ -19,6 +22,10 @@ class _SpecAlgorithm:
     @staticmethod
     def is_eagle():
         return True
+
+    @staticmethod
+    def is_standalone():
+        return False
 
 
 class _ProxyOutputs:
@@ -107,3 +114,14 @@ def test_spec_only_aux_indices_follow_optional_sampling_mask_layout():
         output_dsa_topk_indices_dim=0,
     )
     assert buffers_without_dsa.get_spec_only_aux_indices() == [6, 7, 8]
+
+
+def test_draft_hidden_state_wire_schema_does_not_require_a_local_runner():
+    config = SimpleNamespace(spec_hidden_size=6144, dtype=torch.bfloat16)
+
+    hidden_size, dtype = get_draft_recurrent_hidden_state_spec_from_config(
+        config, _SpecAlgorithm()
+    )
+
+    assert hidden_size == 6144
+    assert dtype is torch.bfloat16
