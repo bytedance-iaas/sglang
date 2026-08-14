@@ -1266,14 +1266,6 @@ class SchedulerPPMixin:
                 self.server_args.speculative_num_draft_tokens
             )
 
-        # Async copy the CPU-bound fields ahead of time; d2h_event in the
-        # caller guarantees completion before the result is consumed.
-        output_result.copy_done = self.device_module.Event()
-        output_result.copy_to_cpu(
-            return_logprob=batch.return_logprob,
-            return_hidden_states=False,
-        )
-
         return output_result
 
     def _pp_process_batch_result(
