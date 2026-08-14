@@ -152,7 +152,10 @@ class TestPPCPRankOffsets(unittest.TestCase):
             [call.kwargs["group"] for call in barrier.call_args_list],
             [fence_groups[phase] for phase in _PP_DISAGG_SCHEDULER_FENCE_PHASES],
         )
-        self.assertEqual(len(set(fence_groups.values())), 4)
+        self.assertEqual(
+            len(set(fence_groups.values())),
+            len(_PP_DISAGG_SCHEDULER_FENCE_PHASES),
+        )
 
 
 if __name__ == "__main__":
