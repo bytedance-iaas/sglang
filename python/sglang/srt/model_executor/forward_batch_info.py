@@ -1696,6 +1696,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     ]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_extend() or self.forward_mode.is_idle():
+                if self.symmetric_spec_deepep_dummy:
+                    self.positions = self.positions[:bs]
+                    self.seq_lens = self.seq_lens[:bs]
+                    self.req_pool_indices = self.req_pool_indices[:bs]
+                    if self.seq_lens_cpu is not None:
+                        self.seq_lens_cpu = self.seq_lens_cpu[:bs]
                 if logits_output.next_token_logits is not None:
                     logits_output.next_token_logits = logits_output.next_token_logits[
                         :bs
