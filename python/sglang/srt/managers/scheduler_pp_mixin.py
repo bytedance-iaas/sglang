@@ -280,21 +280,7 @@ class SchedulerPPMixin:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
 
-                # PP disagg prefill with speculative/MTP relays the last PP
-                # stage's draft seed through the output ring and publishes it
-                # into FutureMap using the request pool indices. Chunked
-                # prefill reuses the same request pool slot for the next
-                # chunk, so launching the next chunk before the prior seed is
-                # published can race the forward path that consumes the same
-                # buffers. Use the already-supported pre-launch result
-                # processing order for this path; keep the old overlap order
-                # for non-speculative prefill.
-                pp_prep_outputs_before_launch = (
-                    get_parallel().pp_async_batch_depth > 0
-                    or not self.spec_algorithm.is_none()
-                )
-
-                if pp_prep_outputs_before_launch:
+                if get_parallel().pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
@@ -310,7 +296,7 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
-                if not pp_prep_outputs_before_launch:
+                if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
