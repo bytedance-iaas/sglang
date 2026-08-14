@@ -1274,12 +1274,36 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Decode
         if batch.forward_mode.is_idle():
-            verify_input = EagleVerifyInput.create_idle_input(
-                self.topk,
-                self.speculative_num_steps,
-                self.speculative_num_draft_tokens,
-                device=self.device,
+            # A sparse DP batch must still run the draft model on every EP
+            # rank. DeepEP low-latency dispatch generations are shared across
+            # the full EP group; jumping directly to target verification on an
+            # idle rank lets it enter a later collective while active ranks are
+            # still in an EAGLE draft step.
+            capture_mode = (
+                CaptureHiddenMode.NULL
+                if self.speculative_algorithm.is_standalone()
+                else CaptureHiddenMode.LAST
             )
+            hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
+                self.draft_worker.draft_runner
+            )
+            batch.spec_info = EagleDraftInput.create_idle_input(
+                device=self.device,
+                hidden_size=hidden_size,
+                dtype=hidden_dtype,
+                topk=self.topk,
+                capture_hidden_mode=capture_mode,
+                vocab_size=self.target_worker.model_config.vocab_size,
+            )
+            with (
+                self.draft_worker.draft_tp_context(
+                    self.draft_worker.draft_runner.tp_group
+                ),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft"),
+            ):
+                verify_input = self.draft_worker.draft(batch)
         elif self._pp_enabled:
             # Under PP the verify input is built from the raw draft tree relayed
             # from the last PP rank of the previous iteration.
