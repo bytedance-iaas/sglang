@@ -566,7 +566,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
             # CUDA Graph buffers are reused; clone before flattening so the
             # relayed raw tokens survive the next replay.
-            if can_cuda_graph:
+            if can_run_decode_cuda_graph:
                 parent_list = parent_list.clone()
                 top_scores_index = top_scores_index.clone()
                 draft_tokens = draft_tokens.clone()

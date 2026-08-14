@@ -1390,7 +1390,6 @@ class HiSparseCoordinator:
     def _preload_to_device_buffer(self, req: Req) -> None:
         """Preload all tokens from host pool into the device buffer."""
         n = self.host_token_len(req.kv.kv_allocated_len)
-        host_indices = self.req_to_host_pool[req.req_pool_idx, :n]
         device_locs = self.req_to_device_buffer[req.req_pool_idx, :n]
         self._load_host_kv(req, device_locs)
 
@@ -2964,7 +2963,32 @@ class HiSparseCoordinator:
     ) -> torch.Tensor:
         """Swap selected top-k tokens into device memory and return their indices.
 
-        top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
+        Multi-step speculative calls use req-major tensors shaped
+        ``[num_reqs, num_steps, top_k]`` and a flat req-major sequence-length
+        vector. The kernel processes all steps for one request in a single
+        block so LRU state and extra-page draft slots remain graph-stable.
+        """
+        num_reqs = req_pool_indices.size(0)
+        needed = num_reqs * num_steps
+
+        if needed > self.top_k_device_locs_buffer.shape[0]:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "HiSparse multi-step output buffer is too small during CUDA "
+                    f"Graph capture: need {needed}, have "
+                    f"{self.top_k_device_locs_buffer.shape[0]}"
+                )
+            self.top_k_device_locs_buffer = torch.full(
+                (needed, self.top_k),
+                -1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+
+        top_k_indices = self.top_k_device_locs_buffer[:needed]
+        if num_steps > 1:
+            top_k_indices = top_k_indices.view(num_reqs, num_steps, self.top_k)
+        top_k_indices.fill_(-1)
 
         swap_seq_lens = compressed_seq_lens
         swap_top_k_result = top_k_result

@@ -19,6 +19,11 @@ from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
 from sglang.srt.runtime_context import get_parallel, get_spec
 
 logger = logging.getLogger(__name__)
+
+_LONG_SPEC_FUSED_TOPK_THRESHOLD = int(
+    os.environ.get("SGLANG_DSA_FUSED_TOPK_MAX_SPEC_SEQ_LEN", "131072")
+)
+
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     concat_cast_kv_fp8_pad,
     dequantize_k_cache_paged,

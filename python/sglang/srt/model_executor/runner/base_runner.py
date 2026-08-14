@@ -122,7 +122,7 @@ def _allocate_decode_buffers(
                 residual_shape = (
                     (max_num_token, pp_proxy_residual_num_blocks, hidden_size)
                     if pp_proxy_residual_num_blocks is not None
-                    else (max_bs, hidden_size)
+                    else (max_num_token, hidden_size)
                 )
                 pp_proxy_tensors["residual"] = torch.zeros(residual_shape, dtype=dtype)
             if pp_proxy_topk_size is not None:

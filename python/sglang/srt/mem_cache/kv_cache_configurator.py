@@ -1197,6 +1197,29 @@ class KVCacheConfigurator:
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
         else:
             PoolCls = DSATokenToKVPool
+
+        if (
+            not get_memory().enable_hisparse
+            and dsa_cp_layer_shard_rank is None
+            and PoolCls is DSATokenToKVPool
+        ):
+            # Compact only the regular target DSA pool. HiSparse has a distinct
+            # host/device layout, CP layer split owns a subset of layers, and
+            # NEXTN draft layers own real indexer state.
+            from sglang.srt.mem_cache.memory_pool import (
+                dsa_compact_indexer_layer_mask,
+            )
+
+            compact_mask = dsa_compact_indexer_layer_mask(
+                self.model_config.hf_config,
+                self.layer_info.num_effective_layers,
+                self.layer_info.start_layer,
+                self.layer_info.end_layer,
+                is_draft_worker=self.is_draft_worker,
+            )
+            if compact_mask is not None:
+                pool_kwargs["indexer_layer_mask"] = compact_mask
+
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
             page_size=self.pool_page_size,

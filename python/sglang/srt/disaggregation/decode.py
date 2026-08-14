@@ -59,8 +59,6 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_with_staging,
     prepare_abort,
     setup_state_kv_args,
-    summarize_dsa_topk_seed,
-    summarize_pd_bootstrap_tensor,
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (

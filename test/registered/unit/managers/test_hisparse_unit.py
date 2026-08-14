@@ -780,6 +780,7 @@ class TestHiSparseUnit(unittest.TestCase):
             )
 
         self._cleanup_req(req, kv_loc, logical_only=True)
+        self._assert_sizes_restored(initial, "direct_path")
 
     def test_admission_once_suppresses_repromotion_after_demotion(self):
         """A pressure-demoted request remains host-backed until it finishes."""
@@ -1453,8 +1454,6 @@ class TestHiSparseUnit(unittest.TestCase):
             self._assert_sizes_restored(initial, "dynamic_repeated_mtp_cycles")
         finally:
             self.coordinator._device_slot_mirrors.remove(draft)
-            del draft
-            del draft_pool
             gc.collect()
             torch.cuda.synchronize()
             self.allocator.set_demote_until_hisparse_available(
