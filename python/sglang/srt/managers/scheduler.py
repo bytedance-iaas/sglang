@@ -87,7 +87,10 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
-from sglang.srt.distributed.parallel_state import get_tp_group
+from sglang.srt.distributed.parallel_state import (
+    create_custom_parallel_group,
+    get_tp_group,
+)
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
@@ -249,7 +252,10 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
-from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from sglang.srt.managers.scheduler_pp_mixin import (
+    SchedulerPPMixin,
+    _pp_attention_dp_control_ranks,
+)
 from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
@@ -1049,6 +1055,16 @@ class Scheduler(
         self.attn_cp_cpu_group = self.attn_cp_group.cpu_group
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
+        self.pp_disagg_scheduler_fence_group = None
+        if get_disagg().disaggregation_mode == "prefill" and self.ps.pp_size > 1:
+            control_ranks = _pp_attention_dp_control_ranks(self.ps, self.tp_group.ranks)
+            self.pp_disagg_scheduler_fence_group = create_custom_parallel_group(
+                control_ranks, backend="gloo"
+            )
+            logger.info(
+                "Initialized PP disaggregation scheduler fence group: ranks=%s",
+                control_ranks,
+            )
 
         # NOTE: dp_tp_* are request/data-plane coordination groups (not tensor collectives).
         # When DP attention is enabled, scope to the attention-TP group; otherwise use

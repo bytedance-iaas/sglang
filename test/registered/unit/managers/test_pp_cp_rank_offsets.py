@@ -11,7 +11,11 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState  # noqa:
 from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa: E402
     SchedulerRequestReceiver,
 )
-from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
+from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
+    SchedulerPPMixin,
+    _pp_attention_dp_control_ranks,
+    _pp_fence_scheduler_iteration,
+)
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -92,7 +96,6 @@ class TestPPCPRankOffsets(unittest.TestCase):
         scheduler.attn_cp_group = _fake_group()
         scheduler.attn_cp_cpu_group = _fake_group()
         calls = []
-        barriers = []
 
         def fake_point_to_point_pyobj(data, rank, group, src, dst, **kwargs):
             calls.append((rank, src, dst, kwargs.get("async_send", False)))
@@ -106,10 +109,6 @@ class TestPPCPRankOffsets(unittest.TestCase):
             patch(
                 "sglang.srt.managers.scheduler_pp_mixin.broadcast_pyobj",
                 side_effect=lambda data, *args, **kwargs: data,
-            ),
-            patch(
-                "sglang.srt.managers.scheduler_pp_mixin.torch.distributed.barrier",
-                side_effect=lambda *, group: barriers.append(group),
             ),
         ):
             self.assertEqual(
@@ -125,10 +124,29 @@ class TestPPCPRankOffsets(unittest.TestCase):
                 (12, 4, 12, False),
             ],
         )
+
+    def test_pp_scheduler_fence_uses_the_full_attention_dp_group(self):
+        ps = _make_ps()
+        shifted_tp_ranks = list(range(24, 32))
+        dp1_ranks = _pp_attention_dp_control_ranks(ps, shifted_tp_ranks)
         self.assertEqual(
-            barriers,
-            [scheduler.attn_tp_cpu_group, scheduler.attn_cp_cpu_group],
+            dp1_ranks,
+            [28, 29, 30, 31],
         )
+        dp0_ranks = _pp_attention_dp_control_ranks(
+            _make_ps(attn_dp_rank=0), shifted_tp_ranks
+        )
+        self.assertEqual(dp0_ranks, [24, 25, 26, 27])
+        self.assertEqual(set(dp0_ranks).intersection(dp1_ranks), set())
+
+        fence_group = object()
+        with patch(
+            "sglang.srt.managers.scheduler_pp_mixin.torch.distributed.barrier"
+        ) as barrier:
+            _pp_fence_scheduler_iteration(fence_group)
+            _pp_fence_scheduler_iteration(None)
+
+        barrier.assert_called_once_with(group=fence_group)
 
 
 if __name__ == "__main__":
