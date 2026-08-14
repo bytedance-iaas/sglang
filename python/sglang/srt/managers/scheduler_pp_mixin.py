@@ -53,6 +53,22 @@ PP_PENDING_RELEASE_MAX_RIDS = 4096
 PP_PENDING_RELEASE_MAX_WAIT_SECONDS = 600
 
 
+def _pp_attention_dp_control_ranks(ps, tp_ranks: List[int]) -> List[int]:
+    """Return the scheduler ranks that must stay in one PP-stage phase."""
+    group_size = ps.attn_tp_size * ps.attn_cp_size
+    assert len(tp_ranks) == ps.tp_size
+    group_start = ps.attn_dp_rank * group_size
+    group_end = group_start + group_size
+    assert group_end <= len(tp_ranks)
+    return tp_ranks[group_start:group_end]
+
+
+def _pp_fence_scheduler_iteration(group) -> None:
+    """Fence PP scheduler iterations on a control-only process group."""
+    if group is not None:
+        torch.distributed.barrier(group=group)
+
+
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     """Check if output send/recv can be skipped for this batch."""
     return (
@@ -387,6 +403,12 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                # PP leaders perform rank-local P2P work while their attention
+                # peers can otherwise enter the next scheduler iteration. A
+                # dedicated group keeps those iterations aligned without
+                # allowing this fence to pair with request, cache, or transfer
+                # collectives on the attention TP/CP groups.
+                _pp_fence_scheduler_iteration(self.pp_disagg_scheduler_fence_group)
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
@@ -1242,12 +1264,6 @@ class SchedulerPPMixin:
                 self.attn_tp_cpu_group,
                 src=self.attn_tp_group.ranks[0],
             )
-            # A blocking broadcast only guarantees that each caller's local
-            # work has completed. The source rank can enter the next Gloo
-            # collective while a peer is still receiving the payload, which
-            # lets the next PP poll all-reduce pair with this broadcast. Keep
-            # every attention-TP scheduler on the same control-plane phase.
-            torch.distributed.barrier(group=self.attn_tp_cpu_group)
 
         if self.ps.attn_cp_size > 1:
             data = broadcast_pyobj(
@@ -1256,7 +1272,6 @@ class SchedulerPPMixin:
                 self.attn_cp_cpu_group,
                 src=self.attn_cp_group.ranks[0],
             )
-            torch.distributed.barrier(group=self.attn_cp_cpu_group)
 
         return data
 
