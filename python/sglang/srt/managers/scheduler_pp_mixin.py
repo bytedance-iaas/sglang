@@ -1176,21 +1176,32 @@ class SchedulerPPMixin:
         process_payload: Optional[Callable] = None,
     ):
         """Run one unconditional, typed consensus phase around the PP ring."""
+        assert self.pp_disagg_control_group is not None
         send_work = []
         if self.pp_group.is_last_rank:
             message = _pp_pack_control_ring_message(
                 phase, origin_has_payload, origin_payload
             )
-            send_work = self._pp_send_pyobj_to_next_stage(message, async_send=True)
+            send_work = self._pp_send_pyobj_to_next_stage(
+                message,
+                async_send=True,
+                group=self.pp_disagg_control_group,
+            )
 
-        message = self._pp_recv_pyobj_from_prev_stage()
+        message = self._pp_recv_pyobj_from_prev_stage(
+            group=self.pp_disagg_control_group
+        )
         has_payload, payload = _pp_unpack_control_ring_message(message, phase)
         if has_payload and process_payload is not None:
             payload = process_payload(payload)
         message = _pp_pack_control_ring_message(phase, has_payload, payload)
 
         if not self.pp_group.is_last_rank:
-            send_work = self._pp_send_pyobj_to_next_stage(message, async_send=True)
+            send_work = self._pp_send_pyobj_to_next_stage(
+                message,
+                async_send=True,
+                group=self.pp_disagg_control_group,
+            )
 
         self._pp_commit_comm_work(send_work)
         return payload if has_payload else None
@@ -1244,31 +1255,41 @@ class SchedulerPPMixin:
         )
         return next_pp_outputs, next_batch_result, d2h_event
 
-    def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
+    def _pp_send_pyobj_to_next_stage(
+        self: Scheduler,
+        data,
+        async_send: bool = False,
+        group: Optional[torch.distributed.ProcessGroup] = None,
+    ):
         p2p_work = []
         if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+            group = self.world_group.cpu_group if group is None else group
             dp_offset = (
                 self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
             )
             p2p_work = point_to_point_pyobj(
                 data,
                 self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                self.world_group.cpu_group,
+                group,
                 self.ps.pp_rank * self.ps.tp_size + dp_offset,
                 ((self.ps.pp_rank + 1) % self.ps.pp_size) * self.ps.tp_size + dp_offset,
                 async_send=async_send,
             )
         return p2p_work
 
-    def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
+    def _pp_recv_pyobj_from_prev_stage(
+        self: Scheduler,
+        group: Optional[torch.distributed.ProcessGroup] = None,
+    ):
         if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+            group = self.world_group.cpu_group if group is None else group
             dp_offset = (
                 self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
             )
             data = point_to_point_pyobj(
                 [],
                 self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                self.world_group.cpu_group,
+                group,
                 ((self.ps.pp_rank - 1) % self.ps.pp_size) * self.ps.tp_size + dp_offset,
                 self.ps.pp_rank * self.ps.tp_size + dp_offset,
             )

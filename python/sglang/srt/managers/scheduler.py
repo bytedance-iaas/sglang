@@ -1056,6 +1056,21 @@ class Scheduler(
         self.attn_cp_cpu_group = self.attn_cp_group.cpu_group
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
+        self.pp_disagg_control_group = None
+        if (
+            get_disagg().disaggregation_mode in ("prefill", "decode")
+            and self.ps.pp_size > 1
+        ):
+            # Tensor-dict metadata uses pp_group.cpu_group. PD consensus must
+            # not share that untagged Gloo stream with pipeline output that is
+            # intentionally sent ahead of its receive slot.
+            self.pp_disagg_control_group = create_custom_parallel_group(
+                self.pp_group.ranks, backend="gloo"
+            )
+            logger.info(
+                "Initialized PP disaggregation control group: ranks=%s",
+                self.pp_group.ranks,
+            )
         self.pp_disagg_scheduler_fence_groups = {}
         if get_disagg().disaggregation_mode == "prefill" and self.ps.pp_size > 1:
             control_ranks = _pp_attention_dp_control_ranks(self.ps, self.tp_group.ranks)
