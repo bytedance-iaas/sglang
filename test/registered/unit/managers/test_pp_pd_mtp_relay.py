@@ -44,8 +44,16 @@ class _ProxyOutputs:
 
 def test_nccl_prewarm_initializes_distinct_tp_and_pp_groups():
     tp_group = object()
-    pp_group = object()
+    pp_group_handle = object()
+    pp_group = SimpleNamespace(
+        device_group=pp_group_handle,
+        ranks=[0, 8],
+        rank_in_group=0,
+    )
     warmup_tensor = object()
+    recv_tensor = object()
+    send_work = Mock()
+    recv_work = Mock()
 
     with (
         patch(
@@ -54,24 +62,43 @@ def test_nccl_prewarm_initializes_distinct_tp_and_pp_groups():
         ),
         patch(
             "sglang.srt.distributed.bootstrap.get_pp_group",
-            return_value=SimpleNamespace(device_group=pp_group),
+            return_value=pp_group,
         ),
         patch(
             "sglang.srt.distributed.bootstrap.torch.zeros",
             return_value=warmup_tensor,
         ),
         patch(
+            "sglang.srt.distributed.bootstrap.torch.empty_like",
+            return_value=recv_tensor,
+        ),
+        patch(
             "sglang.srt.distributed.bootstrap.torch.cuda.current_device",
             return_value=0,
         ),
         patch("sglang.srt.distributed.bootstrap.dist.all_reduce") as all_reduce,
+        patch(
+            "sglang.srt.distributed.bootstrap.dist.isend", return_value=send_work
+        ) as isend,
+        patch(
+            "sglang.srt.distributed.bootstrap.dist.irecv", return_value=recv_work
+        ) as irecv,
+        patch("sglang.srt.distributed.bootstrap.dist.barrier") as barrier,
         patch("sglang.srt.distributed.bootstrap.current_platform.synchronize"),
     ):
         _prewarm_nccl(tp_size=8, pp_size=2, moe_ep_size=1)
 
     assert all_reduce.call_args_list == [
         call(warmup_tensor, group=tp_group),
-        call(warmup_tensor, group=pp_group),
+        call(warmup_tensor, group=pp_group_handle),
+    ]
+    isend.assert_called_once_with(warmup_tensor, dst=8, group=pp_group_handle)
+    irecv.assert_called_once_with(recv_tensor, src=8, group=pp_group_handle)
+    send_work.wait.assert_called_once_with()
+    recv_work.wait.assert_called_once_with()
+    assert barrier.call_args_list == [
+        call(group=pp_group_handle),
+        call(group=pp_group_handle),
     ]
 
 
