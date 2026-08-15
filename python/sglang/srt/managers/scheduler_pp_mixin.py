@@ -512,6 +512,18 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                # A downstream stage blocks in _pp_recv_proxy_tensors() before
+                # it can enter the PD control rings below.  Forward the proxy
+                # immediately after launch so the upstream stage cannot enter a
+                # control ring while the downstream stage is still waiting for
+                # this point-to-point tensor payload.
+                if not self.pp_group.is_last_rank and cur_batch:
+                    self.device_module.current_stream().wait_event(self.launch_event)
+                    self.send_proxy_work = self._pp_send_dict_to_next_stage(
+                        result.pp_hidden_states_proxy_tensors.tensors,
+                        async_send=True,
+                        msg_type="proxy",
+                    )
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -594,17 +606,6 @@ class SchedulerPPMixin:
                             pending_release_status,
                             pending_release_first_seen_at,
                         )
-                if not self.pp_group.is_last_rank:
-                    if cur_batch:
-                        self.device_module.current_stream().wait_event(
-                            self.launch_event
-                        )
-                        self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                            result.pp_hidden_states_proxy_tensors.tensors,
-                            async_send=True,
-                            msg_type="proxy",
-                        )
-
                 self.pp_outputs = next_pp_outputs
                 self.running_batch.batch_is_full = False
 
@@ -703,6 +704,21 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                # Keep the proxy-before-control-ring ordering symmetric with
+                # the disaggregated prefill loop.  Otherwise a downstream PP
+                # rank waits for proxy tensors while the upstream rank waits in
+                # decode_retract_consensus.
+                if (
+                    not self.pp_group.is_last_rank
+                    and cur_batch
+                    and not cur_batch.forward_mode.is_prebuilt()
+                ):
+                    self.device_module.current_stream().wait_event(self.launch_event)
+                    self.send_proxy_work = self._pp_send_dict_to_next_stage(
+                        result.pp_hidden_states_proxy_tensors.tensors,
+                        async_send=True,
+                        msg_type="proxy",
+                    )
 
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -794,17 +810,6 @@ class SchedulerPPMixin:
                             next_batch_result,
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
-
-                if not self.pp_group.is_last_rank:
-                    if cur_batch and not cur_batch.forward_mode.is_prebuilt():
-                        self.device_module.current_stream().wait_event(
-                            self.launch_event
-                        )
-                        self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                            result.pp_hidden_states_proxy_tensors.tensors,
-                            async_send=True,
-                            msg_type="proxy",
-                        )
 
                 self.pp_outputs = next_pp_outputs
                 self.running_batch.batch_is_full = False
