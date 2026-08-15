@@ -30,6 +30,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import torch
 from torch.profiler import record_function
 
+from sglang.kernels.ops.memory.allocator import ALLOCATOR_BATCH_SIZE_STEP
 from sglang.kernels.ops.memory.virtual_slot import alloc_bind_inplace
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -39,7 +40,7 @@ from sglang.srt.mem_cache.allocator.paged import (
 )
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
-from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
+from sglang.srt.utils.common import get_num_new_pages
 
 logger = logging.getLogger(__name__)
 
@@ -864,7 +865,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                     last_loc,
                     self.free_virtual_ids,
                     out_indices,
-                    next_power_of_2(bs),
+                    ALLOCATOR_BATCH_SIZE_STEP,
                     self.page_size,
                 )
 
@@ -923,7 +924,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                     last_loc,
                     self.free_virtual_ids,
                     out_indices,
-                    next_power_of_2(bs),
+                    ALLOCATOR_BATCH_SIZE_STEP,
                     self.page_size,
                 )
 

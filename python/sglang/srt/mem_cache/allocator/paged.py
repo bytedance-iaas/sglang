@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.ops.memory.allocator import (
+    ALLOCATOR_BATCH_SIZE_STEP,
     alloc_decode_kernel,
     alloc_extend_kernel,
 )
@@ -33,7 +34,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_num_new_pages,
     is_hip,
-    next_power_of_2,
 )
 
 _is_hip = is_hip()
@@ -200,7 +200,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             last_loc,
             self.free_pages,
             out_indices,
-            next_power_of_2(bs),
+            ALLOCATOR_BATCH_SIZE_STEP,
             self.page_size,
         )
 
@@ -240,7 +240,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             last_loc,
             self.free_pages,
             out_indices,
-            next_power_of_2(bs),
+            ALLOCATOR_BATCH_SIZE_STEP,
             self.page_size,
         )
 
