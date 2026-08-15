@@ -14,6 +14,7 @@ def _server_args():
         enable_metrics=False,
         enable_nccl_nvls=False,
         enable_symm_mem=False,
+        gc_threshold=None,
         nnodes=1,
     )
 
