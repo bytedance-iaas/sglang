@@ -1,3 +1,5 @@
+from collections import deque
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
@@ -268,6 +270,115 @@ def test_pp_proxy_exchange_is_committed_before_reusing_the_ring():
         ("send", tensor_dict, True, "proxy"),
         ("commit", proxy_work),
     ]
+
+
+def test_pp_disagg_output_ring_relays_fresh_payload_before_control_phase():
+    events = []
+    received_tensors = {"next_token_ids": object()}
+    send_work = [object()]
+    recorded_event = Mock()
+    target = SimpleNamespace(forward_mode=SimpleNamespace(is_prebuilt=lambda: False))
+    scheduler = SimpleNamespace(
+        pp_group=SimpleNamespace(is_last_rank=False),
+        copy_stream_ctx=nullcontext(),
+        copy_stream=SimpleNamespace(
+            wait_stream=lambda stream: events.append(("wait_stream", stream))
+        ),
+        schedule_stream=object(),
+        device_module=SimpleNamespace(
+            Event=Mock(return_value=recorded_event),
+            current_stream=Mock(return_value=object()),
+        ),
+        _pp_recv_dict_from_prev_stage=Mock(
+            side_effect=lambda: events.append("recv") or received_tensors
+        ),
+        _pp_prep_batch_result=Mock(
+            side_effect=lambda batch, metadata, outputs: events.append("prep")
+            or object()
+        ),
+        _pp_send_dict_to_next_stage=Mock(
+            side_effect=lambda tensors, async_send, msg_type: events.append(
+                ("send", tensors, async_send, msg_type)
+            )
+            or send_work
+        ),
+        _pp_send_output_to_next_stage=Mock(),
+        _pp_commit_comm_work=Mock(
+            side_effect=lambda work: events.append(("commit", work))
+        ),
+    )
+
+    with patch(
+        "sglang.srt.managers.scheduler_pp_mixin._pp_can_skip_output_comm",
+        return_value=False,
+    ):
+        outputs, _, event, work = (
+            SchedulerPPMixin._pp_send_recv_and_preprocess_output_tensors(
+                scheduler,
+                next_first_rank_mb_id=0,
+                next_mb_id=0,
+                mbs=[target],
+                mb_metadata=[object()],
+                last_rank_comm_queue=deque(),
+                pp_outputs=None,
+                relay_output_immediately=True,
+            )
+        )
+
+    assert outputs.tensors is received_tensors
+    assert event is recorded_event
+    assert work == []
+    assert events[-2:] == [
+        ("send", received_tensors, True, "output"),
+        ("commit", send_work),
+    ]
+    scheduler._pp_send_output_to_next_stage.assert_not_called()
+
+
+def test_pp_disagg_output_ring_last_stage_starts_relay_chain():
+    events = []
+    send_work = [object()]
+    target = SimpleNamespace(forward_mode=SimpleNamespace(is_prebuilt=lambda: False))
+    recorded_event = Mock()
+    scheduler = SimpleNamespace(
+        pp_group=SimpleNamespace(is_last_rank=True),
+        copy_stream_ctx=nullcontext(),
+        copy_stream=SimpleNamespace(wait_stream=Mock()),
+        schedule_stream=object(),
+        device_module=SimpleNamespace(
+            Event=Mock(return_value=recorded_event),
+            current_stream=Mock(return_value=object()),
+        ),
+        _pp_send_output_to_next_stage=Mock(
+            side_effect=lambda *args: events.append("send") or send_work
+        ),
+        _pp_recv_dict_from_prev_stage=Mock(
+            side_effect=lambda: events.append("recv")
+            or {"next_token_ids": object()}
+        ),
+        _pp_prep_batch_result=Mock(return_value=object()),
+        _pp_commit_comm_work=Mock(
+            side_effect=lambda work: events.append(("commit", work))
+        ),
+    )
+
+    with patch(
+        "sglang.srt.managers.scheduler_pp_mixin._pp_can_skip_output_comm",
+        return_value=False,
+    ):
+        _, _, _, work = SchedulerPPMixin._pp_send_recv_and_preprocess_output_tensors(
+            scheduler,
+            next_first_rank_mb_id=0,
+            next_mb_id=0,
+            mbs=[target],
+            mb_metadata=[object()],
+            last_rank_comm_queue=deque(),
+            pp_outputs=None,
+            relay_output_immediately=True,
+        )
+
+    assert work == []
+    assert events == ["send", "recv", ("commit", send_work)]
 
 
 def test_pp_prefill_rebuilds_one_authoritative_draft_input():
