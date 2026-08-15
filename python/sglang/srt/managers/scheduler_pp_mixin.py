@@ -533,6 +533,7 @@ class SchedulerPPMixin:
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
+                            relay_output_immediately=True,
                         )
                     )
                 # These phases share an untagged P2P group, so every PP stage
@@ -727,6 +728,7 @@ class SchedulerPPMixin:
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
+                            relay_output_immediately=True,
                         )
                     )
 
@@ -1231,6 +1233,7 @@ class SchedulerPPMixin:
         self: Scheduler,
         next_first_rank_mb_id: int,
         next_mb_id: int,
+        relay_output_immediately: bool = False,
     ) -> Tuple[
         Optional[PPProxyTensors],
         Optional[GenerationBatchResult],
@@ -1249,6 +1252,7 @@ class SchedulerPPMixin:
             self.mb_metadata,
             self.last_rank_comm_queue,
             self.pp_outputs,
+            relay_output_immediately=relay_output_immediately,
         )
         return next_pp_outputs, next_batch_result, d2h_event
 
@@ -1729,6 +1733,7 @@ class SchedulerPPMixin:
         mb_metadata: List[PPBatchMetadata],
         last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]],
         pp_outputs: PPProxyTensors | None,
+        relay_output_immediately: bool = False,
     ) -> Tuple[
         Optional[PPProxyTensors],
         Optional[GenerationBatchResult],
@@ -1781,7 +1786,31 @@ class SchedulerPPMixin:
                 d2h_event = self.device_module.Event()
                 d2h_event.record(self.device_module.current_stream())
 
-        if send_first:
+        if relay_output_immediately and self.pp_group.is_last_rank:
+            # Start the relay chain independently of backend send semantics.
+            # Every other stage receives first, so the last stage must be the
+            # unique sender that injects the output into the ring.
+            send_output_work = _do_send()
+            _do_recv()
+            self._pp_commit_comm_work(send_output_work)
+            send_output_work = []
+        elif relay_output_immediately:
+            # The disaggregated PP loops enter CPU control rings immediately
+            # after this exchange.  A non-last stage therefore cannot defer
+            # forwarding the output it just received until the next scheduler
+            # slot: the last stage would wait for that output while the first
+            # stage waits for the control ring.  Relay the fresh payload along
+            # the output ring in the same slot (last -> first -> ... -> last).
+            _do_recv()
+            if next_pp_outputs is not None:
+                send_output_work = self._pp_send_dict_to_next_stage(
+                    next_pp_outputs.tensors,
+                    async_send=True,
+                    msg_type="output",
+                )
+            self._pp_commit_comm_work(send_output_work)
+            send_output_work = []
+        elif send_first:
             send_output_work = _do_send()
             _do_recv()
         else:
