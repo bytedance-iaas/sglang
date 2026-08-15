@@ -1793,11 +1793,14 @@ class SchedulerPPMixin:
         if relay_output_immediately and self.pp_group.is_last_rank:
             # Start the relay chain independently of backend send semantics.
             # Every other stage receives first, so the last stage must be the
-            # unique sender that injects the output into the ring.
+            # unique sender that injects the output into the ring.  Keep this
+            # origin send outstanding: on the first populated slot, rank 0
+            # does not post the matching receive until the next scheduler
+            # slot.  The wrapper commits it at the start of that next slot,
+            # after rank 0 can enter recv, while the dedicated PD control group
+            # keeps the intervening control ring independent.
             send_output_work = _do_send()
             _do_recv()
-            self._pp_commit_comm_work(send_output_work)
-            send_output_work = []
         elif relay_output_immediately:
             # The disaggregated PP loops enter CPU control rings immediately
             # after this exchange.  A non-last stage therefore cannot defer
