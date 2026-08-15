@@ -519,11 +519,15 @@ class SchedulerPPMixin:
                 # this point-to-point tensor payload.
                 if not self.pp_group.is_last_rank and cur_batch:
                     self.device_module.current_stream().wait_event(self.launch_event)
-                    self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                        result.pp_hidden_states_proxy_tensors.tensors,
-                        async_send=True,
-                        msg_type="proxy",
+                    self._pp_send_and_commit_proxy(
+                        result.pp_hidden_states_proxy_tensors.tensors
                     )
+                    # The output ring may immediately reuse the same PP process
+                    # group in the reverse direction.  Finish the first proxy
+                    # exchange before the last stage posts that reverse send;
+                    # otherwise lazy NCCL communicator initialization can leave
+                    # the last stage blocked in output isend while this stage
+                    # has already entered a CPU control ring.
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -717,10 +721,8 @@ class SchedulerPPMixin:
                     and not cur_batch.forward_mode.is_prebuilt()
                 ):
                     self.device_module.current_stream().wait_event(self.launch_event)
-                    self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                        result.pp_hidden_states_proxy_tensors.tensors,
-                        async_send=True,
-                        msg_type="proxy",
+                    self._pp_send_and_commit_proxy(
+                        result.pp_hidden_states_proxy_tensors.tensors
                     )
 
                 if get_parallel().pp_async_batch_depth == 0:
@@ -1201,6 +1203,16 @@ class SchedulerPPMixin:
         if self.pp_group.is_last_rank:
             return []
         return self._pp_send_pyobj_to_next_stage(payload, async_send=True)
+
+    def _pp_send_and_commit_proxy(
+        self: Scheduler, tensor_dict: Dict[str, torch.Tensor]
+    ) -> None:
+        self.send_proxy_work = self._pp_send_dict_to_next_stage(
+            tensor_dict,
+            async_send=True,
+            msg_type="proxy",
+        )
+        self._pp_commit_comm_work(self.send_proxy_work)
 
     def _pp_commit_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
         for p2p_work in work:
