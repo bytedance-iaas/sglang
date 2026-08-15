@@ -498,7 +498,10 @@ class SchedulerPPMixin:
 
                 if get_parallel().pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
-                        self._pp_pd_commit_aligned_output_slot(next_mb_id)
+                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                            next_first_rank_mb_id,
+                            next_mb_id,
+                        )
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
                 if cur_batch:
@@ -527,7 +530,10 @@ class SchedulerPPMixin:
                     # has already entered a CPU control ring.
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
-                        self._pp_pd_commit_aligned_output_slot(next_mb_id)
+                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                            next_first_rank_mb_id,
+                            next_mb_id,
+                        )
                     )
                 # These phases share an untagged P2P group, so every PP stage
                 # must participate exactly once and in the same order. A typed
@@ -687,7 +693,10 @@ class SchedulerPPMixin:
                 # early send output if possible
                 if get_parallel().pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
-                        self._pp_pd_commit_aligned_output_slot(next_mb_id)
+                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                            next_first_rank_mb_id,
+                            next_mb_id,
+                        )
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
 
@@ -715,7 +724,10 @@ class SchedulerPPMixin:
 
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
-                        self._pp_pd_commit_aligned_output_slot(next_mb_id)
+                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                            next_first_rank_mb_id,
+                            next_mb_id,
+                        )
                     )
 
                 next_consensus_retract_rids = self._pp_run_control_ring_phase(
@@ -1203,23 +1215,6 @@ class SchedulerPPMixin:
         for p2p_work in work:
             p2p_work.work.wait()
         work.clear()
-
-    def _pp_pd_commit_aligned_output_slot(self: Scheduler, next_mb_id: int) -> Tuple[
-        Optional[PPProxyTensors],
-        Optional[GenerationBatchResult],
-        Optional[torch.Event],
-    ]:
-        """Pair the PD output send and receive on the same microbatch slot.
-
-        Regular PP intentionally sends ahead from ``next_first_rank_mb_id`` and
-        receives into ``next_mb_id``.  A disaggregated loop enters synchronous
-        CPU control rings before the following slot, so that send-ahead can
-        block the last stage before the first stage posts its matching receive.
-        """
-        return self._pp_commit_send_output_work_and_preprocess_output_tensors(
-            next_mb_id,
-            next_mb_id,
-        )
 
     def _pp_commit_send_output_work_and_preprocess_output_tensors(
         self: Scheduler,
