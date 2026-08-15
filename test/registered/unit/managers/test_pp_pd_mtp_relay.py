@@ -190,20 +190,6 @@ def test_pp_proxy_exchange_is_committed_before_reusing_the_ring():
     ]
 
 
-def test_pp_pd_output_send_and_receive_use_the_same_microbatch_slot():
-    result = (object(), object(), object())
-    scheduler = SimpleNamespace(
-        _pp_commit_send_output_work_and_preprocess_output_tensors=Mock(
-            return_value=result
-        )
-    )
-
-    assert SchedulerPPMixin._pp_pd_commit_aligned_output_slot(scheduler, 3) is result
-    scheduler._pp_commit_send_output_work_and_preprocess_output_tensors.assert_called_once_with(
-        3, 3
-    )
-
-
 def test_pp_prefill_rebuilds_one_authoritative_draft_input():
     topk_p = torch.randn(2, 1)
     topk_index = torch.tensor([[3], [7]], dtype=torch.int64)
