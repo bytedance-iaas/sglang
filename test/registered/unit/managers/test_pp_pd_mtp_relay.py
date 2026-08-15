@@ -1,9 +1,10 @@
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import torch
 
 from sglang.srt.disaggregation.utils import MetadataBuffers
+from sglang.srt.distributed.bootstrap import _prewarm_nccl
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_pp_mixin import (
     PPBatchMetadata,
@@ -37,6 +38,39 @@ class _ProxyOutputs:
         return self.tensors[key]
 
 
+def test_nccl_prewarm_initializes_distinct_tp_and_pp_groups():
+    tp_group = object()
+    pp_group = object()
+    warmup_tensor = object()
+
+    with (
+        patch(
+            "sglang.srt.distributed.bootstrap.get_tp_group",
+            return_value=SimpleNamespace(device_group=tp_group),
+        ),
+        patch(
+            "sglang.srt.distributed.bootstrap.get_pp_group",
+            return_value=SimpleNamespace(device_group=pp_group),
+        ),
+        patch(
+            "sglang.srt.distributed.bootstrap.torch.zeros",
+            return_value=warmup_tensor,
+        ),
+        patch(
+            "sglang.srt.distributed.bootstrap.torch.cuda.current_device",
+            return_value=0,
+        ),
+        patch("sglang.srt.distributed.bootstrap.dist.all_reduce") as all_reduce,
+        patch("sglang.srt.distributed.bootstrap.current_platform.synchronize"),
+    ):
+        _prewarm_nccl(tp_size=8, pp_size=2, moe_ep_size=1)
+
+    assert all_reduce.call_args_list == [
+        call(warmup_tensor, group=tp_group),
+        call(warmup_tensor, group=pp_group),
+    ]
+
+
 def test_mtp_middle_chunk_skips_unused_pp_output_ring():
     batch = SimpleNamespace(
         spec_algorithm=_SpecAlgorithm(),
@@ -56,13 +90,18 @@ def test_pp_control_ring_forwards_valid_empty_payload():
     events = []
     payload = [[], []]
     incoming = _pp_pack_control_ring_message("bootstrap", True, payload)
+    control_group = object()
     scheduler = SimpleNamespace(
         pp_group=SimpleNamespace(is_last_rank=False),
+        pp_disagg_control_group=control_group,
         _pp_recv_pyobj_from_prev_stage=Mock(
-            side_effect=lambda: events.append("recv") or incoming
+            side_effect=lambda group: events.append(("recv", group)) or incoming
         ),
         _pp_send_pyobj_to_next_stage=Mock(
-            side_effect=lambda message, async_send: events.append("send") or [object()]
+            side_effect=lambda message, async_send, group: events.append(
+                ("send", group)
+            )
+            or [object()]
         ),
         _pp_commit_comm_work=Mock(side_effect=lambda work: events.append("commit")),
     )
@@ -77,7 +116,12 @@ def test_pp_control_ring_forwards_valid_empty_payload():
     )
 
     assert result == payload
-    assert events == ["recv", "process", "send", "commit"]
+    assert events == [
+        ("recv", control_group),
+        "process",
+        ("send", control_group),
+        "commit",
+    ]
     forwarded = scheduler._pp_send_pyobj_to_next_stage.call_args.args[0]
     assert _pp_unpack_control_ring_message(forwarded, "bootstrap") == (
         True,
@@ -88,13 +132,18 @@ def test_pp_control_ring_forwards_valid_empty_payload():
 def test_pp_control_ring_last_stage_returns_typed_noop():
     events = []
     incoming = _pp_pack_control_ring_message("release", False, None)
+    control_group = object()
     scheduler = SimpleNamespace(
         pp_group=SimpleNamespace(is_last_rank=True),
+        pp_disagg_control_group=control_group,
         _pp_recv_pyobj_from_prev_stage=Mock(
-            side_effect=lambda: events.append("recv") or incoming
+            side_effect=lambda group: events.append(("recv", group)) or incoming
         ),
         _pp_send_pyobj_to_next_stage=Mock(
-            side_effect=lambda message, async_send: events.append("send") or [object()]
+            side_effect=lambda message, async_send, group: events.append(
+                ("send", group)
+            )
+            or [object()]
         ),
         _pp_commit_comm_work=Mock(side_effect=lambda work: events.append("commit")),
     )
@@ -109,7 +158,11 @@ def test_pp_control_ring_last_stage_returns_typed_noop():
     )
 
     assert result is None
-    assert events == ["send", "recv", "commit"]
+    assert events == [
+        ("send", control_group),
+        ("recv", control_group),
+        "commit",
+    ]
     process_payload.assert_not_called()
     originated = scheduler._pp_send_pyobj_to_next_stage.call_args.args[0]
     assert _pp_unpack_control_ring_message(originated, "release") == (False, None)

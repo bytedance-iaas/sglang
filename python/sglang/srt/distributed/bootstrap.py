@@ -249,17 +249,31 @@ def _init_parallel_groups(
 
 def _prewarm_nccl(*, tp_size: int, pp_size: int, moe_ep_size: int) -> None:
     warmup_start = time.perf_counter()
-    tp_group_handle = get_tp_group().device_group
+    groups = [("tp", get_tp_group().device_group)]
+    if pp_size > 1:
+        groups.append(("pp", get_pp_group().device_group))
 
-    # Single warmup all_reduce to initialize NCCL/RCCL/HCCL communicator
+    # Initialize every communication group that can be used by the first
+    # request. Warming only TP leaves PP point-to-point sends in lazy
+    # communicator initialization, where an isend can block until its delayed
+    # pipeline receive is posted.
     warmup_tensor = torch.zeros(1, device=torch.cuda.current_device())
-    dist.all_reduce(warmup_tensor, group=tp_group_handle)
+    seen_groups = set()
+    warmed_groups = []
+    for group_name, group_handle in groups:
+        group_id = id(group_handle)
+        if group_id in seen_groups:
+            continue
+        dist.all_reduce(warmup_tensor, group=group_handle)
+        seen_groups.add(group_id)
+        warmed_groups.append(group_name)
     current_platform.synchronize()
 
     warmup_elapsed = time.perf_counter() - warmup_start
     logger.info(
         f"NCCL/RCCL/HCCL warmup completed in {warmup_elapsed:.3f}s "
-        f"(tp_size={tp_size}, pp_size={pp_size}, ep_size={moe_ep_size})"
+        f"(groups={warmed_groups}, tp_size={tp_size}, pp_size={pp_size}, "
+        f"ep_size={moe_ep_size})"
     )
 
 
