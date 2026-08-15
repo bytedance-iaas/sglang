@@ -160,6 +160,32 @@ def test_pp_last_stage_consumes_linear_payload_without_forwarding():
     scheduler._pp_send_pyobj_to_next_stage.assert_not_called()
 
 
+def test_pp_proxy_exchange_is_committed_before_reusing_the_ring():
+    events = []
+    proxy_work = [object()]
+    tensor_dict = {"hidden_states": object()}
+    scheduler = SimpleNamespace(
+        send_proxy_work=[],
+        _pp_send_dict_to_next_stage=Mock(
+            side_effect=lambda tensors, async_send, msg_type: events.append(
+                ("send", tensors, async_send, msg_type)
+            )
+            or proxy_work
+        ),
+        _pp_commit_comm_work=Mock(
+            side_effect=lambda work: events.append(("commit", work))
+        ),
+    )
+
+    SchedulerPPMixin._pp_send_and_commit_proxy(scheduler, tensor_dict)
+
+    assert scheduler.send_proxy_work is proxy_work
+    assert events == [
+        ("send", tensor_dict, True, "proxy"),
+        ("commit", proxy_work),
+    ]
+
+
 def test_pp_prefill_rebuilds_one_authoritative_draft_input():
     topk_p = torch.randn(2, 1)
     topk_index = torch.tensor([[3], [7]], dtype=torch.int64)
