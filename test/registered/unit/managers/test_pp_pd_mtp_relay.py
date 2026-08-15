@@ -378,6 +378,33 @@ def test_pp_disagg_output_ring_last_stage_starts_relay_chain():
     scheduler._pp_commit_comm_work.assert_not_called()
 
 
+def test_pp_disagg_output_origin_send_survives_empty_return_slot():
+    send_work = [object()]
+    origin_target = object()
+    scheduler = SimpleNamespace(
+        pp_group=SimpleNamespace(is_last_rank=True),
+        _pp_send_output_to_next_stage=Mock(return_value=send_work),
+        _pp_recv_dict_from_prev_stage=Mock(),
+        _pp_commit_comm_work=Mock(),
+    )
+
+    _, _, _, work = SchedulerPPMixin._pp_send_recv_and_preprocess_output_tensors(
+        scheduler,
+        next_first_rank_mb_id=0,
+        next_mb_id=1,
+        mbs=[origin_target, None],
+        mb_metadata=[object(), None],
+        last_rank_comm_queue=deque(),
+        pp_outputs=None,
+        relay_output_immediately=True,
+    )
+
+    assert work is send_work
+    scheduler._pp_send_output_to_next_stage.assert_called_once()
+    scheduler._pp_recv_dict_from_prev_stage.assert_not_called()
+    scheduler._pp_commit_comm_work.assert_not_called()
+
+
 def test_pp_prefill_rebuilds_one_authoritative_draft_input():
     topk_p = torch.randn(2, 1)
     topk_index = torch.tensor([[3], [7]], dtype=torch.int64)
