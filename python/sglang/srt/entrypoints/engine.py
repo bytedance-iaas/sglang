@@ -1595,7 +1595,10 @@ def _set_envs_and_config(server_args: ServerArgs):
         if server_args.dcp_size > 1:
             os.environ["NCCL_GRAPH_MIXING_SUPPORT"] = "0"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
-    os.environ["CUDA_MODULE_LOADING"] = "AUTO"
+    # Keep AUTO as the SGLang default, but honor an explicit deployment choice
+    # such as EAGER. Overwriting it here happens before scheduler workers are
+    # spawned and silently defeats CUDA's documented module-loading control.
+    os.environ.setdefault("CUDA_MODULE_LOADING", "AUTO")
 
     if os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0":
         # flashinfer uses this environment variable for various kernels from MoE to quant kernels
