@@ -373,8 +373,9 @@ def test_pp_disagg_output_ring_last_stage_starts_relay_chain():
             relay_output_immediately=True,
         )
 
-    assert work == []
-    assert events == ["send", "recv", ("commit", send_work)]
+    assert work is send_work
+    assert events == ["send", "recv"]
+    scheduler._pp_commit_comm_work.assert_not_called()
 
 
 def test_pp_prefill_rebuilds_one_authoritative_draft_input():
