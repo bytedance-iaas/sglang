@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocat
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.sparsity.factory import parse_hisparse_config
+from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -112,6 +113,33 @@ class TestHiSparseConfig(unittest.TestCase):
 
         self.assertIs(result, target_allocator)
         self.assertIs(draft_pool.full_to_hisparse_device_index_mapping, mapping)
+
+    def test_model_runner_wires_hisparse_runtime_configuration(self):
+        tree = ast.parse(inspect.getsource(ModelRunner.maybe_init_hisparse_coordinator))
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "HiSparseCoordinator"
+        ]
+        self.assertEqual(len(calls), 1)
+        keywords = {keyword.arg for keyword in calls[0].keywords}
+        self.assertTrue(
+            {
+                "max_num_steps",
+                "mem_pool_device_override",
+                "dynamic_residency",
+                "dynamic_residency_mode",
+                "dynamic_residency_max_tokens",
+                "dynamic_residency_max_requests",
+                "dynamic_residency_min_remaining_tokens",
+                "dynamic_residency_promote_watermark",
+                "dynamic_residency_demote_watermark",
+                "dynamic_residency_cooldown_steps",
+                "dynamic_residency_admission_window_seconds",
+            }.issubset(keywords)
+        )
 
     def test_coordinator_uses_owned_kv_container(self):
         tree = ast.parse(inspect.getsource(HiSparseCoordinator))
