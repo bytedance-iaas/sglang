@@ -86,7 +86,11 @@ from sglang.srt.disaggregation.utils import (
     get_dsa_seed_metadata_dim,
     prepare_abort,
 )
-from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_pp_output_group,
+    get_world_group,
+)
 from sglang.srt.distributed.parallel_state import (
     create_custom_parallel_group,
     get_tp_group,
@@ -1055,6 +1059,7 @@ class Scheduler(
         self.attn_cp_group = get_parallel().attn_cp_group
         self.attn_cp_cpu_group = self.attn_cp_group.cpu_group
         self.pp_group = get_pp_group()
+        self.pp_output_group = get_pp_output_group()
         self.world_group = get_world_group()
         self.pp_disagg_control_group = None
         if (

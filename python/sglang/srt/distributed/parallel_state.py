@@ -1940,11 +1940,20 @@ def get_moe_tp_group() -> GroupCoordinator:
 get_tensor_model_parallel_group = get_tp_group
 
 _PP: Optional[GroupCoordinator] = None
+_PP_OUTPUT: Optional[GroupCoordinator] = None
 
 
 def get_pp_group() -> GroupCoordinator:
     assert _PP is not None, "pipeline model parallel group is not initialized"
     return _PP
+
+
+def get_pp_output_group() -> GroupCoordinator:
+    """Return the dedicated reverse output-ring pipeline group."""
+    assert (
+        _PP_OUTPUT is not None
+    ), "pipeline output model parallel group is not initialized"
+    return _PP_OUTPUT
 
 
 # kept for backward compatibility
@@ -2544,6 +2553,29 @@ def initialize_model_parallel(
         max_world_size=max_world_size,
     )
 
+    # Proxy tensors flow from one pipeline stage to the next while completed
+    # outputs flow around the same rank ring in the opposite logical phase.
+    # They can overlap in the depth-zero scheduler. Sharing one ProcessGroup
+    # gives both streams one untagged P2P sequence space and allows a proxy send
+    # to cross-match an output send. Keep the established PP group as the
+    # forward proxy channel and give the reverse output ring its own complete
+    # GroupCoordinator (device payload and CPU metadata groups).
+    global _PP_OUTPUT
+    assert _PP_OUTPUT is None, "pipeline output group is already initialized"
+    if pipeline_model_parallel_size > 1:
+        _PP_OUTPUT = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_custom_allreduce=False,
+            group_name="pp_output",
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
+        )
+    else:
+        _PP_OUTPUT = _PP
+
 
 def create_custom_parallel_group(
     group_ranks: List[int], backend: str = "gloo"
@@ -2772,7 +2804,11 @@ def destroy_model_parallel():
         _TP.destroy()
     _TP = None
 
+    global _PP_OUTPUT
     global _PP
+    if _PP_OUTPUT and _PP_OUTPUT is not _PP:
+        _PP_OUTPUT.destroy()
+    _PP_OUTPUT = None
     if _PP:
         _PP.destroy()
     _PP = None

@@ -10,6 +10,7 @@ import torch.distributed as dist
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import (
     get_default_distributed_backend,
+    get_pp_output_group,
     get_pp_group,
     get_tp_group,
     get_world_group,
@@ -253,7 +254,11 @@ def _prewarm_nccl(*, tp_size: int, pp_size: int, moe_ep_size: int) -> None:
     pp_group = None
     if pp_size > 1:
         pp_group = get_pp_group()
+        pp_output_group = get_pp_output_group()
         groups.append(("pp", pp_group.device_group))
+        groups.append(("pp_output", pp_output_group.device_group))
+    else:
+        pp_output_group = None
 
     # Initialize every communication group that can be used by the first
     # request. Warming only TP leaves PP point-to-point sends in lazy
@@ -272,6 +277,7 @@ def _prewarm_nccl(*, tp_size: int, pp_size: int, moe_ep_size: int) -> None:
 
     if pp_group is not None:
         _prewarm_pp_p2p(pp_group, warmup_tensor)
+        _prewarm_pp_p2p(pp_output_group, warmup_tensor)
     current_platform.synchronize()
 
     warmup_elapsed = time.perf_counter() - warmup_start

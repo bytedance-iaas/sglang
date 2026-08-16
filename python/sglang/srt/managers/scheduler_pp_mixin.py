@@ -1384,9 +1384,15 @@ class SchedulerPPMixin:
                 "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
             )
         tensor_dict["__msg_type__"] = msg_type
+        # Forward proxy tensors and reverse/relayed outputs are independent
+        # logical streams that legitimately overlap. They must not share one
+        # untagged P2P sequence space.
+        tensor_group = (
+            self.pp_output_group if msg_type == "output" else self.pp_group
+        )
         p2p_work = []
         p2p_work.extend(
-            self.pp_group.send_tensor_dict(
+            tensor_group.send_tensor_dict(
                 tensor_dict=tensor_dict,
                 all_gather_group=(
                     self.attn_tp_group if self.require_attn_tp_allgather else None
@@ -1411,8 +1417,11 @@ class SchedulerPPMixin:
             if inbox_queue:
                 return inbox_queue.popleft()
 
+        tensor_group = (
+            self.pp_output_group if expected_kind == "output" else self.pp_group
+        )
         while True:
-            tensor_dict = self.pp_group.recv_tensor_dict(
+            tensor_dict = tensor_group.recv_tensor_dict(
                 all_gather_group=all_gather_group
             )
             received_kind = tensor_dict.get("__msg_type__", "default")
