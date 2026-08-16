@@ -288,7 +288,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   // CUDA graph pads the batch to a captured size. Keep padded output rows
   // invalid without a separate fill kernel.
   if (bid >= num_real_reqs[0]) {
-    for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
+    for (int64_t i = tid; i < num_steps * NUM_TOP_K; i += BLOCK_SIZE) {
       req_top_k_device_locs[i] = -1;
     }
     return;
@@ -299,7 +299,6 @@ __global__ void load_cache_to_device_buffer_kernel(
   const BallotMask lanes_before = (BallotMask(1) << lane_id) - BallotMask(1);
 
   const int64_t rid = req_pool_indices[bid];
-  const int64_t seq_len = seq_lens[bid];
 
   // Calculate offsets for this request
   const int32_t* req_top_k_tokens = top_k_tokens + bid * top_k_tokens_stride;
@@ -310,22 +309,6 @@ __global__ void load_cache_to_device_buffer_kernel(
   const int32_t* req_device_buffer_locs = device_buffer_locs + buffer_offset;
   const int64_t* req_host_cache_locs = host_cache_locs + rid * host_stride;
   int16_t* req_lru_slots = lru_slots + rid * lru_slot_stride_0;
-
-  // Fast path: short sequences have all tokens in the device buffer in order.
-  if (seq_len <= HOT_BUFFER_SIZE) {
-    const int count = (seq_len < NUM_TOP_K) ? static_cast<int>(seq_len) : NUM_TOP_K;
-    for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
-      int32_t device_loc = -1;
-      if (i < count) {
-        int32_t token_pos = req_top_k_tokens[i];
-        if (token_pos >= 0) {
-          device_loc = req_device_buffer_locs[token_pos];
-        }
-      }
-      req_top_k_device_locs[i] = device_loc;
-    }
-    return;
-  }
 
   // Shared memory layout (allocated once, reused across steps)
   extern __shared__ char smem_raw[];
@@ -347,8 +330,8 @@ __global__ void load_cache_to_device_buffer_kernel(
 
   for (int64_t step = 0; step < num_steps; step++) {
     // Per-step pointers: [num_reqs, num_steps, NUM_TOP_K] req-major layout
-    const int32_t* step_top_k_tokens = req_top_k_tokens_base + step * NUM_TOP_K;
-    int32_t* step_top_k_device_locs = req_top_k_device_locs_base + step * NUM_TOP_K;
+    const int32_t* step_top_k_tokens = req_top_k_tokens + step * NUM_TOP_K;
+    int32_t* step_top_k_device_locs = req_top_k_device_locs + step * NUM_TOP_K;
     // seq_lens: [num_reqs * num_steps] flat req-major; index = bid * num_steps + step
     const int64_t seq_len = static_cast<int64_t>(seq_lens[bid * num_steps + step]);
 

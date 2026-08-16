@@ -101,6 +101,7 @@ def _run_kernel(
     req_pool_indices: torch.Tensor | None = None,
     num_real_reqs: int | None = None,
     output_fill_value: int = -1,
+    num_steps: int = 1,
 ) -> torch.Tensor:
     batch_size = top_k_tokens.shape[0]
     if req_pool_indices is None:
@@ -125,11 +126,12 @@ def _run_kernel(
         seq_lens=seq_lens,
         lru_slots=lru_slots,
         item_size_bytes=ITEM_SIZE_BYTES,
-        num_top_k=top_k_tokens.shape[1],
+        num_top_k=top_k_tokens.shape[-1],
         hot_buffer_size=HOT_BUFFER_SIZE,
         page_size=1,
         block_size=256,
         num_real_reqs=torch.tensor([num_real_reqs], dtype=torch.int32, device=DEVICE),
+        num_steps=num_steps,
     )
     torch.cuda.synchronize()
     return out
@@ -324,6 +326,28 @@ def test_load_cache_to_device_buffer_fast_path_overwrites_stale_output() -> None
     )
 
     assert torch.equal(out.cpu(), torch.tensor([[7, -1, -1, -1]], dtype=torch.int32))
+
+
+def test_load_cache_to_device_buffer_multistep_fast_path() -> None:
+    state = _make_state([[9, 7, 3, 5, 11]], [[0, 1, 2, 3, -1]], [4])
+    top_k_tokens = torch.tensor(
+        [[[2, 0, -1], [1, 2, 0], [0, -1, -1]]],
+        dtype=torch.int32,
+        device=DEVICE,
+    )
+
+    out = _run_kernel(
+        top_k_tokens=top_k_tokens,
+        seq_lens=torch.tensor([3, 3, 3], dtype=torch.int32, device=DEVICE),
+        output_fill_value=123456,
+        num_steps=3,
+        **state,
+    )
+
+    assert torch.equal(
+        out.cpu(),
+        torch.tensor([[[3, 9, -1], [7, 3, 9], [9, -1, -1]]], dtype=torch.int32),
+    )
 
 
 def test_load_cache_to_device_buffer_hits_newest_and_updates_lru() -> None:
