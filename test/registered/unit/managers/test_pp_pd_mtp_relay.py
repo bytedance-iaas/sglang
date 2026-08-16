@@ -448,7 +448,7 @@ def test_pp_disagg_output_ring_last_stage_starts_relay_chain():
         )
 
     assert work is send_work
-    assert events == ["send", "recv"]
+    assert events == ["recv", "send"]
     scheduler._pp_commit_comm_work.assert_not_called()
 
 
