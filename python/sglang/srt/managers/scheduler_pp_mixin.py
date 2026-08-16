@@ -1384,9 +1384,7 @@ class SchedulerPPMixin:
         # Forward proxy tensors and reverse/relayed outputs are independent
         # logical streams that legitimately overlap. They must not share one
         # untagged P2P sequence space.
-        tensor_group = (
-            self.pp_output_group if msg_type == "output" else self.pp_group
-        )
+        tensor_group = self.pp_output_group if msg_type == "output" else self.pp_group
         p2p_work = []
         p2p_work.extend(
             tensor_group.send_tensor_dict(

@@ -419,8 +419,7 @@ def test_pp_disagg_output_ring_last_stage_starts_relay_chain():
             side_effect=lambda *args: events.append("send") or send_work
         ),
         _pp_recv_dict_from_prev_stage=Mock(
-            side_effect=lambda: events.append("recv")
-            or {"next_token_ids": object()}
+            side_effect=lambda: events.append("recv") or {"next_token_ids": object()}
         ),
         _pp_prep_batch_result=Mock(return_value=object()),
         _pp_commit_comm_work=Mock(
