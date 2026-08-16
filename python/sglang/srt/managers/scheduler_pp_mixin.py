@@ -1817,6 +1817,13 @@ class SchedulerPPMixin:
             # the output ring in the same slot (last -> first -> ... -> last).
             _do_recv()
             if next_pp_outputs is not None:
+                # WorkNCCL.wait() only inserts a dependency on the CUDA stream;
+                # it does not wait for the receive at the Python boundary.  This
+                # branch reverses direction on the same output communicator, so
+                # every tensor in the incoming dictionary must be complete before
+                # the first reverse send is enqueued.  Otherwise the two peers can
+                # assign opposite-direction sends to the same NCCL P2P sequence.
+                self.schedule_stream.synchronize()
                 send_output_work = self._pp_send_dict_to_next_stage(
                     next_pp_outputs.tensors,
                     async_send=True,

@@ -348,13 +348,16 @@ def test_pp_disagg_output_ring_relays_fresh_payload_before_control_phase():
     send_work = [object()]
     recorded_event = Mock()
     target = SimpleNamespace(forward_mode=SimpleNamespace(is_prebuilt=lambda: False))
+    schedule_stream = SimpleNamespace(
+        synchronize=Mock(side_effect=lambda: events.append("sync"))
+    )
     scheduler = SimpleNamespace(
         pp_group=SimpleNamespace(is_last_rank=False),
         copy_stream_ctx=nullcontext(),
         copy_stream=SimpleNamespace(
             wait_stream=lambda stream: events.append(("wait_stream", stream))
         ),
-        schedule_stream=object(),
+        schedule_stream=schedule_stream,
         device_module=SimpleNamespace(
             Event=Mock(return_value=recorded_event),
             current_stream=Mock(return_value=object()),
@@ -398,10 +401,12 @@ def test_pp_disagg_output_ring_relays_fresh_payload_before_control_phase():
     assert outputs.tensors is received_tensors
     assert event is recorded_event
     assert work == []
-    assert events[-2:] == [
+    assert events[-3:] == [
+        "sync",
         ("send", received_tensors, True, "output"),
         ("commit", send_work),
     ]
+    schedule_stream.synchronize.assert_called_once_with()
     scheduler._pp_send_output_to_next_stage.assert_not_called()
 
 
