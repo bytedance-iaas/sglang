@@ -1,7 +1,13 @@
 import json
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
+import torch
+
+from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.sparsity.factory import parse_hisparse_config
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -71,6 +77,38 @@ class TestHiSparseConfig(unittest.TestCase):
         for config in invalid_configs:
             with self.subTest(config=config), self.assertRaises(ValueError):
                 self._parse(config)
+
+    def test_draft_pool_reuses_target_hisparse_mapping(self):
+        configurator = SimpleNamespace(
+            is_draft_worker=True,
+            is_hybrid_swa=False,
+        )
+        draft_pool = object.__new__(HiSparseDSATokenToKVPool)
+        target_allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
+        mapping = torch.tensor([0, 7, -1], dtype=torch.int64)
+        target_allocator.full_to_hisparse_device_index_mapping = mapping
+
+        with (
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.get_memory",
+                return_value=SimpleNamespace(enable_hisparse=True),
+            ),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.get_disagg",
+                return_value=SimpleNamespace(disaggregation_mode="decode"),
+            ),
+        ):
+            result = KVCacheConfigurator._build_token_to_kv_pool_allocator(
+                configurator,
+                sizes=SimpleNamespace(),
+                token_to_kv_pool=draft_pool,
+                is_dsv4_model=False,
+                req_to_token_pool=SimpleNamespace(),
+                token_to_kv_pool_allocator=target_allocator,
+            )
+
+        self.assertIs(result, target_allocator)
+        self.assertIs(draft_pool.full_to_hisparse_device_index_mapping, mapping)
 
 
 if __name__ == "__main__":

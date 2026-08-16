@@ -1606,7 +1606,16 @@ class KVCacheConfigurator:
 
         else:
             assert self.is_draft_worker
-            if self.is_hybrid_swa:
+            if get_memory().enable_hisparse and isinstance(
+                token_to_kv_pool, HiSparseDSATokenToKVPool
+            ):
+                assert isinstance(
+                    token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator
+                )
+                token_to_kv_pool.register_mapping(
+                    token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
+                )
+            elif self.is_hybrid_swa:
                 if self.draft_swa_full_capacity:
                     # Banded depth: the SWA ring is full draft capacity, so use
                     # an IDENTITY full->swa mapping — store and read locs both
