@@ -40,6 +40,30 @@ if TYPE_CHECKING:
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 logger = logging.getLogger(__name__)
 _spec_diag_sync_logs = 0
+_MLP_SYNC_TRANSPORT_LOGGED = False
+
+
+def _use_device_mlp_sync_transport(
+    *,
+    disable_overlap_schedule: bool,
+    offload_tags: set[str],
+    force_cpu_mlp_sync: bool,
+) -> bool:
+    """Return whether scheduler metadata may use the TP device group.
+
+    PP prefill under PD disaggregation posts pipeline receives after this
+    metadata exchange.  Using a second NCCL communicator here can form a launch
+    ordering cycle with an earlier pipeline send, so that topology explicitly
+    stays on the existing Gloo transport.
+    """
+    return (
+        not force_cpu_mlp_sync
+        and len(offload_tags) == 0
+        and (
+            disable_overlap_schedule
+            or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
+        )
+    )
 
 
 def _spec_input_cuda_graph_compatible(local_batch: Optional[ScheduleBatch]) -> bool:
@@ -111,7 +135,7 @@ class MLPSyncBatchInfo:
     local_forward_mode: int
 
     # some gathered elements
-    tp0_info: torch.Tensor = None
+    tp0_info_cpu: torch.Tensor = None
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
@@ -199,17 +223,51 @@ class MLPSyncBatchInfo:
             )
         tp_info[tp_active_ranks[:num_ranks_in_tp_info] == 0] = fallback_tensor
 
-        tp0_info = global_info_tensor[:, 0, :]
-        self.tp0_info = tp0_info
-        # Perform only one Device-to-Host (D2H) memory copy
-        cpu_data = tp0_info[:, :2].cpu()
-        self.global_num_tokens = cpu_data[:, 0].tolist()
-        self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
-        self.can_run_decode_cuda_graph = bool(tp0_info[:, 2].min().item())
-        self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
-        self.can_run_prefill_cuda_graph = bool(tp0_info[:, 6].min().item())
+        # One D2H for every field: each `.item()` / `.tolist()` on a device
+        # tensor is its own stream sync. Copy the whole tensor, not the
+        # `[:, 0, :]` slice -- that slice is non-contiguous once
+        # attn_tp * attn_cp > 1, adding a gather kernel inside the wait.
+        tp0_info_cpu = global_info_tensor.cpu()[:, 0, :]
+        self.tp0_info_cpu = tp0_info_cpu
+        self.global_num_tokens = tp0_info_cpu[:, 0].tolist()
+        self.global_num_tokens_for_logprob = tp0_info_cpu[:, 1].tolist()
+        self.can_run_decode_cuda_graph = bool(tp0_info_cpu[:, 2].min())
+        self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
+        self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())
         if _ENABLE_METRICS_DP_ATTENTION:
-            self.dp_cooperation_info = DPCooperationInfo.create(tp0_info[:, 5].tolist())
+            self.dp_cooperation_info = DPCooperationInfo.create(
+                tp0_info_cpu[:, 5].tolist()
+            )
+
+
+def _log_mlp_sync_transport_once(
+    *,
+    group: torch.distributed.ProcessGroup,
+    group_kind: str,
+    device: torch.device | str,
+    overlap_schedule: bool,
+    sync_info: MLPSyncBatchInfo,
+) -> None:
+    """Log the first metadata collective on every scheduler rank."""
+    global _MLP_SYNC_TRANSPORT_LOGGED
+    if _MLP_SYNC_TRANSPORT_LOGGED:
+        return
+
+    logger.info(
+        "Entering DP-attention MLP sync collective: "
+        "backend=%s, group=%s, group_size=%s, global_rank=%s, group_rank=%s, "
+        "device=%s, overlap_schedule=%s, num_tokens=%s, forward_mode=%s",
+        torch.distributed.get_backend(group),
+        group_kind,
+        torch.distributed.get_world_size(group),
+        torch.distributed.get_rank(),
+        torch.distributed.get_rank(group),
+        device,
+        overlap_schedule,
+        sync_info.num_tokens,
+        sync_info.local_forward_mode,
+    )
+    _MLP_SYNC_TRANSPORT_LOGGED = True
 
 
 def _update_gather_batch(
@@ -267,6 +325,7 @@ def prepare_mlp_sync_batch_raw(
     require_mlp_tp_gather: bool,
     disable_overlap_schedule: bool,
     offload_tags: set[str],
+    force_cpu_mlp_sync: bool = False,
     dwdp: bool = False,
 ):
     global _spec_diag_sync_logs
@@ -344,15 +403,19 @@ def prepare_mlp_sync_batch_raw(
 
         world = get_world_group()
         group = torch.distributed.group.WORLD
+        group_kind = "world"
         device = world.device
-    elif len(offload_tags) == 0 and (
-        disable_overlap_schedule
-        or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
+    elif _use_device_mlp_sync_transport(
+        disable_overlap_schedule=disable_overlap_schedule,
+        offload_tags=offload_tags,
+        force_cpu_mlp_sync=force_cpu_mlp_sync,
     ):
         group = tp_group.device_group
+        group_kind = "device"
         device = tp_group.device
     else:
         group = tp_group.cpu_group
+        group_kind = "cpu"
         device = "cpu"
 
     local_can_run_tbo, local_forward_mode = tbo_preparer.prepare_all_gather(local_batch)
@@ -378,6 +441,13 @@ def prepare_mlp_sync_batch_raw(
     )
 
     if not skip_all_gather:
+        _log_mlp_sync_transport_once(
+            group=group,
+            group_kind=group_kind,
+            device=device,
+            overlap_schedule=not disable_overlap_schedule,
+            sync_info=mlp_sync_info,
+        )
         mlp_sync_info.all_gather(
             device=device,
             group=group,
@@ -386,7 +456,7 @@ def prepare_mlp_sync_batch_raw(
 
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
-                mlp_sync_info.tp0_info[:, 4:6],
+                mlp_sync_info.tp0_info_cpu[:, 4:6],
             )
         )
 
@@ -427,7 +497,7 @@ def prepare_mlp_sync_batch_raw(
     if local_batch is not None and not skip_all_gather:
         local_batch.recv_skipper_forward_mode = (
             SchedulerRecvSkipper.derive_forward_mode(
-                mlp_sync_info.tp0_info[:, 5].tolist()
+                mlp_sync_info.tp0_info_cpu[:, 5].tolist()
             )
         )
 
@@ -465,6 +535,10 @@ class SchedulerDPAttnAdapter:
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             offload_tags=self.offload_tags,
+            force_cpu_mlp_sync=(
+                self.ps.pp_size > 1
+                and self.server_args.disaggregation_mode == "prefill"
+            ),
             dwdp=get_parallel().dwdp_size > 1,
         )
 
