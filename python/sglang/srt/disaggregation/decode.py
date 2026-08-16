@@ -1725,7 +1725,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             # Direct-to-host path: only allocate logical indices (no hisparse
             # device indices) and allocate host indices for RDMA destination.
-            coordinator = self.scheduler.hisparse_coordinator
             kv_loc = alloc_for_decode_prealloc_hisparse(
                 allocator,
                 req=req,
@@ -1733,14 +1732,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 uses_swa_tail=self._uses_swa_tail_prealloc(),
                 swa_tail_len=self._swa_tail_len(fill_len),
             )
-            # Allocate host indices for the RDMA transfer target.
-            host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
-                coordinator.req_to_host_pool,
-                coordinator.req_to_host_pool_allocated_len,
-                req.req_pool_idx,
-                0,
-                coordinator.host_token_len(fill_len),
-            )
+            # The PD wire protocol carries one page-index vector for target
+            # and draft KV. Allocate from the target namespace and mirror the
+            # complete reserved request row into the draft coordinator before
+            # RDMA can complete and direct admission begins.
+            host_indices = self._allocate_hisparse_host_slots(req, fill_len)
         else:
             uses_swa_tail = self._uses_swa_tail_prealloc() and prefix_len == 0
             swa_tail_len = self._swa_tail_len(fill_len)
