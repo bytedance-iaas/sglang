@@ -997,15 +997,6 @@ class Scheduler(
         self.init_all_attention_backends()
         self.init_all_cuda_graphs()
 
-        # Graph-private pools keep every address needed by future replays alive,
-        # so empty_cache cannot invalidate a captured graph.  It can, however,
-        # return unrelated warmup/capture scratch blocks to the driver.  Reclaim
-        # those blocks before the launch-server warmup runs its first eager
-        # speculative forward; otherwise a nearly full KV pool can OOM on a
-        # transient DeepGEMM output even when the caching allocator still owns
-        # enough unused memory.
-        current_platform.empty_cache()
-
         model_runner = self.tp_worker.model_runner
         if model_runner.token_to_kv_pool.post_capture_active:
             tic = time.perf_counter()
