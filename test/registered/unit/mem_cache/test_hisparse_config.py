@@ -3,15 +3,15 @@ import inspect
 import json
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
+
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.sparsity.factory import parse_hisparse_config
-
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -124,6 +124,41 @@ class TestHiSparseConfig(unittest.TestCase):
             and node.value.id in {"req", "r"}
         ]
         self.assertEqual(legacy_accesses, [])
+
+    def test_direct_admission_commits_owner_state_before_draft_mirror(self):
+        coordinator = SimpleNamespace(
+            debug_validate_lifecycle=False,
+            device_buffer_size=8,
+            req_device_buffer_tokens=torch.zeros((1, 1, 8), dtype=torch.int32),
+            active_hisparse_reqs={},
+            _skip_first_backup=[False],
+            _try_promote_from_host=Mock(return_value=False),
+            _device_buffer_alloc_size=Mock(return_value=8),
+            demote_until_hisparse_available=Mock(return_value=True),
+            alloc_device_buffer=Mock(),
+            host_token_len=Mock(return_value=16),
+            _preload_to_device_buffer=Mock(),
+            _state=Mock(return_value=SimpleNamespace(value="device_buffered")),
+        )
+        req = SimpleNamespace(
+            rid="direct-admission",
+            req_pool_idx=0,
+            kv=SimpleNamespace(kv_allocated_len=16),
+            hisparse_staging=True,
+        )
+
+        HiSparseCoordinator.admit_request_direct(coordinator, req)
+
+        coordinator._try_promote_from_host.assert_called_once_with(
+            req, sync_mirrors=False, admission_boundary=True
+        )
+        coordinator.demote_until_hisparse_available.assert_called_once_with(8)
+        coordinator.alloc_device_buffer.assert_called_once_with(req)
+        coordinator._preload_to_device_buffer.assert_not_called()
+        self.assertTrue(torch.all(coordinator.req_device_buffer_tokens == -1))
+        self.assertFalse(req.hisparse_staging)
+        self.assertTrue(coordinator._skip_first_backup[0])
+        self.assertIs(coordinator.active_hisparse_reqs[0], req)
 
 
 if __name__ == "__main__":
