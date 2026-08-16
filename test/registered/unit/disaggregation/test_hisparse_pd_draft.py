@@ -1,5 +1,6 @@
 import ast
 import inspect
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -93,7 +94,7 @@ def test_hisparse_pd_draft_requires_coordinator():
 
 
 def test_hisparse_prealloc_uses_canonical_target_and_draft_host_slots():
-    tree = ast.parse(inspect.getsource(DecodePreallocQueue._pre_alloc))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(DecodePreallocQueue._pre_alloc)))
     canonical_alloc_calls = [
         node
         for node in ast.walk(tree)
@@ -245,6 +246,25 @@ def test_finished_request_releases_target_and_draft_hisparse_state():
     SchedulerBatchResultProcessor._finish_hisparse_request(processor, req)
 
     assert calls == [("target", req), ("draft", req)]
+
+
+@pytest.mark.parametrize(
+    "finish_path",
+    [
+        SchedulerBatchResultProcessor.process_batch_result_prebuilt,
+        SchedulerBatchResultProcessor._handle_finish_state_updated_req,
+    ],
+)
+def test_finished_request_paths_use_target_and_draft_hisparse_cleanup(finish_path):
+    tree = ast.parse(textwrap.dedent(inspect.getsource(finish_path)))
+    calls = [
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    ]
+
+    assert calls.count("_finish_hisparse_request") == 1
+    assert "request_finished" not in calls
 
 
 def _device_coordinator(
