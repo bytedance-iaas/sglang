@@ -1798,16 +1798,19 @@ class SchedulerPPMixin:
                 d2h_event.record(self.device_module.current_stream())
 
         if relay_output_immediately and self.pp_group.is_last_rank:
-            # Start the relay chain independently of backend send semantics.
-            # Every other stage receives first, so the last stage must be the
-            # unique sender that injects the output into the ring.  Keep this
-            # origin send outstanding: on the first populated slot, rank 0
-            # does not post the matching receive until the next scheduler
-            # slot.  The wrapper commits it at the start of that next slot,
-            # after rank 0 can enter recv, while the dedicated PD control group
-            # keeps the intervening control ring independent.
-            send_output_work = _do_send()
+            # In a steady slot, consume the previous relay before injecting the
+            # next origin payload.  Reversing this order makes the last stage's
+            # new send collide with the preceding stage's outstanding relay on
+            # the same untagged output communicator.  In the initial injection
+            # slot _do_recv() is a no-op because there is no return target, so
+            # the last stage remains the unique sender that starts the ring.
             _do_recv()
+            # Keep the origin send outstanding: rank 0 posts the matching
+            # receive in the next scheduler slot.  The wrapper commits it at
+            # the start of that slot, after rank 0 can enter recv, while the
+            # dedicated PD control group keeps the intervening control ring
+            # independent.
+            send_output_work = _do_send()
         elif relay_output_immediately:
             # The disaggregated PP loops enter CPU control rings immediately
             # after this exchange.  A non-last stage therefore cannot defer
