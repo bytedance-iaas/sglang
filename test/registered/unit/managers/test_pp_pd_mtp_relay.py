@@ -1,4 +1,4 @@
-from collections import deque
+from collections import defaultdict, deque
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
@@ -48,6 +48,12 @@ def test_nccl_prewarm_initializes_distinct_tp_and_pp_groups():
         ranks=[0, 8],
         rank_in_group=0,
     )
+    pp_output_group_handle = object()
+    pp_output_group = SimpleNamespace(
+        device_group=pp_output_group_handle,
+        ranks=[0, 8],
+        rank_in_group=0,
+    )
     warmup_tensor = object()
     recv_tensor = object()
     send_work = Mock()
@@ -61,6 +67,10 @@ def test_nccl_prewarm_initializes_distinct_tp_and_pp_groups():
         patch(
             "sglang.srt.distributed.bootstrap.get_pp_group",
             return_value=pp_group,
+        ),
+        patch(
+            "sglang.srt.distributed.bootstrap.get_pp_output_group",
+            return_value=pp_output_group,
         ),
         patch(
             "sglang.srt.distributed.bootstrap.torch.zeros",
@@ -89,14 +99,23 @@ def test_nccl_prewarm_initializes_distinct_tp_and_pp_groups():
     assert all_reduce.call_args_list == [
         call(warmup_tensor, group=tp_group),
         call(warmup_tensor, group=pp_group_handle),
+        call(warmup_tensor, group=pp_output_group_handle),
     ]
-    isend.assert_called_once_with(warmup_tensor, dst=8, group=pp_group_handle)
-    irecv.assert_called_once_with(recv_tensor, src=8, group=pp_group_handle)
-    send_work.wait.assert_called_once_with()
-    recv_work.wait.assert_called_once_with()
+    assert isend.call_args_list == [
+        call(warmup_tensor, dst=8, group=pp_group_handle),
+        call(warmup_tensor, dst=8, group=pp_output_group_handle),
+    ]
+    assert irecv.call_args_list == [
+        call(recv_tensor, src=8, group=pp_group_handle),
+        call(recv_tensor, src=8, group=pp_output_group_handle),
+    ]
+    assert send_work.wait.call_count == 2
+    assert recv_work.wait.call_count == 2
     assert barrier.call_args_list == [
         call(group=pp_group_handle),
         call(group=pp_group_handle),
+        call(group=pp_output_group_handle),
+        call(group=pp_output_group_handle),
     ]
 
 
@@ -266,6 +285,57 @@ def test_pp_proxy_exchange_is_committed_before_reusing_the_ring():
         ("send", tensor_dict, True, "proxy"),
         ("commit", proxy_work),
     ]
+
+
+def test_pp_proxy_and_output_use_independent_tensor_channels():
+    proxy_group = SimpleNamespace(
+        send_tensor_dict=Mock(return_value=[]),
+        recv_tensor_dict=Mock(return_value={"__msg_type__": "proxy"}),
+    )
+    output_group = SimpleNamespace(
+        send_tensor_dict=Mock(return_value=[]),
+        recv_tensor_dict=Mock(return_value={"__msg_type__": "output"}),
+    )
+    all_gather_group = object()
+    scheduler = SimpleNamespace(
+        pp_group=proxy_group,
+        pp_output_group=output_group,
+        _pp_tensor_dict_inbox=defaultdict(deque),
+        require_attn_tp_allgather=False,
+        attn_tp_group=all_gather_group,
+    )
+
+    proxy_tensors = {"hidden_states": object()}
+    output_tensors = {"next_token_ids": object()}
+    SchedulerPPMixin._pp_send_dict_to_next_stage(
+        scheduler, proxy_tensors, async_send=True, msg_type="proxy"
+    )
+    SchedulerPPMixin._pp_send_dict_to_next_stage(
+        scheduler, output_tensors, async_send=True, msg_type="output"
+    )
+    SchedulerPPMixin._pp_recv_typed_dict(
+        scheduler, expected_kind="proxy", all_gather_group=all_gather_group
+    )
+    SchedulerPPMixin._pp_recv_typed_dict(
+        scheduler, expected_kind="output", all_gather_group=all_gather_group
+    )
+
+    proxy_group.send_tensor_dict.assert_called_once_with(
+        tensor_dict=proxy_tensors,
+        all_gather_group=None,
+        async_send=True,
+    )
+    output_group.send_tensor_dict.assert_called_once_with(
+        tensor_dict=output_tensors,
+        all_gather_group=None,
+        async_send=True,
+    )
+    proxy_group.recv_tensor_dict.assert_called_once_with(
+        all_gather_group=all_gather_group
+    )
+    output_group.recv_tensor_dict.assert_called_once_with(
+        all_gather_group=all_gather_group
+    )
 
 
 def test_pp_disagg_output_ring_relays_fresh_payload_before_control_phase():
