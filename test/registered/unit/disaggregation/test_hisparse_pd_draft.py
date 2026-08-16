@@ -1,3 +1,5 @@
+import ast
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -88,6 +90,18 @@ def test_hisparse_pd_draft_requires_coordinator():
 
     with pytest.raises(RuntimeError, match="draft HiSparse coordinator"):
         DecodePreallocQueue._draft_pd_transfer_pool(queue)
+
+
+def test_hisparse_prealloc_uses_canonical_target_and_draft_host_slots():
+    tree = ast.parse(inspect.getsource(DecodePreallocQueue._pre_alloc))
+    canonical_alloc_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_allocate_hisparse_host_slots"
+    ]
+    assert len(canonical_alloc_calls) == 1
 
 
 def test_hisparse_pd_mirrors_target_slots_without_draft_allocation():
