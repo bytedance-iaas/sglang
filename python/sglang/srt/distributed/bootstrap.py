@@ -10,8 +10,8 @@ import torch.distributed as dist
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import (
     get_default_distributed_backend,
-    get_pp_output_group,
     get_pp_group,
+    get_pp_output_group,
     get_tp_group,
     get_world_group,
     init_distributed_environment,
