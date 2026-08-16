@@ -1412,6 +1412,64 @@ class HiSparseCoordinator:
             else host_len
         )
         host_locs = self.req_to_host_pool[req.req_pool_idx, :host_len]
+        if self.debug_validate_lifecycle:
+            host_kernel_locs = self.mem_pool_host.dcp_kernel_indices(host_locs)
+            device_kernel_locs = self.mem_pool_host.dcp_kernel_indices(device_locs)
+            if host_kernel_locs.numel() != device_kernel_locs.numel():
+                raise RuntimeError(
+                    "HiSparse host/device preload length mismatch: "
+                    f"req={req.rid} host={host_kernel_locs.numel()} "
+                    f"device={device_kernel_locs.numel()}"
+                )
+            if self.mem_pool_host.layout == "layer_first":
+                host_rows = int(self.mem_pool_host.kv_buffer.shape[1])
+            else:
+                host_rows = int(self.mem_pool_host.kv_buffer.shape[0])
+            device_rows = int(self.mem_pool_device.kv_buffer[0].shape[0])
+            host_min = (
+                int(host_kernel_locs.min().item()) if host_kernel_locs.numel() else -1
+            )
+            host_max = (
+                int(host_kernel_locs.max().item()) if host_kernel_locs.numel() else -1
+            )
+            device_min = (
+                int(device_kernel_locs.min().item())
+                if device_kernel_locs.numel()
+                else -1
+            )
+            device_max = (
+                int(device_kernel_locs.max().item())
+                if device_kernel_locs.numel()
+                else -1
+            )
+            if host_min < 0 or host_max >= host_rows:
+                raise RuntimeError(
+                    "HiSparse host preload index is out of bounds: "
+                    f"req={req.rid} range=({host_min}, {host_max}) "
+                    f"capacity={host_rows}"
+                )
+            if device_min < 0 or device_max >= device_rows:
+                raise RuntimeError(
+                    "HiSparse device preload index is out of bounds: "
+                    f"req={req.rid} range=({device_min}, {device_max}) "
+                    f"capacity={device_rows}"
+                )
+            logger.warning(
+                "HISPARSE_LOAD_TRACE req=%s req_pool_idx=%d host_len=%d "
+                "host_range=(%d,%d)/%d device_range=(%d,%d)/%d "
+                "layers=%d kv_dim=%d",
+                req.rid,
+                req.req_pool_idx,
+                host_len,
+                host_min,
+                host_max,
+                host_rows,
+                device_min,
+                device_max,
+                device_rows,
+                self.mem_pool_device.layer_num,
+                self.mem_pool_device.kv_cache_dim,
+            )
         for layer_id in range(self.mem_pool_device.layer_num):
             self.mem_pool_host.load_to_device_per_layer(
                 self.mem_pool_device,
