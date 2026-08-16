@@ -727,16 +727,24 @@ WORKDIR /sgl-workspace/sglang
 
 # Keep build provenance at the end so metadata changes do not invalidate build layers.
 ARG SGLANG_BUILD_COMMIT=unknown
+ARG SGLANG_BUILD_TREE=unknown
+ARG SGLANG_PYTHON_MANIFEST_SHA256=unknown
+ARG SGLANG_BUILD_SOURCE=https://github.com/sgl-project/sglang
 ARG SGLANG_BUILD_URL=
 ARG SGLANG_IMAGE_TAG=local/sglang:dev
 ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown} \
+    SGLANG_BUILD_TREE=${SGLANG_BUILD_TREE:-unknown} \
+    SGLANG_PYTHON_MANIFEST_SHA256=${SGLANG_PYTHON_MANIFEST_SHA256:-unknown} \
+    SGLANG_BUILD_SOURCE=${SGLANG_BUILD_SOURCE:-https://github.com/sgl-project/sglang} \
     SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-} \
     SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev}
-LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
+LABEL org.opencontainers.image.source="${SGLANG_BUILD_SOURCE}" \
       org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
       org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
       org.opencontainers.image.url="${SGLANG_BUILD_URL}" \
       ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
+      ai.sglang.build.tree="${SGLANG_BUILD_TREE}" \
+      ai.sglang.build.python-manifest-sha256="${SGLANG_PYTHON_MANIFEST_SHA256}" \
       ai.sglang.build.url="${SGLANG_BUILD_URL}" \
       ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
 
@@ -892,16 +900,24 @@ WORKDIR /sgl-workspace/sglang
 
 # Keep build provenance at the end so metadata changes do not invalidate build layers.
 ARG SGLANG_BUILD_COMMIT=unknown
+ARG SGLANG_BUILD_TREE=unknown
+ARG SGLANG_PYTHON_MANIFEST_SHA256=unknown
+ARG SGLANG_BUILD_SOURCE=https://github.com/sgl-project/sglang
 ARG SGLANG_BUILD_URL=
 ARG SGLANG_IMAGE_TAG=local/sglang:dev
 ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown} \
+    SGLANG_BUILD_TREE=${SGLANG_BUILD_TREE:-unknown} \
+    SGLANG_PYTHON_MANIFEST_SHA256=${SGLANG_PYTHON_MANIFEST_SHA256:-unknown} \
+    SGLANG_BUILD_SOURCE=${SGLANG_BUILD_SOURCE:-https://github.com/sgl-project/sglang} \
     SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-} \
     SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev}
-LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
+LABEL org.opencontainers.image.source="${SGLANG_BUILD_SOURCE}" \
       org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
       org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
       org.opencontainers.image.url="${SGLANG_BUILD_URL}" \
       ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
+      ai.sglang.build.tree="${SGLANG_BUILD_TREE}" \
+      ai.sglang.build.python-manifest-sha256="${SGLANG_PYTHON_MANIFEST_SHA256}" \
       ai.sglang.build.url="${SGLANG_BUILD_URL}" \
       ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
 
