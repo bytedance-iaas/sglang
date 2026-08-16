@@ -778,10 +778,10 @@ class HiSparseCoordinator:
             req
             for req_idx, req in self.active_hisparse_reqs.items()
             if self._is_resident(req_idx)
-            and self.host_token_len(req.kv_allocated_len)
-            > self._device_buffer_alloc_size(req.kv_allocated_len)
+            and self.host_token_len(req.kv.kv_allocated_len)
+            > self._device_buffer_alloc_size(req.kv.kv_allocated_len)
         ]
-        candidates.sort(key=lambda req: req.kv_allocated_len, reverse=True)
+        candidates.sort(key=lambda req: req.kv.kv_allocated_len, reverse=True)
         if candidates:
             self.wait_for_pending_backup()
         for req in candidates:
@@ -799,8 +799,8 @@ class HiSparseCoordinator:
         for req_idx, req in self.active_hisparse_reqs.items():
             if not self._is_resident(req_idx):
                 continue
-            host_len = self.host_token_len(req.kv_allocated_len)
-            alloc_size = self._device_buffer_alloc_size(req.kv_allocated_len)
+            host_len = self.host_token_len(req.kv.kv_allocated_len)
+            alloc_size = self._device_buffer_alloc_size(req.kv.kv_allocated_len)
             current_size = ((host_len + page_size - 1) // page_size) * page_size
             reclaimable += max(0, current_size - alloc_size)
         return max(0, available + reclaimable - page_size)
@@ -872,7 +872,7 @@ class HiSparseCoordinator:
         host_capacity = self.mem_pool_host.size
         host_tokens = host_capacity - self.mem_pool_host.available_size()
         projected_resident_tokens = sum(
-            self._projected_resident_alloc_size(req, req.kv_allocated_len)
+            self._projected_resident_alloc_size(req, req.kv.kv_allocated_len)
             for req_idx, req in self.active_hisparse_reqs.items()
             if self._is_resident(req_idx)
         )
@@ -1049,10 +1049,10 @@ class HiSparseCoordinator:
         """Mirror the target coordinator's admission decision for MTP draft KV."""
         self._device_slot_owner = owner
         owner_state = owner._state(req.req_pool_idx)
-        host_len = self.host_token_len(req.kv_allocated_len)
+        host_len = self.host_token_len(req.kv.kv_allocated_len)
         if owner_state == HiSparseResidencyState.RESIDENT:
             logical_locs = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : req.kv_allocated_len
+                req.req_pool_idx, : req.kv.kv_allocated_len
             ]
             compressed_locs = (
                 self.mem_pool_device.translate_loc_from_full_to_compressed(logical_locs)
@@ -1179,7 +1179,7 @@ class HiSparseCoordinator:
         was_device_buffered = (
             self._state(req.req_pool_idx) == HiSparseResidencyState.DEVICE_BUFFERED
         )
-        logical_len = req.kv_allocated_len if logical_len is None else logical_len
+        logical_len = req.kv.kv_allocated_len if logical_len is None else logical_len
         logical_locs = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :logical_len
         ]
@@ -1333,10 +1333,10 @@ class HiSparseCoordinator:
     ) -> None:
         """Clear request mappings that still reference coordinator-owned pages."""
         physical_locs = physical_locs[physical_locs > 0]
-        if physical_locs.numel() == 0 or req.kv_allocated_len <= 0:
+        if physical_locs.numel() == 0 or req.kv.kv_allocated_len <= 0:
             return
         logical_locs = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : req.kv_allocated_len
+            req.req_pool_idx, : req.kv.kv_allocated_len
         ]
         compressed_locs = self.mem_pool_device.translate_loc_from_full_to_compressed(
             logical_locs
@@ -1401,7 +1401,9 @@ class HiSparseCoordinator:
         host_len: Optional[int] = None,
     ) -> None:
         host_len = (
-            self.host_token_len(req.kv_allocated_len) if host_len is None else host_len
+            self.host_token_len(req.kv.kv_allocated_len)
+            if host_len is None
+            else host_len
         )
         host_locs = self.req_to_host_pool[req.req_pool_idx, :host_len]
         for layer_id in range(self.mem_pool_device.layer_num):
@@ -1422,7 +1424,7 @@ class HiSparseCoordinator:
                 count_transition=False,
             )
         if self.is_dsv4_hisparse:
-            allocated_len = req.kv_allocated_len
+            allocated_len = req.kv.kv_allocated_len
             alloc_size = self._device_buffer_alloc_size(allocated_len)
         else:
             allocated_len = req.kv.kv_allocated_len

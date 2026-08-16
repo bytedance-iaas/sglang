@@ -1,14 +1,17 @@
+import ast
+import inspect
 import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-
+from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.sparsity.factory import parse_hisparse_config
+
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -109,6 +112,18 @@ class TestHiSparseConfig(unittest.TestCase):
 
         self.assertIs(result, target_allocator)
         self.assertIs(draft_pool.full_to_hisparse_device_index_mapping, mapping)
+
+    def test_coordinator_uses_owned_kv_container(self):
+        tree = ast.parse(inspect.getsource(HiSparseCoordinator))
+        legacy_accesses = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+            and node.attr == "kv_allocated_len"
+            and isinstance(node.value, ast.Name)
+            and node.value.id in {"req", "r"}
+        ]
+        self.assertEqual(legacy_accesses, [])
 
 
 if __name__ == "__main__":
