@@ -2,6 +2,7 @@ name: Build GLM-5.2 PD4 measured-base image
 
 on:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
