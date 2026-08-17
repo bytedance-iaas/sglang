@@ -18,9 +18,9 @@ jobs:
     runs-on: x64-docker-build-node
     env:
       BASE_IMAGE: iaas-gpu-cn-beijing.cr.volces.com/serving/sglang:v0.5.15.post1.iaas.dev.202607201127@sha256:a322afaa9aa032810aa559d2497ed57fe91b71ac6d470c8b843923fadf7075d3
-      DEST_IMAGE: iaas-gpu-cn-beijing.cr.volces.com/serving/sglang:glm52-pd4-ed4638c30fea-a322afaa-final
-      SOURCE_COMMIT: ed4638c30fea1f0f8b77fa0a6b2463c659359b89
-      SOURCE_TREE: fe7b446e784d1f4514c7ea9804754561a8036442
+      DEST_IMAGE: iaas-gpu-cn-beijing.cr.volces.com/serving/sglang:glm52-pd4-a9283b72907e-a322afaa-final
+      SOURCE_COMMIT: a9283b72907e6c6788c4bf0e644c75d864af49aa
+      SOURCE_TREE: 9082ff5e8fc8ca6967154702182266451f25c18a
       VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
       VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
       NO_PROXY: localhost,127.0.0.1,::1,iaas-gpu-cn-beijing.cr.volces.com,ai-containers-cn-beijing.cr.volces.com
