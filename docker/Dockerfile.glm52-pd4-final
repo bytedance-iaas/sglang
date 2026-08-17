@@ -21,17 +21,17 @@ LABEL org.opencontainers.image.source="https://github.com/bytedance-iaas/sglang"
 # checkout containing only python/ and installed sglang-kernel 0.4.5 at Pod
 # startup. Bake that exact tested kernel into the image from the pinned wheel
 # prepared by the build workflow while leaving the remaining stack unchanged.
-COPY .glm52-build/sglang_kernel-0.4.5-cp310-abi3-manylinux2014_x86_64.whl /tmp/sglang-kernel.whl
+COPY .glm52-build/sglang_kernel-0.4.5-cp310-abi3-manylinux2014_x86_64.whl /tmp/sglang_kernel-0.4.5-cp310-abi3-manylinux2014_x86_64.whl
 RUN printf '%s  %s\n' \
       5927a14dfff92ced8b1f7c7d5844144bc574ec58e604d4fd53e6f53c709003a8 \
-      /tmp/sglang-kernel.whl \
+      /tmp/sglang_kernel-0.4.5-cp310-abi3-manylinux2014_x86_64.whl \
       | sha256sum --check --status; \
     python3 -m pip install \
-      /tmp/sglang-kernel.whl \
+      /tmp/sglang_kernel-0.4.5-cp310-abi3-manylinux2014_x86_64.whl \
       --force-reinstall \
       --no-deps \
       --break-system-packages \
-      && rm -f /tmp/sglang-kernel.whl
+      && rm -f /tmp/sglang_kernel-0.4.5-cp310-abi3-manylinux2014_x86_64.whl
 
 RUN rm -rf /sgl-workspace/sglang/python
 COPY python /sgl-workspace/sglang/python
