@@ -17,10 +17,19 @@ LABEL org.opencontainers.image.source="https://github.com/bytedance-iaas/sglang"
       ai.sglang.build.base-image="${SGLANG_BASE_IMAGE}" \
       ai.sglang.source.delivery="image-baked-no-runtime-install"
 
-# Preserve every binary and dependency from the measured H20 image. The live
-# benchmark used a sparse checkout containing only python/, so replacing this
-# directory is the exact source-delivery transition and does not rebuild or
-# upgrade PyTorch, FlashInfer, DeepEP, DeepGEMM, Mooncake, EIC, or sgl-kernel.
+# Preserve the measured H20 binary stack. The live benchmark used a sparse
+# checkout containing only python/ and installed sglang-kernel 0.4.5 at Pod
+# startup. Bake that exact tested kernel into the image while leaving PyTorch,
+# FlashInfer, DeepEP, DeepGEMM, Mooncake, and EIC unchanged.
+RUN HTTP_PROXY="" HTTPS_PROXY="" http_proxy="" https_proxy="" \
+    python3 -m pip install \
+      sglang-kernel==0.4.5 \
+      --force-reinstall \
+      --no-deps \
+      --break-system-packages \
+      --timeout 600 \
+      --retries 5
+
 RUN rm -rf /sgl-workspace/sglang/python
 COPY python /sgl-workspace/sglang/python
 COPY .glm52-build/tracked-python.manifest /usr/local/share/sglang/tracked-python.manifest
