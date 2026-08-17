@@ -751,6 +751,10 @@ class Envs:
 
     # DeepEP
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)  # This argument is deprecated
+    # W4AFP8: quantize hidden states to per-tensor FP8 during DeepEP low-latency
+    # dispatch (using w13_input_scale as the static scale), instead of dispatching
+    # per-token FP8 and re-quantizing to per-tensor on the receive side.
+    SGLANG_DEEPEP_W4AFP8_PER_TENSOR_DISPATCH = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)

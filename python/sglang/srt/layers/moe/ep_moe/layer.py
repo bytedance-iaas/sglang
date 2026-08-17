@@ -261,10 +261,24 @@ class DeepEPMoE(FusedMoE):
             )
 
         dispatch_output = self.dispatcher.dispatch(
-            hidden_states=hidden_states, topk_output=topk_output
+            hidden_states=hidden_states,
+            topk_output=topk_output,
+            static_scale=self._deepep_dispatch_static_scale(),
         )
         combine_input = self.run_moe_core(dispatch_output)
         return self.dispatcher.combine(combine_input=combine_input)
+
+    def _deepep_dispatch_static_scale(self) -> Optional[torch.Tensor]:
+        """Per-tensor input scale used to quantize hidden states to FP8 during
+        DeepEP low-latency dispatch. Returns None (per-token FP8 dispatch with
+        receive-side re-quantization) unless the W4AFP8 per-tensor dispatch path
+        is explicitly enabled."""
+        if (
+            getattr(self, "use_w4afp8", False)
+            and envs.SGLANG_DEEPEP_W4AFP8_PER_TENSOR_DISPATCH.get()
+        ):
+            return self.w13_input_scale.float()
+        return None
 
     def dispatch(
         self,
@@ -274,6 +288,7 @@ class DeepEPMoE(FusedMoE):
         return self.dispatcher.dispatch(
             hidden_states=hidden_states,
             topk_output=topk_output,
+            static_scale=self._deepep_dispatch_static_scale(),
         )
 
     def run_moe_core(

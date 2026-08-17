@@ -1659,9 +1659,16 @@ class DeepseekV2MoE(nn.Module):
 
     def op_dispatch_a(self, state):
         if self.ep_size > 1:
+            static_scale = None
+            get_static_scale = getattr(
+                self.experts, "_deepep_dispatch_static_scale", None
+            )
+            if get_static_scale is not None:
+                static_scale = get_static_scale()
             self.experts.dispatcher.dispatch_a(
                 hidden_states=state.hidden_states_mlp_input,
                 topk_output=state.pop("topk_output"),
+                static_scale=static_scale,
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
 

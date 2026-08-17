@@ -6,7 +6,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_cuda, is_cuda_alike
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_cuda_alike
 
 _is_cuda = is_cuda()
 _is_cuda_alike = is_cuda_alike()
@@ -523,13 +523,19 @@ def cutlass_w4a8_moe_deepep_ll(
     )
 
     gateup_input = torch.empty(a_states.shape, dtype=torch.float8_e4m3fn, device=device)
-    fp8_per_token_to_per_tensor_quant_triton(
-        x=a_states,
-        x_scale=a_scales,
-        masked_m=masked_m,
-        output_scale=a1_scale,
-        output=gateup_input,
-    )
+    if get_bool_env_var("SGLANG_DEEPEP_W4AFP8_PER_TENSOR_DISPATCH"):
+        # Hidden states were already quantized to per-tensor FP8 during DeepEP
+        # dispatch (using w13_input_scale as the static scale), so no receive-side
+        # re-quantization is needed.
+        gateup_input = a_states
+    else:
+        fp8_per_token_to_per_tensor_quant_triton(
+            x=a_states,
+            x_scale=a_scales,
+            masked_m=masked_m,
+            output_scale=a1_scale,
+            output=gateup_input,
+        )
     c1 = torch.empty((num_experts, m, n * 2), device=device, dtype=torch.bfloat16)
     c2 = torch.empty((num_experts, m, k), device=device, dtype=torch.bfloat16)
 

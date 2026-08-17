@@ -394,6 +394,7 @@ class _DeepEPDispatcherImplBase:
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
+        static_scale: Optional[torch.Tensor] = None,
     ):
         raise NotImplementedError
 
@@ -505,6 +506,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
+        static_scale: Optional[torch.Tensor] = None,
     ):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
@@ -669,6 +671,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
+        static_scale: Optional[torch.Tensor] = None,
     ):
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
@@ -681,6 +684,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             hidden_states,
             topk_ids,
             topk_weights,
+            static_scale=static_scale,
         )
         return (
             hidden_states,
@@ -728,6 +732,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
+        static_scale: Optional[torch.Tensor] = None,
     ):
         input_global_scale = self.quant_config.get("input_global_scale", None)
 
@@ -754,6 +759,17 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
                 use_fp8=self.use_fp8,
+                # When a static (per-tensor) scale is provided, let DeepEP quantize
+                # to FP8 with this scale during dispatch, instead of dispatching
+                # per-token FP8 and re-quantizing to per-tensor on the receive side.
+                **(
+                    dict(
+                        use_per_tensor_quantization=self.use_fp8,
+                        static_scale=static_scale,
+                    )
+                    if static_scale is not None
+                    else dict()
+                ),
                 **(
                     dict(topk_weights=topk_weights)
                     if _is_npu and not _use_zbal
@@ -925,8 +941,9 @@ class DeepEPDispatcher(BaseDispatcher):
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
+        static_scale: Optional[torch.Tensor] = None,
     ) -> DispatchOutput:
-        self.dispatch_a(hidden_states, topk_output)
+        self.dispatch_a(hidden_states, topk_output, static_scale)
         if self._deepep_dispatch_hooks is not None:
             self._deepep_dispatch_hooks(self)
         ret = self.dispatch_b()
@@ -936,11 +953,13 @@ class DeepEPDispatcher(BaseDispatcher):
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
+        static_scale: Optional[torch.Tensor] = None,
     ):
         self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
         inner_state = self._get_impl().dispatch_a(
             hidden_states=hidden_states,
             topk_output=topk_output,
+            static_scale=static_scale,
         )
         self._dispatch_intermediate_state = inner_state
 
