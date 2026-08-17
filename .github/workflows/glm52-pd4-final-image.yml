@@ -48,6 +48,13 @@ jobs:
               printf '%s  %s\n' "$source_hash" "$source_file"
             done > .glm52-build/tracked-python.manifest
           python_hash="$(sha256sum .glm52-build/tracked-python.manifest | awk '{print $1}')"
+          kernel_wheel=.glm52-build/sglang_kernel-0.4.5-cp310-abi3-manylinux2014_x86_64.whl
+          curl --fail --location --retry 5 --retry-all-errors \
+            --output "$kernel_wheel" \
+            https://files.pythonhosted.org/packages/ab/62/c99dac5404b004f1c8e0d846c18566f2678374cde919ed03db373084ba89/sglang_kernel-0.4.5-cp310-abi3-manylinux2014_x86_64.whl
+          printf '%s  %s\n' \
+            5927a14dfff92ced8b1f7c7d5844144bc574ec58e604d4fd53e6f53c709003a8 \
+            "$kernel_wheel" | sha256sum --check --status
           printf 'python_hash=%s\n' "$python_hash" >> "$GITHUB_OUTPUT"
           {
             printf 'SOURCE_COMMIT=%s\n' "$SOURCE_COMMIT"
