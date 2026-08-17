@@ -109,7 +109,7 @@ class TestDSAIdleSpecMetadata(CustomTestCase):
         with envs.SGLANG_OPT_USE_TOPK_V2.override(
             False
         ), get_context().override_server_args(), get_parallel().override(
-            attn_cp_size=1, attn_dp_rank=0
+            attn_cp_size=1, attn_dp_rank=0, attn_tp_size=1
         ):
             backend.init_forward_metadata(batch)
             # cal_padded_tokens is the padding calculation prepare_mlp_sync_batch
