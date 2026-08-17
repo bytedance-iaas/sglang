@@ -341,6 +341,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # Weights stay MXFP4 (e2m1 + ue8m0 g32, zero requantization);
         # activations are quantized to fp8 per-token-group-128.
         self.use_deep_gemm = get_moe_runner_backend().is_deep_gemm()
+        if (
+            get_moe_a2a_backend().is_megamoe()
+            and is_sm90_supported()
+            and not self.use_deep_gemm
+        ):
+            raise RuntimeError(
+                "SM90 MXFP4 MegaMoE requires "
+                "--moe-runner-backend deep_gemm; refusing silent fallback"
+            )
         self.flashinfer_mxfp4_moe_precision = (
             get_exec().moe.flashinfer_mxfp4_moe_precision
         )
@@ -572,11 +581,25 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return
 
         if self.use_deep_gemm:
-            from deep_gemm import transform_sf_into_required_layout
-
             # Packed fp4 (e2m1 x2 per byte) weights: DeepGEMM expects int8.
             layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
             layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
+            if get_moe_a2a_backend().is_megamoe() and is_sm90_supported():
+                # The SM90 FP4 MegaMoE transform consumes checkpoint-layout
+                # FP32 power-of-two scales, not the SM100 MN-major layout.
+                for scale_name in ("w13_weight_scale", "w2_weight_scale"):
+                    scale = getattr(layer, scale_name)
+                    scale.data = scale.data.view(torch.float8_e8m0fnu).to(torch.float32)
+                from sglang.srt.layers.moe.mega_moe_sm90 import (
+                    build_sm90_fp4_mega_moe_experts_weights,
+                )
+
+                build_sm90_fp4_mega_moe_experts_weights(layer)
+                layer._mxfp4_backend = "deep_gemm"
+                return
+
+            from deep_gemm import transform_sf_into_required_layout
+
             # Checkpoint scales are uint8 e8m0 (biased exponents). DeepGEMM
             # SM100 needs them in packed-UE8M0 TMA-aligned MN-major layout.
             # Round-trip through fp32 is exact (values are powers of two).

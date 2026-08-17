@@ -68,6 +68,23 @@ if _use_aiter_gfx95:
 logger = logging.getLogger(__name__)
 
 # Optional quantization for DeepSeek nvfp4 checkpoint
+
+
+def _normalize_packed_expert_param_name(
+    name: str, params_dict: Dict[str, torch.nn.Parameter]
+) -> str:
+    """Map packed checkpoint names to generic MXFP4 expert parameters.
+
+    Schemes that register ``*_weight_packed`` keep their exact parameter name.
+    The generic ``Mxfp4MoEMethod`` instead registers ``*_weight`` while loading
+    the same packed E2M1 bytes, so use that name only when it actually exists.
+    """
+    if name in params_dict or not name.endswith("_weight_packed"):
+        return name
+    unpacked_name = name.removesuffix("_packed")
+    return unpacked_name if unpacked_name in params_dict else name
+
+
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
 
 
@@ -315,6 +332,7 @@ class DeepseekV2WeightLoaderMixin:
                         if _is_npu:
                             name = name.replace("weight_packed", "weight")
                         name = name.replace(weight_name, param_name)
+                        name = _normalize_packed_expert_param_name(name, params_dict)
                         if name not in params_dict:
                             continue
                         param = params_dict[name]
