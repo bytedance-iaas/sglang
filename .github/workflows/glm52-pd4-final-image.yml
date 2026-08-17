@@ -75,8 +75,8 @@ jobs:
         with:
           driver-opts: |
             network=host
-            env.NO_PROXY=localhost,127.0.0.1,::1,iaas-gpu-cn-beijing.cr.volces.com
-            env.no_proxy=localhost,127.0.0.1,::1,iaas-gpu-cn-beijing.cr.volces.com
+            env.NO_PROXY=iaas-gpu-cn-beijing.cr.volces.com
+            env.no_proxy=iaas-gpu-cn-beijing.cr.volces.com
 
       - name: Build and push the measured-base image
         id: build
