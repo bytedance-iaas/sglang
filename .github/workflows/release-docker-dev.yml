@@ -54,6 +54,11 @@ on:
         description: "Volcengine fork only: Dockerfile target stage for the debug base build (framework_final or runtime). Applies only when private_debug_base_only is set."
         required: false
         default: "framework_final"
+      glm52_measured_base_overlay:
+        description: "Volcengine fork only: build the GLM-5.2 PD4 exact-source overlay on its measured immutable base image."
+        required: false
+        type: boolean
+        default: false
   schedule:
     - cron: "0 0 * * *"
 
@@ -283,7 +288,7 @@ jobs:
             --push .
 
   build-dev-kernel-wheel:
-    if: ${{ github.repository == 'bytedance-iaas/sglang' && !inputs.private_debug_base_only && inputs.private_debug_verify_image == '' && (github.event_name == 'schedule' || inputs.compile_kernel) }}
+    if: ${{ github.repository == 'bytedance-iaas/sglang' && !inputs.glm52_measured_base_overlay && !inputs.private_debug_base_only && inputs.private_debug_verify_image == '' && (github.event_name == 'schedule' || inputs.compile_kernel) }}
     strategy:
       fail-fast: false
       matrix:
@@ -298,7 +303,7 @@ jobs:
 
   build-dev:
     needs: [build-dev-kernel-wheel]
-    if: ${{ github.repository == 'bytedance-iaas/sglang' && !inputs.private_debug_base_only && inputs.private_debug_verify_image == '' && always() && (needs.build-dev-kernel-wheel.result == 'success' || needs.build-dev-kernel-wheel.result == 'skipped') }}
+    if: ${{ github.repository == 'bytedance-iaas/sglang' && !inputs.glm52_measured_base_overlay && !inputs.private_debug_base_only && inputs.private_debug_verify_image == '' && always() && (needs.build-dev-kernel-wheel.result == 'success' || needs.build-dev-kernel-wheel.result == 'skipped') }}
     strategy:
       fail-fast: false
       matrix:
@@ -354,7 +359,7 @@ jobs:
     secrets: inherit
 
   build-dev-debug-base:
-    if: ${{ github.repository == 'bytedance-iaas/sglang' && inputs.private_debug_base_only && inputs.private_debug_verify_image == '' }}
+    if: ${{ github.repository == 'bytedance-iaas/sglang' && !inputs.glm52_measured_base_overlay && inputs.private_debug_base_only && inputs.private_debug_verify_image == '' }}
     uses: ./.github/workflows/_docker-build-and-publish.yml
     with:
       docker_target: ${{ inputs.private_debug_docker_target || 'framework_final' }}
@@ -381,7 +386,7 @@ jobs:
     secrets: inherit
 
   verify-private-debug-image:
-    if: ${{ github.repository == 'bytedance-iaas/sglang' && inputs.private_debug_verify_image != '' }}
+    if: ${{ github.repository == 'bytedance-iaas/sglang' && !inputs.glm52_measured_base_overlay && inputs.private_debug_verify_image != '' }}
     environment: prod
     runs-on: x64-docker-build-node
     env:
@@ -441,3 +446,8 @@ jobs:
             python3 -m pytest -q test/registered/unit/test_runtime_context.py -k TestMoeFlagsGroup
             python3 -m pytest -q test/registered/unit/test_model_overrides.py -k deepseek_spec_moe_resolution
           '
+
+  build-glm52-measured-base-overlay:
+    if: ${{ github.repository == 'bytedance-iaas/sglang' && inputs.glm52_measured_base_overlay }}
+    uses: ./.github/workflows/glm52-pd4-final-image.yml
+    secrets: inherit
