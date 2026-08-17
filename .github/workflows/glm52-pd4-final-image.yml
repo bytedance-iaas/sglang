@@ -24,7 +24,6 @@ jobs:
       VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
       VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
       NO_PROXY: localhost,127.0.0.1,::1,iaas-gpu-cn-beijing.cr.volces.com,ai-containers-cn-beijing.cr.volces.com
-      no_proxy: localhost,127.0.0.1,::1,iaas-gpu-cn-beijing.cr.volces.com,ai-containers-cn-beijing.cr.volces.com
     steps:
       - name: Clean build workspace
         run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
