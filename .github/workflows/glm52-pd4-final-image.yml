@@ -69,21 +69,14 @@ jobs:
         run: |
           set -euo pipefail
           printf '%s' "$VOLCENGINE_CR_PASSWORD" | docker login iaas-gpu-cn-beijing.cr.volces.com --username "$VOLCENGINE_CR_USERNAME" --password-stdin
-          for attempt in 1 2 3 4 5 6; do
-            if docker manifest inspect "$BASE_IMAGE" >/dev/null; then
-              break
-            fi
-            if [ "$attempt" = 6 ]; then
-              echo "failed to pull the immutable measured base after ${attempt} attempts" >&2
-              exit 1
-            fi
-            sleep $((attempt * 5))
-          done
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
-          driver-opts: network=host
+          driver-opts: |
+            network=host
+            env.NO_PROXY=localhost,127.0.0.1,::1,iaas-gpu-cn-beijing.cr.volces.com
+            env.no_proxy=localhost,127.0.0.1,::1,iaas-gpu-cn-beijing.cr.volces.com
 
       - name: Build and push the measured-base image
         id: build
