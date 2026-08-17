@@ -52,9 +52,12 @@ def is_sm90_fp4_mega_moe_available(experts) -> bool:
         import deep_gemm
     except ImportError:
         return False
+    native_module = getattr(deep_gemm, "_C", None)
     return (
         hasattr(deep_gemm, "fp8_fp4_mega_moe")
         and hasattr(deep_gemm, "mega_moe_pre_dispatch_sm90")
+        and native_module is not None
+        and hasattr(native_module, "fp8_fp4_mega_moe_sm90")
         and getattr(experts, "_mega_moe_sm90_fp4_weights", False)
     )
 
@@ -192,6 +195,12 @@ def _resolve_sm90_fp4_weight_transform(deep_gemm):
         raise RuntimeError(
             "SM90 FP4 MegaMoE runtime is incomplete; missing "
             + ", ".join(missing_kernels)
+        )
+    native_module = getattr(deep_gemm, "_C", None)
+    if native_module is None or not hasattr(native_module, "fp8_fp4_mega_moe_sm90"):
+        raise RuntimeError(
+            "SM90 FP4 MegaMoE runtime is incomplete; missing native "
+            "fp8_fp4_mega_moe_sm90"
         )
     native = getattr(deep_gemm, "transform_weights_for_mega_moe_sm90_fp4", None)
     if native is not None:

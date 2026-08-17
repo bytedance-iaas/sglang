@@ -149,6 +149,22 @@ class ScheduleBatchDisaggregationDecodeMixin:
             future_map,
         )
         if spec_info is not None:
+            if server_args.pp_size > 1:
+                # Running PP decode batches carry the raw draft tree relayed
+                # from the prior PP iteration. A newly transferred PD request
+                # instead starts as EagleDraftInput, so normalize it before
+                # ScheduleBatch.merge_batch() can combine the two states.
+                from sglang.srt.speculative.eagle_info import (
+                    EagleDraftInput,
+                    EaglePPVerifyInputRaw,
+                )
+
+                if isinstance(spec_info, EagleDraftInput):
+                    self.input_ids = spec_info.bonus_tokens
+                    spec_info = EaglePPVerifyInputRaw.build_dummy_from_bonus_tokens(
+                        bonus_tokens=spec_info.bonus_tokens,
+                        num_draft=server_args.speculative_num_draft_tokens,
+                    )
             self.spec_info = spec_info
         else:
             # Non-spec: stash last token into the relay so the first DECODE's

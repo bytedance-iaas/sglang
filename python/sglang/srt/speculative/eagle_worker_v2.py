@@ -1192,7 +1192,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
     @property
     def war_fastpath_runner(self):
         # Per the base contract: the step's last shared-buffer-reading phase is
-        # draft_extend, which runs on the draft runner.
+        # draft_extend, which runs on the draft runner. Non-last PP ranks do not
+        # own a draft worker and finish their step in the target runner.
+        if self._draft_worker is None:
+            return self._target_worker.model_runner
         return self._draft_worker.draft_runner
 
     @property
@@ -1300,55 +1303,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Decode
         if batch.forward_mode.is_idle():
-            # A sparse DP batch must still run the draft model on every EP
-            # rank. DeepEP low-latency dispatch generations are shared across
-            # the full EP group; jumping directly to target verification on an
-            # idle rank lets it enter a later collective while active ranks are
-            # still in an EAGLE draft step.
-            capture_mode = (
-                CaptureHiddenMode.NULL
-                if self.speculative_algorithm.is_standalone()
-                else CaptureHiddenMode.LAST
-            )
-            hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
-                self.draft_worker.draft_runner
-            )
-            batch.spec_info = EagleDraftInput.create_idle_input(
-                device=self.device,
-                hidden_size=hidden_size,
-                dtype=hidden_dtype,
-                topk=self.topk,
-                capture_hidden_mode=capture_mode,
-                vocab_size=self.target_worker.model_config.vocab_size,
-            )
-            if (
-                batch.global_num_tokens is not None
-                and _should_force_symmetric_spec_deepep_padding(
-                    spec_algorithm=batch.spec_algorithm,
-                    spec_info=batch.spec_info,
-                    is_extend_in_batch=batch.is_extend_in_batch,
-                    global_num_tokens=batch.global_num_tokens,
-                )
-            ):
-                with (
-                    self.draft_worker.draft_tp_context(
-                        self.draft_worker.draft_runner.tp_group
-                    ),
-                    speculative_moe_backend_context(),
-                    speculative_moe_a2a_backend_context(),
-                    spec_stage_span("draft"),
-                ):
-                    verify_input = self.draft_worker.draft(batch)
-            else:
-                verify_input = EagleVerifyInput.create_idle_input(
-                    self.topk,
-                    self.speculative_num_steps,
-                    self.speculative_num_draft_tokens,
-                    device=self.device,
-                )
+            verify_input = self._build_idle_verify_input(batch)
         elif self._pp_enabled:
             # Under PP the verify input is built from the raw draft tree relayed
-            # from the last PP rank of the previous iteration.
+            # from the last PP rank of the previous iteration. A newly
+            # transferred PD request has no previous local PP iteration and
+            # arrives as EagleDraftInput, so seed its first verify round with
+            # the same bonus-token dummy tree used at the prebuilt boundary.
+            self._normalize_pp_verify_input_from_pd(batch)
             verify_input = self._build_verify_input_from_pp_raw(batch)
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])
@@ -1453,6 +1415,70 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         return batch_output
 
+    def _normalize_pp_verify_input_from_pd(self, batch: ScheduleBatch):
+        """Normalize the first PD handoff into the steady-state PP relay type."""
+        if not isinstance(batch.spec_info, EagleDraftInput):
+            return
+
+        batch.input_ids = batch.spec_info.bonus_tokens
+        batch.spec_info = EaglePPVerifyInputRaw.build_dummy_for_decode(
+            batch, self.speculative_num_draft_tokens
+        )
+
+    def _build_idle_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
+        # PP non-last ranks intentionally have no draft model. They only need
+        # an idle target-verify input to stay aligned with active DP peers.
+        if self._draft_worker is None:
+            return EagleVerifyInput.create_idle_input(
+                self.topk,
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
+                device=self.device,
+            )
+
+        # A sparse DP batch on a draft-owning rank must still run the draft
+        # model when DeepEP requires symmetric dispatch generations.
+        capture_mode = (
+            CaptureHiddenMode.NULL
+            if self.speculative_algorithm.is_standalone()
+            else CaptureHiddenMode.LAST
+        )
+        hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
+            self.draft_worker.draft_runner
+        )
+        batch.spec_info = EagleDraftInput.create_idle_input(
+            device=self.device,
+            hidden_size=hidden_size,
+            dtype=hidden_dtype,
+            topk=self.topk,
+            capture_hidden_mode=capture_mode,
+            vocab_size=self.target_worker.model_config.vocab_size,
+        )
+        if batch.global_num_tokens is not None and (
+            _should_force_symmetric_spec_deepep_padding(
+                spec_algorithm=batch.spec_algorithm,
+                spec_info=batch.spec_info,
+                is_extend_in_batch=batch.is_extend_in_batch,
+                global_num_tokens=batch.global_num_tokens,
+            )
+        ):
+            with (
+                self.draft_worker.draft_tp_context(
+                    self.draft_worker.draft_runner.tp_group
+                ),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft"),
+            ):
+                return self.draft_worker.draft(batch)
+
+        return EagleVerifyInput.create_idle_input(
+            self.topk,
+            self.speculative_num_steps,
+            self.speculative_num_draft_tokens,
+            device=self.device,
+        )
+
     def _build_verify_input_from_pp_raw(self, batch: ScheduleBatch):
         """Build EagleVerifyInput from EaglePPVerifyInputRaw (PP non-last rank).
 
@@ -1478,19 +1504,25 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # build_tree_kernel_efficient expects draft_tokens without bonus.
         draft_tokens_no_bonus = draft_tokens[:, 1:]
 
-        # Directly write to cuda graph buffers for verify attn.
-        tree_mask_buf, position_buf = (
-            self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
-        )
+        # Match the target backend's current verify-mask ownership contract.
+        # Some backends (including DSA) do not read the mask but still own a
+        # QLEN_ONLY scratch buffer that the tree kernel must fill in place.
+        target_attn_backend = self.target_worker.model_runner.attn_backend
+        verify_mask = target_attn_backend.verify_mask
+        bs = batch.seq_lens.shape[0]
+        if verify_mask is None:
+            tree_mask_buf, mask_mode, fill_mask = None, self.tree_mask_mode, True
+        else:
+            mask_mode, fill_mask = verify_mask.mode, verify_mask.is_read
+            tree_mask_buf = verify_mask.buffer if verify_mask.fits(bs) else None
 
         seq_lens_sum = batch.seq_lens_sum
         if seq_lens_sum is None:
-            if batch.seq_lens_cpu is not None:
-                seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            if tree_mask_buf is not None or mask_mode == TreeMaskMode.QLEN_ONLY:
+                seq_lens_sum = 0
             else:
-                seq_lens_sum = int(batch.seq_lens.sum())
+                seq_lens_sum = bs * target_attn_backend.max_context_len
 
-        bs = batch.seq_lens.shape[0]
         assert parent_list.shape == (
             bs,
             num_draft - 1,
@@ -1513,9 +1545,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             topk,
             spec_steps,
             num_draft,
-            self.tree_mask_mode,
+            mask_mode,
             tree_mask_buf,
-            position_buf,
+            fill_prefix_mask=fill_mask,
         )
 
         draft_tokens_arranged = draft_tokens_arranged.to(torch.int64)

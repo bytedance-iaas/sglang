@@ -834,6 +834,30 @@ class CommonKVManager(BaseKVManager):
 
         mla_ratios = getattr(self.kv_args, "mla_compression_ratios", None)
         if mla_ratios:
+            # Matching PP ranks register only their local target-model buffers.
+            # Decode can additionally append a draft-model cache, making the
+            # destination list longer than the prefill list without turning it
+            # into a full-model layout.  Compressed MLA is bucketed by ratio, so
+            # compare against the expected full target layout before deciding
+            # whether global bucket slicing is valid.
+            if state_type is None:
+                c4_full = sum(1 for ratio in mla_ratios if ratio == 4)
+                c128_full = sum(1 for ratio in mla_ratios if ratio == 128)
+                full_target_entries = 2 * c4_full + c128_full
+                if len(dst_kv_ptrs) < full_target_entries:
+                    if len(dst_kv_ptrs) < len(src_kv_ptrs):
+                        raise ValueError(
+                            "Decode compressed-MLA KV pointer list is shorter "
+                            "than the matching prefill PP stage: "
+                            f"src={len(src_kv_ptrs)}, dst={len(dst_kv_ptrs)}, "
+                            f"full_target_entries={full_target_entries}."
+                        )
+                    return (
+                        src_kv_ptrs,
+                        dst_kv_ptrs[: len(src_kv_ptrs)],
+                        len(src_kv_ptrs),
+                    )
+
             # Compressed-MLA (e.g. DeepSeek V4): the flat list is organized
             # by buffer type (compression-ratio bucket) rather than by
             # layer, so we locate the sub-range for this PP stage inside each
@@ -850,6 +874,28 @@ class CommonKVManager(BaseKVManager):
         # Regular MLA PP slicing
         start_layer = self.kv_args.prefill_start_layer
         end_layer = start_layer + len(src_kv_ptrs)
+
+        # With matching PP topologies the decode rank registers only its local
+        # stage buffers. If speculative decoding is enabled only on decode,
+        # draft-model buffers are appended after those target-model buffers, so
+        # the list is longer than the prefill list even though both ranks own
+        # the same target layers. A global [start_layer:end_layer] slice would
+        # be empty on every stage after PP0. Select only the leading target
+        # buffers; the appended draft cache is populated by the decode worker.
+        if len(dst_kv_ptrs) < end_layer:
+            if len(dst_kv_ptrs) < len(src_kv_ptrs):
+                raise ValueError(
+                    "Decode MLA KV pointer list is shorter than the matching "
+                    "prefill PP stage: "
+                    f"src={len(src_kv_ptrs)}, dst={len(dst_kv_ptrs)}, "
+                    f"prefill_layers=[{start_layer}, {end_layer})."
+                )
+            return (
+                src_kv_ptrs,
+                dst_kv_ptrs[: len(src_kv_ptrs)],
+                len(src_kv_ptrs),
+            )
+
         # Decode pp size should be equal to prefill pp size or 1
         sliced_dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
         return src_kv_ptrs, sliced_dst_kv_ptrs, len(src_kv_ptrs)
@@ -917,7 +963,7 @@ class CommonKVManager(BaseKVManager):
 
         if (
             state_type not in (StateType.SWA, StateType.SWA_RING, StateType.C128_STATE)
-            and len(dst_kv_ptrs) == kv_layout_len
+            and len(dst_kv_ptrs) >= kv_layout_len
         ):
             sliced_dst = (
                 list(dst_kv_ptrs[c4_off_s:c4_off_e])

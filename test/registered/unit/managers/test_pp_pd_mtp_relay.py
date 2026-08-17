@@ -537,6 +537,57 @@ def test_pp_prefill_rebuilds_one_authoritative_draft_input():
     scheduler.future_map.stash.assert_called_once()
 
 
+def test_pp_spec_decode_copies_cpu_bound_result_before_processing():
+    bonus_tokens = torch.tensor([11, 13], dtype=torch.int64)
+    pp_outputs = _ProxyOutputs(
+        {
+            "next_token_ids": bonus_tokens,
+            "pp_spec_output": {
+                "draft_tokens": [[11, 2, 3, 4], [13, 5, 6, 7]],
+                "bonus_tokens": [11, 13],
+                "top_scores_index": [[0, 1, 2], [0, 1, 2]],
+                "parent_list": [[-1, 0, 1], [-1, 0, 1]],
+                "accept_lens": [3, 2],
+                "accept_index": None,
+            },
+        }
+    )
+    batch = SimpleNamespace(
+        reqs=[SimpleNamespace(rid="r0"), SimpleNamespace(rid="r1")],
+        req_pool_indices=torch.tensor([0, 1]),
+        forward_mode=SimpleNamespace(is_extend=Mock(return_value=False)),
+        return_logprob=False,
+        input_ids=bonus_tokens.clone(),
+        spec_info=None,
+    )
+    copy_done = Mock()
+    scheduler = SimpleNamespace(
+        spec_algorithm=_SpecAlgorithm(),
+        server_args=SimpleNamespace(speculative_num_draft_tokens=4),
+        future_map=SimpleNamespace(stash=Mock()),
+        device_module=SimpleNamespace(Event=Mock(return_value=copy_done)),
+    )
+
+    with patch.object(
+        GenerationBatchResult, "copy_to_cpu", autospec=True
+    ) as copy_to_cpu:
+        result = SchedulerPPMixin._pp_prep_batch_result(
+            scheduler,
+            batch,
+            PPBatchMetadata(can_run_cuda_graph=True, fwd_batch=None),
+            pp_outputs,
+        )
+
+    assert result.copy_done is copy_done
+    assert result.accept_lens.tolist() == [3, 2]
+    assert result.speculative_num_draft_tokens == 4
+    copy_to_cpu.assert_called_once_with(
+        result,
+        return_logprob=False,
+        return_hidden_states=False,
+    )
+
+
 def test_spec_only_aux_indices_follow_optional_sampling_mask_layout():
     for sampling_mask_tokens, expected in (
         (0, [6, 7, 8, 9]),

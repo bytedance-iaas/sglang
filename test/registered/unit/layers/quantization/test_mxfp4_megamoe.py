@@ -154,6 +154,7 @@ class TestSm90Fp4MegaMoEContract(CustomTestCase):
 
     def test_compat_transform_matches_pr53_layout(self):
         deep_gemm = SimpleNamespace(
+            _C=SimpleNamespace(fp8_fp4_mega_moe_sm90=mock.Mock()),
             fp8_fp4_mega_moe=mock.Mock(),
             mega_moe_pre_dispatch_sm90=mock.Mock(),
         )
@@ -187,6 +188,10 @@ class TestSm90Fp4MegaMoEContract(CustomTestCase):
             l1_weight_out, l1_weight.index_select(1, row_order).view(torch.int8)
         )
         torch.testing.assert_close(l2_weight_out, l2_weight.view(torch.int8))
+        self.assertEqual(l1_weight_out.dtype, torch.int8)
+        self.assertEqual(l2_weight_out.dtype, torch.int8)
+        self.assertTrue(l1_weight_out.is_contiguous())
+        self.assertTrue(l2_weight_out.is_contiguous())
         torch.testing.assert_close(
             l1_scale_out.view(torch.uint8),
             (127 + row_order).to(torch.uint8).reshape(1, 32, 1).expand(-1, -1, 4),
@@ -200,12 +205,20 @@ class TestSm90Fp4MegaMoEContract(CustomTestCase):
         self.assertTrue(l1_scale_out.is_contiguous())
         self.assertTrue(l2_scale_out.is_contiguous())
 
+        (l1_int8_out, _), (l2_int8_out, _) = transform(
+            (l1_weight.view(torch.int8), l1_scale),
+            (l2_weight.view(torch.int8), l2_scale),
+        )
+        torch.testing.assert_close(l1_int8_out, l1_weight_out)
+        torch.testing.assert_close(l2_int8_out, l2_weight_out)
+
     def test_builder_uses_native_transform_when_available(self):
         experts = self._make_experts()
         l1 = (torch.ones(1, dtype=torch.int8), torch.ones(1))
         l2 = (torch.ones(1, dtype=torch.int8), torch.ones(1))
         transform = mock.Mock(return_value=(l1, l2))
         deep_gemm = SimpleNamespace(
+            _C=SimpleNamespace(fp8_fp4_mega_moe_sm90=mock.Mock()),
             transform_weights_for_mega_moe_sm90_fp4=transform,
             fp8_fp4_mega_moe=mock.Mock(),
             mega_moe_pre_dispatch_sm90=mock.Mock(),
@@ -228,6 +241,7 @@ class TestSm90Fp4MegaMoEContract(CustomTestCase):
     def test_builder_works_without_native_transform(self):
         experts = self._make_experts()
         deep_gemm = SimpleNamespace(
+            _C=SimpleNamespace(fp8_fp4_mega_moe_sm90=mock.Mock()),
             fp8_fp4_mega_moe=mock.Mock(),
             mega_moe_pre_dispatch_sm90=mock.Mock(),
         )
@@ -251,9 +265,22 @@ class TestSm90Fp4MegaMoEContract(CustomTestCase):
                 SimpleNamespace(mega_moe_pre_dispatch_sm90=mock.Mock())
             )
 
+    def test_transform_fails_closed_without_native_sm90_entry(self):
+        with self.assertRaisesRegex(
+            RuntimeError, "missing native fp8_fp4_mega_moe_sm90"
+        ):
+            _resolve_sm90_fp4_weight_transform(
+                SimpleNamespace(
+                    _C=SimpleNamespace(),
+                    fp8_fp4_mega_moe=mock.Mock(),
+                    mega_moe_pre_dispatch_sm90=mock.Mock(),
+                )
+            )
+
     def test_availability_requires_sm90_kernel_and_built_weights(self):
         experts = SimpleNamespace(_mega_moe_sm90_fp4_weights=True)
         deep_gemm = SimpleNamespace(
+            _C=SimpleNamespace(fp8_fp4_mega_moe_sm90=mock.Mock()),
             fp8_fp4_mega_moe=mock.Mock(),
             mega_moe_pre_dispatch_sm90=mock.Mock(),
         )
@@ -262,6 +289,13 @@ class TestSm90Fp4MegaMoEContract(CustomTestCase):
             mock.patch("sglang.srt.layers.moe.mega_moe_sm90._device_sm", 90),
         ):
             self.assertTrue(is_sm90_fp4_mega_moe_available(experts))
+
+        deep_gemm._C = SimpleNamespace()
+        with (
+            mock.patch.dict("sys.modules", {"deep_gemm": deep_gemm}),
+            mock.patch("sglang.srt.layers.moe.mega_moe_sm90._device_sm", 90),
+        ):
+            self.assertFalse(is_sm90_fp4_mega_moe_available(experts))
 
     def test_dispatch_uses_fp8_fp4_kernel_not_fp8_kernel(self):
         pre_dispatch = mock.Mock()

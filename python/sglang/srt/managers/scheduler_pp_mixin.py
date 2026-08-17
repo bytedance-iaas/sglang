@@ -1563,6 +1563,18 @@ class SchedulerPPMixin:
                 self.server_args.speculative_num_draft_tokens
             )
 
+        # PP prefill keeps the relayed draft seed on device for the PD handoff,
+        # but decode result processing consumes token and acceptance metadata on
+        # CPU.  Restore the asynchronous D2H path only for decode; removing it
+        # unconditionally makes spec-v2 fail the is_cpu ownership contract on
+        # the first relayed PP verify result.
+        if not batch.forward_mode.is_extend():
+            output_result.copy_done = self.device_module.Event()
+            output_result.copy_to_cpu(
+                return_logprob=batch.return_logprob,
+                return_hidden_states=False,
+            )
+
         return output_result
 
     def _pp_process_batch_result(

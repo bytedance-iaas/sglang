@@ -454,10 +454,26 @@ class EaglePPVerifyInputRaw(SpecInput):
         placeholder tree (each req's bonus token replicated num_draft times)
         is constructed here.
         """
-        bs = len(batch.reqs)
+        return cls.build_dummy_from_bonus_tokens(
+            bonus_tokens=batch.input_ids,
+            num_draft=num_draft,
+        )
+
+    @classmethod
+    def build_dummy_from_bonus_tokens(
+        cls, bonus_tokens: torch.Tensor, num_draft: int
+    ) -> "EaglePPVerifyInputRaw":
+        """Build the first PP verify tree from prefill's bonus tokens.
+
+        A newly transferred PD request carries an :class:`EagleDraftInput`,
+        while an already-running PP decode batch carries the CPU-side raw tree
+        relayed from the previous PP iteration. Normalize the new request to
+        that raw representation before batching so both states can merge.
+        """
+        bonus_tokens = bonus_tokens.tolist()
+        bs = len(bonus_tokens)
         parent_width = max(num_draft - 1, 0)
 
-        bonus_tokens = batch.input_ids.tolist()
         draft_tokens = [bonus_tokens[i : i + 1] * num_draft for i in range(bs)]
         parent_row = list(range(-1, parent_width - 1))
         parent_list = [parent_row[:] for _ in range(bs)]
