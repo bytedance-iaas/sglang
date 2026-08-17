@@ -372,6 +372,7 @@ jobs:
         --build-arg INSTALL_LOCAL_SGL_KERNEL_WHEEL=0
         --build-arg HOPPER_SBO=0
         --build-arg W4A8_PER_TENSOR_TRANSFER=0
+        --build-arg SGL_DEEP_GEMM_COMMIT=aee79a715951a3d47dbbbdbd5387d8be8a131d53
         --build-arg HTTP_PROXY=http://100.68.162.211:3128
         --build-arg HTTPS_PROXY=http://100.68.162.211:3128
         --build-arg ALL_PROXY=http://100.68.162.211:3128

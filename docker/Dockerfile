@@ -13,6 +13,7 @@ ARG BUILD_AND_DOWNLOAD_PARALLEL=8
 ARG SGL_KERNEL_VERSION=0.4.5
 ARG SGL_VERSION
 ARG SGL_DEEP_GEMM_VERSION=0.1.5.post1
+ARG SGL_DEEP_GEMM_COMMIT=
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG PIP_DEFAULT_INDEX
@@ -279,6 +280,31 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # distro resolves to the apt python3-distro under /usr/lib/python3, which the runtime
 # stage does not COPY; force a pip copy into /usr/local so it survives the stage split.
 RUN python3 -m pip install --ignore-installed --no-deps distro
+
+########################################################
+# OPTIONAL STAGE: pinned sgl-deep-gemm source wheel
+########################################################
+FROM torch_deps AS deepgemm_builder
+
+ARG SGL_DEEP_GEMM_COMMIT
+
+WORKDIR /build
+
+# The released wheel remains the default. Private qualification builds may
+# pin an exact DeepGEMM commit when a model requires an unreleased native ABI.
+# Build in a separate stage so build-only dependencies do not enter the image.
+RUN set -eux; \
+    mkdir -p /wheels; \
+    if [ -n "${SGL_DEEP_GEMM_COMMIT}" ]; then \
+        git clone --filter=blob:none --no-checkout \
+            https://github.com/sgl-project/DeepGEMM.git DeepGEMM; \
+        git -C DeepGEMM fetch --depth=1 origin "${SGL_DEEP_GEMM_COMMIT}"; \
+        git -C DeepGEMM checkout --detach FETCH_HEAD; \
+        test "$(git -C DeepGEMM rev-parse HEAD)" = "${SGL_DEEP_GEMM_COMMIT}"; \
+        bash DeepGEMM/build_sgl_deep_gemm.sh; \
+        cp DeepGEMM/dist/sgl_deep_gemm-*.whl /wheels/; \
+        printf '%s\n' "${SGL_DEEP_GEMM_COMMIT}" > /wheels/source-commit; \
+    fi
 
 ########################################################
 # PARALLEL STAGE 2: DeepEP Builder (needs torch_deps)
@@ -564,6 +590,18 @@ WORKDIR /sgl-workspace
 # =============================================================================
 # Copy artifacts from parallel builders
 # =============================================================================
+
+# Replace the released DeepGEMM package only when an exact source wheel was
+# requested. The source marker is retained for runtime provenance checks.
+COPY --from=deepgemm_builder /wheels /tmp/wheels/deepgemm
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if ls /tmp/wheels/deepgemm/sgl_deep_gemm-*.whl >/dev/null 2>&1; then \
+        python3 -m pip install --no-deps --force-reinstall \
+            /tmp/wheels/deepgemm/sgl_deep_gemm-*.whl; \
+        install -D -m 0444 /tmp/wheels/deepgemm/source-commit \
+            /opt/sgl-deep-gemm/source-commit; \
+    fi \
+    && rm -rf /tmp/wheels/deepgemm
 
 # Copy DeepEP wheel and install
 COPY --from=deepep_builder /wheels /tmp/wheels/deepep
