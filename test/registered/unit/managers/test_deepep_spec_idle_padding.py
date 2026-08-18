@@ -8,6 +8,7 @@ from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.managers.scheduler_components.dp_attn import _update_gather_batch
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
+    _should_bypass_attention_for_symmetric_spec_deepep_dummy,
     _should_force_symmetric_spec_deepep_padding,
     _should_materialize_idle_spec_deepep,
     requires_symmetric_spec_deepep_lockstep,
@@ -47,6 +48,30 @@ def _deepep_low_latency_patches():
 
 
 class TestDeepEPSpecIdlePadding(CustomTestCase):
+    def test_only_idle_draft_rows_bypass_attention_for_symmetric_deepep(self):
+        draft_info = SimpleNamespace(is_draft_input=lambda: True)
+        verify_info = SimpleNamespace(is_draft_input=lambda: False)
+
+        self.assertTrue(
+            _should_bypass_attention_for_symmetric_spec_deepep_dummy(
+                forward_mode=ForwardMode.IDLE,
+                spec_info=draft_info,
+                force_symmetric_spec_deepep_padding=True,
+            )
+        )
+        for mode, spec_info, force_symmetric in (
+            (ForwardMode.DRAFT_EXTEND_V2, draft_info, True),
+            (ForwardMode.IDLE, verify_info, True),
+            (ForwardMode.IDLE, draft_info, False),
+        ):
+            self.assertFalse(
+                _should_bypass_attention_for_symmetric_spec_deepep_dummy(
+                    forward_mode=mode,
+                    spec_info=spec_info,
+                    force_symmetric_spec_deepep_padding=force_symmetric,
+                )
+            )
+
     def test_eagle_mixed_active_idle_keeps_peer_counts(self):
         batch = SimpleNamespace(spec_algorithm=SimpleNamespace(is_eagle=lambda: True))
         sync_info = _sync_info([6, 0, 6, 6])

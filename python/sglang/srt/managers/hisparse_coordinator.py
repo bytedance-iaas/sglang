@@ -778,10 +778,10 @@ class HiSparseCoordinator:
             req
             for req_idx, req in self.active_hisparse_reqs.items()
             if self._is_resident(req_idx)
-            and self.host_token_len(req.kv_allocated_len)
-            > self._device_buffer_alloc_size(req.kv_allocated_len)
+            and self.host_token_len(req.kv.kv_allocated_len)
+            > self._device_buffer_alloc_size(req.kv.kv_allocated_len)
         ]
-        candidates.sort(key=lambda req: req.kv_allocated_len, reverse=True)
+        candidates.sort(key=lambda req: req.kv.kv_allocated_len, reverse=True)
         if candidates:
             self.wait_for_pending_backup()
         for req in candidates:
@@ -799,8 +799,8 @@ class HiSparseCoordinator:
         for req_idx, req in self.active_hisparse_reqs.items():
             if not self._is_resident(req_idx):
                 continue
-            host_len = self.host_token_len(req.kv_allocated_len)
-            alloc_size = self._device_buffer_alloc_size(req.kv_allocated_len)
+            host_len = self.host_token_len(req.kv.kv_allocated_len)
+            alloc_size = self._device_buffer_alloc_size(req.kv.kv_allocated_len)
             current_size = ((host_len + page_size - 1) // page_size) * page_size
             reclaimable += max(0, current_size - alloc_size)
         return max(0, available + reclaimable - page_size)
@@ -872,7 +872,7 @@ class HiSparseCoordinator:
         host_capacity = self.mem_pool_host.size
         host_tokens = host_capacity - self.mem_pool_host.available_size()
         projected_resident_tokens = sum(
-            self._projected_resident_alloc_size(req, req.kv_allocated_len)
+            self._projected_resident_alloc_size(req, req.kv.kv_allocated_len)
             for req_idx, req in self.active_hisparse_reqs.items()
             if self._is_resident(req_idx)
         )
@@ -1023,18 +1023,24 @@ class HiSparseCoordinator:
             )
 
         host_len = self.host_token_len(req.kv.kv_allocated_len)
-        if host_len <= self.device_buffer_size:
-            # Short sequences (seq_len <= device_buffer_size): the kernel fast path
-            # returns device_buffer_locs directly without any host loading, so we
-            # must preload all tokens from host pool into the device buffer
-            # TODO(hzh0425): Optimize this.
-            self._preload_to_device_buffer(req)
-        else:
-            # Long sequence: reset device_buffer_tokens to -1 so the kernel
-            # sees all slots as empty -> every top-k lookup is a miss -> host load.
-            self.req_device_buffer_tokens[
-                :, req.req_pool_idx, : self.device_buffer_size
-            ] = -1
+        if not self._try_promote_from_host(
+            req, sync_mirrors=False, admission_boundary=True
+        ):
+            buffer_size = self._device_buffer_alloc_size(req.kv.kv_allocated_len)
+            if not self.demote_until_hisparse_available(buffer_size):
+                raise RuntimeError("HiSparse direct admission allocation failed")
+            self.alloc_device_buffer(req)
+
+            if host_len <= self.device_buffer_size:
+                # Short sequences take the kernel fast path, so preload the
+                # complete host KV into their device buffer.
+                self._preload_to_device_buffer(req)
+            else:
+                # The direct-path buffer starts empty. Every top-k lookup is a
+                # miss until the swap-in kernel populates it.
+                self.req_device_buffer_tokens[
+                    :, req.req_pool_idx, : self.device_buffer_size
+                ] = -1
 
         req.hisparse_staging = False
         self._skip_first_backup[req.req_pool_idx] = True
@@ -1049,10 +1055,10 @@ class HiSparseCoordinator:
         """Mirror the target coordinator's admission decision for MTP draft KV."""
         self._device_slot_owner = owner
         owner_state = owner._state(req.req_pool_idx)
-        host_len = self.host_token_len(req.kv_allocated_len)
+        host_len = self.host_token_len(req.kv.kv_allocated_len)
         if owner_state == HiSparseResidencyState.RESIDENT:
             logical_locs = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : req.kv_allocated_len
+                req.req_pool_idx, : req.kv.kv_allocated_len
             ]
             compressed_locs = (
                 self.mem_pool_device.translate_loc_from_full_to_compressed(logical_locs)
@@ -1179,7 +1185,7 @@ class HiSparseCoordinator:
         was_device_buffered = (
             self._state(req.req_pool_idx) == HiSparseResidencyState.DEVICE_BUFFERED
         )
-        logical_len = req.kv_allocated_len if logical_len is None else logical_len
+        logical_len = req.kv.kv_allocated_len if logical_len is None else logical_len
         logical_locs = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :logical_len
         ]
@@ -1333,10 +1339,10 @@ class HiSparseCoordinator:
     ) -> None:
         """Clear request mappings that still reference coordinator-owned pages."""
         physical_locs = physical_locs[physical_locs > 0]
-        if physical_locs.numel() == 0 or req.kv_allocated_len <= 0:
+        if physical_locs.numel() == 0 or req.kv.kv_allocated_len <= 0:
             return
         logical_locs = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : req.kv_allocated_len
+            req.req_pool_idx, : req.kv.kv_allocated_len
         ]
         compressed_locs = self.mem_pool_device.translate_loc_from_full_to_compressed(
             logical_locs
@@ -1401,9 +1407,69 @@ class HiSparseCoordinator:
         host_len: Optional[int] = None,
     ) -> None:
         host_len = (
-            self.host_token_len(req.kv_allocated_len) if host_len is None else host_len
+            self.host_token_len(req.kv.kv_allocated_len)
+            if host_len is None
+            else host_len
         )
         host_locs = self.req_to_host_pool[req.req_pool_idx, :host_len]
+        if self.debug_validate_lifecycle:
+            host_kernel_locs = self.mem_pool_host.dcp_kernel_indices(host_locs)
+            device_kernel_locs = self.mem_pool_host.dcp_kernel_indices(device_locs)
+            if host_kernel_locs.numel() != device_kernel_locs.numel():
+                raise RuntimeError(
+                    "HiSparse host/device preload length mismatch: "
+                    f"req={req.rid} host={host_kernel_locs.numel()} "
+                    f"device={device_kernel_locs.numel()}"
+                )
+            if self.mem_pool_host.layout == "layer_first":
+                host_rows = int(self.mem_pool_host.kv_buffer.shape[1])
+            else:
+                host_rows = int(self.mem_pool_host.kv_buffer.shape[0])
+            device_rows = int(self.mem_pool_device.kv_buffer[0].shape[0])
+            host_min = (
+                int(host_kernel_locs.min().item()) if host_kernel_locs.numel() else -1
+            )
+            host_max = (
+                int(host_kernel_locs.max().item()) if host_kernel_locs.numel() else -1
+            )
+            device_min = (
+                int(device_kernel_locs.min().item())
+                if device_kernel_locs.numel()
+                else -1
+            )
+            device_max = (
+                int(device_kernel_locs.max().item())
+                if device_kernel_locs.numel()
+                else -1
+            )
+            if host_min < 0 or host_max >= host_rows:
+                raise RuntimeError(
+                    "HiSparse host preload index is out of bounds: "
+                    f"req={req.rid} range=({host_min}, {host_max}) "
+                    f"capacity={host_rows}"
+                )
+            if device_min < 0 or device_max >= device_rows:
+                raise RuntimeError(
+                    "HiSparse device preload index is out of bounds: "
+                    f"req={req.rid} range=({device_min}, {device_max}) "
+                    f"capacity={device_rows}"
+                )
+            logger.warning(
+                "HISPARSE_LOAD_TRACE req=%s req_pool_idx=%d host_len=%d "
+                "host_range=(%d,%d)/%d device_range=(%d,%d)/%d "
+                "layers=%d kv_dim=%d",
+                req.rid,
+                req.req_pool_idx,
+                host_len,
+                host_min,
+                host_max,
+                host_rows,
+                device_min,
+                device_max,
+                device_rows,
+                self.mem_pool_device.layer_num,
+                self.mem_pool_device.kv_cache_dim,
+            )
         for layer_id in range(self.mem_pool_device.layer_num):
             self.mem_pool_host.load_to_device_per_layer(
                 self.mem_pool_device,
@@ -1422,7 +1488,7 @@ class HiSparseCoordinator:
                 count_transition=False,
             )
         if self.is_dsv4_hisparse:
-            allocated_len = req.kv_allocated_len
+            allocated_len = req.kv.kv_allocated_len
             alloc_size = self._device_buffer_alloc_size(allocated_len)
         else:
             allocated_len = req.kv.kv_allocated_len

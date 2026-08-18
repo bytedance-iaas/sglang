@@ -823,6 +823,9 @@ class ModelRunner:
         if not self.enable_hisparse:
             return
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+        from sglang.srt.mem_cache.hisparse_memory_pool import (
+            HiSparseDSATokenToKVPool,
+        )
         from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
         hisparse_cfg = parse_hisparse_config(self.server_args)
@@ -842,6 +845,36 @@ class ModelRunner:
             ),
             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
             swap_in_block_size=hisparse_cfg.swap_in_block_size,
+            max_num_steps=self.server_args.speculative_num_draft_tokens or 1,
+            # Draft workers share the target logical allocator but own a
+            # distinct physical KV tensor. Bind each coordinator to the
+            # runner-local tensor instead of allocator.get_kvcache().
+            mem_pool_device_override=(
+                self.token_to_kv_pool
+                if isinstance(self.token_to_kv_pool, HiSparseDSATokenToKVPool)
+                else None
+            ),
+            dynamic_residency=hisparse_cfg.dynamic_residency,
+            dynamic_residency_mode=hisparse_cfg.dynamic_residency_mode,
+            dynamic_residency_max_tokens=hisparse_cfg.dynamic_residency_max_tokens,
+            dynamic_residency_max_requests=(
+                hisparse_cfg.dynamic_residency_max_requests
+            ),
+            dynamic_residency_min_remaining_tokens=(
+                hisparse_cfg.dynamic_residency_min_remaining_tokens
+            ),
+            dynamic_residency_promote_watermark=(
+                hisparse_cfg.dynamic_residency_promote_watermark
+            ),
+            dynamic_residency_demote_watermark=(
+                hisparse_cfg.dynamic_residency_demote_watermark
+            ),
+            dynamic_residency_cooldown_steps=(
+                hisparse_cfg.dynamic_residency_cooldown_steps
+            ),
+            dynamic_residency_admission_window_seconds=(
+                hisparse_cfg.dynamic_residency_admission_window_seconds
+            ),
         )
 
     def post_capture_resize_kv_pool(self):

@@ -137,6 +137,21 @@ def _should_force_symmetric_spec_deepep_padding(
     )
 
 
+def _should_bypass_attention_for_symmetric_spec_deepep_dummy(
+    *,
+    forward_mode: ForwardMode,
+    spec_info: Optional[SpecInput],
+    force_symmetric_spec_deepep_padding: bool,
+) -> bool:
+    """Whether an idle draft row exists only for DeepEP lockstep."""
+    return (
+        forward_mode.is_idle()
+        and force_symmetric_spec_deepep_padding
+        and spec_info is not None
+        and spec_info.is_draft_input()
+    )
+
+
 def requires_symmetric_spec_deepep_lockstep(forward_batch: ForwardBatch) -> bool:
     """Whether sparse EAGLE DeepEP dispatches must stay host-side lockstep."""
     original_counts = forward_batch.original_global_num_tokens_cpu
@@ -1343,12 +1358,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
         )
-        if _should_force_symmetric_spec_deepep_padding(
-            spec_algorithm=self.spec_algorithm,
-            spec_info=self.spec_info,
-            is_extend_in_batch=self.is_extend_in_batch,
-            global_num_tokens=global_num_tokens,
-        ):
+        force_symmetric_spec_deepep_padding = (
+            _should_force_symmetric_spec_deepep_padding(
+                spec_algorithm=self.spec_algorithm,
+                spec_info=self.spec_info,
+                is_extend_in_batch=self.is_extend_in_batch,
+                global_num_tokens=global_num_tokens,
+            )
+        )
+        if force_symmetric_spec_deepep_padding:
             # The generic cost heuristic chooses SUM_LEN when only a few DP
             # ranks are active.  DeepEP low-latency target verification cannot
             # use that sparse geometry: zero-token ranks finish locally while
@@ -1440,6 +1458,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 num_tokens=num_tokens,
             ):
                 if self.forward_mode.is_idle():
+                    self.symmetric_spec_deepep_dummy = (
+                        _should_bypass_attention_for_symmetric_spec_deepep_dummy(
+                            forward_mode=self.forward_mode,
+                            spec_info=self.spec_info,
+                            force_symmetric_spec_deepep_padding=(
+                                force_symmetric_spec_deepep_padding
+                            ),
+                        )
+                    )
                     self._original_forward_mode = self.forward_mode
                     self.forward_mode = (
                         ForwardMode.DECODE
