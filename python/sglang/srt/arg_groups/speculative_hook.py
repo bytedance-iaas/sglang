@@ -261,18 +261,20 @@ def _handle_dspark(server_args: "ServerArgs") -> None:
         )
     if server_args.disaggregation_mode == "decode" and server_args.pp_size != 1:
         raise ValueError("DeepSeek-V4 DSpark decode requires pp_size == 1.")
-    if server_args.moe_a2a_backend != "none":
+    if server_args.moe_a2a_backend not in ("none", "megamoe"):
         raise ValueError(
-            "DeepSeek-V4 DSpark currently requires --moe-a2a-backend none."
+            "DeepSeek-V4 DSpark supports --moe-a2a-backend none or megamoe; "
+            f"got {server_args.moe_a2a_backend!r}."
         )
-    if server_args.speculative_moe_a2a_backend not in (None, "none"):
+    if (
+        server_args.speculative_moe_a2a_backend is not None
+        and server_args.speculative_moe_a2a_backend
+        != server_args.moe_a2a_backend
+    ):
         raise ValueError(
-            "DeepSeek-V4 DSpark does not support a separate MoE A2A backend."
-        )
-    if server_args.enforce_shared_experts_fusion:
-        raise ValueError(
-            "DeepSeek-V4 DSpark uses separate shared experts in this backport; "
-            "--enforce-shared-experts-fusion is not supported."
+            "DeepSeek-V4 DSpark requires the draft and target MoE A2A "
+            f"backends to match; target={server_args.moe_a2a_backend!r}, "
+            f"draft={server_args.speculative_moe_a2a_backend!r}."
         )
     if server_args.enable_eic_cache:
         raise ValueError("DeepSeek-V4 DSpark does not support EIC in this backport.")
@@ -293,20 +295,17 @@ def _handle_dspark(server_args: "ServerArgs") -> None:
     if server_args.enable_dp_attention:
         if not server_args.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
-        if server_args.moe_a2a_backend != "none":
-            raise ValueError(
-                "DSpark with dp attention only supports the built-in TP MoE "
-                f"(moe_a2a_backend='none'), got {server_args.moe_a2a_backend!r}."
+        if server_args.moe_a2a_backend == "megamoe":
+            from sglang.srt.speculative.ragged_verify import (
+                RaggedVerifyMode,
+                read_ragged_verify_mode,
             )
-        if (
-            server_args.speculative_moe_a2a_backend is not None
-            and server_args.speculative_moe_a2a_backend != server_args.moe_a2a_backend
-        ):
-            raise ValueError(
-                "DSpark ignores --speculative-moe-a2a-backend; with dp attention it "
-                f"must match the target moe_a2a_backend={server_args.moe_a2a_backend!r} "
-                f"(got {server_args.speculative_moe_a2a_backend!r})."
-            )
+
+            if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+                raise ValueError(
+                    "DSpark with dp attention and MegaMoE requires "
+                    "SGLANG_RAGGED_VERIFY_MODE=static."
+                )
 
     bundles_dspark = _target_checkpoint_bundles_dspark_draft(server_args)
     if not bundles_dspark:

@@ -5,6 +5,7 @@ from sglang.srt.arg_groups.speculative_hook import (
     _handle_dspark,
     _target_checkpoint_bundles_dspark_draft,
 )
+from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -45,6 +46,20 @@ def _make_dspark_server_args(
     server_args.attn_cp_size = 1
     server_args.moe_a2a_backend = "none"
     server_args.model_config = SimpleNamespace(hf_config=hf_config)
+    return server_args
+
+
+def _make_dp_decode_dspark_server_args(*, moe_a2a_backend: str) -> ServerArgs:
+    server_args = _make_dspark_server_args(
+        model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+    )
+    server_args.disaggregation_mode = "decode"
+    server_args.pp_size = 1
+    server_args.dp_size = 8
+    server_args.tp_size = 8
+    server_args.enable_dp_attention = True
+    server_args.enable_dp_lm_head = True
+    server_args.moe_a2a_backend = moe_a2a_backend
     return server_args
 
 
@@ -149,13 +164,50 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "Mooncake only"):
             _handle_dspark(server_args)
 
-    def test_shared_expert_fusion_is_rejected_at_startup(self):
+    def test_shared_expert_fusion_is_allowed_for_dspark(self):
         server_args = _make_dspark_server_args(
             model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
         )
         server_args.enforce_shared_experts_fusion = True
-        with self.assertRaisesRegex(ValueError, "separate shared experts"):
+        _handle_dspark(server_args)
+        self.assertTrue(server_args.enforce_shared_experts_fusion)
+
+    def test_dp_attention_allows_megamoe_with_static_verify(self):
+        server_args = _make_dp_decode_dspark_server_args(
+            moe_a2a_backend="megamoe"
+        )
+
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
             _handle_dspark(server_args)
+
+    def test_dp_attention_rejects_non_static_megamoe(self):
+        server_args = _make_dp_decode_dspark_server_args(
+            moe_a2a_backend="megamoe"
+        )
+
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
+            with self.assertRaisesRegex(ValueError, "static"):
+                _handle_dspark(server_args)
+
+    def test_dspark_rejects_unsupported_moe_a2a_backend(self):
+        for backend in ("deepep", "pplx"):
+            server_args = _make_dspark_server_args(
+                model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+            )
+            server_args.moe_a2a_backend = backend
+
+            with self.assertRaisesRegex(ValueError, backend):
+                _handle_dspark(server_args)
+
+    def test_dspark_rejects_mismatched_draft_moe_a2a_backend(self):
+        server_args = _make_dp_decode_dspark_server_args(
+            moe_a2a_backend="megamoe"
+        )
+        server_args.speculative_moe_a2a_backend = "none"
+
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            with self.assertRaisesRegex(ValueError, "backends to match"):
+                _handle_dspark(server_args)
 
 
 if __name__ == "__main__":

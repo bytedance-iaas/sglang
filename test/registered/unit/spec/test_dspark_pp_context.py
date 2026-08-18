@@ -372,6 +372,7 @@ class TestDSparkPPContext(CustomTestCase):
         )
         torch.nn.Module.__init__(model)
         model.num_stages = 1
+        model.num_fused_shared_experts = 0
         params = {
             "stages.0.mlp.shared_experts.gate_up_proj.weight": object(),
             "stages.0.mlp.shared_experts.gate_up_proj.weight_scale_inv": object(),
@@ -388,6 +389,35 @@ class TestDSparkPPContext(CustomTestCase):
         model._assert_shared_experts_loaded(
             params_dict=params,
             loaded_params=set(params),
+        )
+
+    def test_all_fused_shared_expert_shards_must_load(self):
+        model = DeepseekV4ForCausalLMDSpark.__new__(
+            DeepseekV4ForCausalLMDSpark
+        )
+        torch.nn.Module.__init__(model)
+        model.num_stages = 1
+        model.num_fused_shared_experts = 1
+        expected = {
+            ("stages.0.mlp.experts.w13_weight", "w1"),
+            ("stages.0.mlp.experts.w13_weight", "w3"),
+            ("stages.0.mlp.experts.w2_weight", "w2"),
+        }
+
+        with self.assertRaisesRegex(ValueError, "missing.*weights or scales"):
+            model._assert_shared_experts_loaded(
+                params_dict={},
+                loaded_params=set(),
+                expected_fused_shared_params=expected,
+                loaded_fused_shared_params=expected
+                - {("stages.0.mlp.experts.w13_weight", "w3")},
+            )
+
+        model._assert_shared_experts_loaded(
+            params_dict={},
+            loaded_params=set(),
+            expected_fused_shared_params=expected,
+            loaded_fused_shared_params=expected,
         )
 
     def test_block_fp8_projection_slice_selects_matching_weight_and_scale_blocks(self):

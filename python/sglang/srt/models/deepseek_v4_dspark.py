@@ -38,10 +38,12 @@ from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_v4 import (
     DEEPSEEK_V4_STACKED_PARAMS_MAPPING,
     DeepseekV4DecoderLayer,
+    DeepseekV4ForCausalLM,
     MqaAttentionBase,
     _dequant_fp8_wo_a_streaming,
     hc_head_torch,
     make_hc_head_params,
+    resolve_deepseek_v4_num_fused_shared_experts,
 )
 from sglang.srt.models.dspark import (
     DSparkConfidenceHead,
@@ -529,6 +531,7 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
+        num_fused_shared_experts: Optional[int] = None,
     ) -> None:
         super().__init__(
             config=config,
@@ -537,6 +540,7 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
             prefix=prefix,
             is_nextn=True,
             alt_streams=alt_streams,
+            num_fused_shared_experts=num_fused_shared_experts,
         )
         self.stage_id = stage_id
         self.dim = config.hidden_size
@@ -638,6 +642,12 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
 
 class DeepseekV4ForCausalLMDSpark(nn.Module):
 
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        return DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
+            hf_config, quant_config
+        )
+
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -647,17 +657,11 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        server_args = get_global_server_args()
-        if server_args.enforce_shared_experts_fusion:
-            raise ValueError(
-                "Bundled DeepSeek-V4 DSpark in this fork requires separate "
-                "shared experts; --enforce-shared-experts-fusion is unsupported."
+        self.num_fused_shared_experts = (
+            resolve_deepseek_v4_num_fused_shared_experts(
+                type(self), config, quant_config
             )
-        # The fork predates the per-runner fusion decision introduced by
-        # upstream #33889.  Install the supported draft layout before any
-        # DSpark stage constructs its MoE module, and retain it for loading.
-        server_args.disable_shared_experts_fusion = True
-        self.num_fused_shared_experts = 0
+        )
 
         dspark_config = parse_dspark_draft_config(draft_hf_config=config)
         if not dspark_config.require_markov():
@@ -739,6 +743,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                     quant_config=quant_config,
                     prefix=add_prefix(f"stages.{stage_id}", prefix),
                     alt_streams=self.alt_streams,
+                    num_fused_shared_experts=self.num_fused_shared_experts,
                 )
                 for stage_id in range(self.num_stages)
             ]
@@ -1021,11 +1026,34 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 self.config.n_routed_experts + self.num_fused_shared_experts
             ),
         )
+        expected_fused_shared_params = set()
+        loaded_fused_shared_params = set()
+        if self.num_fused_shared_experts > 0:
+            shared_expert_id = int(self.config.n_routed_experts)
+            for stage_id in range(self.num_stages):
+                stage_prefix = f"stages.{stage_id}.mlp."
+                for param_name, _weight_name, expert_id, shard_id in (
+                    expert_params_mapping
+                ):
+                    if expert_id != shared_expert_id:
+                        continue
+                    candidate_prefix = stage_prefix + param_name
+                    expected_fused_shared_params.update(
+                        (candidate, shard_id)
+                        for candidate in params_dict
+                        if candidate.startswith(candidate_prefix)
+                    )
 
         for name, loaded_weight in weights:
             mapped = self._remap_dspark_weight_name(name)
             if mapped is None:
                 continue
+            is_shared_expert = ".mlp.shared_experts." in mapped
+            if self.num_fused_shared_experts > 0 and is_shared_expert:
+                mapped = mapped.replace(
+                    ".mlp.shared_experts.",
+                    f".mlp.experts.{self.config.n_routed_experts}.",
+                )
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in mapped:
@@ -1060,12 +1088,19 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                         expert_id=expert_id,
                     )
                     loaded_params.add(candidate)
+                    if is_shared_expert:
+                        loaded_fused_shared_params.add((candidate, shard_id))
                     break
                 else:
                     if mapped not in params_dict:
-                        if ".mlp.shared_experts." in mapped:
+                        if is_shared_expert:
+                            layout = (
+                                "fused"
+                                if self.num_fused_shared_experts > 0
+                                else "separate"
+                            )
                             raise ValueError(
-                                "DSpark V4 draft failed to resolve a separate "
+                                f"DSpark V4 draft failed to resolve a {layout} "
                                 f"shared-expert checkpoint tensor: {name!r} -> "
                                 f"{mapped!r}."
                             )
@@ -1084,12 +1119,43 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             params_dict=params_dict, loaded_params=loaded_params
         )
         self._assert_shared_experts_loaded(
-            params_dict=params_dict, loaded_params=loaded_params
+            params_dict=params_dict,
+            loaded_params=loaded_params,
+            expected_fused_shared_params=expected_fused_shared_params,
+            loaded_fused_shared_params=loaded_fused_shared_params,
         )
 
     def _assert_shared_experts_loaded(
-        self, *, params_dict: dict, loaded_params: set
+        self,
+        *,
+        params_dict: dict,
+        loaded_params: set,
+        expected_fused_shared_params: Optional[set] = None,
+        loaded_fused_shared_params: Optional[set] = None,
     ) -> None:
+        if self.num_fused_shared_experts > 0:
+            expected = expected_fused_shared_params or set()
+            loaded = loaded_fused_shared_params or set()
+            if not expected:
+                raise ValueError(
+                    "DSpark V4 draft expected fused shared-expert parameter "
+                    "slots, but the constructed model has none."
+                )
+            missing = expected - loaded
+            if missing:
+                raise ValueError(
+                    "DSpark V4 draft checkpoint is missing fused shared-expert "
+                    f"weights or scales: {sorted(missing)}."
+                )
+            for stage_id in range(self.num_stages):
+                prefix = f"stages.{stage_id}.mlp.experts."
+                if not any(candidate.startswith(prefix) for candidate, _ in loaded):
+                    raise ValueError(
+                        "DSpark V4 draft did not load fused shared-expert "
+                        f"tensors for stage {stage_id}."
+                    )
+            return
+
         shared_params = {
             name for name in params_dict if ".mlp.shared_experts." in name
         }

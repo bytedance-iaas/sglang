@@ -108,6 +108,36 @@ logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 
+
+def resolve_deepseek_v4_num_fused_shared_experts(
+    model_class,
+    hf_config: DeepSeekV4Config,
+    quant_config: Optional[QuantizationConfig],
+) -> int:
+    """Resolve the DSV4 shared-expert layout for one model construction.
+
+    The fork builds target and draft workers from separate ``ServerArgs``
+    copies.  Return the decision instead of rewriting either copy so each
+    runner retains the layout it was built with, matching upstream's
+    per-runner fusion semantics without importing the newer runtime-context
+    framework.
+    """
+
+    server_args = get_global_server_args()
+    if server_args.disable_shared_experts_fusion:
+        return 0
+
+    reason = model_class.shared_experts_fusion_disable_reason(
+        hf_config, quant_config
+    )
+    if reason is not None:
+        log_info_on_rank0(
+            logger,
+            f"{reason} Shared experts fusion optimization is disabled.",
+        )
+        return 0
+    return int(hf_config.n_shared_experts or 0)
+
 DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
     ("gate_up_proj", "gate_proj", 0),
     ("gate_up_proj", "up_proj", 1),
@@ -828,6 +858,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         prefix: str = "",
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
         compress_ratio_override: Optional[int] = None,
+        num_fused_shared_experts: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -849,6 +880,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             alt_stream=alt_streams[0] if alt_streams is not None else None,
             is_nextn=is_nextn,
             is_deepseek_v4=True,
+            num_fused_shared_experts_override=num_fused_shared_experts,
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1161,6 +1193,7 @@ class DeepseekV4Model(nn.Module):
         config: DeepSeekV4Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        num_fused_shared_experts: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.pp_group = get_pp_group()
@@ -1185,6 +1218,7 @@ class DeepseekV4Model(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
                 alt_streams=self.alt_streams,
+                num_fused_shared_experts=num_fused_shared_experts,
             ),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
@@ -1358,7 +1392,10 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts()
         self.model = DeepseekV4Model(
-            config, quant_config, prefix=add_prefix("model", prefix)
+            config,
+            quant_config,
+            prefix=add_prefix("model", prefix),
+            num_fused_shared_experts=self.num_fused_shared_experts,
         )
         self.pp_group = get_pp_group()
         if self.pp_group.is_last_rank:
@@ -1417,16 +1454,23 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.capture_aux_hidden_states = bool(local_layer_ids)
         self.model.dspark_layers_to_capture = local_layer_ids or None
 
-    def determine_num_fused_shared_experts(self):
-        self.num_fused_shared_experts = 0
-        if get_global_server_args().disable_shared_experts_fusion:
-            return
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        del quant_config
+        if not get_global_server_args().enforce_shared_experts_fusion:
+            return "Config does not support fused shared expert(s)."
+        if int(hf_config.n_shared_experts or 0) != 1:
+            raise ValueError(
+                "DeepSeek V4 shared-experts fusion expects exactly one shared "
+                f"expert, but got n_shared_experts={hf_config.n_shared_experts}."
+            )
+        return None
 
-        get_global_server_args().disable_shared_experts_fusion = True
-        log_info_on_rank0(
-            logger,
-            "DeepSeek V4 requires different clamping for shared and routed experts. "
-            "Shared experts fusion optimization is disabled.",
+    def determine_num_fused_shared_experts(self):
+        self.num_fused_shared_experts = (
+            resolve_deepseek_v4_num_fused_shared_experts(
+                type(self), self.config, self.quant_config
+            )
         )
 
     @torch.no_grad()
