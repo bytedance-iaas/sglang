@@ -45,6 +45,11 @@ class KVArgs:
     aux_data_ptrs: List[int]
     aux_data_lens: List[int]
     aux_item_lens: List[int]
+    # Indices within aux_data_ptrs for topk_p, topk_index, hidden_states, and
+    # the optional DSA seed.
+    # Mooncake skips these writes from non-last prefill PP ranks so their
+    # zero-filled local buffers cannot race the last rank's valid MTP seed.
+    spec_aux_indices: List[int]
     state_types: List[StateType]
     state_data_ptrs: List[List[int]]
     state_data_lens: List[List[int]]
