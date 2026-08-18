@@ -352,7 +352,14 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.qk_nope_head_dim = cfg.qk_nope_head_dim
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
         self.indexer_head_dim = cfg.index_head_dim
-        self.compression_ratios = cfg.compress_ratios
+        # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
+        self.compression_ratios = cfg.compress_ratios[mr.start_layer : mr.end_layer]
+        if mr.pp_size > 1:
+            logger.info(
+                f"DSV4 pool PP slice: rank={mr.pp_group.rank_in_group} "
+                f"layers=[{mr.start_layer},{mr.end_layer}) "
+                f"local={len(self.compression_ratios)}/{len(cfg.compress_ratios)}"
+            )
         self.swa_page_size = cfg.window_size
         self.swa_ratio = mr.server_args.swa_full_tokens_ratio
         self.is_speculative = (
@@ -388,7 +395,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             )
 
         self.bytes_per_full_token = self._get_bytes_per_full_token()
-        if self.is_speculative:
+        if self.is_speculative and self._should_budget_draft_pool(mr):
             self.bytes_per_full_token += self._get_draft_bytes_per_full_token(mr)
 
         # Online c128 keeps a single in-progress (max, sum, kv) state per index
@@ -420,6 +427,26 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 logger.info(
                     "DSV4 compressed attention: online c128 enabled (ring_size=1)"
                 )
+
+    @staticmethod
+    def _should_budget_draft_pool(mr: ModelRunner) -> bool:
+        """Return whether this PP stage owns the speculative draft KV pool.
+
+        DSV4 DSpark PD prefill keeps the full draft SWA pool on the final PP
+        stage, matching ``prepare_dspark_hicache_draft_plan``. Earlier stages
+        either have no draft pool or retain only a one-page lifecycle pool, so
+        charging the full packed draft geometry there understates the shared PP
+        token capacity. Other speculative layouts keep the existing budgeting
+        behavior.
+        """
+
+        if not mr.spec_algorithm.is_dspark():
+            return True
+        return not (
+            mr.server_args.disaggregation_mode == "prefill"
+            and mr.pp_size > 1
+            and mr.pp_rank != mr.pp_size - 1
+        )
 
     def _get_draft_bytes_per_full_token(self, mr: ModelRunner) -> float:
         """Return the draft pool's flat contribution to one target full token."""
