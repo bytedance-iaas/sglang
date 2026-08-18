@@ -130,7 +130,7 @@ void dispatch_w4a8_moe_mm_sm90(
     // group gemm 1
     if (m <= 4) {
       INVOKE_GEMM_WITH_CONFIG((SM90_PP<64, 32, 512, 2, 1, 1>));
-    } else if (m <= 32) {
+    } else if (m <= 16) {
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 2, 1, 1>));
     } else if (m <= 64) {
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
