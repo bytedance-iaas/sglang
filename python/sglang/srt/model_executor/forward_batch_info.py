@@ -95,6 +95,69 @@ def _elastic_should_preserve_local_token_counts(
     return uneven_token_count
 
 
+def _should_materialize_idle_spec_deepep(
+    *,
+    forward_mode: ForwardMode,
+    spec_info: Optional[SpecInput],
+    dp_padding_mode: DpPaddingMode,
+    num_tokens: int,
+) -> bool:
+    """Whether an idle speculative rank needs real rows for symmetric MoE A2A."""
+    return (
+        forward_mode.is_idle()
+        and dp_padding_mode.is_max_len()
+        and num_tokens > 0
+        and spec_info is not None
+    )
+
+
+def _should_force_symmetric_spec_deepep_padding(
+    *,
+    spec_algorithm: Optional[SpeculativeAlgorithm],
+    spec_info: Optional[SpecInput],
+    is_extend_in_batch: bool,
+    global_num_tokens: List[int],
+) -> bool:
+    """Keep EAGLE verify ranks in one DeepEP low-latency handshake geometry."""
+    if (
+        spec_algorithm is None
+        or not spec_algorithm.is_eagle()
+        or spec_info is None
+        or len(global_num_tokens) <= 1
+        or min(global_num_tokens) > 0
+        or max(global_num_tokens) == 0
+    ):
+        return False
+
+    from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
+
+    return (
+        get_moe_a2a_backend().is_deepep()
+        and get_deepep_mode().resolve(is_extend_in_batch).is_low_latency()
+    )
+
+
+def requires_symmetric_spec_deepep_lockstep(forward_batch: ForwardBatch) -> bool:
+    """Whether sparse EAGLE DeepEP dispatches must stay host-side lockstep."""
+    original_counts = forward_batch.original_global_num_tokens_cpu
+    return (
+        (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        )
+        and forward_batch.spec_algorithm is not None
+        and forward_batch.spec_algorithm.is_eagle()
+        and forward_batch.spec_info is not None
+        and forward_batch.dp_padding_mode is not None
+        and forward_batch.dp_padding_mode.is_max_len()
+        and original_counts is not None
+        and len(original_counts) > 1
+        and min(original_counts) == 0
+        and max(original_counts) > 0
+    )
+
+
 class ForwardMode(IntEnum):
     # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
     # It is also called "prefill" in common terminology.
@@ -520,6 +583,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Gate for reusing the first MTP draft step's indexer topk across steps;
     # the carried topk lives on spec_info (see EagleDraftInput.dsa_topk_indices).
     reuse_dsa_topk_indices: Optional[bool] = False
+    # Sparse EAGLE + DeepEP ranks may carry one synthetic draft row solely to
+    # enter the same MoE collectives as active peers. It has no request KV and
+    # must not run DSA attention.
+    symmetric_spec_deepep_dummy: bool = False
 
     minimax_m3_precached_sparse_layers: Optional[Set[int]] = None
 
@@ -1276,6 +1343,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
         )
+        if _should_force_symmetric_spec_deepep_padding(
+            spec_algorithm=self.spec_algorithm,
+            spec_info=self.spec_info,
+            is_extend_in_batch=self.is_extend_in_batch,
+            global_num_tokens=global_num_tokens,
+        ):
+            # The generic cost heuristic chooses SUM_LEN when only a few DP
+            # ranks are active.  DeepEP low-latency target verification cannot
+            # use that sparse geometry: zero-token ranks finish locally while
+            # active peers wait for their device-side handshake.
+            dp_padding_mode = DpPaddingMode.MAX_LEN
         if _elastic_should_preserve_local_token_counts(
             model_runner=model_runner,
             dp_padding_mode=dp_padding_mode,
@@ -1355,10 +1433,26 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 hybrid_ssm
                 and self.spec_info is not None
                 and not self.spec_info.is_draft_input()
+            ) or _should_materialize_idle_spec_deepep(
+                forward_mode=self.forward_mode,
+                spec_info=self.spec_info,
+                dp_padding_mode=dp_padding_mode,
+                num_tokens=num_tokens,
             ):
                 if self.forward_mode.is_idle():
                     self._original_forward_mode = self.forward_mode
-                    self.forward_mode = ForwardMode.TARGET_VERIFY
+                    self.forward_mode = (
+                        ForwardMode.DECODE
+                        if self.spec_info.is_draft_input()
+                        else ForwardMode.TARGET_VERIFY
+                    )
+                    # DeepEP low-latency must dispatch a real dummy row here.
+                    # Leaving this at the original zero marks every padded top-k
+                    # row invalid, recreating the zero-token handshake that the
+                    # symmetric padding is meant to avoid.
+                    if self.num_token_non_padded is not None:
+                        self.num_token_non_padded.fill_(num_tokens)
+                    self.num_token_non_padded_cpu = num_tokens
                 # Invert the spec_scale_global_num_tokens scaling.
                 bs = self.batch_size = num_tokens // self.spec_info.num_tokens_per_req
             elif self.is_extend_in_batch and dp_padding_mode.is_max_len():
@@ -1600,7 +1694,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     ]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_extend() or self.forward_mode.is_idle():
-                if self.forward_mode.is_idle():
+                if self.symmetric_spec_deepep_dummy:
                     self.positions = self.positions[:bs]
                     self.seq_lens = self.seq_lens[:bs]
                     self.req_pool_indices = self.req_pool_indices[:bs]

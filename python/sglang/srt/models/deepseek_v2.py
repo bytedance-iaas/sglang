@@ -51,6 +51,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed import (
     divide,
+    get_moe_ep_group,
     get_pp_group,
     tensor_model_parallel_all_reduce,
 )
@@ -148,7 +149,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    PPProxyTensors,
+    requires_symmetric_spec_deepep_lockstep,
+)
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
@@ -1450,6 +1455,14 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
 
+        if requires_symmetric_spec_deepep_lockstep(forward_batch):
+            # Materialized idle ranks skip the expensive DSA attention work and
+            # can otherwise launch several low-latency DeepEP generations ahead
+            # of active ranks.  DeepEP's device handshake is not a host barrier;
+            # keep the sparse verify round in layer order.  Fully active decode
+            # batches never enter this path.
+            get_moe_ep_group().barrier()
+
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_output=topk_output,
@@ -2080,6 +2093,15 @@ class DeepseekV2AttentionMLA(
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
+        if forward_batch.symmetric_spec_deepep_dummy:
+            # This row exists only to keep sparse EAGLE ranks in the same
+            # DeepEP MoE generations. There is no real request KV to attend;
+            # forwarding the activation preserves the layer/collective shape
+            # without asking DSA and FlashMLA to plan a synthetic cache row.
+            if isinstance(hidden_states, tuple):
+                hidden_states = hidden_states[0]
+            return hidden_states, None, forward_batch, None
+
         if self.attn_mha.kv_b_proj is None:
             self.attn_mha.kv_b_proj = self.kv_b_proj
 
