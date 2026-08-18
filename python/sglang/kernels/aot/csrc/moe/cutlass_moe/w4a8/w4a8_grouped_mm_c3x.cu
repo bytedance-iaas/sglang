@@ -99,32 +99,27 @@ void dispatch_w4a8_moe_mm_sm90(
     torch::Tensor const& s_strides,
     int64_t chunk_size,
     int64_t topk) {
-  // Two tensor layouts feed this grouped GEMM:
-  //   - 2D contiguous (prefill / deepep_normal): a=[total_m, K], d=[total_m, N]
-  //       total_m = num_tokens * topk (all experts' rows concatenated).
-  //   - 3D masked (deepep low-latency / decode): a=[E, cap, K], d=[E, cap, N]
-  //       cap = num_max_dispatch_tokens_per_rank * num_ranks is a *fixed*
-  //       padded slab capacity (CUDA-graph static). The real per-expert row
-  //       count is masked_m[e] (a device tensor, not visible here), so cap
-  //       itself vastly over-estimates the decode load (e.g. cap=1024 while a
-  //       decode step only has O(batch) rows per expert).
-  //
-  // This heuristic only picks the tile/schedule; the real problem shapes come
-  // from `problem_sizes`. It must key off the *expected per-group M*, not the
-  // total/capacity rows, since one tile config is shared by all E experts.
-  // n and k are the last dim in both layouts.
-  //   - 2D:  m = total_m / num_experts   (exact average per-expert load)
-  //   - 3D:  m = cap      / num_experts   (static full-occupancy estimate;
-  //          matches the upstream expected_m_per_group and stays
-  //          CUDA-graph-safe by not reading masked_m).
-  // num_experts == expert_offsets.size(0) (caller passes expert_offsets[:-1]).
+  // Two tensor layouts are supported:
+  //   - Contiguous grouped (normal / deepep_normal): a=[total_m, K], d=[total_m, N]
+  //   - Masked 3D (deepep low-latency): a=[E, m, K], d=[E, m, N]
+  // The heuristic below only selects the tile/schedule config; the actual GEMM
+  // problem shapes come from `problem_sizes`. It must be driven by the *expected
+  // per-group M* (average rows each expert processes), not the total row count,
+  // because this is a grouped GEMM: one tile config is shared by all E experts.
+  // n and k are always the last dim in both layouts.
+  //   - Contiguous: total rows are split across the experts, so the per-group M
+  //     is total_m / num_experts. num_experts == expert_offsets.size(0) (the
+  //     caller always passes expert_offsets[:-1]). This exactly reproduces the
+  //     Python-side `m * topk / num_local_experts`.
+  //   - Masked 3D: each expert owns a fixed slab of a_tensors.size(1) rows,
+  //     which is already the per-group M.
   int const num_experts = static_cast<int>(expert_offsets.size(0));
   uint32_t const m = a_tensors.dim() == 3
-                         ? static_cast<uint32_t>(a_tensors.size(1) / num_experts)
+                         ? static_cast<uint32_t>(a_tensors.size(1))
                          : static_cast<uint32_t>(a_tensors.size(0) / num_experts);
   uint32_t const n = d_tensors.size(-1);
   uint32_t const k = a_tensors.size(-1);
-  (void)topk;  // per-group M derived from num_experts; topk kept for ABI compat
+  (void)topk;  // per-group M is derived from num_experts; topk kept for ABI compatibility
 
   if (n == 4096 && k == 7168) {
     // group gemm 1
