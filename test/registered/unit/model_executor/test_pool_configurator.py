@@ -343,7 +343,44 @@ class TestDSV4DSparkDraftKvBudget(unittest.TestCase):
         def is_eagle():
             return False
 
-    def test_uses_packed_draft_geometry_and_all_stages(self):
+    def _make_runner(
+        self,
+        *,
+        pp_rank=0,
+        pp_size=1,
+        start_layer=0,
+        end_layer=3,
+        compress_ratios=None,
+    ):
+        if compress_ratios is None:
+            compress_ratios = [0, 0, 0]
+        return SimpleNamespace(
+            model_config=SimpleNamespace(
+                qk_nope_head_dim=448,
+                qk_rope_head_dim=64,
+                index_head_dim=128,
+                compress_ratios=compress_ratios,
+                window_size=128,
+            ),
+            server_args=SimpleNamespace(
+                swa_full_tokens_ratio=0.1,
+                speculative_algorithm="DSPARK",
+                effective_speculative_algorithm="DSPARK",
+                max_speculative_num_draft_tokens=6,
+                disaggregation_mode="prefill",
+            ),
+            enable_hisparse=False,
+            spec_algorithm=self._DSparkAlgorithm(),
+            dspark_draft_num_layers=3,
+            dspark_draft_cell_size_per_token=584,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            pp_rank=pp_rank,
+            pp_size=pp_size,
+            pp_group=SimpleNamespace(rank_in_group=pp_rank),
+        )
+
+    def test_uses_packed_draft_geometry(self):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             get_dsv4_kv_bytes_per_token,
         )
@@ -372,28 +409,48 @@ class TestDSV4DSparkDraftKvBudget(unittest.TestCase):
     def test_configurator_adds_exact_flat_draft_term(self):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 
-        runner = SimpleNamespace(
-            model_config=SimpleNamespace(
-                qk_nope_head_dim=448,
-                qk_rope_head_dim=64,
-                index_head_dim=128,
-                compress_ratios=[0, 0, 0],
-                window_size=128,
-            ),
-            server_args=SimpleNamespace(
-                swa_full_tokens_ratio=0.1,
-                speculative_algorithm="DSPARK",
-                effective_speculative_algorithm="DSPARK",
-                max_speculative_num_draft_tokens=6,
-            ),
-            enable_hisparse=False,
-            spec_algorithm=self._DSparkAlgorithm(),
-            dspark_draft_num_layers=3,
-            dspark_draft_cell_size_per_token=584,
-        )
+        runner = self._make_runner()
 
         configurator = DSV4PoolConfigurator(runner)
         target_bytes = 0.1 * 584 * 3
+        draft_bytes = 0.1 * 584 * 3
+        self.assertAlmostEqual(
+            configurator.bytes_per_full_token,
+            target_bytes + draft_bytes,
+        )
+
+    def test_pp_uses_only_local_target_layers(self):
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        runner = self._make_runner(
+            pp_rank=1,
+            pp_size=4,
+            start_layer=2,
+            end_layer=4,
+            compress_ratios=[0] * 8,
+        )
+
+        configurator = DSV4PoolConfigurator(runner)
+
+        self.assertEqual(configurator.compression_ratios, [0, 0])
+        self.assertAlmostEqual(
+            configurator.bytes_per_full_token,
+            0.1 * 584 * 2,
+        )
+
+    def test_final_pp_stage_budgets_packed_draft_pool(self):
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        runner = self._make_runner(
+            pp_rank=3,
+            pp_size=4,
+            start_layer=6,
+            end_layer=8,
+            compress_ratios=[0] * 8,
+        )
+
+        configurator = DSV4PoolConfigurator(runner)
+        target_bytes = 0.1 * 584 * 2
         draft_bytes = 0.1 * 584 * 3
         self.assertAlmostEqual(
             configurator.bytes_per_full_token,
