@@ -221,9 +221,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         transferred = queue.pop_transferred(max_successes=2)
 
-        self.assertEqual(
-            [req.rid for req in transferred], ["success-0", "success-1"]
-        )
+        self.assertEqual([req.rid for req in transferred], ["success-0", "success-1"])
         self.assertEqual([entry.req.rid for entry in queue.queue], ["success-2"])
         self.assertEqual(queue._commit_transfer_to_req.call_count, 2)
         self.assertEqual(
@@ -272,6 +270,33 @@ class TestDecodeQueueCleanup(CustomTestCase):
         # are distinct, but a shared allocator must reserve the slot only once.
         self.assertEqual(scheduler.hisparse_direct_admission_capacity(), 3)
         shared_physical_allocator.available_size.assert_called_once_with()
+
+    @patch("sglang.srt.disaggregation.decode." "poll_and_all_reduce_attn_cp_tp_group")
+    def test_pp_transfer_success_ignores_hicache_state_when_hicache_disabled(
+        self, mock_poll
+    ):
+        decode_req = SimpleNamespace(
+            req=SimpleNamespace(rid="ready", bootstrap_host="2.2.2.2"),
+            kv_receiver=FakeReceiver(),
+            metadata_buffer_index=0,
+            hicache_restore_status=HiCacheRestoreResult.PENDING,
+        )
+        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        queue.queue = [decode_req]
+        queue.enable_staging = False
+        queue.scheduler = SimpleNamespace(
+            enable_decode_hicache=False,
+            attn_cp_cpu_group=object(),
+            attn_tp_cpu_group=object(),
+            server_args=object(),
+        )
+        mock_poll.return_value = [KVPoll.Success]
+
+        success, failed = queue.get_transferred_status_for_pp()
+
+        self.assertEqual(success, ["ready"])
+        self.assertEqual(failed, [])
+        self.assertEqual(mock_poll.call_args.kwargs["ordered_keys"], ["ready"])
 
     def test_retracted_decode_requests_keep_scheduler_non_idle(self):
         scheduler = Scheduler.__new__(Scheduler)

@@ -11,7 +11,12 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState  # noqa:
 from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa: E402
     SchedulerRequestReceiver,
 )
-from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
+from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
+    _PP_DISAGG_SCHEDULER_FENCE_PHASES,
+    SchedulerPPMixin,
+    _pp_attention_dp_control_ranks,
+    _pp_fence_scheduler_phase,
+)
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -119,6 +124,37 @@ class TestPPCPRankOffsets(unittest.TestCase):
                 (12, 12, 4, True),
                 (12, 4, 12, False),
             ],
+        )
+
+    def test_pp_scheduler_fence_uses_the_full_attention_dp_group(self):
+        ps = _make_ps()
+        shifted_tp_ranks = list(range(24, 32))
+        dp1_ranks = _pp_attention_dp_control_ranks(ps, shifted_tp_ranks)
+        self.assertEqual(
+            dp1_ranks,
+            [28, 29, 30, 31],
+        )
+        dp0_ranks = _pp_attention_dp_control_ranks(
+            _make_ps(attn_dp_rank=0), shifted_tp_ranks
+        )
+        self.assertEqual(dp0_ranks, [24, 25, 26, 27])
+        self.assertEqual(set(dp0_ranks).intersection(dp1_ranks), set())
+
+        fence_groups = {phase: object() for phase in _PP_DISAGG_SCHEDULER_FENCE_PHASES}
+        with patch(
+            "sglang.srt.managers.scheduler_pp_mixin.torch.distributed.barrier"
+        ) as barrier:
+            for phase in _PP_DISAGG_SCHEDULER_FENCE_PHASES:
+                _pp_fence_scheduler_phase(fence_groups[phase])
+            _pp_fence_scheduler_phase(None)
+
+        self.assertEqual(
+            [call.kwargs["group"] for call in barrier.call_args_list],
+            [fence_groups[phase] for phase in _PP_DISAGG_SCHEDULER_FENCE_PHASES],
+        )
+        self.assertEqual(
+            len(set(fence_groups.values())),
+            len(_PP_DISAGG_SCHEDULER_FENCE_PHASES),
         )
 
 

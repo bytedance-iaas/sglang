@@ -217,7 +217,59 @@ def poll_and_all_reduce_attn_cp_tp_group(
     pollers,
     attn_cp_cpu_group: dist.ProcessGroup,
     attn_tp_cpu_group: dist.ProcessGroup,
+    ordered_keys: Optional[List[str]] = None,
 ):
+    canonical_to_local_indices = None
+    if ordered_keys is not None:
+        assert len(ordered_keys) == len(pollers)
+        assert len(set(ordered_keys)) == len(ordered_keys)
+        local_key_to_index = {key: i for i, key in enumerate(ordered_keys)}
+        local_key_to_poller = dict(zip(ordered_keys, pollers))
+        canonical_to_local_indices = sorted(
+            range(len(ordered_keys)), key=ordered_keys.__getitem__
+        )
+        ordered_keys = [ordered_keys[i] for i in canonical_to_local_indices]
+        pollers = [pollers[i] for i in canonical_to_local_indices]
+        digest = hashlib.blake2b(digest_size=8)
+        for key in ordered_keys:
+            encoded_key = key.encode("utf-8")
+            digest.update(len(encoded_key).to_bytes(8, "little"))
+            digest.update(encoded_key)
+        signature = torch.tensor(
+            [
+                len(ordered_keys),
+                int.from_bytes(digest.digest(), "little") & ((1 << 63) - 1),
+            ],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        # Reduce global extrema over the TP x CP process grid. Encoding max as
+        # min(-value) keeps this to one collective per group and, unlike a
+        # rank-local comparison, makes every participant take the same branch.
+        signature_extrema = torch.cat((signature, -signature))
+        for group in (attn_tp_cpu_group, attn_cp_cpu_group):
+            dist.all_reduce(signature_extrema, op=dist.ReduceOp.MIN, group=group)
+        signatures_match = torch.equal(signature_extrema[:2], -signature_extrema[2:])
+
+        if not signatures_match:
+            # Queue membership can be transiently skewed while PP ranks retire
+            # completed requests and admit refills. Poll the global intersection
+            # so common requests can still release resources; defer only local
+            # extras until they appear on every participant.
+            common_keys = set(ordered_keys)
+            for group in (attn_tp_cpu_group, attn_cp_cpu_group):
+                gathered_keys = [None] * dist.get_world_size(group)
+                dist.all_gather_object(gathered_keys, sorted(common_keys), group=group)
+                common_keys.intersection_update(*(set(keys) for keys in gathered_keys))
+            ordered_keys = sorted(common_keys)
+            canonical_to_local_indices = [
+                local_key_to_index[key] for key in ordered_keys
+            ]
+            pollers = [local_key_to_poller[key] for key in ordered_keys]
+
+            if not pollers:
+                return [KVPoll.Bootstrapping] * len(local_key_to_index)
+
     # First sync across attn-tp ranks so all TP participants for a given (dp, cp)
     # shard observe the same status transitions.
     polls = poll_and_all_reduce(pollers, attn_tp_cpu_group)
@@ -230,7 +282,14 @@ def poll_and_all_reduce_attn_cp_tp_group(
         op=dist.ReduceOp.MIN,
         group=attn_cp_cpu_group,
     )
-    return tensor_to_reduce.tolist()
+    polls = tensor_to_reduce.tolist()
+    if canonical_to_local_indices is None:
+        return polls
+
+    local_order_polls = [KVPoll.Bootstrapping] * len(local_key_to_index)
+    for canonical_index, local_index in enumerate(canonical_to_local_indices):
+        local_order_polls[local_index] = polls[canonical_index]
+    return local_order_polls
 
 
 def poll_and_all_reduce_with_staging(

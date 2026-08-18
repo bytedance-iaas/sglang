@@ -1,6 +1,13 @@
 import triton
 import triton.language as tl
 
+# Keep the batch reduction shape independent of the runtime batch size.  A
+# constexpr next_power_of_2(batch_size) makes Triton load a new module for every
+# batch bucket, which can stall distributed schedulers when the first real
+# request reaches a previously unseen bucket.  A runtime loop over fixed-size
+# blocks compiles once and still supports batches larger than one block.
+ALLOCATOR_BATCH_SIZE_STEP = 512
+
 
 # free_page_ptr aliases self.free_pages, which the paged allocator re-slices
 # after every allocation (self.free_pages = self.free_pages[num_new_pages:]).
@@ -19,31 +26,35 @@ def alloc_extend_kernel(
     last_loc_ptr,
     free_page_ptr,
     out_indices,
-    bs_upper: tl.constexpr,
+    batch_size_step: tl.constexpr,
     page_size: tl.constexpr,
 ):
     pid = tl.program_id(0)
-
-    load_offset = tl.arange(0, bs_upper)
-    seq_lens = tl.load(seq_lens_ptr + load_offset, mask=load_offset <= pid)
-    pre_lens = tl.load(pre_lens_ptr + load_offset, mask=load_offset <= pid)
-    extend_lens = seq_lens - pre_lens
 
     seq_len = tl.load(seq_lens_ptr + pid)
     pre_len = tl.load(pre_lens_ptr + pid)
     extend_len = seq_len - pre_len
 
-    sum_extend_lens = tl.sum(extend_lens)
-    output_start_loc = sum_extend_lens - extend_len
+    sum_extend_lens = 0
+    sum_num_new_pages = 0
+    sum_extend_lens = sum_extend_lens.to(tl.int64)
+    sum_num_new_pages = sum_num_new_pages.to(tl.int64)
+    num_batch_blocks = tl.cdiv(pid + 1, batch_size_step)
+    for block_id in range(num_batch_blocks):
+        offsets = block_id * batch_size_step + tl.arange(0, batch_size_step)
+        mask = offsets <= pid
+        block_seq_lens = tl.load(seq_lens_ptr + offsets, mask=mask, other=0)
+        block_pre_lens = tl.load(pre_lens_ptr + offsets, mask=mask, other=0)
+        sum_extend_lens += tl.sum(block_seq_lens - block_pre_lens)
+        num_pages_after = (block_seq_lens + page_size - 1) // page_size
+        num_pages_before = (block_pre_lens + page_size - 1) // page_size
+        sum_num_new_pages += tl.sum(num_pages_after - num_pages_before)
 
-    num_pages_after = (seq_lens + page_size - 1) // page_size
-    num_pages_before = (pre_lens + page_size - 1) // page_size
-    num_new_pages = num_pages_after - num_pages_before
+    output_start_loc = sum_extend_lens - extend_len
 
     num_page_start_loc_self = (seq_len + page_size - 1) // page_size - (
         pre_len + page_size - 1
     ) // page_size
-    sum_num_new_pages = tl.sum(num_new_pages)
     new_page_start_loc = sum_num_new_pages - num_page_start_loc_self
 
     # Part 1: fill the old partial page
@@ -105,26 +116,29 @@ def alloc_decode_kernel(
     last_loc_ptr,
     free_page_ptr,
     out_indices,
-    bs_upper: tl.constexpr,
+    batch_size_step: tl.constexpr,
     page_size: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
-    load_offset = tl.arange(0, bs_upper)
-    seq_lens = tl.load(seq_lens_ptr + load_offset, mask=load_offset <= pid)
-    pre_lens = tl.where(load_offset <= pid, seq_lens - 1, seq_lens)
-
     seq_len = tl.load(seq_lens_ptr + pid)
     pre_len = seq_len - 1
 
-    num_pages_after = (seq_lens + page_size - 1) // page_size
-    num_pages_before = (pre_lens + page_size - 1) // page_size
-    num_new_pages = num_pages_after - num_pages_before
+    sum_num_new_pages = 0
+    sum_num_new_pages = sum_num_new_pages.to(tl.int64)
+    num_batch_blocks = tl.cdiv(pid + 1, batch_size_step)
+    for block_id in range(num_batch_blocks):
+        offsets = block_id * batch_size_step + tl.arange(0, batch_size_step)
+        mask = offsets <= pid
+        block_seq_lens = tl.load(seq_lens_ptr + offsets, mask=mask, other=0)
+        block_pre_lens = tl.where(mask, block_seq_lens - 1, block_seq_lens)
+        num_pages_after = (block_seq_lens + page_size - 1) // page_size
+        num_pages_before = (block_pre_lens + page_size - 1) // page_size
+        sum_num_new_pages += tl.sum(num_pages_after - num_pages_before)
 
     num_page_start_loc_self = (seq_len + page_size - 1) // page_size - (
         pre_len + page_size - 1
     ) // page_size
-    sum_num_new_pages = tl.sum(num_new_pages)
     new_page_start_loc = sum_num_new_pages - num_page_start_loc_self
 
     if num_page_start_loc_self == 0:

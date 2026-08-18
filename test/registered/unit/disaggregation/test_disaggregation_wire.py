@@ -1,9 +1,11 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
 
+from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.disaggregation.common.utils import (
     group_concurrent_contiguous,
@@ -15,6 +17,7 @@ from sglang.srt.disaggregation.common.utils import (
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     get_dsv4_c128_state_indices,
+    poll_and_all_reduce_attn_cp_tp_group,
     setup_state_kv_args,
     summarize_pd_bootstrap_tensor,
 )
@@ -29,6 +32,56 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestDisaggregationWire(unittest.TestCase):
+    @patch("sglang.srt.disaggregation.utils.dist.all_reduce")
+    def test_rank_local_queue_order_is_canonicalized_before_poll(self, _all_reduce):
+        poller_b = Mock()
+        poller_b.poll.return_value = KVPoll.Success
+        poller_a = Mock()
+        poller_a.poll.return_value = KVPoll.WaitingForInput
+
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [poller_b, poller_a],
+            "attn-cp",
+            "attn-tp",
+            ordered_keys=["request-b", "request-a"],
+        )
+
+        self.assertEqual(polls, [KVPoll.Success, KVPoll.WaitingForInput])
+        poller_a.poll.assert_called_once_with()
+        poller_b.poll.assert_called_once_with()
+
+    @patch("sglang.srt.disaggregation.utils.dist.get_world_size", return_value=2)
+    @patch("sglang.srt.disaggregation.utils.dist.all_gather_object")
+    @patch("sglang.srt.disaggregation.utils.dist.all_reduce")
+    def test_rank_local_queue_mismatch_polls_common_requests(
+        self, all_reduce, all_gather_object, _get_world_size
+    ):
+        def emulate_rank_mismatch(tensor, op=None, group=None):
+            if tensor.dtype == torch.int64:
+                tensor[2] -= 1
+
+        def emulate_remote_keys(output, local_keys, group=None):
+            output[0] = local_keys
+            output[1] = (
+                ["request-a", "request-c"] if group == "attn-tp" else ["request-a"]
+            )
+
+        all_reduce.side_effect = emulate_rank_mismatch
+        all_gather_object.side_effect = emulate_remote_keys
+        poller_b = Mock()
+        poller_a = Mock()
+        poller_a.poll.return_value = KVPoll.WaitingForInput
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [poller_b, poller_a],
+            "attn-cp",
+            "attn-tp",
+            ordered_keys=["request-b", "request-a"],
+        )
+
+        self.assertEqual(polls, [KVPoll.Bootstrapping, KVPoll.WaitingForInput])
+        poller_b.poll.assert_not_called()
+        poller_a.poll.assert_called_once_with()
+
     def test_pd_bootstrap_summary_preserves_bytes_and_metadata(self):
         value = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
         summary = summarize_pd_bootstrap_tensor(value)

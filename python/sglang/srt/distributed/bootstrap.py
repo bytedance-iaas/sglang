@@ -11,6 +11,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import (
     get_default_distributed_backend,
     get_pp_group,
+    get_pp_output_group,
     get_tp_group,
     get_world_group,
     init_distributed_environment,
@@ -249,18 +250,66 @@ def _init_parallel_groups(
 
 def _prewarm_nccl(*, tp_size: int, pp_size: int, moe_ep_size: int) -> None:
     warmup_start = time.perf_counter()
-    tp_group_handle = get_tp_group().device_group
+    groups = [("tp", get_tp_group().device_group)]
+    pp_group = None
+    if pp_size > 1:
+        pp_group = get_pp_group()
+        pp_output_group = get_pp_output_group()
+        groups.append(("pp", pp_group.device_group))
+        groups.append(("pp_output", pp_output_group.device_group))
+    else:
+        pp_output_group = None
 
-    # Single warmup all_reduce to initialize NCCL/RCCL/HCCL communicator
+    # Initialize every communication group that can be used by the first
+    # request. Warming only TP leaves PP point-to-point sends in lazy
+    # communicator initialization, where an isend can block until its delayed
+    # pipeline receive is posted.
     warmup_tensor = torch.zeros(1, device=torch.cuda.current_device())
-    dist.all_reduce(warmup_tensor, group=tp_group_handle)
+    seen_groups = set()
+    warmed_groups = []
+    for group_name, group_handle in groups:
+        group_id = id(group_handle)
+        if group_id in seen_groups:
+            continue
+        dist.all_reduce(warmup_tensor, group=group_handle)
+        seen_groups.add(group_id)
+        warmed_groups.append(group_name)
+
+    if pp_group is not None:
+        _prewarm_pp_p2p(pp_group, warmup_tensor)
+        _prewarm_pp_p2p(pp_output_group, warmup_tensor)
     current_platform.synchronize()
 
     warmup_elapsed = time.perf_counter() - warmup_start
     logger.info(
         f"NCCL/RCCL/HCCL warmup completed in {warmup_elapsed:.3f}s "
-        f"(tp_size={tp_size}, pp_size={pp_size}, ep_size={moe_ep_size})"
+        f"(groups={warmed_groups}, tp_size={tp_size}, pp_size={pp_size}, "
+        f"ep_size={moe_ep_size})"
     )
+
+
+def _prewarm_pp_p2p(pp_group, warmup_tensor: torch.Tensor) -> None:
+    """Initialize every directed unbatched P2P communicator in the PP ring."""
+    recv_tensor = torch.empty_like(warmup_tensor)
+    group_handle = pp_group.device_group
+    ranks = pp_group.ranks
+    rank_in_group = pp_group.rank_in_group
+
+    # ProcessGroupNCCL creates a pair communicator lazily for an unbatched P2P
+    # operation. A collective all-reduce on the same process group does not
+    # initialize it, so exercise each PP edge in the same direction used by
+    # send_tensor_dict before the event loop can send ahead of its receive.
+    for src_index, src_rank in enumerate(ranks):
+        dst_index = (src_index + 1) % len(ranks)
+        dst_rank = ranks[dst_index]
+        work = None
+        if rank_in_group == src_index:
+            work = dist.isend(warmup_tensor, dst=dst_rank, group=group_handle)
+        elif rank_in_group == dst_index:
+            work = dist.irecv(recv_tensor, src=src_rank, group=group_handle)
+        if work is not None:
+            work.wait()
+        dist.barrier(group=group_handle)
 
 
 def _check_tp_memory_balance(
