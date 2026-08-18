@@ -168,9 +168,7 @@ class TestDeepEPSpecIdlePadding(CustomTestCase):
             ForwardMode.SPLIT_PREFILL,
             ForwardMode.DLLM_EXTEND,
         ):
-            unsupported_batch = SimpleNamespace(
-                forward_mode=unsupported_mode, **shared
-            )
+            unsupported_batch = SimpleNamespace(forward_mode=unsupported_mode, **shared)
             self.assertFalse(requires_symmetric_spec_deepep_lockstep(unsupported_batch))
 
         active_draft_extend_batch.original_global_num_tokens_cpu = [1, 1, 1, 1]

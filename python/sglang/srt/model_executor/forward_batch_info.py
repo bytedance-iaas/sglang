@@ -136,6 +136,7 @@ def _should_force_symmetric_spec_deepep_padding(
         and get_deepep_mode().resolve(is_extend_in_batch).is_low_latency()
     )
 
+
 def requires_symmetric_spec_deepep_lockstep(forward_batch: ForwardBatch) -> bool:
     """Whether sparse EAGLE DeepEP dispatches must stay host-side lockstep."""
     original_counts = forward_batch.original_global_num_tokens_cpu
@@ -155,6 +156,8 @@ def requires_symmetric_spec_deepep_lockstep(forward_batch: ForwardBatch) -> bool
         and min(original_counts) == 0
         and max(original_counts) > 0
     )
+
+
 class ForwardMode(IntEnum):
     # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
     # It is also called "prefill" in common terminology.
