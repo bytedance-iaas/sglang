@@ -103,12 +103,23 @@ void dispatch_w4a8_moe_mm_sm90(
   //   - Contiguous grouped (normal / deepep_normal): a=[total_m, K], d=[total_m, N]
   //   - Masked 3D (deepep low-latency): a=[E, m, K], d=[E, m, N]
   // The heuristic below only selects the tile/schedule config; the actual GEMM
-  // problem shapes come from `problem_sizes`. Picking the right (m, n, k) still
-  // matters because TileShapeK drives the scale packing (PackedScalesNum).
-  // n and k are always the last dim in both layouts; m differs, so branch on it.
-  uint32_t const m = a_tensors.dim() == 3 ? a_tensors.size(1) : a_tensors.size(0) / topk;
+  // problem shapes come from `problem_sizes`. It must be driven by the *expected
+  // per-group M* (average rows each expert processes), not the total row count,
+  // because this is a grouped GEMM: one tile config is shared by all E experts.
+  // n and k are always the last dim in both layouts.
+  //   - Contiguous: total rows are split across the experts, so the per-group M
+  //     is total_m / num_experts. num_experts == expert_offsets.size(0) (the
+  //     caller always passes expert_offsets[:-1]). This exactly reproduces the
+  //     Python-side `m * topk / num_local_experts`.
+  //   - Masked 3D: each expert owns a fixed slab of a_tensors.size(1) rows,
+  //     which is already the per-group M.
+  int const num_experts = static_cast<int>(expert_offsets.size(0));
+  uint32_t const m = a_tensors.dim() == 3
+                         ? static_cast<uint32_t>(a_tensors.size(1))
+                         : static_cast<uint32_t>(a_tensors.size(0) / num_experts);
   uint32_t const n = d_tensors.size(-1);
   uint32_t const k = a_tensors.size(-1);
+  (void)topk;  // per-group M is derived from num_experts; topk kept for ABI compatibility
 
   if (n == 4096 && k == 7168) {
     // group gemm 1
@@ -116,8 +127,12 @@ void dispatch_w4a8_moe_mm_sm90(
       INVOKE_GEMM_WITH_CONFIG((SM90_PP<64, 32, 512, 2, 1, 1>));
     } else if (m <= 32) {
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 2, 1, 1>));
+    } else if (m <= 64) {
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
     } else if (m <= 256) {
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 1, 1, 1>));
+    } else if (m <= 512) {
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 2, 1>));
     } else if (m <= 1024) {
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 2, 1, 1>));
     } else if (m <= 4096) {
@@ -131,6 +146,10 @@ void dispatch_w4a8_moe_mm_sm90(
     // group gemm 2
     if (m <= 8) {
       INVOKE_GEMM_WITH_CONFIG((SM90_PP<64, 16, 512, 1, 1, 1>));
+    } else if (m <= 16) {
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 2, 1, 1>));
+    } else if (m <= 64) {
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
     } else if (m <= 512) {
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
     } else if (m <= 4096) {
