@@ -15,6 +15,7 @@ rows ("Expected lengths.size(0) == B to be true"); on ROCm it is fatal because
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -110,6 +111,9 @@ class TestDSAIdleSpecMetadata(CustomTestCase):
             False
         ), get_context().override_server_args(), get_parallel().override(
             attn_cp_size=1, attn_dp_rank=0, attn_tp_size=1
+        ), patch(
+            "sglang.srt.layers.attention.dsa_backend.is_cuda",
+            return_value=False,
         ):
             backend.init_forward_metadata(batch)
             # cal_padded_tokens is the padding calculation prepare_mlp_sync_batch
