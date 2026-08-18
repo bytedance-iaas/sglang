@@ -1055,9 +1055,7 @@ class SchedulerPPMixin:
             # the request metadata sent to the decode group.
             draft_input = result.next_draft_input
             tensor_dict["spec_prefill_topk_p"] = draft_input.topk_p.contiguous()
-            tensor_dict["spec_prefill_topk_index"] = (
-                draft_input.topk_index.contiguous()
-            )
+            tensor_dict["spec_prefill_topk_index"] = draft_input.topk_index.contiguous()
             tensor_dict["spec_prefill_hidden_states"] = (
                 draft_input.hidden_states.contiguous()
             )
