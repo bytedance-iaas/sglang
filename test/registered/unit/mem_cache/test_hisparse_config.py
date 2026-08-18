@@ -1,5 +1,6 @@
 import ast
 import inspect
+import textwrap
 import json
 import unittest
 from types import SimpleNamespace
@@ -115,7 +116,11 @@ class TestHiSparseConfig(unittest.TestCase):
         self.assertIs(draft_pool.full_to_hisparse_device_index_mapping, mapping)
 
     def test_model_runner_wires_hisparse_runtime_configuration(self):
-        tree = ast.parse(inspect.getsource(ModelRunner.maybe_init_hisparse_coordinator))
+        tree = ast.parse(
+            textwrap.dedent(
+                inspect.getsource(ModelRunner.maybe_init_hisparse_coordinator)
+            )
+        )
         calls = [
             node
             for node in ast.walk(tree)
