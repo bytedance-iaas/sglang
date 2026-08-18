@@ -1042,6 +1042,19 @@ class SchedulerPPMixin:
                 # Tail-drafted chain for the next verify round (root = bonus).
                 tensor_dict["spec_next_chain"] = result.next_verify_chain
 
+        # The draft extend only runs on the last stage, but every rank needs its
+        # output: process_batch_result_disagg_prefill reads it off the relayed
+        # result to fill the PD aux buffers.
+        draft_input = result.next_draft_input
+        if (
+            batch.forward_mode.is_extend()
+            and draft_input is not None
+            and draft_input.topk_p is not None
+        ):
+            tensor_dict["draft_topk_p"] = draft_input.topk_p.contiguous()
+            tensor_dict["draft_topk_index"] = draft_input.topk_index.contiguous()
+            tensor_dict["draft_hidden_states"] = draft_input.hidden_states.contiguous()
+
         if batch.return_logprob:
             logprob_dict = get_logprob_dict_from_result(result)
             tensor_dict = {
@@ -1182,8 +1195,29 @@ class SchedulerPPMixin:
             ) = get_logprob_from_pp_outputs(pp_outputs)
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
         batch.input_ids = next_token_ids
+        next_draft_input = None
 
-        if not self.spec_algorithm.is_none() and "pp_spec_output" in pp_outputs.tensors:
+        if "draft_topk_p" in pp_outputs.tensors:
+            from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+            # Rebuild the draft proposal the last stage put on the ring.
+            # Rebinding batch.spec_info to this exact object preserves the
+            # ownership invariant in process_batch_result_disagg_prefill.
+            next_draft_input = EagleDraftInput(
+                topk_p=pp_outputs["draft_topk_p"],
+                topk_index=pp_outputs["draft_topk_index"],
+                hidden_states=pp_outputs["draft_hidden_states"],
+                bonus_tokens=next_token_ids,
+                num_tokens_per_req=1,
+                num_tokens_for_logprob_per_req=1,
+            )
+            batch.spec_info = next_draft_input
+            self.future_map.stash(
+                batch.req_pool_indices,
+                RelayPayload.from_draft_input(next_draft_input),
+            )
+            batch.input_ids = None
+        elif not self.spec_algorithm.is_none() and "pp_spec_output" in pp_outputs.tensors:
             # Spec-v2 decode path: the last PP rank produced draft tokens for
             # this iter; rebuild the raw draft tree so _build_verify_input_from_pp_raw
             # can construct EagleVerifyInput on this rank.
@@ -1209,11 +1243,11 @@ class SchedulerPPMixin:
                 batch.req_pool_indices, RelayPayload(bonus_tokens=next_token_ids)
             )
             batch.input_ids = None
-
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
             next_token_ids=pp_outputs["next_token_ids"],
+            next_draft_input=next_draft_input,
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
