@@ -110,10 +110,11 @@ void dispatch_w4a8_moe_mm_sm90(
   //       decode step only has O(batch) rows per expert).
   //
   // This heuristic only picks the tile/schedule; the real problem shapes come
-  // from `problem_sizes`. It must key off the *expected per-group M*, not the
-  // total/capacity rows, since one tile config is shared by all E experts.
+  // from `problem_sizes`. The 2D prefill thresholds were tuned against the
+  // original token count, while the 3D LL capacity must be normalized to avoid
+  // selecting a prefill tile for decode.
   // n and k are the last dim in both layouts.
-  //   - 2D:  m = total_m / num_experts   (exact average per-expert load)
+  //   - 2D:  m = total_m / topk          (original input token count)
   //   - 3D:  m = cap      / num_experts   (static full-occupancy estimate;
   //          matches the upstream expected_m_per_group and stays
   //          CUDA-graph-safe by not reading masked_m).
@@ -121,10 +122,9 @@ void dispatch_w4a8_moe_mm_sm90(
   int const num_experts = static_cast<int>(expert_offsets.size(0));
   uint32_t const m = a_tensors.dim() == 3
                          ? static_cast<uint32_t>(a_tensors.size(1) / num_experts)
-                         : static_cast<uint32_t>(a_tensors.size(0) / num_experts);
+                         : static_cast<uint32_t>(a_tensors.size(0) / topk);
   uint32_t const n = d_tensors.size(-1);
   uint32_t const k = a_tensors.size(-1);
-  (void)topk;  // per-group M derived from num_experts; topk kept for ABI compat
 
   if (n == 4096 && k == 7168) {
     // group gemm 1
