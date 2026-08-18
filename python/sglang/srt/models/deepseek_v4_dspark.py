@@ -794,7 +794,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.markov_head.configure_tp_shard(lm_head=lm_head)
 
     def prune_to_ctx_projection(self) -> None:
-        if self.is_lifecycle_only:
+        if vars(self).get("is_lifecycle_only", False):
             return
         stage0 = self.stages[0]
         projection_stage = nn.Module()
