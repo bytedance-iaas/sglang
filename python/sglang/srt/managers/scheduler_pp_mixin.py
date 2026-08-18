@@ -1055,9 +1055,7 @@ class SchedulerPPMixin:
             # the request metadata sent to the decode group.
             draft_input = result.next_draft_input
             tensor_dict["spec_prefill_topk_p"] = draft_input.topk_p.contiguous()
-            tensor_dict["spec_prefill_topk_index"] = (
-                draft_input.topk_index.contiguous()
-            )
+            tensor_dict["spec_prefill_topk_index"] = draft_input.topk_index.contiguous()
             tensor_dict["spec_prefill_hidden_states"] = (
                 draft_input.hidden_states.contiguous()
             )
@@ -1263,14 +1261,6 @@ class SchedulerPPMixin:
             output_result.speculative_num_draft_tokens = (
                 self.server_args.speculative_num_draft_tokens
             )
-
-        # Async copy the CPU-bound fields ahead of time; d2h_event in the
-        # caller guarantees completion before the result is consumed.
-        output_result.copy_done = self.device_module.Event()
-        output_result.copy_to_cpu(
-            return_logprob=batch.return_logprob,
-            return_hidden_states=False,
-        )
 
         return output_result
 

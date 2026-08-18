@@ -61,7 +61,9 @@ def test_pp_prefill_rebuilds_one_authoritative_draft_input():
         _pp_spec_store_bonus=Mock(),
     )
 
-    with patch.object(GenerationBatchResult, "copy_to_cpu", autospec=True):
+    with patch.object(
+        GenerationBatchResult, "copy_to_cpu", autospec=True
+    ) as copy_to_cpu:
         result = SchedulerPPMixin._pp_prep_batch_result(
             scheduler,
             batch,
@@ -70,6 +72,8 @@ def test_pp_prefill_rebuilds_one_authoritative_draft_input():
         )
 
     assert batch.spec_info is result.next_draft_input
+    assert result.copy_done is None
+    copy_to_cpu.assert_not_called()
     assert result.next_draft_input.topk_p is topk_p
     assert result.next_draft_input.topk_index is topk_index
     assert result.next_draft_input.hidden_states is hidden_states
