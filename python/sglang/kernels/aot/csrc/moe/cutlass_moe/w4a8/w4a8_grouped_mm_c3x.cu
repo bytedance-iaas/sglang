@@ -99,9 +99,16 @@ void dispatch_w4a8_moe_mm_sm90(
     torch::Tensor const& s_strides,
     int64_t chunk_size,
     int64_t topk) {
-  uint32_t const m = a_tensors.size(0) / topk;
-  uint32_t const n = d_tensors.size(1);
-  uint32_t const k = a_tensors.size(1);
+  // Two tensor layouts are supported:
+  //   - Contiguous grouped (normal / deepep_normal): a=[total_m, K], d=[total_m, N]
+  //   - Masked 3D (deepep low-latency): a=[E, m, K], d=[E, m, N]
+  // The heuristic below only selects the tile/schedule config; the actual GEMM
+  // problem shapes come from `problem_sizes`. Picking the right (m, n, k) still
+  // matters because TileShapeK drives the scale packing (PackedScalesNum).
+  // n and k are always the last dim in both layouts; m differs, so branch on it.
+  uint32_t const m = a_tensors.dim() == 3 ? a_tensors.size(1) : a_tensors.size(0) / topk;
+  uint32_t const n = d_tensors.size(-1);
+  uint32_t const k = a_tensors.size(-1);
 
   if (n == 4096 && k == 7168) {
     // group gemm 1
