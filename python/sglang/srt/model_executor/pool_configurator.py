@@ -667,7 +667,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.num_layers_ca128 = sum(1 for r in self.compression_ratios if r == 128)
 
         self.bytes_per_full_token = self._get_bytes_per_full_token()
-        if self.is_speculative:
+        if self.is_speculative and self._should_budget_draft_pool(kvc):
             # Reserve memory for the speculative draft worker by inflating
             # per-token bytes by (target+draft)/target. Equivalent to dflash's
             # scale_kv_cell_size_per_token_for_dflash but applied to
@@ -705,6 +705,26 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 logger.info(
                     "DSV4 compressed attention: online c128 enabled (ring_size=1)"
                 )
+
+    @staticmethod
+    def _should_budget_draft_pool(kvc: KVCacheConfigurator) -> bool:
+        """Return whether this PP stage owns the speculative draft KV pool.
+
+        DSV4 DSpark PD prefill keeps the full draft SWA pool on the final PP
+        stage, matching ``prepare_dspark_hicache_draft_plan``. Earlier stages
+        either have no draft pool or retain only a one-page lifecycle pool, so
+        charging the full draft geometry there understates the shared PP token
+        capacity. Other speculative layouts keep the existing budgeting
+        behavior.
+        """
+
+        if not kvc.spec_algorithm.is_dspark():
+            return True
+        return not (
+            kvc.server_args.disaggregation_mode == "prefill"
+            and kvc.ps.pp_size > 1
+            and kvc.ps.pp_rank != kvc.ps.pp_size - 1
+        )
 
     def _get_bytes_per_full_token(self) -> float:
         kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
