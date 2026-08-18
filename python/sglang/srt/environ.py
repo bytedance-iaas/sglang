@@ -916,6 +916,10 @@ class Envs:
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
 
     # Spec Config
+    # Experimental: allow pipeline parallelism x speculative decoding
+    # (EAGLE/MTP). Off by default; see the PP+spec RFC for constraints
+    # (topk=1 chains, non-overlap schedule).
+    SGLANG_ENABLE_PP_SPEC = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
