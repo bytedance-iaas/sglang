@@ -436,9 +436,21 @@ RUN JUST_VERSION=1.42.4 \
     && rm -f /tmp/just.tar.gz
 
 # Install oh-my-zsh and plugins
-RUN sh -c "$(curl --retry 3 --retry-delay 2 -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended \
-    && git clone --depth 1 https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-autosuggestions \
-    && git clone --depth 1 https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
+RUN set -eu; \
+    sh -c "$(curl --retry 5 --retry-all-errors --retry-delay 2 -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended; \
+    clone_with_retry() { \
+        repo="$1"; \
+        dest="$2"; \
+        attempt=1; \
+        while ! git clone --depth 1 "$repo" "$dest"; do \
+            rm -rf "$dest"; \
+            if [ "$attempt" -ge 5 ]; then return 1; fi; \
+            attempt=$((attempt + 1)); \
+            sleep 2; \
+        done; \
+    }; \
+    clone_with_retry https://github.com/zsh-users/zsh-autosuggestions "${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-autosuggestions"; \
+    clone_with_retry https://github.com/zsh-users/zsh-syntax-highlighting.git "${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting"
 
 ########################################################
 # PARALLEL STAGE 5: Gateway Builder (starts from base)
