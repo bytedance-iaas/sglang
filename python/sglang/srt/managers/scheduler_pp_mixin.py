@@ -327,16 +327,15 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
+                self._pp_commit_comm_work(self.send_proxy_work)
                 if cur_batch:
-                    result, self.launch_event = (
-                        self._pp_launch_batch_and_commit_previous_proxy(
-                            mb_id,
-                            cur_batch,
-                            pp_proxy_tensors,
-                        )
+                    result, self.launch_event = self._pp_launch_batch(
+                        mb_id,
+                        cur_batch,
+                        pp_proxy_tensors,
+                        self.mb_metadata,
+                        self.last_rank_comm_queue,
                     )
-                else:
-                    self._pp_commit_comm_work(self.send_proxy_work)
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -506,7 +505,7 @@ class SchedulerPPMixin:
                     )
                 if cur_batch:
                     result, self.launch_event = (
-                        self._pp_launch_batch_and_commit_previous_proxy(
+                        self._pp_launch_prefill_batch_and_commit_previous_proxy(
                             mb_id,
                             cur_batch,
                             pp_proxy_tensors,
@@ -1226,18 +1225,20 @@ class SchedulerPPMixin:
         self._pp_send_proxy(tensor_dict)
         self._pp_commit_comm_work(self.send_proxy_work)
 
-    def _pp_launch_batch_and_commit_previous_proxy(
+    def _pp_launch_prefill_batch_and_commit_previous_proxy(
         self: Scheduler,
         mb_id: int,
         cur_batch: ScheduleBatch,
         pp_proxy_tensors: Optional[PPProxyTensors],
     ):
-        """Launch the current forward before waiting on the previous proxy send.
+        """Launch Prefill before waiting on its previous eager proxy send.
 
         The previous proxy payload remains pinned by ``P2PWork.payload``.  It only
         has to be committed before the next proxy send reuses the channel.  This
         ordering lets the peer reach its matching receive instead of forming a
-        cycle with the reverse PP output ring.
+        cycle with the reverse PP output ring.  Disaggregated Decode deliberately
+        keeps the old ordering because graph proxy tensors can alias static output
+        buffers; this helper is only used by disaggregated Prefill.
         """
         result, launch_event = self._pp_launch_batch(
             mb_id,
