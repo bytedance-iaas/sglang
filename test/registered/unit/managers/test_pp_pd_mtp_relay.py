@@ -287,7 +287,7 @@ def test_pp_proxy_exchange_stays_outstanding_until_the_next_launch():
     scheduler._pp_commit_comm_work.assert_not_called()
 
 
-def test_pp_launches_current_forward_before_committing_previous_proxy_send():
+def test_pp_prefill_launches_before_committing_previous_proxy_send():
     events = []
     previous_work = [object()]
     batch = object()
@@ -309,7 +309,7 @@ def test_pp_launches_current_forward_before_committing_previous_proxy_send():
         ),
     )
 
-    actual = SchedulerPPMixin._pp_launch_batch_and_commit_previous_proxy(
+    actual = SchedulerPPMixin._pp_launch_prefill_batch_and_commit_previous_proxy(
         scheduler,
         mb_id=3,
         cur_batch=batch,
