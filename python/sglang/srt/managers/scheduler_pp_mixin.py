@@ -327,15 +327,16 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                self._pp_commit_comm_work(self.send_proxy_work)
                 if cur_batch:
-                    result, self.launch_event = self._pp_launch_batch(
-                        mb_id,
-                        cur_batch,
-                        pp_proxy_tensors,
-                        self.mb_metadata,
-                        self.last_rank_comm_queue,
+                    result, self.launch_event = (
+                        self._pp_launch_batch_and_commit_previous_proxy(
+                            mb_id,
+                            cur_batch,
+                            pp_proxy_tensors,
+                        )
                     )
+                else:
+                    self._pp_commit_comm_work(self.send_proxy_work)
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -503,15 +504,16 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                self._pp_commit_comm_work(self.send_proxy_work)
                 if cur_batch:
-                    result, self.launch_event = self._pp_launch_batch(
-                        mb_id,
-                        cur_batch,
-                        pp_proxy_tensors,
-                        self.mb_metadata,
-                        self.last_rank_comm_queue,
+                    result, self.launch_event = (
+                        self._pp_launch_batch_and_commit_previous_proxy(
+                            mb_id,
+                            cur_batch,
+                            pp_proxy_tensors,
+                        )
                     )
+                else:
+                    self._pp_commit_comm_work(self.send_proxy_work)
                 # A downstream stage blocks in _pp_recv_proxy_tensors() before
                 # it can enter the PD control rings below.  Forward the proxy
                 # immediately after launch so the upstream stage cannot enter a
@@ -519,15 +521,11 @@ class SchedulerPPMixin:
                 # this point-to-point tensor payload.
                 if not self.pp_group.is_last_rank and cur_batch:
                     self.device_module.current_stream().wait_event(self.launch_event)
-                    self._pp_send_and_commit_proxy(
-                        result.pp_hidden_states_proxy_tensors.tensors
-                    )
-                    # The output ring may immediately reuse the same PP process
-                    # group in the reverse direction.  Finish the first proxy
-                    # exchange before the last stage posts that reverse send;
-                    # otherwise lazy NCCL communicator initialization can leave
-                    # the last stage blocked in output isend while this stage
-                    # has already entered a CPU control ring.
+                    self._pp_send_proxy(result.pp_hidden_states_proxy_tensors.tensors)
+                    # Keep this send outstanding while the reverse output ring
+                    # progresses.  Its payload is pinned by P2PWork and the next
+                    # iteration commits it after launching the following forward,
+                    # before this channel can be reused.
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -1214,15 +1212,42 @@ class SchedulerPPMixin:
             return []
         return self._pp_send_pyobj_to_next_stage(payload, async_send=True)
 
-    def _pp_send_and_commit_proxy(
-        self: Scheduler, tensor_dict: Dict[str, torch.Tensor]
-    ) -> None:
+    def _pp_send_proxy(self: Scheduler, tensor_dict: Dict[str, torch.Tensor]) -> None:
         self.send_proxy_work = self._pp_send_dict_to_next_stage(
             tensor_dict,
             async_send=True,
             msg_type="proxy",
         )
+
+    def _pp_send_and_commit_proxy(
+        self: Scheduler, tensor_dict: Dict[str, torch.Tensor]
+    ) -> None:
+        """Send synchronously for paths whose proxy buffers may be reused early."""
+        self._pp_send_proxy(tensor_dict)
         self._pp_commit_comm_work(self.send_proxy_work)
+
+    def _pp_launch_batch_and_commit_previous_proxy(
+        self: Scheduler,
+        mb_id: int,
+        cur_batch: ScheduleBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors],
+    ):
+        """Launch the current forward before waiting on the previous proxy send.
+
+        The previous proxy payload remains pinned by ``P2PWork.payload``.  It only
+        has to be committed before the next proxy send reuses the channel.  This
+        ordering lets the peer reach its matching receive instead of forming a
+        cycle with the reverse PP output ring.
+        """
+        result, launch_event = self._pp_launch_batch(
+            mb_id,
+            cur_batch,
+            pp_proxy_tensors,
+            self.mb_metadata,
+            self.last_rank_comm_queue,
+        )
+        self._pp_commit_comm_work(self.send_proxy_work)
+        return result, launch_event
 
     def _pp_commit_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
         for p2p_work in work:

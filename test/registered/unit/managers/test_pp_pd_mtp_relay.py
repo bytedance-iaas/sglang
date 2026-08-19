@@ -261,7 +261,7 @@ def test_pp_last_stage_consumes_linear_payload_without_forwarding():
     scheduler._pp_send_pyobj_to_next_stage.assert_not_called()
 
 
-def test_pp_proxy_exchange_is_committed_before_reusing_the_ring():
+def test_pp_proxy_exchange_stays_outstanding_until_the_next_launch():
     events = []
     proxy_work = [object()]
     tensor_dict = {"hidden_states": object()}
@@ -278,12 +278,48 @@ def test_pp_proxy_exchange_is_committed_before_reusing_the_ring():
         ),
     )
 
-    SchedulerPPMixin._pp_send_and_commit_proxy(scheduler, tensor_dict)
+    SchedulerPPMixin._pp_send_proxy(scheduler, tensor_dict)
 
     assert scheduler.send_proxy_work is proxy_work
     assert events == [
         ("send", tensor_dict, True, "proxy"),
-        ("commit", proxy_work),
+    ]
+    scheduler._pp_commit_comm_work.assert_not_called()
+
+
+def test_pp_launches_current_forward_before_committing_previous_proxy_send():
+    events = []
+    previous_work = [object()]
+    batch = object()
+    proxy_tensors = object()
+    result = object()
+    launch_event = object()
+    metadata = object()
+    output_queue = object()
+    scheduler = SimpleNamespace(
+        mb_metadata=metadata,
+        last_rank_comm_queue=output_queue,
+        send_proxy_work=previous_work,
+        _pp_launch_batch=Mock(
+            side_effect=lambda *args: events.append(("launch", args))
+            or (result, launch_event)
+        ),
+        _pp_commit_comm_work=Mock(
+            side_effect=lambda work: events.append(("commit", work))
+        ),
+    )
+
+    actual = SchedulerPPMixin._pp_launch_batch_and_commit_previous_proxy(
+        scheduler,
+        mb_id=3,
+        cur_batch=batch,
+        pp_proxy_tensors=proxy_tensors,
+    )
+
+    assert actual == (result, launch_event)
+    assert events == [
+        ("launch", (3, batch, proxy_tensors, metadata, output_queue)),
+        ("commit", previous_work),
     ]
 
 
