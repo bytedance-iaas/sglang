@@ -99,66 +99,29 @@ void dispatch_w4a8_moe_mm_sm90(
     torch::Tensor const& s_strides,
     int64_t chunk_size,
     int64_t topk) {
-  // Two tensor layouts are supported:
-  //   - Contiguous grouped (normal / deepep_normal): a=[total_m, K], d=[total_m, N]
-  //   - Masked 3D (deepep low-latency): a=[E, m, K], d=[E, m, N]
-  // The heuristic below only selects the tile/schedule config; the actual GEMM
-  // problem shapes come from `problem_sizes`. It must be driven by the *expected
-  // per-group M* (average rows each expert processes), not the total row count,
-  // because this is a grouped GEMM: one tile config is shared by all E experts.
-  // n and k are always the last dim in both layouts.
-  //   - Contiguous: total rows are split across the experts, so the per-group M
-  //     is total_m / num_experts. num_experts == expert_offsets.size(0) (the
-  //     caller always passes expert_offsets[:-1]). This exactly reproduces the
-  //     Python-side `m * topk / num_local_experts`.
-  //   - Masked 3D: each expert owns a fixed slab of a_tensors.size(1) rows,
-  //     which is already the per-group M.
+  uint32_t const n = d_tensors.size(-1);
+  uint32_t const k = a_tensors.size(-1);
+
+  // DeepSeek-V3.2 uses 2D contiguous tensors for prefill and 3D masked tensors
+  // for low-latency decode. The 3D slab capacity is not the real expert M, and
+  // the highly skewed 2D expert distribution is not represented by one average
+  // M. Use the robust H20 winners measured against each real layout.
+  if ((n == 4096 && k == 7168) || (n == 7168 && k == 2048)) {
+    if (a_tensors.dim() == 3) {
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 2, 1, 1>));
+    } else {
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 1, 1>));
+    }
+    return;
+  }
+
   int const num_experts = static_cast<int>(expert_offsets.size(0));
   uint32_t const m = a_tensors.dim() == 3
                          ? static_cast<uint32_t>(a_tensors.size(1))
                          : static_cast<uint32_t>(a_tensors.size(0) / num_experts);
-  uint32_t const n = d_tensors.size(-1);
-  uint32_t const k = a_tensors.size(-1);
-  (void)topk;  // per-group M is derived from num_experts; topk kept for ABI compatibility
+  (void)topk;
 
-  if (n == 4096 && k == 7168) {
-    // group gemm 1
-    if (m <= 4) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_PP<64, 32, 512, 2, 1, 1>));
-    } else if (m <= 32) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 2, 1, 1>));
-    } else if (m <= 64) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
-    } else if (m <= 256) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 1, 1, 1>));
-    } else if (m <= 512) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 2, 1>));
-    } else if (m <= 1024) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 2, 1, 1>));
-    } else if (m <= 4096) {
-      // Optimized for prefill: seq_len up to 4096 (m=4096 with topk=1)
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 2, 1, 1>));
-    } else {
-      // Optimized for prefill: seq_len up to 8192 (m=8192 with topk=1)
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 1, 1>));
-    }
-  } else if (n == 7168 && k == 2048) {
-    // group gemm 2
-    if (m <= 8) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_PP<64, 16, 512, 1, 1, 1>));
-    } else if (m <= 16) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 2, 1, 1>));
-    } else if (m <= 64) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
-    } else if (m <= 512) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
-    } else if (m <= 4096) {
-      // Optimized for prefill: larger cluster for better throughput
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 2, 1, 1>));
-    } else {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 1, 1>));
-    }
-  } else if (n == 512 && k == 7168) {
+  if (n == 512 && k == 7168) {
     // group gemm 1 for tp
     if (m <= 4) {
       INVOKE_GEMM_WITH_CONFIG((SM90_PP<64, 32, 512, 2, 1, 1>));
