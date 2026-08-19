@@ -61,6 +61,7 @@ from sglang.srt.entrypoints.openai.utils import (
     should_include_usage,
     to_openai_style_logprobs,
 )
+from sglang.srt.openai_observability import is_otel_available, otel_provider
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -1490,6 +1491,10 @@ class OpenAIServingChat(OpenAIServingBase):
         audio_tokens = {}
         video_tokens = {}
 
+        is_first_token = True
+        start_time = time.time()
+        time_of_first_token = None
+        usage = None
         stream_started = False
         try:
             include_usage, continuous_usage_stats = should_include_usage(
@@ -1536,6 +1541,10 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 finish_reason = content["meta_info"].get("finish_reason", None)
                 finish_reason_type = finish_reason["type"] if finish_reason else None
+
+                if is_first_token:
+                    time_of_first_token = time.time()
+                    is_first_token = False
 
                 # Track finish_reason for each index
                 if finish_reason_type:
@@ -1691,7 +1700,53 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 yield f"data: {usage_chunk.model_dump_json()}\n\n"
 
+            # Emit OpenTelemetry (APMPlus) gen-ai metrics/span for this stream.
+            if is_otel_available():
+                # usage may be None when include_usage is disabled; build a
+                # snapshot from tracked token counters so TTFT/TPOT and token
+                # histograms are still populated for observability.
+                otel_usage = (
+                    usage.__dict__
+                    if usage is not None and not isinstance(usage, dict)
+                    else usage
+                )
+                if otel_usage is None:
+                    otel_usage = {
+                        "prompt_tokens": sum(
+                            tok for idx, tok in prompt_tokens.items() if idx % request.n == 0
+                        ),
+                        "completion_tokens": sum(completion_tokens.values()),
+                        "total_tokens": sum(
+                            tok for idx, tok in prompt_tokens.items() if idx % request.n == 0
+                        )
+                        + sum(completion_tokens.values()),
+                    }
+                complete_response = {
+                    "model": request.model,
+                    "usage": otel_usage,
+                    "choices": [
+                        {
+                            "index": idx,
+                            "finish_reason": (fr or {}).get("type"),
+                        }
+                        for idx, fr in finish_reasons.items()
+                    ],
+                }
+                otel_provider.record(
+                    "sglang_chat_completion",
+                    raw_request.headers,
+                    request,
+                    complete_response,
+                    otel_usage,
+                    start_time,
+                    time_of_first_token=time_of_first_token,
+                    stream=True,
+                )
+
         except ValueError as e:
+            otel_provider.recordException(
+                "sglang_chat_completion", raw_request.headers, request, e
+            )
             if not stream_started:
                 raise
             error = self.create_streaming_error_response(str(e))
@@ -1706,11 +1761,15 @@ class OpenAIServingChat(OpenAIServingBase):
         raw_request: Request,
     ) -> Union[ChatCompletionResponse, ErrorResponse, ORJSONResponse]:
         """Handle non-streaming chat completion request"""
+        start_time = time.time()
         try:
             ret = await self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
             ).__anext__()
         except ValueError as e:
+            otel_provider.recordException(
+                "sglang_chat_completion", raw_request.headers, request, e
+            )
             return self.create_error_response(str(e))
 
         if not isinstance(ret, list):
@@ -1721,6 +1780,17 @@ class OpenAIServingChat(OpenAIServingBase):
             ret,
             int(time.time()),
         )
+
+        if is_otel_available() and isinstance(response, ChatCompletionResponse):
+            otel_provider.record(
+                "sglang_chat_completion",
+                raw_request.headers,
+                request,
+                response,
+                response.usage,
+                start_time,
+                stream=False,
+            )
 
         return response
 
