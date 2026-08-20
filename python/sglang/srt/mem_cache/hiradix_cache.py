@@ -825,7 +825,9 @@ class HiRadixCache(RadixCache):
         """Convert raw token_ids to a RadixKey; must be list (not tuple) for paged match."""
         return RadixKey(token_ids=list(token_ids))
 
-    def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
+    def inc_lock_ref(
+        self, node: TreeNode, lock_ancestors: bool = True
+    ) -> IncLockRefResult:
         if self.disable:
             return IncLockRefResult(delta=0)
 
@@ -838,11 +840,16 @@ class HiRadixCache(RadixCache):
             node.lock_ref += 1
             self._update_leaf_status(node)
             self._update_host_leaf_status(node)
+            if not lock_ancestors:
+                break
             node = node.parent
         return IncLockRefResult(delta=delta)
 
     def dec_lock_ref(
-        self, node: TreeNode, params: Optional[DecLockRefParams] = None
+        self,
+        node: TreeNode,
+        params: Optional[DecLockRefParams] = None,
+        lock_ancestors: bool = True,
     ) -> DecLockRefResult:
         if self.disable:
             return DecLockRefResult(delta=0)
@@ -856,6 +863,8 @@ class HiRadixCache(RadixCache):
             node.lock_ref -= 1
             self._update_leaf_status(node)
             self._update_host_leaf_status(node)
+            if not lock_ancestors:
+                break
             if node.parent is None:
                 assert (
                     node is self.root_node

@@ -383,7 +383,11 @@ class EICHiRadixCache(RadixCache):
             node.host_value = host_indices
             self.ongoing_write_through[node.id] = node
             if not write_back:
-                self.inc_lock_ref(node)
+                # ponytail: lock only the leaf; ancestors are protected by
+                # their other resident children, so locking them just removes
+                # shared-prefix tokens from evictable_size and starves batch
+                # formation during the ~600ms EIC write.
+                self.inc_lock_ref(node, lock_ancestors=False)
         else:
             return 0
 
@@ -550,7 +554,9 @@ class EICHiRadixCache(RadixCache):
                         self.cache_controller.mem_pool_host.free(node.host_value)
                     node.host_value = None
             if not write_back:
-                self.dec_lock_ref(self.ongoing_write_through[ack_id])
+                self.dec_lock_ref(
+                    self.ongoing_write_through[ack_id], lock_ancestors=False
+                )
             # clear the reference
             del self.ongoing_write_through[ack_id]
         cost_time = time.perf_counter() - write_check_start_time
@@ -1822,7 +1828,11 @@ class EICPagedHiRadixCache(EICHiRadixCache):
             node.host_value = host_indices
             self.ongoing_write_through[node.id] = node
             if not write_back:
-                self.inc_lock_ref(node)
+                # ponytail: lock only the leaf; ancestors are protected by
+                # their other resident children, so locking them just removes
+                # shared-prefix tokens from evictable_size and starves batch
+                # formation during the ~600ms EIC write.
+                self.inc_lock_ref(node, lock_ancestors=False)
         else:
             return 0
 

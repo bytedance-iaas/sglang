@@ -589,7 +589,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
 
-    def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
+    def inc_lock_ref(
+        self, node: TreeNode, lock_ancestors: bool = True
+    ) -> IncLockRefResult:
         if self.disable:
             return IncLockRefResult(delta=0)
 
@@ -601,11 +603,16 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                 delta -= len(node.key)
             node.lock_ref += 1
             self._update_leaf_status(node)
+            if not lock_ancestors:
+                break
             node = node.parent
         return IncLockRefResult(delta=delta)
 
     def dec_lock_ref(
-        self, node: TreeNode, params: Optional[DecLockRefParams] = None
+        self,
+        node: TreeNode,
+        params: Optional[DecLockRefParams] = None,
+        lock_ancestors: bool = True,
     ) -> DecLockRefResult:
         if self.disable:
             return DecLockRefResult(delta=0)
@@ -618,6 +625,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                 delta += len(node.key)
             node.lock_ref -= 1
             self._update_leaf_status(node)
+            if not lock_ancestors:
+                break
             if node.parent is None:
                 assert (
                     node is self.root_node

@@ -386,7 +386,12 @@ class EICKVClient:
     def _write_thread(self):
         logger.info(f"start write thread thread_id {threading.get_ident()}")
         while True:
-            keys, values = self.write_queue.get()
+            keys, values, copy_event = self.write_queue.get()
+            if copy_event is not None:
+                # ponytail: wait for the GPU→CPU copy here, not in the
+                # caller's thread, so the cache-controller write thread can
+                # continue queuing writes while the copy is in flight.
+                copy_event.synchronize()
             self._async_set_impl(keys, values)
             for value in values:
                 if self.kv_cache_write_mem_pool.check_data_ptr_allocated(
@@ -412,13 +417,19 @@ class EICKVClient:
             if objs is None:
                 return False
 
+            copy_event = None
             if obj_inputs is not None:
                 write_stream = torch.cuda.current_stream()
                 with torch.cuda.stream(write_stream):
                     for i in range(len(keys)):
                         objs[i] = objs[i].reshape(obj_inputs[i].shape)
                         objs[i].copy_(obj_inputs[i], non_blocking=True)
-                write_stream.synchronize()
+                # ponytail: record an event instead of synchronizing; the
+                # write thread waits on it before mset. Frees the caller
+                # (cache-controller write thread) from blocking ~600ms on
+                # the GPU→CPU copy.
+                copy_event = torch.cuda.Event()
+                copy_event.record(write_stream)
             elif device_indices is not None and copy_func is not None:
                 copy_func(device_indices, objs)
             else:
@@ -426,7 +437,7 @@ class EICKVClient:
                     "async set impl input obj_inputs and device_indices are both None"
                 )
                 return False
-            self.write_queue.put((keys, objs))
+            self.write_queue.put((keys, objs, copy_event))
 
             cost_time = time.perf_counter() - start_time
             if cost_time >= 0.5:
@@ -450,7 +461,7 @@ class EICKVClient:
                     "async set impl input obj_inputs and device_indices are both None"
                 )
                 return False
-            self.write_queue.put((keys, objs))
+            self.write_queue.put((keys, objs, None))
             logger.warning(
                 f"async batch set fallback to malloc, cost {(time.perf_counter() - start_time) * 1e3}.2f ms, {len(keys)} keys"
             )
