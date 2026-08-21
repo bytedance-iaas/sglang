@@ -5,6 +5,7 @@ from sglang.srt.arg_groups.speculative_hook import (
     _handle_dspark,
     _target_checkpoint_bundles_dspark_draft,
 )
+from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -82,6 +83,59 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
             server_args.speculative_draft_model_path,
             "deepseek-ai/some-other-dspark-draft",
         )
+
+
+class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
+    """Gate contract for DSpark + DP attention + MoE A2A backends."""
+
+    def _dp_server_args(
+        self, *, moe_a2a_backend: str, moe_runner_backend: str = "auto"
+    ) -> ServerArgs:
+        server_args = _make_dspark_server_args(
+            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+        )
+        server_args.enable_dp_attention = True
+        server_args.enable_dp_lm_head = True
+        server_args.dp_size = 2
+        server_args.tp_size = 2
+        server_args.moe_a2a_backend = moe_a2a_backend
+        server_args.moe_runner_backend = moe_runner_backend
+        return server_args
+
+    def test_supported_a2a_backends(self):
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            for backend, runner in (
+                ("none", "auto"),
+                ("megamoe", "deep_gemm"),
+                ("deepep", "deep_gemm"),
+            ):
+                _handle_dspark(
+                    self._dp_server_args(
+                        moe_a2a_backend=backend, moe_runner_backend=runner
+                    )
+                )
+
+            for backend, runner in (
+                ("deepep", "marlin"),
+                ("pplx", "deep_gemm"),
+            ):
+                with self.assertRaisesRegex(ValueError, backend):
+                    _handle_dspark(
+                        self._dp_server_args(
+                            moe_a2a_backend=backend, moe_runner_backend=runner
+                        )
+                    )
+
+    def test_a2a_backends_require_static_verify_mode(self):
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
+            for backend in ("megamoe", "deepep"):
+                with self.assertRaisesRegex(ValueError, "static"):
+                    _handle_dspark(
+                        self._dp_server_args(
+                            moe_a2a_backend=backend,
+                            moe_runner_backend="deep_gemm",
+                        )
+                    )
 
 
 if __name__ == "__main__":

@@ -283,17 +283,33 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     if server_args.enable_dp_attention and server_args.dp_size > 1:
         if not server_args.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
-        supports_dspark_dp_moe = server_args.moe_a2a_backend == "none" or (
+        supports_dspark_dp_moe = server_args.moe_a2a_backend in (
+            "none",
+            "megamoe",
+        ) or (
             server_args.moe_a2a_backend == "deepep"
             and server_args.moe_runner_backend == "deep_gemm"
         )
         if not supports_dspark_dp_moe:
             raise ValueError(
-                "DSpark with dp attention only supports moe_a2a_backend='none' "
-                "or moe_a2a_backend='deepep' with moe_runner_backend='deep_gemm'; "
+                "DSpark with dp attention supports moe_a2a_backend='none', "
+                "moe_a2a_backend='megamoe', or moe_a2a_backend='deepep' with "
+                "moe_runner_backend='deep_gemm'; "
                 f"got moe_a2a_backend={server_args.moe_a2a_backend!r}, "
                 f"moe_runner_backend={server_args.moe_runner_backend!r}."
             )
+        if server_args.moe_a2a_backend != "none":
+            from sglang.srt.speculative.ragged_verify import (
+                RaggedVerifyMode,
+                read_ragged_verify_mode,
+            )
+
+            if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+                raise ValueError(
+                    "DSpark with dp attention + "
+                    f"moe_a2a_backend={server_args.moe_a2a_backend!r} requires "
+                    "SGLANG_RAGGED_VERIFY_MODE=static."
+                )
         if (
             server_args.speculative_moe_a2a_backend is not None
             and server_args.speculative_moe_a2a_backend != server_args.moe_a2a_backend
