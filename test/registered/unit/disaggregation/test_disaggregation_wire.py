@@ -15,7 +15,10 @@ from sglang.srt.disaggregation.common.utils import (
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     get_dsv4_c128_state_indices,
+    pack_state_types,
+    resolve_state_component_dst_index,
     setup_state_kv_args,
+    unpack_state_types,
 )
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -57,6 +60,24 @@ class TestDisaggregationWire(unittest.TestCase):
     def test_list_of_buffers_roundtrip(self):
         bufs = [b"abc", b"", b"de", b"x" * 17]
         self.assertEqual(unpack_list_of_buffers(pack_list_of_buffers(bufs)), bufs)
+
+    def test_state_component_matching_uses_type_occurrence(self):
+        src_state_types = [StateType.SWA, StateType.SWA]
+        dst_state_types = [StateType.SWA, StateType.C128_STATE, StateType.SWA]
+
+        self.assertEqual(
+            resolve_state_component_dst_index(src_state_types, dst_state_types, 0),
+            0,
+        )
+        self.assertEqual(
+            resolve_state_component_dst_index(src_state_types, dst_state_types, 1),
+            2,
+        )
+
+    def test_state_types_roundtrip(self):
+        state_types = [StateType.SWA, StateType.C128_STATE, StateType.SWA_RING]
+
+        self.assertEqual(unpack_state_types(pack_state_types(state_types)), state_types)
 
 
 class TestGroupConcurrentContiguous(unittest.TestCase):
