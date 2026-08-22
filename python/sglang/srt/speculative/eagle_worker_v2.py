@@ -1204,6 +1204,29 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # draft_extend, which runs on the draft runner.
         return self._draft_worker.draft_runner
 
+    def requires_dp_attention_eager_forward(self, batch: ScheduleBatch) -> bool:
+        """Keep seedless GLM MTP draft fallback rank-consistent under DP attention."""
+        # Non-last PP ranks have no draft model and only run the target forward,
+        # so they never force a draft-graph fallback.
+        if self._draft_worker is None:
+            return False
+        if not self._draft_worker.seed_dsa_topk_from_draft_extend:
+            return False
+
+        draft_input = batch.spec_info
+        if draft_input is None:
+            return False
+
+        # Under overlap scheduling, FutureMap resolves the inputs after this
+        # scheduler-side graph vote. The current tensor may be stale after a
+        # seeded running batch merges a seedless prebuilt batch, while the
+        # future flag already reflects the merged batch.
+        if getattr(draft_input, "future_indices", None) is not None:
+            has_seed = getattr(draft_input, "future_dsa_topk_indices_available", False)
+        else:
+            has_seed = getattr(draft_input, "dsa_topk_indices", None) is not None
+        return not has_seed
+
     @property
     def spec_v2_attn_backends(self) -> tuple:
         # Every attn backend a spec_v2 forward touches; consumed by
