@@ -1,0 +1,136 @@
+name: Build GLM-5.2 PD4 final retest image
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: glm52-pd4-final-image
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'bytedance-iaas/sglang'
+    environment: prod
+    runs-on: x64-docker-build-node
+    env:
+      BASE_IMAGE: iaas-gpu-cn-beijing.cr.volces.com/serving/sglang:v0.5.15.post1.iaas.dev.202607201127@sha256:a322afaa9aa032810aa559d2497ed57fe91b71ac6d470c8b843923fadf7075d3
+      DEST_IMAGE: iaas-gpu-cn-beijing.cr.volces.com/serving/sglang:glm52-pd4-e3a144d307-mtp-dpvote
+      SOURCE_COMMIT: e3a144d307468fe56fe98c22f975617fa6b0fc1b
+      SOURCE_TREE: e830c08570ba8c95643e1f239672744db6ad5719
+      VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
+      VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
+      NO_PROXY: localhost,127.0.0.1,::1,iaas-gpu-cn-beijing.cr.volces.com,ai-containers-cn-beijing.cr.volces.com
+    steps:
+      - name: Clean build workspace
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+
+      - name: Check out the image-build branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Freeze and verify measured source identity
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          git cat-file -e "${SOURCE_COMMIT}^{commit}"
+          test "$(git rev-parse "${SOURCE_COMMIT}^{tree}")" = "${SOURCE_TREE}"
+          git diff --exit-code "${SOURCE_COMMIT}" -- python
+          mkdir -p .glm52-build
+          git ls-tree -r --name-only "${SOURCE_COMMIT}" -- python | LC_ALL=C sort | \
+            while IFS= read -r source_file; do
+              source_hash="$(sha256sum "$source_file" | awk '{print $1}')"
+              printf '%s  %s\n' "$source_hash" "$source_file"
+            done > .glm52-build/tracked-python.manifest
+          python_hash="$(sha256sum .glm52-build/tracked-python.manifest | awk '{print $1}')"
+          kernel_wheel=.glm52-build/sglang_kernel-0.4.5-cp310-abi3-manylinux2014_x86_64.whl
+          curl --fail --location --retry 5 --retry-all-errors \
+            --output "$kernel_wheel" \
+            https://files.pythonhosted.org/packages/ab/62/c99dac5404b004f1c8e0d846c18566f2678374cde919ed03db373084ba89/sglang_kernel-0.4.5-cp310-abi3-manylinux2014_x86_64.whl
+          printf '%s  %s\n' \
+            5927a14dfff92ced8b1f7c7d5844144bc574ec58e604d4fd53e6f53c709003a8 \
+            "$kernel_wheel" | sha256sum --check --status
+          printf 'python_hash=%s\n' "$python_hash" >> "$GITHUB_OUTPUT"
+          {
+            printf 'SOURCE_COMMIT=%s\n' "$SOURCE_COMMIT"
+            printf 'SOURCE_TREE=%s\n' "$SOURCE_TREE"
+            printf 'SOURCE_PYTHON_SHA256=%s\n' "$python_hash"
+            printf 'BASE_IMAGE=%s\n' "$BASE_IMAGE"
+            printf 'DEST_IMAGE=%s\n' "$DEST_IMAGE"
+          } | tee /tmp/glm52-image-identity.txt
+
+      - name: Log in to Volcengine registries
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "$VOLCENGINE_CR_PASSWORD" | docker login iaas-gpu-cn-beijing.cr.volces.com --username "$VOLCENGINE_CR_USERNAME" --password-stdin
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            network=host
+            env.NO_PROXY=iaas-gpu-cn-beijing.cr.volces.com
+            env.no_proxy=iaas-gpu-cn-beijing.cr.volces.com
+
+      - name: Build and push the measured-base image
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --platform linux/amd64 \
+            --push \
+            --tag "$DEST_IMAGE" \
+            --file docker/Dockerfile.glm52-pd4-final \
+            --build-arg "BASE_IMAGE=$BASE_IMAGE" \
+            --build-arg "SGLANG_SOURCE_COMMIT=$SOURCE_COMMIT" \
+            --build-arg "SGLANG_SOURCE_TREE=$SOURCE_TREE" \
+            --build-arg "SGLANG_SOURCE_PYTHON_SHA256=${{ steps.identity.outputs.python_hash }}" \
+            --build-arg "SGLANG_BUILD_URL=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --build-arg "SGLANG_BASE_IMAGE=$BASE_IMAGE" \
+            --metadata-file /tmp/glm52-image-metadata.json \
+            .
+          digest="$(python3 -c 'import json; print(json.load(open("/tmp/glm52-image-metadata.json"))["containerimage.digest"])')"
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+          printf 'IMAGE_REF=%s@%s\n' "$DEST_IMAGE" "$digest" | tee /tmp/glm52-final-image.txt
+
+      - name: Verify immutable image and runtime import
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_ref="${DEST_IMAGE}@${{ steps.build.outputs.digest }}"
+          docker buildx imagetools inspect "$image_ref"
+          docker pull "$image_ref"
+          docker inspect "$image_ref" --format '{{json .Config.Labels}}'
+          docker run --rm --entrypoint cat "$image_ref" /usr/local/share/sglang/source-provenance.env
+          docker run --rm -i --workdir /tmp --entrypoint python3 "$image_ref" - < scripts/ci/verify_glm52_pd4_final_image.py
+
+      - name: Verify PP relay ordering regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_ref="${DEST_IMAGE}@${{ steps.build.outputs.digest }}"
+          docker run --rm \
+            --volume "$PWD/test/registered/unit/managers/test_pp_pd_mtp_relay.py:/tmp/test_pp_pd_mtp_relay.py:ro" \
+            --workdir /tmp \
+            "$image_ref" \
+            python3 -m pytest -q /tmp/test_pp_pd_mtp_relay.py
+
+      - name: Publish identity summary
+        shell: bash
+        run: |
+          {
+            echo '### GLM-5.2 PD4 final measured-base image'
+            echo
+            echo "- Source commit: \`$SOURCE_COMMIT\`"
+            echo "- Source tree: \`$SOURCE_TREE\`"
+            echo "- Python manifest: \`${{ steps.identity.outputs.python_hash }}\`"
+            echo "- Base image: \`$BASE_IMAGE\`"
+            echo "- Image: \`${DEST_IMAGE}@${{ steps.build.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
