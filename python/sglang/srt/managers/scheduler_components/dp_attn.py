@@ -94,6 +94,7 @@ class MLPSyncBatchInfo:
     num_tokens_for_logprob: int
     can_run_decode_cuda_graph: bool
     can_run_prefill_cuda_graph: bool
+    can_draft_cuda_graph: bool
     is_extend_in_batch: bool
     local_can_run_tbo: bool
     local_forward_mode: int
@@ -118,6 +119,7 @@ class MLPSyncBatchInfo:
                 self.local_forward_mode,
                 int(self.can_run_prefill_cuda_graph),
                 self.prefill_cuda_graph_max_prefix_len,
+                int(self.can_draft_cuda_graph),
             ],
             device=device,
             dtype=dtype,
@@ -134,6 +136,7 @@ class MLPSyncBatchInfo:
                 ForwardMode.IDLE.value,  # local_forward_mode
                 0,  # can_run_prefill_cuda_graph
                 0,  # prefill_cuda_graph_max_prefix_len
+                1,  # can_draft_cuda_graph
             ],
             device=device,
             dtype=dtype,
@@ -216,6 +219,7 @@ class MLPSyncBatchInfo:
         self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
         self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())
         self.prefill_cuda_graph_max_prefix_len = int(tp0_info_cpu[:, 7].max())
+        self.can_draft_cuda_graph = bool(tp0_info_cpu[:, 8].min())
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 tp0_info_cpu[:, 5].tolist()
@@ -248,6 +252,7 @@ def _update_gather_batch(
     batch.dp_prefill_cuda_graph_max_prefix_len = (
         mlp_sync_info.prefill_cuda_graph_max_prefix_len
     )
+    batch.can_run_dp_draft_cuda_graph = mlp_sync_info.can_draft_cuda_graph
 
 
 def should_skip_scheduler_all_gather(dp_size: int) -> bool:
@@ -351,8 +356,6 @@ def _local_prefill_cuda_graph_vote(
         return_logprob=return_logprob,
         lora_ineligible=prefill_graph_runner.enable_lora,
     )
-
-
 def prepare_mlp_sync_batch_raw(
     local_batch: ScheduleBatch,
     model_runner: ModelRunner,
@@ -395,6 +398,13 @@ def prepare_mlp_sync_batch_raw(
 
     can_run_decode_cuda_graph = _local_decode_cuda_graph_vote(
         local_batch=local_batch, disable_cuda_graph=disable_cuda_graph
+    )
+    # Rank-consistent draft graph gate: a seedless DSA draft rank forces the
+    # whole cohort to run the draft phase eagerly, while target verify and
+    # draft-extend can still replay their own graphs.
+    can_draft_cuda_graph = not (
+        local_batch is not None
+        and getattr(local_batch, "force_disable_draft_cuda_graph", False)
     )
     breakable_prefill = check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
     full_prefill = check_cuda_graph_backend(Phase.PREFILL, Backend.FULL)
@@ -458,6 +468,7 @@ def prepare_mlp_sync_batch_raw(
         num_tokens_for_logprob=num_tokens_for_logprob,
         can_run_decode_cuda_graph=can_run_decode_cuda_graph,
         can_run_prefill_cuda_graph=can_run_prefill_cuda_graph,
+        can_draft_cuda_graph=can_draft_cuda_graph,
         is_extend_in_batch=is_extend_in_batch,
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
