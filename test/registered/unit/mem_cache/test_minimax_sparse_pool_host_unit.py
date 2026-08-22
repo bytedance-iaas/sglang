@@ -9,7 +9,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
-from sglang.srt.mem_cache.memory_pool_host import (
+from sglang.srt.mem_cache.pool_host.base import (
     HICACHE_HOST_MEMORY_RESERVE_BYTES,
 )
 from sglang.srt.mem_cache.pool_host.common import (
