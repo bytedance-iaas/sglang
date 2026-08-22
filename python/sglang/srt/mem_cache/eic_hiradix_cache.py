@@ -790,10 +790,6 @@ class EICHiRadixCache(RadixCache):
             self._queue_report(st, self._KIND_FINAL, d)
 
     def _swa_headroom_ok(self, quota):
-        # A hybrid-SWA load retains only the trailing sliding-window SWA KV;
-        # the prefix SWA is overwritten (see alloc_device_indices). So the SWA
-        # pool consumption is min(quota, max(sliding_window, page)), not the
-        # full quota.
         swa = getattr(
             self.cache_controller.mem_pool_device_allocator, "swa_attn_allocator", None
         )
@@ -1795,12 +1791,20 @@ class EICPagedHiRadixCache(EICHiRadixCache):
             host_hit_length += len(last_node.host_value)
             last_node = last_node.parent
 
+        # Load-back keeps only the trailing window of SWA KV; report that.
+        swa_host_hit_length = 0
+        if host_hit_length > 0 and self.sliding_window_size is not None:
+            swa_host_hit_length = min(
+                host_hit_length, max(self.sliding_window_size, self.page_size)
+            )
+
         return MatchResult(
             device_indices=value,
             last_device_node=last_node,
             last_host_node=last_host_node,
             best_match_node=last_host_node,
             host_hit_length=host_hit_length,
+            swa_host_hit_length=swa_host_hit_length,
         )
 
     def write_backup(self, node: TreeNode, write_back=False):

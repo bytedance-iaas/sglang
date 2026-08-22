@@ -386,7 +386,9 @@ class EICKVClient:
     def _write_thread(self):
         logger.info(f"start write thread thread_id {threading.get_ident()}")
         while True:
-            keys, values = self.write_queue.get()
+            keys, values, copy_event = self.write_queue.get()
+            if copy_event is not None:
+                copy_event.synchronize()
             self._async_set_impl(keys, values)
             for value in values:
                 if self.kv_cache_write_mem_pool.check_data_ptr_allocated(
@@ -412,13 +414,15 @@ class EICKVClient:
             if objs is None:
                 return False
 
+            copy_event = None
             if obj_inputs is not None:
                 write_stream = torch.cuda.current_stream()
                 with torch.cuda.stream(write_stream):
                     for i in range(len(keys)):
                         objs[i] = objs[i].reshape(obj_inputs[i].shape)
                         objs[i].copy_(obj_inputs[i], non_blocking=True)
-                write_stream.synchronize()
+                copy_event = torch.cuda.Event()
+                copy_event.record(write_stream)
             elif device_indices is not None and copy_func is not None:
                 copy_func(device_indices, objs)
             else:
@@ -426,7 +430,7 @@ class EICKVClient:
                     "async set impl input obj_inputs and device_indices are both None"
                 )
                 return False
-            self.write_queue.put((keys, objs))
+            self.write_queue.put((keys, objs, copy_event))
 
             cost_time = time.perf_counter() - start_time
             if cost_time >= 0.5:
@@ -450,7 +454,7 @@ class EICKVClient:
                     "async set impl input obj_inputs and device_indices are both None"
                 )
                 return False
-            self.write_queue.put((keys, objs))
+            self.write_queue.put((keys, objs, None))
             logger.warning(
                 f"async batch set fallback to malloc, cost {(time.perf_counter() - start_time) * 1e3}.2f ms, {len(keys)} keys"
             )
@@ -1747,22 +1751,17 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
         full_indices = full_allocator.alloc(need_size)
         if full_indices is None:
             return None
-        # Hybrid-SWA models only retain the trailing sliding-window KV; the
-        # prefix SWA is evicted. Allocating `need_size` SWA slots would exhaust
-        # the (small) SWA pool for long prefixes. Cap the SWA allocation at the
-        # retained window (one page for DSV4) and alias the full span onto it
-        # via a modulo mapping -- later pages overwrite earlier ones, which is
-        # correct since only the tail SWA is live.
+        # Only the trailing window gets real SWA slots; earlier tokens map to 0.
         swa_window = getattr(self.device_pool, "swa_window_size", need_size)
         num_swa = min(need_size, max(swa_window, self.page_size))
         swa_indices = swa_allocator.alloc(num_swa)
         if swa_indices is None:
             full_allocator.free(full_indices)
             return None
-        # full_to_swa_index_mapping[full_indices[i]] = swa_indices[i % num_swa]
-        swa_indices_aliased = swa_indices[
-            torch.arange(len(full_indices), device=full_indices.device) % num_swa
-        ]
+        swa_indices_aliased = torch.zeros(
+            len(full_indices), dtype=swa_indices.dtype, device=swa_indices.device
+        )
+        swa_indices_aliased[-num_swa:] = swa_indices
         allocator.set_full_to_swa_mapping(full_indices, swa_indices_aliased)
         return full_indices
 
