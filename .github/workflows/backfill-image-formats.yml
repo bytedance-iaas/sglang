@@ -6,28 +6,48 @@ on:
       image_refs:
         description: |
           目标镜像引用列表，每行一个，不含格式后缀。
+          auto_rename=true 且 source_image_ref 为空时，以此为源镜像列表进行重命名+补全。
           格式: iaas-gpu-cn-beijing.cr.volces.com/serving/<framework>:<tag>
           示例: iaas-gpu-cn-beijing.cr.volces.com/serving/sglang:v0.5.16.iaas.202607280000-kimi-k3-cu130
-        required: true
+        required: false
         type: string
+        default: ""
       source_image_ref:
         description: |
-          可选：源镜像引用，用于将旧命名格式的镜像重命名为新 tag（docker pull + tag + push）。
-          留空则跳过重命名，直接对 image_refs 中的镜像补全格式。
+          可选：当 auto_rename=true 时，以此为源镜像（而非 image_refs）进行重命名。
+          留空则使用 image_refs 中的镜像作为源。
           格式: iaas-gpu-cn-beijing.cr.volces.com/serving/<framework>:<old-tag>
         required: false
         type: string
         default: ""
-      source_image_is_customer:
-        description: "源镜像在客户仓库（ai-containers-cn-beijing）而非研发仓库"
+      auto_rename:
+        description: |
+          启用自动重命名：从源镜像 tag 提取版本号，按 ServingKit 日构建规则自动生成标准 tag。
+          有 source_image_ref 时以它为准；否则以 image_refs 中的镜像为准。
+          重命名后自动补全 zstd + nydus 格式。
         required: false
         type: boolean
         default: false
-      sync_to_customer:
-        description: "补全格式后触发 Bits 流水线同步到客户仓库"
+      auto_rename_mode:
+        description: "自动重命名模式: manual→iaas.dev, nightly→iaas.nightly, version→byted.{tag_value}"
         required: false
-        type: boolean
-        default: false
+        type: string
+        default: "manual"
+      auto_rename_tag_value:
+        description: "version 模式下的 tag_value（仅 auto_rename_mode=version 时需要）"
+        required: false
+        type: string
+        default: ""
+      auto_rename_variant_suffix:
+        description: "变体后缀（如 deepseek-v4, kimi-k3, glm52-pd4）"
+        required: false
+        type: string
+        default: ""
+      auto_rename_cuda_suffix:
+        description: "CUDA 后缀（如 cu130）"
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   group: backfill-image-formats-${{ github.run_id }}
@@ -59,12 +79,9 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Login to Volcengine CR
-        env:
-          CUSTOMER_CR_REGISTRY: ${{ vars.CUSTOMER_CR_REGISTRY || 'ai-containers-cn-beijing.cr.volces.com' }}
         run: |
           set -euo pipefail
           echo "${VOLCENGINE_CR_PASSWORD}" | docker login "${VOLCENGINE_CR_REGISTRY}" --username "${VOLCENGINE_CR_USERNAME}" --password-stdin
-          echo "${VOLCENGINE_CR_PASSWORD}" | docker login "${CUSTOMER_CR_REGISTRY}" --username "${VOLCENGINE_CR_USERNAME}" --password-stdin || echo "[login] customer registry login failed (non-fatal)"
 
       - name: Install nydus tooling
         run: |
@@ -83,36 +100,24 @@ jobs:
           nydusify --version
           nydus-image --version
 
-      - name: Rename image (old tag -> new tag)
-        if: ${{ inputs.source_image_ref != '' }}
-        env:
-          TARGET_IMAGE_REF: ${{ inputs.image_refs }}
-          SOURCE_IMAGE_REF: ${{ inputs.source_image_ref }}
-          SOURCE_IS_CUSTOMER: ${{ inputs.source_image_is_customer }}
+      - name: Validate inputs
         run: |
           set -euo pipefail
-
-          TARGET="$(echo "${TARGET_IMAGE_REF}" | head -1 | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-
-          echo "=== $(date '+%H:%M:%S') Rename (zstd-customer -> gzip-dev) ==="
-          echo "  Source: ${SOURCE_IMAGE_REF}"
-          echo "  Target: ${TARGET}"
-
-          if docker manifest inspect "${TARGET}" >/dev/null 2>&1; then
-            echo "  Target already exists, skipping rename"
-            exit 0
+          if [ "${{ inputs.auto_rename }}" = "false" ] && [ -z "${{ inputs.image_refs }}" ]; then
+            echo "ERROR: image_refs is required when auto_rename is disabled"
+            exit 1
           fi
+          echo "Input validation passed."
 
-          # Pull from customer registry (zstd compressed), docker auto-decompresses.
-          # Push to dev registry uses default gzip compression, completing zstd->gzip conversion.
-          docker pull "${SOURCE_IMAGE_REF}"
-          docker tag "${SOURCE_IMAGE_REF}" "${TARGET}"
-          docker push "${TARGET}"
-          echo "  Converted & renamed: ${SOURCE_IMAGE_REF} -> ${TARGET}"
-
-      - name: Backfill image formats
+      - name: Auto-rename and backfill
         env:
           IMAGE_REFS: ${{ inputs.image_refs }}
+          SOURCE_IMAGE_REF: ${{ inputs.source_image_ref }}
+          AUTO_RENAME: ${{ inputs.auto_rename }}
+          AUTO_RENAME_MODE: ${{ inputs.auto_rename_mode }}
+          AUTO_RENAME_TAG_VALUE: ${{ inputs.auto_rename_tag_value }}
+          AUTO_RENAME_VARIANT_SUFFIX: ${{ inputs.auto_rename_variant_suffix }}
+          AUTO_RENAME_CUDA_SUFFIX: ${{ inputs.auto_rename_cuda_suffix }}
         run: |
           set -euo pipefail
 
@@ -125,11 +130,80 @@ jobs:
             return 1
           }
 
+          generate_tag() {
+            local source_tag="$1"
+            local version
+            version="$(echo "${source_tag}" | sed -n 's/^v\([0-9][0-9.]*\)\..*/\1/p')"
+            if [ -z "${version}" ]; then
+              echo "  ERROR: cannot extract version from tag: ${source_tag}"
+              echo "  Expected format: v<version>.<rest>, e.g. v0.5.16.iaas.202607280000-kimi-k3-cu130"
+              return 1
+            fi
+            echo "  Extracted version: ${version}"
+
+            local timestamp="$(TZ=Asia/Shanghai date +'%Y%m%d%H%M')"
+            local new_tag
+            case "${AUTO_RENAME_MODE}" in
+              nightly) new_tag="v${version}.iaas.nightly.${timestamp}" ;;
+              manual)  new_tag="v${version}.iaas.dev.${timestamp}" ;;
+              version)
+                if [ -z "${AUTO_RENAME_TAG_VALUE}" ]; then
+                  echo "  ERROR: auto_rename_tag_value is required for version mode"
+                  return 1
+                fi
+                new_tag="v${version}.byted.${AUTO_RENAME_TAG_VALUE}.${timestamp}"
+                ;;
+              *)
+                echo "  ERROR: unknown auto_rename_mode: ${AUTO_RENAME_MODE}"
+                return 1
+                ;;
+            esac
+
+            if [ -n "${AUTO_RENAME_VARIANT_SUFFIX}" ]; then
+              new_tag="${new_tag}-${AUTO_RENAME_VARIANT_SUFFIX}"
+            fi
+            if [ -n "${AUTO_RENAME_CUDA_SUFFIX}" ]; then
+              new_tag="${new_tag}-${AUTO_RENAME_CUDA_SUFFIX}"
+            fi
+
+            echo "${new_tag}"
+          }
+
+          rename_and_backfill() {
+            local source_ref="$1"
+
+            echo ""
+            echo "=== $(date '+%H:%M:%S') Processing: ${source_ref} ==="
+
+            local source_tag="${source_ref##*:}"
+            local source_registry_ns="${source_ref%%:*}"
+
+            if [ "${AUTO_RENAME}" = "true" ]; then
+              local new_tag
+              new_tag="$(generate_tag "${source_tag}")" || return 1
+              local target_ref="${source_registry_ns}:${new_tag}"
+              echo "  Generated target: ${target_ref}"
+
+              if docker manifest inspect "${target_ref}" >/dev/null 2>&1; then
+                echo "  Target already exists, using existing: ${target_ref}"
+              else
+                echo "  Renaming: ${source_ref} -> ${target_ref}"
+                docker pull "${source_ref}"
+                docker tag "${source_ref}" "${target_ref}"
+                docker push "${target_ref}"
+                echo "  Renamed: ${target_ref}"
+              fi
+              backfill_one "${target_ref}"
+            else
+              backfill_one "${source_ref}"
+            fi
+          }
+
           backfill_one() {
             local image_ref="$1"
 
             echo ""
-            echo "=== $(date '+%H:%M:%S') ${image_ref} ==="
+            echo "=== $(date '+%H:%M:%S') Backfill: ${image_ref} ==="
 
             if ! docker manifest inspect "${image_ref}" >/dev/null 2>&1; then
               echo "  ERROR: base image not found: ${image_ref}"
@@ -167,36 +241,33 @@ jobs:
             fi
 
             echo "  done: ${image_ref}"
-            echo ""
           }
 
-          while IFS= read -r line; do
-            line="${line//[$'\r\n']/}"
-            [[ -z "$line" || "$line" == \#* ]] && continue
-            backfill_one "$line"
-          done <<< "${IMAGE_REFS}"
+          echo "=== $(date '+%H:%M:%S') Backfill Image Formats ==="
+          echo "  auto_rename: ${AUTO_RENAME}"
+          echo "  auto_rename_mode: ${AUTO_RENAME_MODE}"
+          echo "  variant_suffix: ${AUTO_RENAME_VARIANT_SUFFIX:-<none>}"
+          echo "  cuda_suffix: ${AUTO_RENAME_CUDA_SUFFIX:-<none>}"
 
-          echo "All backfills complete."
-
-      - name: Trigger Bits sync pipeline
-        if: ${{ inputs.sync_to_customer }}
-        env:
-          IMAGE_REFS: ${{ inputs.image_refs }}
-        run: |
-          set -euo pipefail
-
-          BITS_PIPELINE_ID="1008460003842"
-          BITS_SPACE_ID="779378790402"
-
-          echo "Images to sync:"
-          while IFS= read -r line; do
-            line="${line//[$'\r\n']/}"
-            [[ -z "$line" || "$line" == \#* ]] && continue
-            framework="${line##*/}"; framework="${framework%%:*}"
-            tag="${line##*:}"
-            echo "  framework=${framework} tag=${tag}"
-          done <<< "${IMAGE_REFS}"
+          # Determine source images
+          if [ "${AUTO_RENAME}" = "true" ] && [ -n "${SOURCE_IMAGE_REF}" ]; then
+            echo "  Using source_image_ref as rename source"
+            rename_and_backfill "${SOURCE_IMAGE_REF}"
+          elif [ "${AUTO_RENAME}" = "true" ]; then
+            echo "  Using image_refs as rename source"
+            while IFS= read -r line; do
+              line="${line//[$'\r\n']/}"
+              [[ -z "$line" || "$line" == \#* ]] && continue
+              rename_and_backfill "$line"
+            done <<< "${IMAGE_REFS}"
+          else
+            echo "  Direct backfill (no rename)"
+            while IFS= read -r line; do
+              line="${line//[$'\r\n']/}"
+              [[ -z "$line" || "$line" == \#* ]] && continue
+              backfill_one "$line"
+            done <<< "${IMAGE_REFS}"
+          fi
 
           echo ""
-          echo "Bits 流水线: https://bits.bytedance.net/devops/${BITS_SPACE_ID}/pipeline/detail/${BITS_PIPELINE_ID}"
-          echo "请手动触发流水线，填入对应的 framework 和 tag。"
+          echo "All backfills complete."
