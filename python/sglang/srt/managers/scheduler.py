@@ -2788,6 +2788,21 @@ class Scheduler(
             )
             req.time_stats.set_prefill_bootstrap_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            if (
+                is_retracted
+                and not get_disagg().disaggregation_decode_enable_offload_kvcache
+            ):
+                # Offload disabled: release_req skipped the device->host KV copy
+                # (get_cpu_copy is unimplemented for e.g. HiSparse pools), so the
+                # retracted KV cannot be restored from a CPU copy on resume.
+                # Recompute it on the prefill worker instead, reusing the PD
+                # true-retraction rebootstrap path (same as pause_generation).
+                if req.output_ids:
+                    req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
+                req.pd_rebootstrap_in_progress = True
+                req.time_stats.set_retract_time()
+                self.disagg_decode_prealloc_queue.add(req, is_rebootstrap=True)
+                return
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
             if not is_retracted:
                 req.time_stats.set_decode_prealloc_queue_entry_time()

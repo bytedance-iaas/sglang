@@ -1850,11 +1850,21 @@ def release_req(
     if hisparse_coordinator is not None and not req.finished():
         hisparse_coordinator.retract_req(req)
 
-    # In decode disaggregation the retracted KV is offloaded to host so it can be
-    # restored later without recompute (see resume_retracted_reqs/load_kv_cache).
-    # Callers that will recompute the KV instead (PD true-retraction rebootstrap)
-    # pass offload_kv=False to skip the wasteful device->host copy.
-    if server_args.disaggregation_mode == "decode" and offload_kv:
+    # In decode disaggregation the retracted KV can be offloaded to host so it can
+    # be restored later without recompute (see resume_retracted_reqs/load_kv_cache).
+    # This device->host copy goes through token_to_kv_pool_allocator.get_cpu_copy,
+    # which is only implemented for the offload-capable pools that back
+    # --disaggregation-decode-enable-offload-kvcache. HiSparse pools
+    # (HiSparse[C4]DevicePool) intentionally raise NotImplementedError there, so
+    # gate the offload on the flag; when it is off the retracted KV is recovered
+    # by recomputing it on the prefill worker (PD true-retraction rebootstrap),
+    # see Scheduler.update_running_batch. Callers that always recompute (pause
+    # retract) pass offload_kv=False to skip the copy regardless of the flag.
+    if (
+        server_args.disaggregation_mode == "decode"
+        and offload_kv
+        and server_args.disaggregation_decode_enable_offload_kvcache
+    ):
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
     # TODO (csy): for preempted requests, we may want to insert into the tree
     release_kv_cache(req, tree_cache, is_insert=False)
