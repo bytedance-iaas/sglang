@@ -134,7 +134,7 @@ jobs:
             local source_tag="$1"
             local source_ref="$2"
             local version
-            version="$(echo "${source_tag}" | sed -n 's/^v\([0-9][0-9.]*\)\..*/\1/p')"
+            version="$(echo "${source_tag}" | grep -oE '^v[0-9]+\.[0-9]+\.[0-9]+(\.post[0-9]+)?' | sed 's/^v//' || true)"
             if [ -z "${version}" ]; then
               echo "  Version is not present in tag '${source_tag}'; inspecting the image..." >&2
               if ! docker pull "${source_ref}" >&2; then
@@ -156,11 +156,66 @@ jobs:
                 detected_version=""
               done
 
-              version="$(echo "${detected_version}" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+              version="$(echo "${detected_version}" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(\.post[0-9]+)?' | head -1 || true)"
+              if [ "${version}" = "0.0.0" ]; then
+                echo "  Ignoring placeholder package version: ${detected_version}" >&2
+                version=""
+              fi
+
+              # Source-overlay images can intentionally retain a 0.0.0 wheel
+              # version. Resolve their recorded build commit to the nearest
+              # release tag in this repository.
               if [ -z "${version}" ]; then
-                echo "  ERROR: the tag has no version and the container does not expose an installed sglang package version" >&2
+                local build_commit
+                build_commit="$(
+                  docker image inspect "${source_ref}" \
+                    --format '{{ index .Config.Labels "ai.sglang.build.commit" }}' \
+                    2>/dev/null || true
+                )"
+                if [[ "${build_commit}" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+                  echo "  Resolving recorded build commit: ${build_commit}" >&2
+                  if ! git cat-file -e "${build_commit}^{commit}" 2>/dev/null; then
+                    git fetch --quiet --no-tags origin "${build_commit}" --depth=1000 || true
+                  fi
+                  git fetch --quiet --tags origin || true
+                  local release_tag
+                  release_tag="$(
+                    git describe --tags --match 'v[0-9]*' --abbrev=0 "${build_commit}" \
+                      2>/dev/null || true
+                  )"
+                  version="$(
+                    echo "${release_tag}" | \
+                      grep -oE '^v[0-9]+\.[0-9]+\.[0-9]+(\.post[0-9]+)?' | \
+                      sed 's/^v//' || true
+                  )"
+                  if [ -n "${version}" ]; then
+                    echo "  Resolved ${build_commit} to release baseline ${release_tag}" >&2
+                  fi
+                fi
+              fi
+
+              # Older images without source provenance may still record the
+              # versioned ServingKit image they were built from.
+              if [ -z "${version}" ]; then
+                local base_image
+                base_image="$(
+                  docker image inspect "${source_ref}" \
+                    --format '{{ index .Config.Labels "ai.sglang.build.base-image" }}' \
+                    2>/dev/null || true
+                )"
+                version="$(
+                  echo "${base_image}" | \
+                    grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+(\.post[0-9]+)?' | \
+                    head -1 | sed 's/^v//' || true
+                )"
+                if [ -n "${version}" ]; then
+                  echo "  Detected version from base-image metadata: ${version}" >&2
+                fi
+              fi
+
+              if [ -z "${version}" ]; then
+                echo "  ERROR: unable to determine a non-placeholder sglang version from the tag, container, build commit, or image metadata" >&2
                 echo "  Source image: ${source_ref}" >&2
-                echo "  Tried: python3/python + importlib.metadata.version(\"sglang\")" >&2
                 return 1
               fi
             fi
