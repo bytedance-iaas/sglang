@@ -177,7 +177,8 @@ class TestSidpServerArgs(CustomTestCase):
             ({"dp_size": 4}, "must equal dp_size"),
             ({"sidp_k": 0}, "sidp_k.*must be in"),
             ({"sidp_k": 9}, "sidp_k.*must be in"),
-            ({"sidp_cache_cycles": 1}, "sidp_cache_cycles.*must be >= 2"),
+            ({"sidp_cache_cycles": 1}, "sidp_cache_cycles.*must be 2"),
+            ({"sidp_cache_cycles": 3}, "sidp_cache_cycles.*must be 2"),
             ({"tp_size": 2}, "tp_size=1"),
             ({"dwdp_size": 2}, "mutually exclusive"),
             ({"pp_size": 2}, "pp_size=1"),
@@ -227,6 +228,41 @@ class TestSidpServerArgs(CustomTestCase):
             ["--model-path", "dummy", "--sidp-enable-peak-shifting"]
         )
         self.assertTrue(parsed.sidp_enable_peak_shifting)
+
+    def test_graph_profiling_parameters(self):
+        args = self._make_sidp_args(
+            sidp_enable_graph_profiling=True,
+            sidp_profile_sample_interval=7,
+            sidp_profile_warmup_replays=3,
+            sidp_profile_output_dir="/tmp/sidp-test-profile",
+        )
+        with patch.dict(
+            os.environ,
+            {"PYTORCH_CUDA_ALLOC_CONF": "", "PYTORCH_ALLOC_CONF": ""},
+        ):
+            args._handle_sidp()
+
+    def test_invalid_graph_profiling_parameters(self):
+        cases = [
+            ({"disable_cuda_graph": True}, "requires CUDA Graph"),
+            ({"sidp_k": 8}, "requires remote weight communication"),
+            ({"sidp_profile_sample_interval": 0}, "must be at least 1"),
+            ({"sidp_profile_warmup_replays": -1}, "cannot be negative"),
+            ({"sidp_profile_output_dir": ""}, "cannot be empty"),
+        ]
+        for overrides, message in cases:
+            with self.subTest(overrides=overrides):
+                args = self._make_sidp_args(
+                    sidp_enable_graph_profiling=True, **overrides
+                )
+                with (
+                    patch.dict(
+                        os.environ,
+                        {"PYTORCH_CUDA_ALLOC_CONF": "", "PYTORCH_ALLOC_CONF": ""},
+                    ),
+                    self.assertRaisesRegex(AssertionError, message),
+                ):
+                    args._handle_sidp()
 
 
 class TestMultimodalFeatureTransport(CustomTestCase):
