@@ -1108,8 +1108,10 @@ class ServerArgs:
     sidp_enable_graph_profiling: A[
         bool,
         "Insert SiDP timing events into CUDA Graph and periodically emit sampled "
-        "cycle/copy/RAW-wait diagnostics. This perturbs performance and is only "
-        "for diagnosis, never final throughput measurement.",
+        "cycle diagnostics. With sidp_k < sidp_size this also records copy and "
+        "RAW-wait timing; with sidp_k == sidp_size it provides a fully-resident "
+        "compute reference. This perturbs performance and is only for diagnosis, "
+        "never final throughput measurement.",
         NS("parallel"),
     ] = False
     sidp_profile_sample_interval: A[
@@ -6528,10 +6530,6 @@ class ServerArgs:
             assert not self.disable_cuda_graph, (
                 "SiDP graph profiling requires CUDA Graph; remove "
                 "--disable-cuda-graph"
-            )
-            assert self.sidp_k < self.sidp_size, (
-                "SiDP graph profiling requires remote weight communication "
-                "(sidp_k < sidp_size)"
             )
             assert (
                 self.sidp_profile_sample_interval >= 1

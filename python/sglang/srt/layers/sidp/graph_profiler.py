@@ -52,7 +52,12 @@ class SidpGraphProfiler:
         }
         self.sample_interval = sample_interval
         self.warmup_replays = warmup_replays
-        self.order = "peak-shifting" if peak_shifting else "compute"
+        self.has_communication = any(cycle_layers.values())
+        self.order = (
+            "resident"
+            if not self.has_communication
+            else ("peak-shifting" if peak_shifting else "compute")
+        )
         self.replay_index = 0
 
         self.forward_start = _timing_event()
@@ -98,6 +103,7 @@ class SidpGraphProfiler:
                 "sample_interval": sample_interval,
                 "warmup_replays": warmup_replays,
                 "cycle_layers": self.cycle_layers,
+                "communication_enabled": self.has_communication,
             }
         )
 
@@ -199,8 +205,16 @@ class SidpGraphProfiler:
         for cycle in range(self.num_cycles):
             compute_start_ms = self._offset_ms(self.compute_start[cycle])
             compute_end_ms = self._offset_ms(self.compute_end[cycle])
-            comm_start_ms = self._offset_ms(self.comm_start[cycle])
-            comm_end_ms = self._offset_ms(self.comm_end[cycle])
+            if self.has_communication:
+                comm_start_ms = self._offset_ms(self.comm_start[cycle])
+                comm_end_ms = self._offset_ms(self.comm_end[cycle])
+                comm_duration_ms = self._duration_ms(
+                    self.comm_start[cycle], self.comm_end[cycle]
+                )
+            else:
+                comm_start_ms = None
+                comm_end_ms = None
+                comm_duration_ms = 0.0
             cycles.append(
                 {
                     "cycle": cycle,
@@ -212,9 +226,7 @@ class SidpGraphProfiler:
                     ),
                     "comm_start_ms": comm_start_ms,
                     "comm_end_ms": comm_end_ms,
-                    "comm_duration_ms": self._duration_ms(
-                        self.comm_start[cycle], self.comm_end[cycle]
-                    ),
+                    "comm_duration_ms": comm_duration_ms,
                 }
             )
             cycle_copies = self._layer_records(self.cycle_layers.get(cycle, []))
