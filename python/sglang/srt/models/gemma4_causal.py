@@ -532,6 +532,7 @@ class Gemma4DecoderLayer(nn.Module):
         self._sidp_mgr = None
         self._sidp_begin_forward = False
         self._sidp_end_forward = False
+        self._sidp_dummy_compute = False
 
         # Gemma 4 uses different head dimensions for sliding vs full attention
         layer_type = config.layer_types[layer_id]
@@ -656,6 +657,18 @@ class Gemma4DecoderLayer(nn.Module):
             self._sidp_mgr.begin_forward()
         if self._sidp_mgr is not None:
             self._sidp_mgr.record_cycle_compute_start(self.layer_id)
+
+        if self._sidp_dummy_compute:
+            # Profiling-only copy-pipeline experiment: preserve the real Graph
+            # boundaries, WAR release, prefetch schedule, and final comm join,
+            # but remove decoder compute and RAW waits. Outputs are deliberately
+            # meaningless and this path is rejected unless profiling is enabled.
+            if self._sidp_bound:
+                self._sidp_mgr.record_dummy_consume_and_prefetch_next(self.layer_id)
+            self._sidp_mgr.record_cycle_compute_end(self.layer_id)
+            if self._sidp_end_forward:
+                self._sidp_mgr.end_forward()
+            return hidden_states, None
 
         # Gemma4 residual pattern following JAX implementation:
         # 1. input_norm(x) -> attn -> post_attn_norm -> ADD residual

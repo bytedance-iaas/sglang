@@ -43,6 +43,8 @@ class SidpGraphProfiler:
         warmup_replays: int,
         output_dir: str,
         peak_shifting: bool,
+        dummy_compute: bool = False,
+        sync_strategy: str = "none",
     ) -> None:
         self.dp_rank = dp_rank
         self.dp_size = dp_size
@@ -53,6 +55,8 @@ class SidpGraphProfiler:
         self.sample_interval = sample_interval
         self.warmup_replays = warmup_replays
         self.has_communication = any(cycle_layers.values())
+        self.dummy_compute = dummy_compute
+        self.sync_strategy = sync_strategy
         self.order = (
             "resident"
             if not self.has_communication
@@ -104,6 +108,8 @@ class SidpGraphProfiler:
                 "warmup_replays": warmup_replays,
                 "cycle_layers": self.cycle_layers,
                 "communication_enabled": self.has_communication,
+                "dummy_compute": self.dummy_compute,
+                "sync_strategy": self.sync_strategy,
             }
         )
 
@@ -178,7 +184,11 @@ class SidpGraphProfiler:
         return records
 
     def collect_after_graph_replay(
-        self, *, raw_batch_size: int, graph_batch_size: int
+        self,
+        *,
+        raw_batch_size: int,
+        graph_batch_size: int,
+        launch_profile: dict | None = None,
     ) -> None:
         """Synchronize and emit one sampled replay.
 
@@ -268,6 +278,8 @@ class SidpGraphProfiler:
             "sample_interval": self.sample_interval,
             "raw_batch_size": raw_batch_size,
             "graph_batch_size": graph_batch_size,
+            "dummy_compute": self.dummy_compute,
+            "host_launch": launch_profile,
             "anchor_host_ns": anchor_host_ns,
             "anchor_offset_ms": anchor_offset_ms,
             "collection_sync_wait_ms": self._round_ms(

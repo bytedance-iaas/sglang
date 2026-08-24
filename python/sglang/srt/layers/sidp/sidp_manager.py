@@ -21,6 +21,10 @@ from sglang.srt.layers.sidp.scheduler import (
     prefetch_order,
     remote_positions,
 )
+from sglang.srt.layers.sidp.sync_strategy import (
+    NoSyncStrategy,
+    build_peak_sync_strategy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +56,11 @@ class SidpManager:
         self.enable_cycle_overlap = config.enable_cycle_overlap
         self.enable_peak_shifting = config.enable_peak_shifting
         self.enable_graph_profiling = config.enable_graph_profiling
+        self.profile_dummy_compute = config.profile_dummy_compute
+        self.peak_sync_strategy = config.peak_sync_strategy
+        self.peak_sync_min_raw_bs = config.peak_sync_min_raw_bs
+        self.peak_sync_max_replays = config.peak_sync_max_replays
+        self.peak_sync_timeout_s = config.peak_sync_timeout_s
 
         # D2: TCPStore is created lazily in setup() so that all ranks
         # have finished load_model() before any rank tries to connect.
@@ -87,6 +96,7 @@ class SidpManager:
         self._layers_ref: Dict[int, Any] = {}
         self._ipc_refs: List[torch.Tensor] = []
         self._graph_profiler: SidpGraphProfiler | None = None
+        self._launch_sync_strategy = NoSyncStrategy()
 
     def setup(self, model, model_runner=None):
         """Call after model weights are loaded. Exchanges IPC handles, releases
@@ -116,6 +126,20 @@ class SidpManager:
             wait_for_workers=False,
         )
         logger.info(f"[SiDP rank{self.dp_rank}] TCPStore connected")
+        self._launch_sync_strategy = build_peak_sync_strategy(
+            self.peak_sync_strategy,
+            enabled=self.enable_peak_shifting,
+            store=self.store,
+            dp_rank=self.dp_rank,
+            dp_size=self.dp_size,
+            min_raw_bs=self.peak_sync_min_raw_bs,
+            max_replays=self.peak_sync_max_replays,
+            timeout_s=self.peak_sync_timeout_s,
+        )
+        logger.info(
+            f"[SiDP rank{self.dp_rank}] peak sync strategy: "
+            f"{self._launch_sync_strategy.name}"
+        )
 
         layers = self._collect_decoder_layers(model)
         self._layers_ref = layers
@@ -152,6 +176,8 @@ class SidpManager:
                 warmup_replays=self.config.profile_warmup_replays,
                 output_dir=self.config.profile_output_dir,
                 peak_shifting=self.enable_peak_shifting,
+                dummy_compute=self.profile_dummy_compute,
+                sync_strategy=self._launch_sync_strategy.name,
             )
             logger.warning(
                 f"[SiDP rank{self.dp_rank}] CUDA Graph profiling enabled; "
@@ -272,6 +298,7 @@ class SidpManager:
             layer._sidp_mgr = self
             layer._sidp_begin_forward = lid == 0
             layer._sidp_end_forward = lid == self.num_layers - 1
+            layer._sidp_dummy_compute = self.profile_dummy_compute
 
         logger.info(f"[SiDP rank{self.dp_rank}] setup complete")
 
@@ -336,6 +363,20 @@ class SidpManager:
                 # it with the next forward's c0 while c5 computes.
                 self._enqueue_next_forward_cycle_zero()
 
+    def record_dummy_consume_and_prefetch_next(self, layer_id: int):
+        """Advance the copy pipeline without reading weights in diagnostic mode.
+
+        Dummy-compute profiling intentionally omits the RAW dependency because
+        no MLP reads the rolling buffer.  Record an empty wait interval so the
+        normal profiler schema remains complete, then release the slot at the
+        current compute-stream point and enqueue the next cycle normally.
+        """
+        compute_stream = torch.cuda.current_stream()
+        if self._graph_profiler is not None and layer_id // self.dp_size > 0:
+            self._graph_profiler.record_wait_start(layer_id, compute_stream)
+            self._graph_profiler.record_wait_end(layer_id, compute_stream)
+        self.record_compute_and_prefetch_next(layer_id)
+
     def begin_forward(self):
         """Start one eager or captured forward with cycle 0 already resident.
 
@@ -388,14 +429,28 @@ class SidpManager:
         )
 
     def profile_after_cuda_graph_replay(
-        self, *, raw_batch_size: int, graph_batch_size: int
+        self,
+        *,
+        raw_batch_size: int,
+        graph_batch_size: int,
+        launch_profile: dict | None = None,
     ):
         """Collect one sampled decode replay when profiling is enabled."""
         if self._graph_profiler is not None:
             self._graph_profiler.collect_after_graph_replay(
                 raw_batch_size=raw_batch_size,
                 graph_batch_size=graph_batch_size,
+                launch_profile=launch_profile,
             )
+
+    def before_cuda_graph_replay(
+        self, *, raw_batch_size: int, graph_batch_size: int
+    ) -> dict:
+        """Apply the configured peak synchronization strategy before replay."""
+        return self._launch_sync_strategy.before_launch(
+            raw_batch_size=raw_batch_size,
+            graph_batch_size=graph_batch_size,
+        )
 
     def prefetch_first_layers(self):
         """Backward-compatible alias; forward-boundary hooks call begin_forward."""

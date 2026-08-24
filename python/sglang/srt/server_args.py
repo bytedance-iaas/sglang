@@ -1114,6 +1114,51 @@ class ServerArgs:
         "never final throughput measurement.",
         NS("parallel"),
     ] = False
+    sidp_profile_dummy_compute: A[
+        bool,
+        "Profiling-only SiDP experiment that preserves the real CUDA Graph copy "
+        "pipeline but skips Gemma4 decoder compute and RAW waits. Generated "
+        "tokens are meaningless; use only to isolate cross-rank prefetch skew.",
+        NS("parallel"),
+    ] = False
+    sidp_peak_sync_strategy: A[
+        str,
+        Arg(
+            help="Cross-rank CUDA Graph launch synchronization for SiDP "
+            "peak-shifting. 'force_sync' aligns every launch after all ranks "
+            "reach the configured bulk batch; 'none' preserves unsynchronized "
+            "behavior for A/B comparison. The strategy is ignored when "
+            "peak-shifting is disabled.",
+            choices=["none", "force_sync"],
+        ),
+        NS("parallel"),
+    ] = "force_sync"
+    sidp_peak_sync_min_raw_bs: A[
+        int,
+        Arg(
+            help="Minimum per-rank raw decode batch that arms SiDP force_sync. "
+            "All ranks must reach this threshold before synchronization starts.",
+        ),
+        NS("parallel"),
+    ] = 64
+    sidp_peak_sync_max_replays: A[
+        int,
+        Arg(
+            help="Maximum number of SiDP force_sync launches. Zero keeps "
+            "synchronizing every launch after the bulk threshold; a positive "
+            "value is useful for bounded diagnostics.",
+        ),
+        NS("parallel"),
+    ] = 0
+    sidp_peak_sync_timeout_s: A[
+        float,
+        Arg(
+            help="TCPStore barrier timeout in seconds for SiDP force_sync. "
+            "Timeout is fail-stop because continuing independently would lose "
+            "the common peak-shifting phase.",
+        ),
+        NS("parallel"),
+    ] = 30.0
     sidp_profile_sample_interval: A[
         int,
         Arg(help="Collect one SiDP CUDA Graph timing sample every N decode replays."),
@@ -6540,6 +6585,26 @@ class ServerArgs:
             assert (
                 self.sidp_profile_output_dir
             ), "sidp_profile_output_dir cannot be empty"
+        if self.sidp_profile_dummy_compute:
+            assert self.sidp_enable_graph_profiling, (
+                "SiDP dummy compute requires --sidp-enable-graph-profiling"
+            )
+            assert self.sidp_k < self.sidp_size, (
+                "SiDP dummy compute requires remote weight communication "
+                "(sidp_k < sidp_size)"
+            )
+        assert self.sidp_peak_sync_strategy in ("none", "force_sync"), (
+            "sidp_peak_sync_strategy must be one of: none, force_sync"
+        )
+        assert self.sidp_peak_sync_min_raw_bs >= 1, (
+            "sidp_peak_sync_min_raw_bs must be at least 1"
+        )
+        assert self.sidp_peak_sync_max_replays >= 0, (
+            "sidp_peak_sync_max_replays cannot be negative"
+        )
+        assert self.sidp_peak_sync_timeout_s > 0, (
+            "sidp_peak_sync_timeout_s must be positive"
+        )
 
         # CUDA IPC cannot export allocations backed by expandable segments.
         for var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
@@ -6571,6 +6636,7 @@ class ServerArgs:
             f"SiDP enabled: sidp_size={self.sidp_size}, k={self.sidp_k}, "
             f"cache_cycles={self.sidp_cache_cycles}, "
             f"peak_shifting={self.sidp_enable_peak_shifting}, "
+            f"peak_sync_strategy={self.sidp_peak_sync_strategy}, "
             f"graph_profiling={self.sidp_enable_graph_profiling}, "
             f"rdzv_port={self.sidp_rdzv_port}"
         )
