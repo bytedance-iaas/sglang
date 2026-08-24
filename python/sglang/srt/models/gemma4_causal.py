@@ -530,6 +530,8 @@ class Gemma4DecoderLayer(nn.Module):
         # SiDP hook state (set by SidpManager.setup)
         self._sidp_bound = False
         self._sidp_mgr = None
+        self._sidp_begin_forward = False
+        self._sidp_end_forward = False
 
         # Gemma 4 uses different head dimensions for sliding vs full attention
         layer_type = config.layer_types[layer_id]
@@ -650,6 +652,9 @@ class Gemma4DecoderLayer(nn.Module):
     ) -> tuple[
         torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]
     ]:
+        if self._sidp_begin_forward:
+            self._sidp_mgr.begin_forward()
+
         # Gemma4 residual pattern following JAX implementation:
         # 1. input_norm(x) -> attn -> post_attn_norm -> ADD residual
         # 2. pre_ff_norm -> mlp -> post_ff_norm -> ADD residual
@@ -713,6 +718,8 @@ class Gemma4DecoderLayer(nn.Module):
                     norm2.variance_epsilon,
                     norm3.variance_epsilon,
                 )
+                if self._sidp_end_forward:
+                    self._sidp_mgr.end_forward()
                 return hidden_states, None
 
             hidden_states_1 = self.post_feedforward_layernorm_1(hidden_states_1)
@@ -761,6 +768,8 @@ class Gemma4DecoderLayer(nn.Module):
                 hidden_states = hidden_states + per_layer_contribution
 
             hidden_states = hidden_states * self.layer_scalar
+        if self._sidp_end_forward:
+            self._sidp_mgr.end_forward()
         return hidden_states, None
 
 

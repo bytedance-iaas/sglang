@@ -1094,8 +1094,8 @@ class ServerArgs:
     sidp_cache_cycles: A[
         int,
         Arg(
-            help="SiDP rolling buffer depth (number of concurrent prefetch cycles). "
-            "Must be >= 2 for compute/communication overlap.",
+            help="SiDP rolling buffer depth. The current cross-forward cycle "
+            "pipeline requires exactly 2 cycles.",
         ),
         NS("parallel"),
     ] = 2
@@ -6482,9 +6482,10 @@ class ServerArgs:
         assert (
             1 <= self.sidp_k <= self.sidp_size
         ), f"sidp_k ({self.sidp_k}) must be in [1, sidp_size ({self.sidp_size})]"
-        assert (
-            self.sidp_cache_cycles >= 2
-        ), f"sidp_cache_cycles ({self.sidp_cache_cycles}) must be >= 2"
+        assert self.sidp_cache_cycles == 2, (
+            f"sidp_cache_cycles ({self.sidp_cache_cycles}) must be 2 for the "
+            "current cross-forward cycle pipeline"
+        )
         assert self.tp_size == 1, "SiDP requires tp_size=1 (classic DP mode)"
         assert self.dwdp_size <= 1, "SiDP and DWDP are mutually exclusive"
         assert self.pp_size == 1, "SiDP requires pp_size=1"
@@ -6526,8 +6527,8 @@ class ServerArgs:
                     self.sidp_rdzv_port = candidate
                     break
 
-        # SiDP does not force-disable CUDA Graph. Graph mode currently uses
-        # the serial graph-safe path; full cycle overlap is enabled in eager.
+        # SiDP does not force-disable CUDA Graph. Eager and captured forwards
+        # use the same cross-forward cycle pipeline.
         logger.info(
             f"SiDP enabled: sidp_size={self.sidp_size}, k={self.sidp_k}, "
             f"cache_cycles={self.sidp_cache_cycles}, "

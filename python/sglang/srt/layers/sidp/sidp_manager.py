@@ -1,8 +1,8 @@
-"""SiDP manager for IPC weight sharing and bounded prefetch buffers.
+"""SiDP manager for IPC weight sharing and bounded cycle prefetch.
 
-Eager mode implements cycle-level D5 WAR/RAW overlap and optional D4
-peak-shifting. CUDA Graph mode intentionally retains the graph-safe serial
-prefetch fallback until the same cycle DAG is captured in a later phase.
+The cycle pipeline is shared by eager execution and CUDA Graph capture. Each
+forward starts with cycle 0 resident, overlaps cycle c with prefetch(c + 1),
+and leaves the next forward's cycle 0 resident at graph/forward completion.
 """
 
 import logging
@@ -48,7 +48,7 @@ class SidpManager:
         self.k = config.k
         self.cache_cycles = config.cache_cycles
         self.num_layers = config.num_layers
-        self.enable_eager_overlap = config.enable_eager_overlap
+        self.enable_cycle_overlap = config.enable_cycle_overlap
         self.enable_peak_shifting = config.enable_peak_shifting
 
         # D2: TCPStore is created lazily in setup() so that all ranks
@@ -60,12 +60,11 @@ class SidpManager:
         # D7: DMA engine wrapper
         self.memcpy = SidpCudaMemcpy()
 
-        # D7/D8: eager uses this as the asynchronous cycle-fill stream;
-        # graph-safe fallback forks/joins it inside each layer's capture scope.
+        # D7/D8: asynchronous cycle-fill stream, captured alongside the model
+        # stream when CUDA Graph is enabled.
         self.comm_stream = torch.cuda.Stream()
 
-        # Per-slot RAW/WAR events. Eager uses both; graph-safe serial fallback
-        # uses RAW only and never overwrites a slot before its immediate GEMM.
+        # Per-slot RAW/WAR events for the bounded cycle ring.
         self._prefetch_events: List[torch.cuda.Event] = []
         self._consume_events: List[torch.cuda.Event] = []
 
@@ -82,6 +81,7 @@ class SidpManager:
         self._num_cycles = 0
         self._cycle_cache_depth = 0
         self._queued_cycles: set[int] = set()
+        self._next_forward_cycle_zero_queued = False
         self._layers_ref: Dict[int, Any] = {}
         self._ipc_refs: List[torch.Tensor] = []
 
@@ -142,7 +142,7 @@ class SidpManager:
         logger.info(
             f"[SiDP rank{self.dp_rank}] local={len(local_layers)}, "
             f"non_local={len(non_local_layers)}, "
-            f"mode={'eager-cycle-overlap' if self.enable_eager_overlap else 'serial-graph-safe'}, "
+            f"mode={'cross-forward-cycle-overlap' if self.enable_cycle_overlap else 'serial-graph-safe'}, "
             f"order={'peak-shifting' if self.enable_peak_shifting else 'compute'}"
         )
 
@@ -176,7 +176,7 @@ class SidpManager:
         )
 
         # Allocate buffers BEFORE releasing weights (their shapes are still
-        # needed here). Eager overlap uses cycle_cache_depth * (D-k) slots;
+        # needed here). Cycle overlap uses cycle_cache_depth * (D-k) slots;
         # graph-safe fallback keeps the original cache_cycles layer slots.
         self._alloc_buffers(layers, non_local_layers)
         logger.info(
@@ -243,33 +243,34 @@ class SidpManager:
         for evt in self._consume_events:
             evt.record(torch.cuda.current_stream())
 
-        # Bind hook to non-local layers
-        for lid in non_local_layers:
-            layer = layers[lid]
-            layer._sidp_bound = True
-            layer._sidp_mgr = self
+        if self.enable_cycle_overlap and self._cycle_layers.get(0):
+            self._initialize_cycle_zero()
 
-        # Local layers: no SiDP intervention needed
-        for lid in local_layers:
-            layer = layers[lid]
-            layer._sidp_bound = False
-            layer._sidp_mgr = None
+        # All layers know the forward boundary manager; only non-local layers
+        # execute per-layer RAW/WAR hooks.
+        for lid, layer in layers.items():
+            layer._sidp_bound = lid in self.peer_views
+            layer._sidp_mgr = self
+            layer._sidp_begin_forward = lid == 0
+            layer._sidp_end_forward = lid == self.num_layers - 1
 
         logger.info(f"[SiDP rank{self.dp_rank}] setup complete")
 
     def wait_prefetch(self, layer_id: int):
         """Called BEFORE the MLP GEMM of a non-local layer.
 
-        Eager mode only waits on this slot's RAW event; the copy was enqueued
-        ahead of time by the cycle pipeline. Graph-safe fallback issues this
-        layer's DMA inside the current capture scope using fork/copy/join, so
-        its dependency chain never crosses a graph boundary. The MLP then
-        reads the fixed slot via the rebound weight.data.
+        Cycle 0 is resident before the forward begins, so it has no in-forward
+        RAW edge. Later cycles wait only for their own slot's prefetch event.
+        The serial fallback issues this layer's DMA using fork/copy/join.
         """
         slot = self._layer_to_slot[layer_id]
         compute_stream = torch.cuda.current_stream()
 
-        if self.enable_eager_overlap:
+        if self.enable_cycle_overlap and self.k < self.dp_size:
+            if layer_id // self.dp_size == 0:
+                # The previous forward's tail (or setup for the first forward)
+                # established the cycle-0-resident invariant.
+                return
             # RAW: this layer alone waits for its copy. Other cycle copies stay
             # in flight on comm_stream while earlier layers compute.
             compute_stream.wait_event(self._prefetch_events[slot])
@@ -293,8 +294,8 @@ class SidpManager:
         compute_stream.wait_event(self._prefetch_events[slot])
 
     def record_compute_and_prefetch_next(self, layer_id: int):
-        """Record buffer consumption and advance the eager cycle window."""
-        if not self.enable_eager_overlap:
+        """Record buffer consumption and advance the cycle window."""
+        if not self.enable_cycle_overlap:
             return
 
         slot = self._layer_to_slot[layer_id]
@@ -302,24 +303,42 @@ class SidpManager:
 
         cycle = layer_id // self.dp_size
         if self._last_non_local_in_cycle.get(cycle) == layer_id:
-            # Reuse this cycle's slot only after all of its per-position
-            # consume events have been recorded. With depth=2, compute(c)
-            # releases the buffers used to prefetch c+2 while c+1 is resident.
-            self._enqueue_cycle(cycle + self._cycle_cache_depth)
+            next_cycle = cycle + self._cycle_cache_depth
+            if next_cycle < self._num_cycles:
+                # With depth=2, compute(c) releases the slot used to prefetch
+                # c+2 while c+1 is resident.
+                self._enqueue_cycle(next_cycle)
+            elif cycle == self._num_cycles - self._cycle_cache_depth:
+                # Gemma4 has six cycles. Once c4 releases slot group 0, refill
+                # it with the next forward's c0 while c5 computes.
+                self._enqueue_next_forward_cycle_zero()
 
-    def prefetch_first_layers(self):
-        """Prime the eager cycle window before entering layer 0.
+    def begin_forward(self):
+        """Start one eager or captured forward with cycle 0 already resident.
 
-        Cycle 0 is demand data; later resident cycles are lookahead. Since the
-        copies are queued on one comm stream, compute can begin as soon as its
-        first remote layer is ready while the rest of the window keeps filling.
+        The graph-start fork orders cycle 1 after the previous forward. No
+        cross-forward event is needed because forwards/graph launches are
+        serialized on the model stream and the previous forward ended with a
+        comm-stream join.
         """
-        if not self.enable_eager_overlap:
+        if not self.enable_cycle_overlap:
             return
 
         self._queued_cycles.clear()
-        for cycle in range(min(self._cycle_cache_depth, self._num_cycles)):
-            self._enqueue_cycle(cycle)
+        self._queued_cycles.add(0)  # resident from setup or previous forward
+        self._next_forward_cycle_zero_queued = False
+        self.comm_stream.wait_stream(torch.cuda.current_stream())
+        for cycle in range(1, min(self._cycle_cache_depth, self._num_cycles)):
+            self._enqueue_cycle(cycle, wait_for_consume=False)
+
+    def end_forward(self):
+        """Join the tail prefetch so the next forward starts with c0 resident."""
+        if self.enable_cycle_overlap:
+            torch.cuda.current_stream().wait_stream(self.comm_stream)
+
+    def prefetch_first_layers(self):
+        """Backward-compatible alias; forward-boundary hooks call begin_forward."""
+        self.begin_forward()
 
     def get_weight_buffer(self, layer_id: int, param_name: str) -> torch.Tensor:
         """Return the local rolling buffer holding the prefetched weight for this layer."""
@@ -330,12 +349,13 @@ class SidpManager:
     # Internal methods
     # ------------------------------------------------------------------
 
-    def _do_prefetch(self, layer_id: int):
+    def _do_prefetch(self, layer_id: int, wait_for_consume: bool = True):
         """Issue raw cudaMemcpyAsync on comm_stream for one layer's weights."""
         slot = self._layer_to_slot[layer_id]
 
-        # WAR: wait for previous compute that used this slot to finish
-        self.comm_stream.wait_event(self._consume_events[slot])
+        if wait_for_consume:
+            # WAR: wait for previous compute that used this slot to finish.
+            self.comm_stream.wait_event(self._consume_events[slot])
 
         for pname, peer_view in self.peer_views[layer_id].items():
             buf = self.buffers[slot][pname]
@@ -349,8 +369,8 @@ class SidpManager:
         # RAW: mark prefetch done for this slot
         self._prefetch_events[slot].record(self.comm_stream)
 
-    def _enqueue_cycle(self, cycle: int):
-        """Enqueue one cycle exactly once in the current eager forward."""
+    def _enqueue_cycle(self, cycle: int, wait_for_consume: bool = True):
+        """Enqueue one cycle exactly once in the current forward."""
         if cycle in self._queued_cycles:
             return
         layers = self._cycle_layers.get(cycle)
@@ -358,12 +378,46 @@ class SidpManager:
             return
         self._queued_cycles.add(cycle)
         for layer_id in layers:
+            self._do_prefetch(layer_id, wait_for_consume=wait_for_consume)
+
+    def _enqueue_next_forward_cycle_zero(self):
+        """Refill slot group 0 for the next forward while the tail computes."""
+        if self._next_forward_cycle_zero_queued:
+            return
+        self._next_forward_cycle_zero_queued = True
+        for layer_id in self._cycle_layers[0]:
             self._do_prefetch(layer_id)
+
+    def _initialize_cycle_zero(self):
+        """Materialize the first forward's cycle 0 during model initialization."""
+        compute_stream = torch.cuda.current_stream()
+        self.comm_stream.wait_stream(compute_stream)
+        for layer_id in self._cycle_layers[0]:
+            self._do_prefetch(layer_id, wait_for_consume=False)
+        compute_stream.wait_stream(self.comm_stream)
+        torch.cuda.synchronize()
 
     def _build_cycle_schedule(self):
         """Build compute-order cycle membership and stable slot identities."""
         self._num_cycles = (self.num_layers + self.dp_size - 1) // self.dp_size
         self._cycle_cache_depth = min(self.cache_cycles, self._num_cycles)
+        if self.enable_cycle_overlap and self.k < self.dp_size:
+            if self._cycle_cache_depth != 2:
+                raise NotImplementedError(
+                    "SiDP cross-forward cycle overlap currently requires "
+                    "cache_cycles=2"
+                )
+            if self._num_cycles % 2 != 0:
+                # TODO(SiDP): for an odd cycle count, slot group 0 is still
+                # consumed by the final cycle. The future fallback should refill
+                # next-forward c0 position-by-position as that final cycle
+                # computes. This intentionally uses compute order (and may
+                # incast) for only the tail cycle. Current Gemma4 has 6 cycles,
+                # so leave this branch explicit but unimplemented for now.
+                raise NotImplementedError(
+                    "SiDP cross-forward cycle overlap currently requires an even "
+                    "number of cycles; odd-cycle tail refill is reserved"
+                )
         # Slot identity always follows compute order. The fetch policy may be
         # peak-shifted independently without changing buffer ownership.
         self._remote_positions = remote_positions(
@@ -389,7 +443,7 @@ class SidpManager:
 
     def _alloc_buffers(self, layers, non_local_layers):
         """Allocate serial layer slots or the eager cycle cache."""
-        if self.enable_eager_overlap:
+        if self.enable_cycle_overlap:
             num_slots = self._cycle_cache_depth * len(self._remote_positions)
         else:
             num_slots = min(self.cache_cycles, len(non_local_layers))
@@ -412,7 +466,7 @@ class SidpManager:
             for pname, (shape, dtype) in param_shapes.items():
                 self.buffers[s][pname] = torch.empty(shape, dtype=dtype, device=device)
 
-        if self.enable_eager_overlap:
+        if self.enable_cycle_overlap:
             remote_count = len(self._remote_positions)
             for lid in non_local_layers:
                 cycle = lid // self.dp_size
