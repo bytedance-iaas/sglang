@@ -2452,7 +2452,10 @@ class Scheduler(
         return ret
 
     def get_num_allocatable_reqs(self, running_bs):
-        res = get_global_server_args().pp_max_micro_batch_size - running_bs
+        if self.ps.pp_size > 1:
+            res = get_global_server_args().pp_max_micro_batch_size - running_bs
+        else:
+            res = self.max_running_requests - running_bs
         res = min(res, self.req_to_token_pool.available_size())
         return res
 
