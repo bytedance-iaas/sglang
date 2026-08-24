@@ -50,9 +50,6 @@ elif is_hip():
     from sglang.kernels.ops.sampling.renorm_triton import (
         top_k_renorm_probs_triton as top_k_renorm_prob,
     )
-    from sglang.kernels.ops.sampling.renorm_triton import (
-        top_p_renorm_probs_triton as top_p_renorm_prob,
-    )
 
     _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
 else:
@@ -326,6 +323,21 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
     sliding_window = _cfg_get(
         text_config, "sliding_window", _cfg_get(config, "sliding_window")
     )
+
+    if sliding_window is None:
+        try:
+            import json
+            from pathlib import Path
+
+            model_path = _cfg_get(config, "_name_or_path")
+            if model_path:
+                config_path = Path(model_path) / "config.json"
+                if config_path.exists():
+                    raw_config = json.loads(config_path.read_text())
+                    sliding_window = raw_config.get("sliding_window")
+        except Exception:
+            sliding_window = None
+
     if sliding_window is None:
         raise ValueError(
             "DFLASH sliding_attention layers require config.sliding_window."
