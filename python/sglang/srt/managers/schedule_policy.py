@@ -459,6 +459,7 @@ class PrefillAdder:
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
+        enable_eic_cache: bool = False,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -484,8 +485,11 @@ class PrefillAdder:
         self.log_hit_tokens = 0
         self.reprocessed_log_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
+        self.log_hit_gpu_tokens = 0
+        self.log_hit_eic_tokens = 0
         self.log_input_tokens = 0
         self.reprocessed_log_input_tokens = 0
+        self.enable_eic_cache = enable_eic_cache
 
         if running_batch is not None:
             # Estimate the offset in the remaining token space
@@ -745,6 +749,7 @@ class PrefillAdder:
         max_new_tokens: int,
         retracted_stain: bool,
         mamba_gap_reserve: int = 0,
+        eic_prefix_len: int = 0,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
@@ -780,6 +785,8 @@ class PrefillAdder:
         # reprocessed_log_* is a subset of log_*; metrics_reporter subtracts it
         # when computing the first-attempt prefix cache hit rate.
         self.log_hit_tokens += prefix_len
+        self.log_hit_gpu_tokens += prefix_len - eic_prefix_len
+        self.log_hit_eic_tokens += eic_prefix_len
         self.log_input_tokens += extend_input_len
         if retracted_stain:
             self.reprocessed_log_hit_tokens += prefix_len
@@ -1087,7 +1094,13 @@ class PrefillAdder:
         total_tokens += self._mamba_gap_budget_for_req(req)
 
         # adjusting the input_tokens based on host_hit_length and page_size
-        real_input_tokens = cand_extend_input_len - req.host_hit_length
+        if self.enable_eic_cache:
+            # Load-back already folded into prefix_indices by the admission gate,
+            # so the candidate extend length is exactly the recompute; do not
+            # re-subtract the host hit.
+            real_input_tokens = cand_extend_input_len
+        else:
+            real_input_tokens = cand_extend_input_len - req.host_hit_length
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
 
@@ -1156,7 +1169,11 @@ class PrefillAdder:
             ):
                 return AddReqResult.OTHER
 
-            if req.needs_host_load_back():
+            eic_prefix_len = 0
+            if self.enable_eic_cache:
+                # Load-back already resolved by the async admission gate.
+                eic_prefix_len = req.eic_loaded_len
+            elif req.needs_host_load_back():
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         best_match_node=req.best_match_node,
@@ -1167,6 +1184,8 @@ class PrefillAdder:
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
+                req.last_matched_prefix_len = prefix_len
+                eic_prefix_len = len(new_indices)
 
             input_tokens = self.ceil_paged_tokens(
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
@@ -1209,6 +1228,7 @@ class PrefillAdder:
                     ),
                     req.retracted_stain,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                    eic_prefix_len=eic_prefix_len,
                 )
             else:
                 # Make sure at least one page is available

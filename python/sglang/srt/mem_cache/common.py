@@ -53,6 +53,7 @@ def free_swa_out_of_window_slots(
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     is_chunk_cache: bool = False,
+    release_cache_protected_prefix: bool = False,
 ) -> None:
     if req.kv is None:
         return
@@ -61,7 +62,12 @@ def free_swa_out_of_window_slots(
     assert (
         req.cache_protected_len % page_size == 0
     ), "cache_protected_len must be page aligned"
-    evict_floor = max(req.cache_protected_len, getattr(req, "swa_evict_floor", 0))
+    # ``cache_protected_len`` is the eviction floor for caches whose radix tree
+    # owns the prefix SWA. EIC has no SWA tree state, so it opts into releasing
+    # out-of-window prefix SWA and restores it from host storage on reuse.
+    evict_floor = getattr(req, "swa_evict_floor", 0)
+    if not release_cache_protected_prefix:
+        evict_floor = max(req.cache_protected_len, evict_floor)
     if page_size > 1 and evict_floor > req.cache_protected_len:
         evict_floor = -(-evict_floor // page_size) * page_size
     req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, evict_floor)
@@ -85,9 +91,16 @@ def free_swa_out_of_window_slots(
         new_swa_evicted_seqlen = (new_swa_evicted_seqlen // page_size) * page_size
 
     if new_swa_evicted_seqlen > req.kv.swa_evicted_seqlen:
-        free_slots = req_to_token_pool.req_to_token[
-            req.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
-        ]
+        lo, hi = req.kv.swa_evicted_seqlen, new_swa_evicted_seqlen
+        # EIC loads the prefix asynchronously: the loaded full indices land in
+        # req.prefix_indices (via _finalize_load_admit), NOT in req_to_token
+        # (which stays 0 for the loaded portion). Use prefix_indices so the
+        # out-of-window SWA is actually freed; req_to_token would map to 0 and
+        # be silently dropped by free_swa's >= page_size filter.
+        if release_cache_protected_prefix and hi <= len(req.prefix_indices):
+            free_slots = req.prefix_indices[lo:hi]
+        else:
+            free_slots = req_to_token_pool.req_to_token[req.req_pool_idx, lo:hi]
         token_to_kv_pool_allocator.free_swa(free_slots)
         maybe_evict_dsv4_state_on_swa(
             token_to_kv_pool_allocator, req_to_token_pool, req, new_swa_evicted_seqlen
@@ -97,7 +110,10 @@ def free_swa_out_of_window_slots(
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     if getattr(req, "skip_radix_cache_insert", False):
-        return
+        if getattr(req, "allow_radix_cache_insert_once", False):
+            req.allow_radix_cache_insert_once = False
+        else:
+            return
 
     tree_cache.cache_unfinished_req(req, **kwargs)
 
@@ -129,7 +145,17 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
             tree_cache.evict(EvictParams(num_tokens=num_tokens - available_size))
 
 
-def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+def release_kv_cache(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    is_insert: bool = True,
+    is_decode: bool = False,
+):
+    from sglang.srt.mem_cache.eic_hiradix_cache import EICHiRadixCache
+
+    if isinstance(tree_cache, EICHiRadixCache) and is_decode:
+        is_insert = is_insert and tree_cache.save_decode_cache
+
     # the two resources currently have the same lifecycle, thus simplify logic below
     assert (req.req_pool_idx is None) == (req.kv is None)
     # MambaRadixCache may alloc mamba state before alloc KV cache

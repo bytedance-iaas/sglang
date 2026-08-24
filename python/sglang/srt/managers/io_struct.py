@@ -2194,6 +2194,14 @@ class LazyDumpTensorsReqInput(BaseReq, kw_only=True):
     pass
 
 
+class EnableEICReqInput(BaseReq, kw_only=True):
+    pass
+
+
+class DisableEICReqInput(BaseReq, kw_only=True):
+    pass
+
+
 class LazyDumpTensorsReqOutput(BaseReq, kw_only=True):
     success: bool
 
@@ -2209,6 +2217,11 @@ class DumperControlReqOutput(BaseReq, kw_only=True):
     # JSON-native per-worker response dicts.
     response: List[Dict[str, Any]]
     error: str = ""
+
+
+class EICSwitchOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
 
 
 # The following request types are either defined in other files,
