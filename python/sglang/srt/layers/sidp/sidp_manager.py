@@ -14,6 +14,7 @@ import torch.distributed
 
 from sglang.srt.layers.sidp.config import SidpConfig
 from sglang.srt.layers.sidp.cuda_memcpy import SidpCudaMemcpy
+from sglang.srt.layers.sidp.graph_profiler import SidpGraphProfiler
 from sglang.srt.layers.sidp.scheduler import (
     is_local_layer,
     owner_of,
@@ -50,6 +51,7 @@ class SidpManager:
         self.num_layers = config.num_layers
         self.enable_cycle_overlap = config.enable_cycle_overlap
         self.enable_peak_shifting = config.enable_peak_shifting
+        self.enable_graph_profiling = config.enable_graph_profiling
 
         # D2: TCPStore is created lazily in setup() so that all ranks
         # have finished load_model() before any rank tries to connect.
@@ -84,6 +86,7 @@ class SidpManager:
         self._next_forward_cycle_zero_queued = False
         self._layers_ref: Dict[int, Any] = {}
         self._ipc_refs: List[torch.Tensor] = []
+        self._graph_profiler: SidpGraphProfiler | None = None
 
     def setup(self, model, model_runner=None):
         """Call after model weights are loaded. Exchanges IPC handles, releases
@@ -139,6 +142,22 @@ class SidpManager:
                 non_local_layers.append(lid)
         self._non_local_layers = non_local_layers
         self._build_cycle_schedule()
+        if self.enable_graph_profiling:
+            self._graph_profiler = SidpGraphProfiler(
+                dp_rank=self.dp_rank,
+                dp_size=self.dp_size,
+                num_cycles=self._num_cycles,
+                cycle_layers=self._cycle_layers,
+                sample_interval=self.config.profile_sample_interval,
+                warmup_replays=self.config.profile_warmup_replays,
+                output_dir=self.config.profile_output_dir,
+                peak_shifting=self.enable_peak_shifting,
+            )
+            logger.warning(
+                f"[SiDP rank{self.dp_rank}] CUDA Graph profiling enabled; "
+                "timing events and sampled synchronization perturb performance. "
+                f"Diagnostics will be written to {self._graph_profiler.path}"
+            )
         logger.info(
             f"[SiDP rank{self.dp_rank}] local={len(local_layers)}, "
             f"non_local={len(non_local_layers)}, "
@@ -273,7 +292,11 @@ class SidpManager:
                 return
             # RAW: this layer alone waits for its copy. Other cycle copies stay
             # in flight on comm_stream while earlier layers compute.
+            if self._graph_profiler is not None:
+                self._graph_profiler.record_wait_start(layer_id, compute_stream)
             compute_stream.wait_event(self._prefetch_events[slot])
+            if self._graph_profiler is not None:
+                self._graph_profiler.record_wait_end(layer_id, compute_stream)
             return
 
         # fork: comm_stream starts after compute_stream's current point
@@ -324,17 +347,55 @@ class SidpManager:
         if not self.enable_cycle_overlap:
             return
 
+        compute_stream = torch.cuda.current_stream()
+        if self._graph_profiler is not None:
+            self._graph_profiler.record_forward_start(compute_stream)
         self._queued_cycles.clear()
         self._queued_cycles.add(0)  # resident from setup or previous forward
         self._next_forward_cycle_zero_queued = False
-        self.comm_stream.wait_stream(torch.cuda.current_stream())
+        self.comm_stream.wait_stream(compute_stream)
         for cycle in range(1, min(self._cycle_cache_depth, self._num_cycles)):
             self._enqueue_cycle(cycle, wait_for_consume=False)
 
     def end_forward(self):
         """Join the tail prefetch so the next forward starts with c0 resident."""
         if self.enable_cycle_overlap:
-            torch.cuda.current_stream().wait_stream(self.comm_stream)
+            compute_stream = torch.cuda.current_stream()
+            if self._graph_profiler is not None:
+                self._graph_profiler.record_forward_compute_end(compute_stream)
+            compute_stream.wait_stream(self.comm_stream)
+            if self._graph_profiler is not None:
+                self._graph_profiler.record_forward_end(compute_stream)
+
+    def record_cycle_compute_start(self, layer_id: int):
+        """Mark the start of a full decoder cycle for diagnostic captures."""
+        if self._graph_profiler is None or layer_id % self.dp_size != 0:
+            return
+        self._graph_profiler.record_cycle_compute_start(
+            layer_id // self.dp_size, torch.cuda.current_stream()
+        )
+
+    def record_cycle_compute_end(self, layer_id: int):
+        """Mark the end of a full decoder cycle for diagnostic captures."""
+        is_cycle_end = (
+            layer_id % self.dp_size == self.dp_size - 1
+            or layer_id == self.num_layers - 1
+        )
+        if self._graph_profiler is None or not is_cycle_end:
+            return
+        self._graph_profiler.record_cycle_compute_end(
+            layer_id // self.dp_size, torch.cuda.current_stream()
+        )
+
+    def profile_after_cuda_graph_replay(
+        self, *, raw_batch_size: int, graph_batch_size: int
+    ):
+        """Collect one sampled decode replay when profiling is enabled."""
+        if self._graph_profiler is not None:
+            self._graph_profiler.collect_after_graph_replay(
+                raw_batch_size=raw_batch_size,
+                graph_batch_size=graph_batch_size,
+            )
 
     def prefetch_first_layers(self):
         """Backward-compatible alias; forward-boundary hooks call begin_forward."""
@@ -357,7 +418,14 @@ class SidpManager:
             # WAR: wait for previous compute that used this slot to finish.
             self.comm_stream.wait_event(self._consume_events[slot])
 
-        for pname, peer_view in self.peer_views[layer_id].items():
+        peer_params = self.peer_views[layer_id]
+        if self._graph_profiler is not None:
+            self._graph_profiler.record_copy_start(
+                layer_id,
+                sum(peer_view.nbytes for peer_view in peer_params.values()),
+                self.comm_stream,
+            )
+        for pname, peer_view in peer_params.items():
             buf = self.buffers[slot][pname]
             self.memcpy.async_copy(
                 buf.data_ptr(),
@@ -367,6 +435,8 @@ class SidpManager:
             )
 
         # RAW: mark prefetch done for this slot
+        if self._graph_profiler is not None:
+            self._graph_profiler.record_copy_end(layer_id, self.comm_stream)
         self._prefetch_events[slot].record(self.comm_stream)
 
     def _enqueue_cycle(self, cycle: int, wait_for_consume: bool = True):
@@ -377,23 +447,35 @@ class SidpManager:
         if not layers:
             return
         self._queued_cycles.add(cycle)
+        if self._graph_profiler is not None:
+            self._graph_profiler.record_cycle_comm_start(cycle, self.comm_stream)
         for layer_id in layers:
             self._do_prefetch(layer_id, wait_for_consume=wait_for_consume)
+        if self._graph_profiler is not None:
+            self._graph_profiler.record_cycle_comm_end(cycle, self.comm_stream)
 
     def _enqueue_next_forward_cycle_zero(self):
         """Refill slot group 0 for the next forward while the tail computes."""
         if self._next_forward_cycle_zero_queued:
             return
         self._next_forward_cycle_zero_queued = True
+        if self._graph_profiler is not None:
+            self._graph_profiler.record_cycle_comm_start(0, self.comm_stream)
         for layer_id in self._cycle_layers[0]:
             self._do_prefetch(layer_id)
+        if self._graph_profiler is not None:
+            self._graph_profiler.record_cycle_comm_end(0, self.comm_stream)
 
     def _initialize_cycle_zero(self):
         """Materialize the first forward's cycle 0 during model initialization."""
         compute_stream = torch.cuda.current_stream()
         self.comm_stream.wait_stream(compute_stream)
+        if self._graph_profiler is not None:
+            self._graph_profiler.record_cycle_comm_start(0, self.comm_stream)
         for layer_id in self._cycle_layers[0]:
             self._do_prefetch(layer_id, wait_for_consume=False)
+        if self._graph_profiler is not None:
+            self._graph_profiler.record_cycle_comm_end(0, self.comm_stream)
         compute_stream.wait_stream(self.comm_stream)
         torch.cuda.synchronize()
 

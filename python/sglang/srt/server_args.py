@@ -1105,6 +1105,28 @@ class ServerArgs:
         "permutation waves. Disabled by default for compute-order A/B comparison.",
         NS("parallel"),
     ] = False
+    sidp_enable_graph_profiling: A[
+        bool,
+        "Insert SiDP timing events into CUDA Graph and periodically emit sampled "
+        "cycle/copy/RAW-wait diagnostics. This perturbs performance and is only "
+        "for diagnosis, never final throughput measurement.",
+        NS("parallel"),
+    ] = False
+    sidp_profile_sample_interval: A[
+        int,
+        Arg(help="Collect one SiDP CUDA Graph timing sample every N decode replays."),
+        NS("parallel"),
+    ] = 20
+    sidp_profile_warmup_replays: A[
+        int,
+        Arg(help="Skip this many decode graph replays before SiDP timing samples."),
+        NS("parallel"),
+    ] = 20
+    sidp_profile_output_dir: A[
+        str,
+        Arg(help="Directory for per-rank SiDP CUDA Graph profile JSONL files."),
+        NS("parallel"),
+    ] = "/tmp/sidp_profile"
     sidp_rdzv_port: A[
         int,
         Arg(
@@ -6502,6 +6524,24 @@ class ServerArgs:
             f"sidp_rdzv_port ({self.sidp_rdzv_port}) must not conflict with "
             f"the HTTP server port ({self.port})"
         )
+        if self.sidp_enable_graph_profiling:
+            assert not self.disable_cuda_graph, (
+                "SiDP graph profiling requires CUDA Graph; remove "
+                "--disable-cuda-graph"
+            )
+            assert self.sidp_k < self.sidp_size, (
+                "SiDP graph profiling requires remote weight communication "
+                "(sidp_k < sidp_size)"
+            )
+            assert (
+                self.sidp_profile_sample_interval >= 1
+            ), "sidp_profile_sample_interval must be at least 1"
+            assert (
+                self.sidp_profile_warmup_replays >= 0
+            ), "sidp_profile_warmup_replays cannot be negative"
+            assert (
+                self.sidp_profile_output_dir
+            ), "sidp_profile_output_dir cannot be empty"
 
         # CUDA IPC cannot export allocations backed by expandable segments.
         for var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
@@ -6533,6 +6573,7 @@ class ServerArgs:
             f"SiDP enabled: sidp_size={self.sidp_size}, k={self.sidp_k}, "
             f"cache_cycles={self.sidp_cache_cycles}, "
             f"peak_shifting={self.sidp_enable_peak_shifting}, "
+            f"graph_profiling={self.sidp_enable_graph_profiling}, "
             f"rdzv_port={self.sidp_rdzv_port}"
         )
 

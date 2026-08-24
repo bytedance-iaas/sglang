@@ -1183,10 +1183,15 @@ class ModelRunner:
             num_layers=num_layers,
             enable_cycle_overlap=True,
             enable_peak_shifting=self.server_args.sidp_enable_peak_shifting,
+            enable_graph_profiling=self.server_args.sidp_enable_graph_profiling,
+            profile_sample_interval=self.server_args.sidp_profile_sample_interval,
+            profile_warmup_replays=self.server_args.sidp_profile_warmup_replays,
+            profile_output_dir=self.server_args.sidp_profile_output_dir,
         )
         manager = SidpManager(config)
         set_global_sidp_manager(manager)
         manager.setup(self.model, model_runner=self)
+        self.sidp_manager = manager
 
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(

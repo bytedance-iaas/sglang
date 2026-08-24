@@ -654,6 +654,8 @@ class Gemma4DecoderLayer(nn.Module):
     ]:
         if self._sidp_begin_forward:
             self._sidp_mgr.begin_forward()
+        if self._sidp_mgr is not None:
+            self._sidp_mgr.record_cycle_compute_start(self.layer_id)
 
         # Gemma4 residual pattern following JAX implementation:
         # 1. input_norm(x) -> attn -> post_attn_norm -> ADD residual
@@ -718,6 +720,8 @@ class Gemma4DecoderLayer(nn.Module):
                     norm2.variance_epsilon,
                     norm3.variance_epsilon,
                 )
+                if self._sidp_mgr is not None:
+                    self._sidp_mgr.record_cycle_compute_end(self.layer_id)
                 if self._sidp_end_forward:
                     self._sidp_mgr.end_forward()
                 return hidden_states, None
@@ -768,6 +772,8 @@ class Gemma4DecoderLayer(nn.Module):
                 hidden_states = hidden_states + per_layer_contribution
 
             hidden_states = hidden_states * self.layer_scalar
+        if self._sidp_mgr is not None:
+            self._sidp_mgr.record_cycle_compute_end(self.layer_id)
         if self._sidp_end_forward:
             self._sidp_mgr.end_forward()
         return hidden_states, None
