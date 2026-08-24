@@ -1099,6 +1099,12 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = 2
+    sidp_enable_peak_shifting: A[
+        bool,
+        "Enable SiDP peak-shifting: reorder each cycle's remote prefetches into "
+        "permutation waves. Disabled by default for compute-order A/B comparison.",
+        NS("parallel"),
+    ] = False
     sidp_rdzv_port: A[
         int,
         Arg(
@@ -6520,10 +6526,13 @@ class ServerArgs:
                     self.sidp_rdzv_port = candidate
                     break
 
-        # SiDP does NOT disable cuda graph — it works inside the graph
+        # SiDP does not force-disable CUDA Graph. Graph mode currently uses
+        # the serial graph-safe path; full cycle overlap is enabled in eager.
         logger.info(
             f"SiDP enabled: sidp_size={self.sidp_size}, k={self.sidp_k}, "
-            f"cache_cycles={self.sidp_cache_cycles}, rdzv_port={self.sidp_rdzv_port}"
+            f"cache_cycles={self.sidp_cache_cycles}, "
+            f"peak_shifting={self.sidp_enable_peak_shifting}, "
+            f"rdzv_port={self.sidp_rdzv_port}"
         )
 
     def _handle_data_parallelism(self):

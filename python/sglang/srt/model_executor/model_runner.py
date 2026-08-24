@@ -1171,6 +1171,15 @@ class ModelRunner:
                 num_layers = getattr(text_config, "num_hidden_layers", 0)
             else:
                 num_layers = 0
+        enable_eager_overlap = cuda_graph_fully_disabled()
+        enable_peak_shifting = (
+            self.server_args.sidp_enable_peak_shifting and enable_eager_overlap
+        )
+        if self.server_args.sidp_enable_peak_shifting and not enable_eager_overlap:
+            logger.warning(
+                "SiDP peak-shifting currently applies only when CUDA Graph is fully "
+                "disabled; graph-safe serial prefetch will keep compute order."
+            )
         config = SidpConfig(
             dp_size=self.server_args.sidp_size,
             dp_rank=dp_rank,
@@ -1181,6 +1190,8 @@ class ModelRunner:
             # (which may be 0.0.0.0 and is not a stable client destination).
             rdzv_host="127.0.0.1",
             num_layers=num_layers,
+            enable_eager_overlap=enable_eager_overlap,
+            enable_peak_shifting=enable_peak_shifting,
         )
         manager = SidpManager(config)
         set_global_sidp_manager(manager)

@@ -220,6 +220,14 @@ class TestSidpServerArgs(CustomTestCase):
         ):
             args._handle_sidp()
 
+    def test_peak_shifting_cli_flag(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        parsed = parser.parse_args(
+            ["--model-path", "dummy", "--sidp-enable-peak-shifting"]
+        )
+        self.assertTrue(parsed.sidp_enable_peak_shifting)
+
 
 class TestMultimodalFeatureTransport(CustomTestCase):
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
