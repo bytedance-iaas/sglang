@@ -1073,6 +1073,39 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = 1
+    sidp_size: A[
+        int,
+        Arg(
+            help="SiDP (Shared-weight Intra-node DP) group size. "
+            "When > 0, dense FFN weights are distributed across DP ranks "
+            "and prefetched via NVLink IPC. The current implementation is "
+            "experimental, Gemma4-only, and single-node. Must equal dp_size.",
+        ),
+        NS("parallel"),
+    ] = 0
+    sidp_k: A[
+        int,
+        Arg(
+            help="SiDP ownership knob: number of layers each rank holds locally. "
+            "k=1 is maximum sharing; k=dp_size disables sharing (pure DP fallback).",
+        ),
+        NS("parallel"),
+    ] = 1
+    sidp_cache_cycles: A[
+        int,
+        Arg(
+            help="SiDP rolling buffer depth (number of concurrent prefetch cycles). "
+            "Must be >= 2 for compute/communication overlap.",
+        ),
+        NS("parallel"),
+    ] = 2
+    sidp_rdzv_port: A[
+        int,
+        Arg(
+            help="SiDP TCPStore rendezvous port (auto-allocated if 0).",
+        ),
+        NS("parallel"),
+    ] = 0
     dcp_comm_backend: A[
         str,
         Arg(
@@ -3507,6 +3540,7 @@ class ServerArgs:
 
         # must run before _handle_cuda_graph_config and _handle_data_parallelism
         self._handle_dwdp()
+        self._handle_sidp()
 
         self._handle_cuda_graph_config()
 
@@ -6429,6 +6463,67 @@ class ServerArgs:
             f"dp_attention_local_control_broadcast=True, "
             f"enable_dp_lm_head=True, SCHEDULER_SKIP_ALL_GATHER=True, "
             f"disable_cuda_graph=True"
+        )
+
+    def _handle_sidp(self):
+        if self.sidp_size <= 0:
+            return
+
+        assert self.sidp_size >= 2, "SiDP requires sidp_size >= 2"
+        assert (
+            self.sidp_size == self.dp_size
+        ), f"sidp_size ({self.sidp_size}) must equal dp_size ({self.dp_size})"
+        assert (
+            1 <= self.sidp_k <= self.sidp_size
+        ), f"sidp_k ({self.sidp_k}) must be in [1, sidp_size ({self.sidp_size})]"
+        assert (
+            self.sidp_cache_cycles >= 2
+        ), f"sidp_cache_cycles ({self.sidp_cache_cycles}) must be >= 2"
+        assert self.tp_size == 1, "SiDP requires tp_size=1 (classic DP mode)"
+        assert self.dwdp_size <= 1, "SiDP and DWDP are mutually exclusive"
+        assert self.pp_size == 1, "SiDP requires pp_size=1"
+        assert self.nnodes == 1, "SiDP currently supports single-node execution only"
+        assert self.device == "cuda", "SiDP currently requires CUDA"
+        assert self.base_gpu_id == 0 and self.gpu_id_step == 1, (
+            "SiDP currently requires contiguous CUDA devices starting at GPU 0 "
+            "(base_gpu_id=0, gpu_id_step=1)"
+        )
+        assert (
+            0 <= self.sidp_rdzv_port <= 65535
+        ), f"sidp_rdzv_port ({self.sidp_rdzv_port}) must be in [0, 65535]"
+        assert self.sidp_rdzv_port == 0 or self.sidp_rdzv_port != self.port, (
+            f"sidp_rdzv_port ({self.sidp_rdzv_port}) must not conflict with "
+            f"the HTTP server port ({self.port})"
+        )
+
+        # CUDA IPC cannot export allocations backed by expandable segments.
+        for var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
+            for field in os.environ.get(var, "").split(","):
+                key, _, value = field.partition(":")
+                if (
+                    key.strip() == "expandable_segments"
+                    and value.strip().lower() == "true"
+                ):
+                    raise RuntimeError(
+                        f"SiDP is incompatible with {var}=...expandable_segments:True: "
+                        "CUDA IPC cannot export expandable-segment allocations. "
+                        "Disable expandable_segments before starting the server."
+                    )
+
+        # Allocate rendezvous port for SiDP TCPStore (D2)
+        if self.sidp_rdzv_port == 0:
+            while True:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.bind(("", 0))
+                    candidate = s.getsockname()[1]
+                if candidate != self.port:
+                    self.sidp_rdzv_port = candidate
+                    break
+
+        # SiDP does NOT disable cuda graph — it works inside the graph
+        logger.info(
+            f"SiDP enabled: sidp_size={self.sidp_size}, k={self.sidp_k}, "
+            f"cache_cycles={self.sidp_cache_cycles}, rdzv_port={self.sidp_rdzv_port}"
         )
 
     def _handle_data_parallelism(self):

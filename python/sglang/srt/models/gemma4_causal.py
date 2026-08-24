@@ -527,6 +527,10 @@ class Gemma4DecoderLayer(nn.Module):
 
         self.layer_id = layer_id
 
+        # SiDP hook state (set by SidpManager.setup)
+        self._sidp_bound = False
+        self._sidp_mgr = None
+
         # Gemma 4 uses different head dimensions for sliding vs full attention
         layer_type = config.layer_types[layer_id]
         self.is_full_attention = layer_type == "full_attention"
@@ -677,7 +681,11 @@ class Gemma4DecoderLayer(nn.Module):
             moe_input = residual
 
             # Dense MLP branch
+            if self._sidp_bound:
+                self._sidp_mgr.wait_prefetch(self.layer_id)
             hidden_states_1 = self.mlp(hidden_states)
+            if self._sidp_bound:
+                self._sidp_mgr.record_compute_and_prefetch_next(self.layer_id)
 
             # MoE branch: router sees residual (= post_attn_out + old_residual)
             router_logits = self.router(moe_input)
@@ -717,7 +725,11 @@ class Gemma4DecoderLayer(nn.Module):
             hidden_states, residual = self.pre_feedforward_layernorm(
                 hidden_states, residual
             )
+            if self._sidp_bound:
+                self._sidp_mgr.wait_prefetch(self.layer_id)
             hidden_states = self.mlp(hidden_states)
+            if self._sidp_bound:
+                self._sidp_mgr.record_compute_and_prefetch_next(self.layer_id)
 
         if (
             not self.has_ple

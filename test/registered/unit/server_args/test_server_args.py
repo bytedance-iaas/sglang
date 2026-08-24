@@ -130,6 +130,97 @@ class TestMmEncoderDataParallelLogging(CustomTestCase):
         self.assertIn("high-resolution or multi-image", logs.output[0])
 
 
+class TestSidpServerArgs(CustomTestCase):
+    def _make_sidp_args(self, **overrides):
+        args = ServerArgs(model_path="dummy")
+        values = dict(
+            sidp_size=8,
+            dp_size=8,
+            sidp_k=1,
+            sidp_cache_cycles=2,
+            sidp_rdzv_port=29500,
+            tp_size=1,
+            dwdp_size=1,
+            pp_size=1,
+            nnodes=1,
+            device="cuda",
+            base_gpu_id=0,
+            gpu_id_step=1,
+        )
+        values.update(overrides)
+        for key, value in values.items():
+            setattr(args, key, value)
+        return args
+
+    def test_valid_sidp_topology(self):
+        args = self._make_sidp_args()
+        with patch.dict(
+            os.environ,
+            {"PYTORCH_CUDA_ALLOC_CONF": "", "PYTORCH_ALLOC_CONF": ""},
+        ):
+            args._handle_sidp()
+        self.assertEqual(args.sidp_rdzv_port, 29500)
+
+    def test_sidp_auto_allocates_rendezvous_port(self):
+        args = self._make_sidp_args(sidp_rdzv_port=0)
+        with patch.dict(
+            os.environ,
+            {"PYTORCH_CUDA_ALLOC_CONF": "", "PYTORCH_ALLOC_CONF": ""},
+        ):
+            args._handle_sidp()
+        self.assertGreater(args.sidp_rdzv_port, 0)
+        self.assertLessEqual(args.sidp_rdzv_port, 65535)
+
+    def test_invalid_sidp_parameters_and_topologies(self):
+        cases = [
+            ({"sidp_size": 1, "dp_size": 1}, "sidp_size >= 2"),
+            ({"dp_size": 4}, "must equal dp_size"),
+            ({"sidp_k": 0}, "sidp_k.*must be in"),
+            ({"sidp_k": 9}, "sidp_k.*must be in"),
+            ({"sidp_cache_cycles": 1}, "sidp_cache_cycles.*must be >= 2"),
+            ({"tp_size": 2}, "tp_size=1"),
+            ({"dwdp_size": 2}, "mutually exclusive"),
+            ({"pp_size": 2}, "pp_size=1"),
+            ({"nnodes": 2}, "single-node"),
+            ({"device": "cpu"}, "requires CUDA"),
+            ({"base_gpu_id": 1}, "contiguous CUDA devices"),
+            ({"gpu_id_step": 2}, "contiguous CUDA devices"),
+            ({"sidp_rdzv_port": -1}, "must be in"),
+            ({"sidp_rdzv_port": 65536}, "must be in"),
+            ({"sidp_rdzv_port": 30000}, "must not conflict"),
+        ]
+        for overrides, message in cases:
+            with self.subTest(overrides=overrides):
+                args = self._make_sidp_args(**overrides)
+                with (
+                    patch.dict(
+                        os.environ,
+                        {
+                            "PYTORCH_CUDA_ALLOC_CONF": "",
+                            "PYTORCH_ALLOC_CONF": "",
+                        },
+                    ),
+                    self.assertRaisesRegex(AssertionError, message),
+                ):
+                    args._handle_sidp()
+
+    def test_expandable_segments_is_rejected(self):
+        args = self._make_sidp_args()
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "PYTORCH_CUDA_ALLOC_CONF": (
+                        "garbage_collection_threshold:0.8,expandable_segments:True"
+                    ),
+                    "PYTORCH_ALLOC_CONF": "",
+                },
+            ),
+            self.assertRaisesRegex(RuntimeError, "expandable_segments:True"),
+        ):
+            args._handle_sidp()
+
+
 class TestMultimodalFeatureTransport(CustomTestCase):
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
     def test_cuda_ipc_is_explicit_and_bounded(self, _mock_is_cuda):

@@ -604,6 +604,7 @@ class ModelRunner:
         )
 
         self.maybe_init_dwdp()
+        self.maybe_init_sidp()
 
         # Must run before backend/graph init so no draft graph records a
         # routed-experts capture-write kernel.
@@ -1149,6 +1150,42 @@ class ModelRunner:
         set_global_dwdp_manager(manager)
         manager.setup(self.model)
 
+    def maybe_init_sidp(self):
+        if self.is_draft_worker:
+            return
+        if getattr(self.server_args, "sidp_size", 0) <= 0:
+            return
+
+        from sglang.srt.layers.sidp import (
+            SidpConfig,
+            SidpManager,
+            set_global_sidp_manager,
+        )
+
+        dp_rank = self.ps.dp_rank if self.ps.dp_rank is not None else 0
+        hf_config = self.model_config.hf_config
+        num_layers = getattr(hf_config, "num_hidden_layers", None)
+        if num_layers is None:
+            text_config = getattr(hf_config, "text_config", None)
+            if text_config is not None:
+                num_layers = getattr(text_config, "num_hidden_layers", 0)
+            else:
+                num_layers = 0
+        config = SidpConfig(
+            dp_size=self.server_args.sidp_size,
+            dp_rank=dp_rank,
+            k=self.server_args.sidp_k,
+            cache_cycles=self.server_args.sidp_cache_cycles,
+            rdzv_port=self.server_args.sidp_rdzv_port,
+            # SiDP is currently single-node; do not reuse the HTTP bind host
+            # (which may be 0.0.0.0 and is not a stable client destination).
+            rdzv_host="127.0.0.1",
+            num_layers=num_layers,
+        )
+        manager = SidpManager(config)
+        set_global_sidp_manager(manager)
+        manager.setup(self.model, model_runner=self)
+
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(
             base_model=self.model,
@@ -1577,6 +1614,12 @@ class ModelRunner:
             dwdp_mgr = get_global_dwdp_manager()
             if dwdp_mgr is not None:
                 dwdp_mgr.prefetch_first_layers()
+
+            from sglang.srt.layers.sidp import get_global_sidp_manager
+
+            sidp_mgr = get_global_sidp_manager()
+            if sidp_mgr is not None:
+                sidp_mgr.prefetch_first_layers()
 
             if forward_batch.forward_mode.is_split_prefill():
                 # Layer-split mode; stays on ModelRunner, not the eager runner.
