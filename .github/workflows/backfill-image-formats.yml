@@ -132,14 +132,39 @@ jobs:
 
           generate_tag() {
             local source_tag="$1"
+            local source_ref="$2"
             local version
             version="$(echo "${source_tag}" | sed -n 's/^v\([0-9][0-9.]*\)\..*/\1/p')"
             if [ -z "${version}" ]; then
-              echo "  ERROR: cannot extract version from tag: ${source_tag}"
-              echo "  Expected format: v<version>.<rest>, e.g. v0.5.16.iaas.202607280000-kimi-k3-cu130"
-              return 1
+              echo "  Version is not present in tag '${source_tag}'; inspecting the image..." >&2
+              if ! docker pull "${source_ref}" >&2; then
+                echo "  ERROR: failed to pull source image for version detection: ${source_ref}" >&2
+                return 1
+              fi
+
+              local detected_version=""
+              local python_cmd
+              for python_cmd in python3 python; do
+                if detected_version="$(
+                  docker run --rm --entrypoint "${python_cmd}" "${source_ref}" \
+                    -c 'import importlib.metadata as m; print(m.version("sglang"))' \
+                    2>/dev/null
+                )" && [ -n "${detected_version}" ]; then
+                  echo "  Detected installed sglang version with ${python_cmd}: ${detected_version}" >&2
+                  break
+                fi
+                detected_version=""
+              done
+
+              version="$(echo "${detected_version}" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+              if [ -z "${version}" ]; then
+                echo "  ERROR: the tag has no version and the container does not expose an installed sglang package version" >&2
+                echo "  Source image: ${source_ref}" >&2
+                echo "  Tried: python3/python + importlib.metadata.version(\"sglang\")" >&2
+                return 1
+              fi
             fi
-            echo "  Extracted version: ${version}"
+            echo "  Using sglang version: ${version}" >&2
 
             local timestamp="$(TZ=Asia/Shanghai date +'%Y%m%d%H%M')"
             local new_tag
@@ -148,13 +173,13 @@ jobs:
               manual)  new_tag="v${version}.iaas.dev.${timestamp}" ;;
               version)
                 if [ -z "${AUTO_RENAME_TAG_VALUE}" ]; then
-                  echo "  ERROR: auto_rename_tag_value is required for version mode"
+                  echo "  ERROR: auto_rename_tag_value is required for version mode" >&2
                   return 1
                 fi
                 new_tag="v${version}.byted.${AUTO_RENAME_TAG_VALUE}.${timestamp}"
                 ;;
               *)
-                echo "  ERROR: unknown auto_rename_mode: ${AUTO_RENAME_MODE}"
+                echo "  ERROR: unknown auto_rename_mode: ${AUTO_RENAME_MODE}" >&2
                 return 1
                 ;;
             esac
@@ -180,7 +205,7 @@ jobs:
 
             if [ "${AUTO_RENAME}" = "true" ]; then
               local new_tag
-              new_tag="$(generate_tag "${source_tag}")" || return 1
+              new_tag="$(generate_tag "${source_tag}" "${source_ref}")" || return 1
               local target_ref="${source_registry_ns}:${new_tag}"
               echo "  Generated target: ${target_ref}"
 
