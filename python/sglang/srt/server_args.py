@@ -1094,8 +1094,8 @@ class ServerArgs:
     sidp_cache_cycles: A[
         int,
         Arg(
-            help="SiDP rolling buffer depth (number of concurrent prefetch cycles). "
-            "Must be >= 2 for compute/communication overlap.",
+            help="SiDP rolling buffer depth. The current cross-forward cycle "
+            "pipeline requires exactly 2 cycles.",
         ),
         NS("parallel"),
     ] = 2
@@ -1105,6 +1105,30 @@ class ServerArgs:
         "permutation waves. Disabled by default for compute-order A/B comparison.",
         NS("parallel"),
     ] = False
+    sidp_enable_graph_profiling: A[
+        bool,
+        "Insert SiDP timing events into CUDA Graph and periodically emit sampled "
+        "cycle diagnostics. With sidp_k < sidp_size this also records copy and "
+        "RAW-wait timing; with sidp_k == sidp_size it provides a fully-resident "
+        "compute reference. This perturbs performance and is only for diagnosis, "
+        "never final throughput measurement.",
+        NS("parallel"),
+    ] = False
+    sidp_profile_sample_interval: A[
+        int,
+        Arg(help="Collect one SiDP CUDA Graph timing sample every N decode replays."),
+        NS("parallel"),
+    ] = 20
+    sidp_profile_warmup_replays: A[
+        int,
+        Arg(help="Skip this many decode graph replays before SiDP timing samples."),
+        NS("parallel"),
+    ] = 20
+    sidp_profile_output_dir: A[
+        str,
+        Arg(help="Directory for per-rank SiDP CUDA Graph profile JSONL files."),
+        NS("parallel"),
+    ] = "/tmp/sidp_profile"
     sidp_rdzv_port: A[
         int,
         Arg(
@@ -6482,9 +6506,10 @@ class ServerArgs:
         assert (
             1 <= self.sidp_k <= self.sidp_size
         ), f"sidp_k ({self.sidp_k}) must be in [1, sidp_size ({self.sidp_size})]"
-        assert (
-            self.sidp_cache_cycles >= 2
-        ), f"sidp_cache_cycles ({self.sidp_cache_cycles}) must be >= 2"
+        assert self.sidp_cache_cycles == 2, (
+            f"sidp_cache_cycles ({self.sidp_cache_cycles}) must be 2 for the "
+            "current cross-forward cycle pipeline"
+        )
         assert self.tp_size == 1, "SiDP requires tp_size=1 (classic DP mode)"
         assert self.dwdp_size <= 1, "SiDP and DWDP are mutually exclusive"
         assert self.pp_size == 1, "SiDP requires pp_size=1"
@@ -6501,6 +6526,20 @@ class ServerArgs:
             f"sidp_rdzv_port ({self.sidp_rdzv_port}) must not conflict with "
             f"the HTTP server port ({self.port})"
         )
+        if self.sidp_enable_graph_profiling:
+            assert not self.disable_cuda_graph, (
+                "SiDP graph profiling requires CUDA Graph; remove "
+                "--disable-cuda-graph"
+            )
+            assert (
+                self.sidp_profile_sample_interval >= 1
+            ), "sidp_profile_sample_interval must be at least 1"
+            assert (
+                self.sidp_profile_warmup_replays >= 0
+            ), "sidp_profile_warmup_replays cannot be negative"
+            assert (
+                self.sidp_profile_output_dir
+            ), "sidp_profile_output_dir cannot be empty"
 
         # CUDA IPC cannot export allocations backed by expandable segments.
         for var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
@@ -6526,12 +6565,13 @@ class ServerArgs:
                     self.sidp_rdzv_port = candidate
                     break
 
-        # SiDP does not force-disable CUDA Graph. Graph mode currently uses
-        # the serial graph-safe path; full cycle overlap is enabled in eager.
+        # SiDP does not force-disable CUDA Graph. Eager and captured forwards
+        # use the same cross-forward cycle pipeline.
         logger.info(
             f"SiDP enabled: sidp_size={self.sidp_size}, k={self.sidp_k}, "
             f"cache_cycles={self.sidp_cache_cycles}, "
             f"peak_shifting={self.sidp_enable_peak_shifting}, "
+            f"graph_profiling={self.sidp_enable_graph_profiling}, "
             f"rdzv_port={self.sidp_rdzv_port}"
         )
 
