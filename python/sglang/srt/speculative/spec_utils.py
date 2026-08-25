@@ -1024,9 +1024,7 @@ def commit_mamba_states_after_verify(
 
 
 def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
-    """eagle/ngram share a stateless free function; dflash keeps stateful
-    prep on its draft input -- the dispatcher routes.
-    """
+    """Run common spec-v2 bookkeeping, then dispatch algorithm-specific prep."""
     server_args = get_server_args()
     if server_args.enable_mamba_extra_buffer_lazy():
         # Scheduler phase (outside forward isolation).
@@ -1034,6 +1032,11 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
             get_exec().mamba.mamba_track_interval,
             server_args.max_speculative_num_draft_tokens,
         )
+
+    batch.maybe_evict_swa()
+    for req in batch.reqs:
+        req.decode_batch_idx += 1
+
     if batch.spec_algorithm.is_dflash_family():
         batch.spec_info.prepare_for_decode(batch)
     else:

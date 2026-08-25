@@ -1841,7 +1841,8 @@ def release_req(
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
-) -> None:
+    abort_on_unsupported_backup: bool = False,
+) -> bool:
     if hisparse_coordinator is not None and not req.finished():
         hisparse_coordinator.retract_req(req)
 
@@ -1849,8 +1850,20 @@ def release_req(
     # restored later without recompute (see resume_retracted_reqs/load_kv_cache).
     # Callers that will recompute the KV instead (PD true-retraction rebootstrap)
     # pass offload_kv=False to skip the wasteful device->host copy.
+    backup_succeeded = True
     if server_args.disaggregation_mode == "decode" and offload_kv:
-        req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
+        try:
+            req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
+        except NotImplementedError:
+            if not abort_on_unsupported_backup:
+                raise
+            backup_succeeded = False
+            req.kv_cache_cpu = None
+            logger.error(
+                "CPU-tensor retraction backup is unsupported for request %s; "
+                "aborting the request instead of crashing the scheduler.",
+                req.rid,
+            )
     # TODO (csy): for preempted requests, we may want to insert into the tree
     release_kv_cache(req, tree_cache, is_insert=False)
     # NOTE(lsyin): we should use the newly evictable memory instantly.
@@ -1858,6 +1871,7 @@ def release_req(
     evict_from_tree_cache(tree_cache, num_tokens)
 
     req.reset_for_retract()
+    return backup_succeeded
 
 
 def retract_all(
@@ -2729,6 +2743,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         whether the next decode step fits in the KV pool."""
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
         evict_from_tree_cache(self.tree_cache, num_tokens)
+        if self.token_to_kv_pool_allocator.available_size() >= num_tokens:
+            return True
+
+        # SWA eviction is normally done while preparing the next decode batch.
+        # When SWA is the first limiting pool, the scheduler can reach this OOM
+        # check before prepare_for_decode() releases out-of-window SWA pages.
+        if (
+            self.forward_mode is not None
+            and self.forward_mode.is_decode()
+            and self.tree_cache.supports_swa()
+        ):
+            self.maybe_evict_swa(force=True)
+            evict_from_tree_cache(self.tree_cache, num_tokens)
+
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
     def retract_decode(
@@ -2738,6 +2766,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         sorted_indices = self._get_decode_retraction_order(self.reqs, server_args)
 
         retracted_reqs = []
+        reqs_to_abort: List[Req] = []
         first_iter = True
         while first_iter or (
             not self.check_decode_mem(selected_indices=sorted_indices)
@@ -2749,11 +2778,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             first_iter = False
             idx = sorted_indices.pop()
             req = self.reqs[idx]
-            retracted_reqs.append(req)
             # release memory and don't insert into the tree because we need the space instantly
-            self.release_req(idx, len(sorted_indices), server_args)
+            if self.release_req(
+                idx,
+                len(sorted_indices),
+                server_args,
+                abort_on_unsupported_backup=True,
+            ):
+                retracted_reqs.append(req)
+            else:
+                req.to_finish = FINISH_ABORT(
+                    "Retraction KV backup is unsupported. Aborting the request.",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                reqs_to_abort.append(req)
+                logger.warning(
+                    "retract_decode: aborted request %s because KV backup is "
+                    "unsupported",
+                    req.rid,
+                )
 
-        reqs_to_abort: List[Req] = []
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
         ):
@@ -2767,7 +2811,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
             reqs_to_abort.append(last_req)
-            self.release_req(last_idx, 0, server_args)
+            self.release_req(last_idx, 0, server_args, offload_kv=False)
             logger.warning(
                 "retract_decode: aborted last request %s due to OOM", last_req.rid
             )
@@ -2822,8 +2866,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         return sorted_indices
 
-    def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
-        release_req(
+    def release_req(
+        self,
+        idx: int,
+        remaing_req_count: int,
+        server_args: ServerArgs,
+        offload_kv: bool = True,
+        abort_on_unsupported_backup: bool = False,
+    ) -> bool:
+        return release_req(
             req=self.reqs[idx],
             remaing_req_count=remaing_req_count,
             server_args=server_args,
@@ -2831,6 +2882,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
+            offload_kv=offload_kv,
+            abort_on_unsupported_backup=abort_on_unsupported_backup,
         )
 
     def prepare_encoder_info_decode(self):
@@ -3204,7 +3257,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_num_tokens=self.extend_num_tokens,
         )
 
-    def maybe_evict_swa(self):
+    def maybe_evict_swa(self, force: bool = False):
         if self.tree_cache.supports_swa():
             sliding_window_size = self.tree_cache.sliding_window_size
             server_args = get_server_args()
@@ -3221,7 +3274,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # We set evict_swa condition here with two reasons:
                     # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.
                     # 2. Evict swa every eviction_interval iterations to reduce the overhead.
-                    if swa_maintenance_step and req.decode_batch_idx >= 1:
+                    if req.decode_batch_idx >= 1 and (force or swa_maintenance_step):
                         self._evict_swa(req, req.seqlen - 1)
 
                     # DSV4-NPU only (no-op elsewhere): the small paged compress-state

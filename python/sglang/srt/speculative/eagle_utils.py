@@ -877,8 +877,6 @@ def eagle_sample(
 
 
 def eagle_prepare_for_decode(batch: ScheduleBatch):
-    batch.maybe_evict_swa()
-
     bs = batch.batch_size()
 
     # Accumulate penalty
@@ -909,8 +907,6 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
         cur_kv_lens[i] = cur
         nxt_kv_lens[i] = nxt
         num_needed_tokens += nxt - cur
-        r.decode_batch_idx += 1
-
     cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
     nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
 
