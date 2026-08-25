@@ -354,6 +354,86 @@ def test_scheduler_admits_draft_with_target_device_slot_owner():
     assert calls == [("target", req, None), ("draft", req, target)]
 
 
+@pytest.mark.parametrize(
+    "method_name", ["admit_request_into_staging", "abort_staging_request"]
+)
+def test_draft_mirror_cannot_own_staging_lifecycle(method_name):
+    target = object()
+    draft = SimpleNamespace(_device_slot_owner=target)
+
+    with pytest.raises(RuntimeError, match="canonical HiSparse slot owner"):
+        getattr(HiSparseCoordinator, method_name)(draft, SimpleNamespace())
+
+
+def test_draft_finish_before_target_preserves_canonical_mapping():
+    """Mirror cleanup must not make physical ownership order-dependent."""
+    mapping = torch.zeros(8, dtype=torch.int64)
+    mapping[torch.tensor([1, 2])] = torch.tensor([64, 65])
+    release_calls = []
+
+    def release_hisparse_ownership(
+        *, mapping_indices, extra_owned_coordinates, clear_extra_owner
+    ):
+        release_calls.append(extra_owned_coordinates.clone())
+        mapping[mapping_indices] = 0
+        clear_extra_owner()
+
+    allocator = SimpleNamespace(
+        release_hisparse_ownership=release_hisparse_ownership
+    )
+    mem_pool_device = SimpleNamespace(
+        full_to_hisparse_device_index_mapping=mapping,
+        translate_loc_from_full_to_compressed=lambda locs: locs,
+    )
+    req_to_token = SimpleNamespace(
+        req_to_token=torch.tensor([[1, 2]], dtype=torch.int64)
+    )
+
+    def coordinator(owner=None):
+        item = SimpleNamespace(
+            decode_producer_stream=None,
+            wait_for_pending_backup=lambda: None,
+            clear_pending_draft_extend_backup=lambda: None,
+            _is_resident=lambda req_idx: False,
+            is_dsv4_hisparse=True,
+            req_device_buffer_size=torch.tensor([2], dtype=torch.int64),
+            req_to_token_pool=req_to_token,
+            mem_pool_device=mem_pool_device,
+            req_device_buffer_tokens=torch.zeros((1, 1, 2), dtype=torch.int32),
+            req_device_buffer_token_locs=torch.zeros(
+                (1, 1, 2), dtype=torch.int32
+            ),
+            req_to_device_buffer=torch.tensor([[64, 65]], dtype=torch.int64),
+            token_to_kv_pool_allocator=allocator,
+            req_to_host_pool=torch.full((1, 2), -1, dtype=torch.int64),
+            req_to_host_pool_allocated_len=torch.zeros(1, dtype=torch.int64),
+            _debug_validate_host_request_slots=lambda *args, **kwargs: None,
+            _host_slot_owner=None,
+            lru_slots=torch.zeros((1, 1, 2), dtype=torch.int16),
+            _lru_init=torch.zeros(2, dtype=torch.int16),
+            _skip_first_backup=[False],
+            active_hisparse_reqs={},
+            _clear_residency_state=lambda req_idx: None,
+        )
+        item._device_slot_owner = item if owner is None else owner
+        item._host_slot_owner = item._device_slot_owner
+        return item
+
+    target = coordinator()
+    draft = coordinator(owner=target)
+    req = SimpleNamespace(
+        rid="req-finish-order", req_pool_idx=0, kv=SimpleNamespace(kv_allocated_len=2)
+    )
+
+    HiSparseCoordinator.request_finished(draft, req)
+    assert mapping[[1, 2]].tolist() == [64, 65]
+    assert release_calls == []
+
+    HiSparseCoordinator.request_finished(target, req)
+    assert mapping[[1, 2]].tolist() == [0, 0]
+    assert len(release_calls) == 1
+
+
 def test_shared_hisparse_allocator_capacity_counts_one_mirrored_buffer():
     allocator = SimpleNamespace(available_size=lambda: 24)
     shared_pool_allocator = SimpleNamespace(hisparse_attn_allocator=allocator)
