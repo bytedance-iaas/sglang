@@ -33,6 +33,31 @@ class GetVolcengineImageTagTest(unittest.TestCase):
             "v0.5.17.iaas.nightly.202608121200",
         )
 
+    def test_manual_tag_with_injected_value(self) -> None:
+        self.assertEqual(
+            build_tag(
+                mode="manual",
+                version="0.5.17",
+                timestamp="202608121200",
+                tag_value="day0_deepseek_v4_official",
+            ),
+            "day0_deepseek_v4_official",
+        )
+
+    def test_manual_tag_with_injected_value_and_suffixes(self) -> None:
+        self.assertEqual(
+            build_tag(
+                mode="manual",
+                version="0.5.17",
+                timestamp="202608121200",
+                tag_value="day0_deepseek_v4_official",
+                variant_suffix="w4a8",
+                cuda_suffix="cu130",
+                format_suffix="nydus",
+            ),
+            "day0_deepseek_v4_official-w4a8-cu130-nydus",
+        )
+
     def test_format_suffix_trails_cuda_suffix(self) -> None:
         self.assertEqual(
             build_tag(
@@ -88,7 +113,15 @@ class GetVolcengineImageTagTest(unittest.TestCase):
             build_tag(mode="version", version="0.5.17", timestamp="202608121200")
 
     def test_validate_suffix_accepts_safe_values(self) -> None:
-        for value in ("zstd", "nydus", "cu130", "w4a8", "deepseek-v4", ""):
+        for value in (
+            "zstd",
+            "nydus",
+            "cu130",
+            "w4a8",
+            "deepseek-v4",
+            "day0_deepseek_v4_official",
+            "",
+        ):
             validate_suffix("format-suffix", value)
 
     def test_validate_suffix_rejects_unsafe_values(self) -> None:
