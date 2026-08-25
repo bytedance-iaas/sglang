@@ -2101,11 +2101,14 @@ class HiSparseCoordinator:
     def supports_hisparse_draft_slots(self) -> bool:
         return not self.is_dsv4_hisparse
 
-    def _ensure_padded_buffer(self, req_pool_indices: torch.Tensor) -> None:
-        """Ensure each request owns a fixed hot buffer plus one extra draft page."""
+    def _compute_padded_grow(self, req_indices_list: List[int]):
+        """Return the per-request grow plan and total device-pool demand needed
+        to bring every request up to ``padded_buffer_size`` (hot buffer + draft
+        page).  Resident requests keep a virtual hot buffer and only need one
+        extra graph-stable speculative page."""
         grow_reqs = []
         total_grow = 0
-        for req_idx in req_pool_indices.cpu().tolist():
+        for req_idx in req_indices_list:
             current_cap = int(self.req_device_buffer_size[req_idx])
             if current_cap >= self.padded_buffer_size:
                 continue
@@ -2120,16 +2123,41 @@ class HiSparseCoordinator:
             )
             grow_reqs.append((req_idx, current_cap, resident, grow_size))
             total_grow += grow_size
+        return grow_reqs, total_grow
+
+    def _ensure_padded_buffer(self, req_pool_indices: torch.Tensor) -> None:
+        """Ensure each request owns a fixed hot buffer plus one extra draft page."""
+        req_indices_list = req_pool_indices.cpu().tolist()
+        grow_reqs, total_grow = self._compute_padded_grow(req_indices_list)
 
         if total_grow == 0:
             return
-        all_new = self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(
-            total_grow
-        )
+        allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+        all_new = allocator.alloc(total_grow)
         if all_new is None:
-            raise RuntimeError(
-                f"HiSparse: failed to grow buffers for draft slots (need {total_grow})"
-            )
+            # schedulable_hisparse_available() -- which gates PD admission
+            # (hisparse_direct_admission_capacity) and KV-full decode retraction
+            # (HiSparse allocator.available_size()) -- counts reclaimable resident
+            # device pages as available.  The other two device-pool allocation
+            # sites (admit_request_direct, the dynamic-decode grow path) honor that
+            # promise by reclaiming before allocating; this spec-verify grow path
+            # historically called alloc() raw and raised into the scheduler event
+            # loop on None, SIGQUIT-ing PID 1 under KV-retraction pressure at
+            # decode batch > ~16.  Reclaim first, then retry.  Demotion can change
+            # the residency/current_cap of requests in this batch, so recompute the
+            # grow plan against the post-demotion state before writing slots.
+            self.demote_until_hisparse_available(total_grow)
+            grow_reqs, total_grow = self._compute_padded_grow(req_indices_list)
+            if total_grow == 0:
+                return
+            all_new = allocator.alloc(total_grow)
+            if all_new is None:
+                raise RuntimeError(
+                    "HiSparse: failed to grow buffers for draft slots even after "
+                    f"reclaiming resident device pages (need {total_grow}, "
+                    f"available={allocator.available_size()}). The decode batch was "
+                    "admitted beyond reclaim-adjusted HiSparse device-pool capacity."
+                )
 
         offset = 0
         for req_idx, current_cap, resident, grow_size in grow_reqs:
