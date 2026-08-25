@@ -40,11 +40,22 @@ class GetVolcengineImageTagTest(unittest.TestCase):
                 version="0.5.17",
                 timestamp="202608121200",
                 tag_value="day0_deepseek_v4_official",
+            ),
+            "day0_deepseek_v4_official",
+        )
+
+    def test_manual_tag_with_injected_value_and_suffixes(self) -> None:
+        self.assertEqual(
+            build_tag(
+                mode="manual",
+                version="0.5.17",
+                timestamp="202608121200",
+                tag_value="day0_deepseek_v4_official",
                 variant_suffix="w4a8",
                 cuda_suffix="cu130",
                 format_suffix="nydus",
             ),
-            "v0.5.17.iaas.dev.day0_deepseek_v4_official.202608121200-w4a8-cu130-nydus",
+            "day0_deepseek_v4_official-w4a8-cu130-nydus",
         )
 
     def test_format_suffix_trails_cuda_suffix(self) -> None:

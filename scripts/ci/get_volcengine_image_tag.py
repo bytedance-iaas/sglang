@@ -28,16 +28,14 @@ def build_tag(
 ) -> str:
     """Compose the final image tag.
 
-    Manual tags optionally include an injected value before the timestamp.
+    Manual tags use ``tag_value`` verbatim when it is provided, otherwise they
+    fall back to the generated ``v<ver>.iaas.dev.<ts>`` name.
     Suffix order is fixed as ``variant`` -> ``cuda`` -> ``format`` so that the
     image format marker (e.g. ``zstd`` / ``nydus``) always trails the CUDA
-    marker: ``v<ver>.iaas.dev[.<val>].<ts>[-<variant>][-cu130][-zstd]``.
+    marker: ``<manual-tag>[-<variant>][-cu130][-zstd]``.
     """
     if mode == "manual":
-        tag = f"v{version}.iaas.dev"
-        if tag_value:
-            tag = f"{tag}.{tag_value}"
-        tag = f"{tag}.{timestamp}"
+        tag = tag_value or f"v{version}.iaas.dev.{timestamp}"
     elif mode == "nightly":
         tag = f"v{version}.iaas.nightly.{timestamp}"
     else:
@@ -90,8 +88,8 @@ def main() -> None:
     parser.add_argument(
         "--tag-value",
         default="",
-        help="Injected after .iaas.dev in manual mode; required for version "
-        "mode and inserted after .byted.",
+        help="Used verbatim as the base tag in manual mode; required for "
+        "version mode and inserted after .byted.",
     )
     parser.add_argument("--cuda-suffix", choices=["", "cu129", "cu130"], default="")
     parser.add_argument(

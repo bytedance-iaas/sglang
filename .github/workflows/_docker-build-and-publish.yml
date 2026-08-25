@@ -47,7 +47,7 @@ on:
         type: string
         default: "version"
       tag_value:
-        description: "Optional tag value injected into manual tags; required for version-mode tags"
+        description: "Optional manual tag override; required as the value in version-mode tags"
         required: false
         type: string
         default: ""
