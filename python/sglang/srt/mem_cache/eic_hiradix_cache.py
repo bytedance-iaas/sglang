@@ -768,7 +768,7 @@ class EICHiRadixCache(RadixCache):
         d, hh = st["d"], st["hh"]
         node = st["best_match_node"]
         quota = span - d
-        swa_ok = self._swa_headroom_ok(quota)
+        swa_ok = self._swa_headroom_ok(quota) and self._full_headroom_ok(quota)
         if (
             quota >= max(self.load_back_threshold, 1)
             and node is not None
@@ -788,6 +788,21 @@ class EICHiRadixCache(RadixCache):
             self._admit_verdict[st["h"]] = d
         else:
             self._queue_report(st, self._KIND_FINAL, d)
+
+    def _full_headroom_ok(self, quota):
+        # The async admission gate allocates OUTSIDE add_one_req's rem_total_tokens
+        # budget, so every queued req can pin a load-back until the pool is full
+        # with #running-req: 0 and evictable_size 0 -- an unrecoverable prefill OOM
+        # (the baseline's init_load_back sits inside that budget and self-bounds).
+        # A refused load degrades to a device-only admit below, not a deadlock.
+        reserve = getattr(self, "_load_back_reserve", None)
+        if reserve is None:
+            from sglang.srt.server_args import get_global_server_args
+
+            cps = get_global_server_args().chunked_prefill_size or 0
+            reserve = self._load_back_reserve = cps if cps > 0 else self.page_size
+        alloc = self.cache_controller.mem_pool_device_allocator
+        return alloc.available_size() + self.evictable_size_ >= quota + reserve
 
     def _swa_headroom_ok(self, quota):
         swa = getattr(

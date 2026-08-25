@@ -419,6 +419,8 @@ class TestEICHiCacheRegression(unittest.TestCase):
         cache.pp_group = object() if pp_size > 1 else None
         cache.tp_size, cache.rank, cache.tp_group = 1, 0, None
         cache.load_back_threshold = 10
+        cache._load_back_reserve = 16384
+        cache.evictable_size_ = 0
         cache.root_node = FakeTreeNode(0, True, None)
         cache.ongoing_load_admit = {}
         cache.ongoing_load_back = {}
@@ -454,7 +456,8 @@ class TestEICHiCacheRegression(unittest.TestCase):
             )
         q = Queue()
         cache.cache_controller = SimpleNamespace(
-            ack_load_queue=q, mem_pool_device_allocator=SimpleNamespace()
+            ack_load_queue=q,
+            mem_pool_device_allocator=SimpleNamespace(available_size=lambda: 10**9),
         )
         return cache
 
@@ -661,6 +664,23 @@ class TestEICHiCacheRegression(unittest.TestCase):
         self.assertEqual(len(req.prefix_indices), 14)  # 4 device + 10 loaded
         self.assertEqual(s.freed, [(100, 10)])
         self.assertEqual(s.locks, [])
+
+    def test_gate_refuses_load_back_without_pool_headroom(self):
+        # The agent-workload OOM: the async gate allocates outside add_one_req's
+        # budget, so N queued reqs each pinned a load-back until the pool was full
+        # with 0 running reqs and 0 evictable. Below the reserve the gate must
+        # admit device-only instead of kicking another load.
+        s = self._make_stage(0, self.FakeStore(), {}, pp_size=1)
+        kicked = []
+        s.load_back = lambda node, allow_evict=None: kicked.append(
+            node
+        ) or torch.arange(16, dtype=torch.int64)
+        s.cache_controller.mem_pool_device_allocator.available_size = lambda: 6144
+        req = self._make_req("req-oom", 4, 16, load_node_id=101)
+        self.assertTrue(EICPagedHiRadixCache.check_load_back_progress(s, req))
+        self.assertEqual(kicked, [])
+        self.assertEqual(len(req.prefix_indices), 4)  # device-only admit
+        self.assertEqual(s.ongoing_load_admit, {})
 
     def test_finalize_asserts_on_verdict_before_ack(self):
         # I5 enforcement: a FINAL verdict may never land before the local ack
