@@ -245,7 +245,6 @@ class TestSidpServerArgs(CustomTestCase):
     def test_invalid_graph_profiling_parameters(self):
         cases = [
             ({"disable_cuda_graph": True}, "requires CUDA Graph"),
-            ({"sidp_k": 8}, "requires remote weight communication"),
             ({"sidp_profile_sample_interval": 0}, "must be at least 1"),
             ({"sidp_profile_warmup_replays": -1}, "cannot be negative"),
             ({"sidp_profile_output_dir": ""}, "cannot be empty"),
@@ -259,6 +258,80 @@ class TestSidpServerArgs(CustomTestCase):
                     patch.dict(
                         os.environ,
                         {"PYTORCH_CUDA_ALLOC_CONF": "", "PYTORCH_ALLOC_CONF": ""},
+                    ),
+                    self.assertRaisesRegex(AssertionError, message),
+                ):
+                    args._handle_sidp()
+
+    def test_dummy_compute_requires_profiling_and_remote_weights(self):
+        cases = [
+            (
+                {"sidp_profile_dummy_compute": True},
+                "requires --sidp-enable-graph-profiling",
+            ),
+            (
+                {
+                    "sidp_profile_dummy_compute": True,
+                    "sidp_enable_graph_profiling": True,
+                    "sidp_k": 8,
+                },
+                "requires remote weight communication",
+            ),
+        ]
+        for overrides, message in cases:
+            with self.subTest(overrides=overrides):
+                args = self._make_sidp_args(**overrides)
+                with (
+                    patch.dict(
+                        os.environ,
+                        {
+                            "PYTORCH_CUDA_ALLOC_CONF": "",
+                            "PYTORCH_ALLOC_CONF": "",
+                        },
+                    ),
+                    self.assertRaisesRegex(AssertionError, message),
+                ):
+                    args._handle_sidp()
+
+    def test_valid_dummy_compute_profile(self):
+        args = self._make_sidp_args(
+            sidp_enable_graph_profiling=True,
+            sidp_profile_dummy_compute=True,
+        )
+        with patch.dict(
+            os.environ,
+            {"PYTORCH_CUDA_ALLOC_CONF": "", "PYTORCH_ALLOC_CONF": ""},
+        ):
+            args._handle_sidp()
+
+    def test_peak_sync_does_not_require_profiling(self):
+        args = self._make_sidp_args(
+            sidp_enable_peak_shifting=True,
+            sidp_peak_sync_strategy="force_sync",
+        )
+        with patch.dict(
+            os.environ,
+            {"PYTORCH_CUDA_ALLOC_CONF": "", "PYTORCH_ALLOC_CONF": ""},
+        ):
+            args._handle_sidp()
+
+    def test_invalid_peak_sync_parameters(self):
+        cases = [
+            ({"sidp_peak_sync_strategy": "invalid"}, "must be one of"),
+            ({"sidp_peak_sync_min_raw_bs": 0}, "must be at least 1"),
+            ({"sidp_peak_sync_max_replays": -1}, "cannot be negative"),
+            ({"sidp_peak_sync_timeout_s": 0}, "must be positive"),
+        ]
+        for overrides, message in cases:
+            with self.subTest(overrides=overrides):
+                args = self._make_sidp_args(**overrides)
+                with (
+                    patch.dict(
+                        os.environ,
+                        {
+                            "PYTORCH_CUDA_ALLOC_CONF": "",
+                            "PYTORCH_ALLOC_CONF": "",
+                        },
                     ),
                     self.assertRaisesRegex(AssertionError, message),
                 ):

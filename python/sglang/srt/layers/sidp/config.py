@@ -14,6 +14,11 @@ class SidpConfig:
     enable_cycle_overlap: bool = False
     enable_peak_shifting: bool = False
     enable_graph_profiling: bool = False
+    profile_dummy_compute: bool = False
+    peak_sync_strategy: str = "force_sync"
+    peak_sync_min_raw_bs: int = 64
+    peak_sync_max_replays: int = 0
+    peak_sync_timeout_s: float = 30.0
     profile_sample_interval: int = 20
     profile_warmup_replays: int = 20
     profile_output_dir: str = "/tmp/sidp_profile"
