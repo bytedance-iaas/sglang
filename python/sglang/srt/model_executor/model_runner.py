@@ -1183,6 +1183,7 @@ class ModelRunner:
             num_layers=num_layers,
             enable_cycle_overlap=True,
             enable_peak_shifting=self.server_args.sidp_enable_peak_shifting,
+            enable_debug_logging=self.server_args.sidp_enable_debug_logging,
             enable_graph_profiling=self.server_args.sidp_enable_graph_profiling,
             profile_dummy_compute=self.server_args.sidp_profile_dummy_compute,
             peak_sync_strategy=self.server_args.sidp_peak_sync_strategy,

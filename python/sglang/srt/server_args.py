@@ -1105,6 +1105,12 @@ class ServerArgs:
         "permutation waves. Disabled by default for compute-order A/B comparison.",
         NS("parallel"),
     ] = False
+    sidp_enable_debug_logging: A[
+        bool,
+        "Enable SiDP setup/debug logs and diagnostic HBM before/after sampling. "
+        "Disabled by default and independent of graph profiling.",
+        NS("parallel"),
+    ] = False
     sidp_enable_graph_profiling: A[
         bool,
         "Insert SiDP timing events into CUDA Graph and periodically emit sampled "
@@ -6632,14 +6638,15 @@ class ServerArgs:
 
         # SiDP does not force-disable CUDA Graph. Eager and captured forwards
         # use the same cross-forward cycle pipeline.
-        logger.info(
-            f"SiDP enabled: sidp_size={self.sidp_size}, k={self.sidp_k}, "
-            f"cache_cycles={self.sidp_cache_cycles}, "
-            f"peak_shifting={self.sidp_enable_peak_shifting}, "
-            f"peak_sync_strategy={self.sidp_peak_sync_strategy}, "
-            f"graph_profiling={self.sidp_enable_graph_profiling}, "
-            f"rdzv_port={self.sidp_rdzv_port}"
-        )
+        if self.sidp_enable_debug_logging:
+            logger.info(
+                f"SiDP enabled: sidp_size={self.sidp_size}, k={self.sidp_k}, "
+                f"cache_cycles={self.sidp_cache_cycles}, "
+                f"peak_shifting={self.sidp_enable_peak_shifting}, "
+                f"peak_sync_strategy={self.sidp_peak_sync_strategy}, "
+                f"graph_profiling={self.sidp_enable_graph_profiling}, "
+                f"rdzv_port={self.sidp_rdzv_port}"
+            )
 
     def _handle_data_parallelism(self):
         # The dp_size==1 resets moved to the resolution pipeline

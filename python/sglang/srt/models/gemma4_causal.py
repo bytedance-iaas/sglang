@@ -532,6 +532,7 @@ class Gemma4DecoderLayer(nn.Module):
         self._sidp_mgr = None
         self._sidp_begin_forward = False
         self._sidp_end_forward = False
+        self._sidp_profile_enabled = False
         self._sidp_dummy_compute = False
 
         # Gemma 4 uses different head dimensions for sliding vs full attention
@@ -655,7 +656,7 @@ class Gemma4DecoderLayer(nn.Module):
     ]:
         if self._sidp_begin_forward:
             self._sidp_mgr.begin_forward()
-        if self._sidp_mgr is not None:
+        if self._sidp_profile_enabled:
             self._sidp_mgr.record_cycle_compute_start(self.layer_id)
 
         if self._sidp_dummy_compute:
@@ -733,7 +734,7 @@ class Gemma4DecoderLayer(nn.Module):
                     norm2.variance_epsilon,
                     norm3.variance_epsilon,
                 )
-                if self._sidp_mgr is not None:
+                if self._sidp_profile_enabled:
                     self._sidp_mgr.record_cycle_compute_end(self.layer_id)
                 if self._sidp_end_forward:
                     self._sidp_mgr.end_forward()
@@ -785,7 +786,7 @@ class Gemma4DecoderLayer(nn.Module):
                 hidden_states = hidden_states + per_layer_contribution
 
             hidden_states = hidden_states * self.layer_scalar
-        if self._sidp_mgr is not None:
+        if self._sidp_profile_enabled:
             self._sidp_mgr.record_cycle_compute_end(self.layer_id)
         if self._sidp_end_forward:
             self._sidp_mgr.end_forward()

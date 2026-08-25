@@ -1232,13 +1232,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.model_runner.war_fastpath_read_done_event = read_done
             sidp_manager = getattr(self.model_runner, "sidp_manager", None)
             sidp_launch_profile = None
-            if sidp_manager is not None:
+            if (
+                sidp_manager is not None
+                and sidp_manager.needs_cuda_graph_launch_hook
+            ):
                 sidp_launch_profile = sidp_manager.before_cuda_graph_replay(
                     raw_batch_size=self.raw_bs,
                     graph_batch_size=self.bs,
                 )
             output = self.backend.replay(self._replay_graph_key, forward_batch)
-            if sidp_manager is not None:
+            if sidp_manager is not None and sidp_manager.graph_profiling_enabled:
                 sidp_manager.profile_after_cuda_graph_replay(
                     raw_batch_size=self.raw_bs,
                     graph_batch_size=self.bs,

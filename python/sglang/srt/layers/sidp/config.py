@@ -13,6 +13,7 @@ class SidpConfig:
     transfer_dtype: str = "same"
     enable_cycle_overlap: bool = False
     enable_peak_shifting: bool = False
+    enable_debug_logging: bool = False
     enable_graph_profiling: bool = False
     profile_dummy_compute: bool = False
     peak_sync_strategy: str = "force_sync"
