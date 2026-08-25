@@ -91,6 +91,20 @@ assert (
     "demote_until_hisparse_available" in coordinator_src
 ), "HiSparse retract fix(c) missing: reclaim-before-raise in _ensure_padded_buffer"
 
+# HiSparse ownership fix: target owns the shared physical C4 namespace, while
+# draft mirrors may clear only their local aliases. The allocator must release
+# all mapping and side-buffer owners transactionally by complete physical page.
+allocator_src = pathlib.Path(
+    "/sgl-workspace/sglang/python/sglang/srt/mem_cache/allocator/hisparse.py"
+).read_text()
+assert "class _HiSparsePageOwnership" in allocator_src
+assert "_stable_unique_page_ids" in allocator_src
+assert "release_hisparse_ownership" in allocator_src
+assert "Only the canonical HiSparse slot owner may abort staging requests" in (
+    coordinator_src
+)
+assert "It must neither clear the canonical" in coordinator_src
+
 print(
     json.dumps(
         {
@@ -103,6 +117,7 @@ print(
             "observability_available": otel_available,
             "mtp_dp_vote_fix": True,
             "hisparse_retract_fix": True,
+            "hisparse_page_ownership_fix": True,
         },
         sort_keys=True,
     )
