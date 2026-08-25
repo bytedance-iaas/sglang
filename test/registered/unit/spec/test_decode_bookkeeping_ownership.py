@@ -3,9 +3,9 @@
 Per-request accounting state (`decode_batch_idx` / `extend_batch_idx` iter
 clocks, `kv_committed_len` / `kv_allocated_len` KV watermarks,
 `spec_verify_ct`, and the `maybe_evict_swa()` call) must only be advanced by
-the reviewed owner sites in _OWNER_SITES; spec-v2 draft workers must not
-repeat any of them (the scheduler-driven free function / resolve path already
-does).
+the reviewed owner sites in _OWNER_SITES; spec-v2 algorithm-specific prep and
+draft workers must not repeat any of them (the common scheduler-driven free
+function / resolve path already does).
 A clock that runs fast fires SWA eviction in the overlap race window and
 releases the SWA prefix lock early; neither shows up in e2e CI or the idle
 leak checker, hence this AST-level guard.
@@ -40,7 +40,7 @@ _EVICT_METHOD = "maybe_evict_swa"
 # attribute (`= 0` resets exempt) or "evict" for a `maybe_evict_swa()` call.
 # Any added/removed/recounted site fails until reviewed here.
 _SB = "managers/schedule_batch.py"
-_EAGLE_DECODE = ("speculative/eagle_utils.py", "eagle_prepare_for_decode")
+_SPEC_DECODE = ("speculative/spec_utils.py", "spec_prepare_for_decode")
 _RESOLVE = (
     "managers/scheduler_components/batch_result_processor.py",
     "SchedulerBatchResultProcessor._resolve_spec_v2_tokens",
@@ -52,16 +52,19 @@ _OWNER_SITES = {
     (_SB, "ScheduleBatch.prepare_for_decode", "kv_committed_len"): 1,
     (_SB, "ScheduleBatch.prepare_for_extend", "extend_batch_idx"): 1,
     (_SB, "ScheduleBatch.prepare_for_extend", "kv_committed_len"): 1,
+    # Decode OOM fallback may force SWA maintenance before retraction.
+    (_SB, "ScheduleBatch.check_decode_mem", "evict"): 1,
     # kv_allocated_len is settled inside the owned-kv alloc functions (op28).
     ("mem_cache/allocation.py", "alloc_for_extend", "evict"): 1,
     ("mem_cache/allocation.py", "alloc_for_extend", "kv_allocated_len"): 1,
     ("mem_cache/allocation.py", "alloc_for_decode", "evict"): 1,
     ("mem_cache/allocation.py", "alloc_for_decode", "kv_allocated_len"): 1,
-    # spec v2: no pre-claim; resolve commits the full accepted run uniformly.
+    # spec v2: common preparation owns the decode clock and SWA maintenance for
+    # every algorithm; resolve commits the full accepted run uniformly.
     # kv_allocated_len for spec v2 draft decode (eagle + dflash) is settled
     # inside the owned-kv alloc_for_spec_decode function (op42).
-    (*_EAGLE_DECODE, "decode_batch_idx"): 1,
-    (*_EAGLE_DECODE, "evict"): 1,
+    (*_SPEC_DECODE, "decode_batch_idx"): 1,
+    (*_SPEC_DECODE, "evict"): 1,
     (
         "mem_cache/allocation.py",
         "alloc_for_spec_decode",
