@@ -38,17 +38,6 @@ on:
         required: false
         type: string
         default: ""
-      auto_rename_variant_suffix:
-        description: "变体后缀（如 deepseek-v4, kimi-k3, glm52-pd4）"
-        required: false
-        type: string
-        default: ""
-      auto_rename_cuda_suffix:
-        description: "CUDA 后缀（如 cu130）"
-        required: false
-        type: string
-        default: ""
-
 concurrency:
   group: backfill-image-formats-${{ github.run_id }}
   cancel-in-progress: false
@@ -116,8 +105,6 @@ jobs:
           AUTO_RENAME: ${{ inputs.auto_rename }}
           AUTO_RENAME_MODE: ${{ inputs.auto_rename_mode }}
           AUTO_RENAME_TAG_VALUE: ${{ inputs.auto_rename_tag_value }}
-          AUTO_RENAME_VARIANT_SUFFIX: ${{ inputs.auto_rename_variant_suffix }}
-          AUTO_RENAME_CUDA_SUFFIX: ${{ inputs.auto_rename_cuda_suffix }}
         run: |
           set -euo pipefail
 
@@ -239,13 +226,6 @@ jobs:
                 ;;
             esac
 
-            if [ -n "${AUTO_RENAME_VARIANT_SUFFIX}" ]; then
-              new_tag="${new_tag}-${AUTO_RENAME_VARIANT_SUFFIX}"
-            fi
-            if [ -n "${AUTO_RENAME_CUDA_SUFFIX}" ]; then
-              new_tag="${new_tag}-${AUTO_RENAME_CUDA_SUFFIX}"
-            fi
-
             echo "${new_tag}"
           }
 
@@ -326,9 +306,6 @@ jobs:
           echo "=== $(date '+%H:%M:%S') Backfill Image Formats ==="
           echo "  auto_rename: ${AUTO_RENAME}"
           echo "  auto_rename_mode: ${AUTO_RENAME_MODE}"
-          echo "  variant_suffix: ${AUTO_RENAME_VARIANT_SUFFIX:-<none>}"
-          echo "  cuda_suffix: ${AUTO_RENAME_CUDA_SUFFIX:-<none>}"
-
           # Determine source images
           if [ "${AUTO_RENAME}" = "true" ] && [ -n "${SOURCE_IMAGE_REF}" ]; then
             echo "  Using source_image_ref as rename source"
