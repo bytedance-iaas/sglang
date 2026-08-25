@@ -7784,6 +7784,23 @@ class ServerArgs:
                 raise ValueError(
                     "The argument disaggregation-decode-enable-offload-kvcache is only supported when hicache-storage-backend is provided."
                 )
+            if self.enable_hisparse:
+                # The device->host retract offload path (release_req ->
+                # get_cpu_copy) is unimplemented for the HiSparse device pools:
+                # under HiSparse the committed KV is compressed and owned by the
+                # HiSparseCoordinator, whose retract_req already frees the device
+                # buffer / host slots before release_req runs, so a pool-level CPU
+                # copy would read freed memory. HiSparse decode-side retraction
+                # recovers instead by recomputing the prefix on the prefill worker
+                # (PD true-retraction rebootstrap), which needs no host offload.
+                raise ValueError(
+                    "--disaggregation-decode-enable-offload-kvcache is incompatible "
+                    "with --enable-hisparse: HiSparse compressed KV is owned by the "
+                    "HiSparseCoordinator and freed on retract, so it cannot be "
+                    "offloaded to a host CPU copy. HiSparse retraction recovers via "
+                    "PD rebootstrap (prefix recompute) instead; drop one of the two "
+                    "flags."
+                )
 
         # Validate the effective ratio: model branches may declare a reset
         # (e.g. Step3p forces 1.0 under hierarchical cache) that supersedes

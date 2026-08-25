@@ -116,7 +116,23 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
         )
 
     def get_cpu_copy(self, indices, mamba_indices=None):
-        raise NotImplementedError("HiSparseDevicePool does not support get_cpu_copy")
+        # HiSparse committed KV is compressed and owned by the HiSparseCoordinator,
+        # which frees the device buffer / host slots on retract_req before
+        # release_req runs -- there is no stable device tensor left to copy here.
+        # Retraction under HiSparse must not offload; it recovers via PD
+        # rebootstrap (prefix recompute) instead. server_args rejects
+        # --disaggregation-decode-enable-offload-kvcache + --enable-hisparse, and
+        # release_req only calls this when offload is enabled, so reaching here is
+        # a bug (an offload path was wired without the coordinator hand-off).
+        raise NotImplementedError(
+            "HiSparseDSATokenToKVPool.get_cpu_copy is intentionally unsupported: "
+            "HiSparse KV is coordinator-owned and freed on retract; decode-side "
+            "retraction recovers via PD rebootstrap, not host offload. Do not "
+            "enable --disaggregation-decode-enable-offload-kvcache with HiSparse."
+        )
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
-        raise NotImplementedError("HiSparseDevicePool does not support load_cpu_copy")
+        raise NotImplementedError(
+            "HiSparseDSATokenToKVPool.load_cpu_copy is intentionally unsupported: "
+            "see get_cpu_copy -- HiSparse retraction recovers via PD rebootstrap."
+        )

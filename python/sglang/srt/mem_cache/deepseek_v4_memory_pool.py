@@ -243,10 +243,25 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         return super().set_key_buffer_fused(layer_id, loc, cache_k)
 
     def get_cpu_copy(self, indices, mamba_indices=None):
-        raise NotImplementedError("HiSparseC4DevicePool does not support get_cpu_copy")
+        # DSV4 HiSparse compressed KV is coordinator-owned and freed on retract
+        # (HiSparseCoordinator.retract_req) before release_req runs, so there is
+        # no stable device tensor to copy here. HiSparse decode-side retraction
+        # recovers via PD rebootstrap (prefix recompute), not host offload;
+        # server_args rejects --disaggregation-decode-enable-offload-kvcache with
+        # --enable-hisparse, and release_req only calls this when offload is on,
+        # so reaching here is a wiring bug.
+        raise NotImplementedError(
+            "HiSparseC4DevicePool.get_cpu_copy is intentionally unsupported: "
+            "HiSparse KV is coordinator-owned and freed on retract; decode-side "
+            "retraction recovers via PD rebootstrap, not host offload. Do not "
+            "enable --disaggregation-decode-enable-offload-kvcache with HiSparse."
+        )
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
-        raise NotImplementedError("HiSparseC4DevicePool does not support load_cpu_copy")
+        raise NotImplementedError(
+            "HiSparseC4DevicePool.load_cpu_copy is intentionally unsupported: "
+            "see get_cpu_copy -- HiSparse retraction recovers via PD rebootstrap."
+        )
 
 
 class DeepSeekV4IndexerPool(KVCache):
