@@ -1,5 +1,6 @@
 import os
 import weakref
+from collections.abc import Callable
 
 import torch
 
@@ -11,6 +12,73 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.utils.common import get_num_new_pages
+
+
+def _stable_unique_page_ids(page_ids: torch.Tensor) -> torch.Tensor:
+    """Deduplicate page ids without changing their first-owner order."""
+    if page_ids.numel() == 0:
+        return page_ids.to(dtype=torch.int64)
+
+    unique_page_ids, inverse = torch.unique(
+        page_ids.to(dtype=torch.int64), sorted=False, return_inverse=True
+    )
+    positions = torch.arange(
+        page_ids.numel(), dtype=torch.int64, device=page_ids.device
+    )
+    first_positions = torch.full_like(unique_page_ids, page_ids.numel())
+    first_positions.scatter_reduce_(
+        0, inverse, positions, reduce="amin", include_self=True
+    )
+    return unique_page_ids[torch.argsort(first_positions)]
+
+
+class _HiSparsePageOwnership:
+    """Release physical pages only after every logical/buffer owner is clear."""
+
+    def __init__(
+        self,
+        *,
+        mapping: torch.Tensor,
+        child_allocator: PagedTokenToKVPoolAllocator,
+        page_size: int,
+    ) -> None:
+        assert child_allocator.is_not_in_free_group
+        assert page_size > 0
+        self.mapping = mapping
+        self.child_allocator = child_allocator
+        self.page_size = page_size
+
+    def release(
+        self,
+        *,
+        mapping_indices: torch.Tensor,
+        extra_owned_coordinates: torch.Tensor | None = None,
+        clear_extra_owner: Callable[[], None] | None = None,
+    ) -> None:
+        # This physical allocator is not part of the logical allocator's free
+        # transaction. Fail before mutating any owner if that invariant breaks.
+        assert self.child_allocator.is_not_in_free_group
+        coordinates = self.mapping[mapping_indices]
+        if extra_owned_coordinates is not None:
+            coordinates = torch.cat([coordinates, extra_owned_coordinates])
+        positive_coordinates = coordinates[coordinates > 0].to(torch.int64)
+        page_ids = _stable_unique_page_ids(
+            positive_coordinates // self.page_size
+        )
+
+        self.mapping[mapping_indices] = 0
+        if clear_extra_owner is not None:
+            clear_extra_owner()
+        if page_ids.numel() == 0:
+            return
+
+        offsets = torch.arange(
+            self.page_size, dtype=torch.int64, device=page_ids.device
+        )
+        full_page_blocks = (
+            page_ids[:, None] * self.page_size + offsets
+        ).reshape(-1)
+        self.child_allocator.free(full_page_blocks)
 
 
 class HiSparseDemotionMixin:
@@ -94,6 +162,11 @@ class HiSparseTokenToKVPoolAllocator(HiSparseDemotionMixin, BaseTokenToKVPoolAll
                 ),
                 torch.tensor([-1], dtype=torch.int64, device=self.device),
             ]
+        )
+        self._page_ownership = _HiSparsePageOwnership(
+            mapping=self.full_to_hisparse_device_index_mapping,
+            child_allocator=self.hisparse_attn_allocator,
+            page_size=self.page_size,
         )
 
         self.free_pages = None
@@ -235,8 +308,9 @@ class HiSparseTokenToKVPoolAllocator(HiSparseDemotionMixin, BaseTokenToKVPoolAll
         return buffer_indices
 
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):
-        # disable free group mechanism for device buffer free
-        self.hisparse_attn_allocator.is_not_in_free_group = True
+        # Device-page ownership is independent from the logical free group.
+        # Never mutate the child allocator's transaction state implicitly.
+        assert self.hisparse_attn_allocator.is_not_in_free_group
         buffer_indices = buffer_indices[buffer_indices > 0]
         if buffer_indices.numel() == 0:
             return
@@ -259,6 +333,19 @@ class HiSparseTokenToKVPoolAllocator(HiSparseDemotionMixin, BaseTokenToKVPoolAll
                 raise RuntimeError(
                     "HiSparse physical free list contains duplicate pages after free"
                 )
+
+    def release_hisparse_ownership(
+        self,
+        *,
+        mapping_indices: torch.Tensor,
+        extra_owned_coordinates: torch.Tensor | None = None,
+        clear_extra_owner: Callable[[], None] | None = None,
+    ) -> None:
+        self._page_ownership.release(
+            mapping_indices=mapping_indices,
+            extra_owned_coordinates=extra_owned_coordinates,
+            clear_extra_owner=clear_extra_owner,
+        )
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
         return last_locs
@@ -385,10 +472,7 @@ class HiSparseTokenToKVPoolAllocator(HiSparseDemotionMixin, BaseTokenToKVPoolAll
         )
 
     def free_hisparse(self, free_indices: torch.Tensor):
-        hisparse_indices = self._kvcache._translate_loc_to_hisparse_device(free_indices)
-        hisparse_indices = hisparse_indices[hisparse_indices > 0]
-        self.free_hisparse_indices(hisparse_indices)
-        self.full_to_hisparse_device_index_mapping[free_indices] = 0
+        self.release_hisparse_ownership(mapping_indices=free_indices)
 
     def clear(self):
         self.logical_attn_allocator.clear()
@@ -494,6 +578,11 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(
                 ),
                 torch.tensor([-1], dtype=torch.int64, device=self.device),
             ]
+        )
+        self._page_ownership = _HiSparsePageOwnership(
+            mapping=self.full_to_hisparse_device_index_mapping,
+            child_allocator=self.hisparse_attn_allocator,
+            page_size=self.hisparse_page_size,
         )
 
         self.need_sort = logical_attn_allocator.need_sort
@@ -657,8 +746,21 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(
         return buffer_indices
 
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):
-        self.hisparse_attn_allocator.is_not_in_free_group = True
+        assert self.hisparse_attn_allocator.is_not_in_free_group
         self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
+
+    def release_hisparse_ownership(
+        self,
+        *,
+        mapping_indices: torch.Tensor,
+        extra_owned_coordinates: torch.Tensor | None = None,
+        clear_extra_owner: Callable[[], None] | None = None,
+    ) -> None:
+        self._page_ownership.release(
+            mapping_indices=mapping_indices,
+            extra_owned_coordinates=extra_owned_coordinates,
+            clear_extra_owner=clear_extra_owner,
+        )
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
         return (last_locs - 3) // self.compress_ratio
@@ -743,12 +845,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(
         )
 
     def free_compressed(self, compressed_indices: torch.Tensor):
-        hisparse_indices = self.hisparse_kvcache.translate_loc_to_hisparse_device(
-            compressed_indices
-        )
-        hisparse_indices = hisparse_indices[hisparse_indices > 0]
-        self.free_hisparse_indices(hisparse_indices)
-        self.full_to_hisparse_device_index_mapping[compressed_indices] = 0
+        self.release_hisparse_ownership(mapping_indices=compressed_indices)
 
     def free_hisparse(self, free_indices: torch.Tensor):
         compressed_indices = (

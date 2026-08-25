@@ -907,6 +907,10 @@ class HiSparseCoordinator:
         )
 
     def admit_request_into_staging(self, req: Req) -> None:
+        if self._device_slot_owner is not self:
+            raise RuntimeError(
+                "Only the canonical HiSparse slot owner may admit staging requests"
+            )
         req.hisparse_staging = True
         self._set_residency_state(
             req.req_pool_idx,
@@ -2934,6 +2938,11 @@ class HiSparseCoordinator:
         Must be called when aborting a request that has been admitted into staging
         but has not yet completed (i.e. req.hisparse_staging is True).
         """
+        if self._device_slot_owner is not self:
+            raise RuntimeError(
+                "Only the canonical HiSparse slot owner may abort staging requests"
+            )
+
         # Remove from staging queue
         self.ack_staging_queue = [
             act for act in self.ack_staging_queue if act.req is not req
@@ -2977,32 +2986,20 @@ class HiSparseCoordinator:
         self.wait_for_pending_backup()
         self.clear_pending_draft_extend_backup()
 
-        # Use kv_allocated_len (not seqlen): under speculative decoding the
-        # allocator can over-allocate beyond the committed seqlen, and those
-        # extra slots may carry stale mapping entries pointing at buffer slots
-        # we just freed via free_hisparse_indices(all_hi). If left set, the
-        # subsequent release_kv_cache -> allocator.free -> free_hisparse path
-        # re-frees them (double-free into the page allocator's free list).
+        # Use kv_allocated_len (not seqlen): speculative decoding may reserve
+        # beyond the committed length. The canonical owner must retire every
+        # such mapping together with the side-buffer aliases before the later
+        # logical release_kv_cache step.
         allocated_len = req.kv.kv_allocated_len
 
         is_resident_req = self._is_resident(req.req_pool_idx)
 
-        # Release only coordinator-owned side-buffer memory.  A resident
-        # request's main full-to-device mapping remains owned by allocator.free
-        # after this method returns; clearing it here would leak the resident
-        # physical pages.
         current_cap = int(self.req_device_buffer_size[req.req_pool_idx])
         if is_resident_req and not self.is_dsv4_hisparse and current_cap > 0:
             self._free_resident_spec_page(
                 req, free_physical=self._device_slot_owner is self
             )
             current_cap = 0
-        elif current_cap > 0 and self._device_slot_owner is self:
-            side_buf_hi = self.req_to_device_buffer[req.req_pool_idx, :current_cap]
-            all_hi = torch.unique(side_buf_hi[side_buf_hi > 0])
-            if all_hi.numel() > 0:
-                self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
-
         if (current_cap > 0 and not is_resident_req) or (
             self.is_dsv4_hisparse and is_resident_req
         ):
@@ -3014,16 +3011,28 @@ class HiSparseCoordinator:
                     allocated_locs
                 )
             )
-            if self.is_dsv4_hisparse and is_resident_req:
-                hisparse_indices = self._hisparse_device_locs(compressed_locs)
-                hisparse_indices = hisparse_indices[hisparse_indices > 0]
-                if hisparse_indices.numel() > 0:
-                    self.token_to_kv_pool_allocator.free_hisparse_indices(
-                        hisparse_indices
-                    )
-            self.mem_pool_device.full_to_hisparse_device_index_mapping[
-                compressed_locs
-            ] = 0
+
+            def clear_device_buffer_owner() -> None:
+                self.req_device_buffer_tokens[:, req.req_pool_idx, :] = -1
+                self.req_device_buffer_token_locs[:, req.req_pool_idx, :] = -1
+                self.req_to_device_buffer[req.req_pool_idx, :] = 0
+                self.req_device_buffer_size[req.req_pool_idx] = 0
+
+            if self._device_slot_owner is self:
+                self.token_to_kv_pool_allocator.release_hisparse_ownership(
+                    mapping_indices=compressed_locs,
+                    extra_owned_coordinates=self.req_to_device_buffer[
+                        req.req_pool_idx, :current_cap
+                    ],
+                    clear_extra_owner=clear_device_buffer_owner,
+                )
+            else:
+                # Target owns the numerical physical-slot namespace shared by
+                # target/draft tensors. A draft mirror clears only its local
+                # side-buffer aliases. It must neither clear the canonical
+                # mapping nor return the target allocator's pages, so cleanup
+                # remains safe even if mirror/owner call order changes.
+                clear_device_buffer_owner()
 
         host_indices = self.req_to_host_pool[req.req_pool_idx]
         host_indices = host_indices[host_indices >= 0]

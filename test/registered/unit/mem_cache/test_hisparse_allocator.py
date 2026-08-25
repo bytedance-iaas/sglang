@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
+    _HiSparsePageOwnership,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -15,7 +16,217 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
+class _LogicalPageAllocator:
+    def __init__(self, page_size=256, num_pages=4):
+        self.page_size = page_size
+        self.size = page_size * num_pages
+        self._next_page = 0
+        self.freed_pages = set()
+
+    def available_size(self):
+        return self.size - self._next_page * self.page_size
+
+    def alloc_extend(
+        self,
+        prefix_lens,
+        prefix_lens_cpu,
+        seq_lens,
+        seq_lens_cpu,
+        last_loc,
+        extend_num_tokens,
+    ):
+        page = self._next_page
+        self._next_page += 1
+        return torch.arange(
+            page * self.page_size,
+            page * self.page_size + extend_num_tokens,
+            dtype=torch.int64,
+        )
+
+    def free(self, indices):
+        self.freed_pages.update((indices // self.page_size).tolist())
+
+
+class _PhysicalPageAllocator:
+    def __init__(self, page_size=64, num_pages=8):
+        self.page_size = page_size
+        self.size = page_size * num_pages
+        # Slot/page zero is the allocator sentinel, matching the real allocator.
+        self.is_not_in_free_group = True
+        self.free_pages = list(range(1, num_pages + 1))
+        self.used_pages = set()
+
+    def available_size(self):
+        return len(self.free_pages) * self.page_size
+
+    def _take_page(self):
+        page = self.free_pages.pop(0)
+        self.used_pages.add(page)
+        return torch.arange(
+            page * self.page_size,
+            (page + 1) * self.page_size,
+            dtype=torch.int64,
+        )
+
+    def alloc(self, need_size):
+        assert need_size == self.page_size
+        return self._take_page()
+
+    def alloc_extend(self, *args, **kwargs):
+        return self._take_page()
+
+    def free(self, indices):
+        pages = torch.unique(indices // self.page_size).tolist()
+        for page in pages:
+            self.used_pages.remove(page)
+            self.free_pages.append(page)
+
+
+class _C4Pool:
+    page_size = 64
+
+    def __init__(self, mapping):
+        self.full_to_hisparse_device_index_mapping = mapping
+
+    @staticmethod
+    def translate_loc_from_full_to_compressed(full_indices):
+        return full_indices[(full_indices + 1) % 4 == 0] // 4
+
+    def _translate_loc_to_hisparse_device(self, compressed_indices):
+        return self.full_to_hisparse_device_index_mapping[compressed_indices]
+
+
 class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
+    def test_page_ownership_clears_all_owners_before_stable_page_free(self):
+        mapping = torch.zeros(8, dtype=torch.int64)
+        mapping[torch.tensor([1, 2, 3])] = torch.tensor([9, 5, 11])
+        buffer_owner = torch.tensor([4, 7], dtype=torch.int64)
+        child_allocator = MagicMock(is_not_in_free_group=True)
+
+        def verify_owner_clear(free_indices):
+            self.assertEqual(mapping[[1, 2, 3]].tolist(), [0, 0, 0])
+            self.assertEqual(buffer_owner.tolist(), [0, 0])
+            # First-seen page order is page 2, then page 1.
+            self.assertEqual(
+                free_indices.tolist(), list(range(8, 12)) + list(range(4, 8))
+            )
+
+        child_allocator.free.side_effect = verify_owner_clear
+        ownership = _HiSparsePageOwnership(
+            mapping=mapping, child_allocator=child_allocator, page_size=4
+        )
+
+        ownership.release(
+            mapping_indices=torch.tensor([1, 2, 3]),
+            extra_owned_coordinates=buffer_owner,
+            clear_extra_owner=buffer_owner.zero_,
+        )
+
+        child_allocator.free.assert_called_once()
+
+    def test_page_ownership_rejects_child_allocator_free_group(self):
+        mapping = torch.tensor([0, 4], dtype=torch.int64)
+        child_allocator = MagicMock(is_not_in_free_group=True)
+        ownership = _HiSparsePageOwnership(
+            mapping=mapping, child_allocator=child_allocator, page_size=4
+        )
+        child_allocator.is_not_in_free_group = False
+
+        with self.assertRaises(AssertionError):
+            ownership.release(mapping_indices=torch.tensor([1]))
+
+        self.assertEqual(mapping.tolist(), [0, 4])
+        child_allocator.free.assert_not_called()
+
+    def test_dsv4_finish_releases_composite_and_coordinator_c4_pages(self):
+        """Finish must release both physical owners before logical free."""
+        logical = _LogicalPageAllocator()
+        physical = _PhysicalPageAllocator()
+        mapping = torch.zeros(4 * logical.size + physical.page_size, dtype=torch.int64)
+        c4_pool = _C4Pool(mapping)
+
+        allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
+        allocator.compress_ratio = 4
+        allocator.page_size = logical.page_size
+        allocator.hisparse_page_size = physical.page_size
+        allocator.logical_attn_allocator = logical
+        allocator.hisparse_attn_allocator = physical
+        allocator.hisparse_kvcache = c4_pool
+        allocator.full_to_hisparse_device_index_mapping = mapping
+        allocator.is_not_in_free_group = True
+        allocator.free_group = []
+        allocator._page_ownership = _HiSparsePageOwnership(
+            mapping=mapping,
+            child_allocator=physical,
+            page_size=physical.page_size,
+        )
+
+        # The target coordinator canonically owns one fixed C4 side-buffer page.
+        coordinator_page = physical.alloc(physical.page_size)
+        coordinator_page_id = int(coordinator_page[0] // physical.page_size)
+
+        logical_locs = allocator.alloc_extend(
+            prefix_lens=torch.tensor([0]),
+            prefix_lens_cpu=torch.tensor([0]),
+            seq_lens=torch.tensor([logical.page_size]),
+            seq_lens_cpu=torch.tensor([logical.page_size]),
+            last_loc=torch.tensor([-1]),
+            extend_num_tokens=logical.page_size,
+        )
+        self.assertEqual(len(physical.used_pages), 2)
+
+        compressed_locs = c4_pool.translate_loc_from_full_to_compressed(logical_locs)
+        device_buffer_owner = coordinator_page.clone()
+        allocator.release_hisparse_ownership(
+            mapping_indices=compressed_locs,
+            extra_owned_coordinates=device_buffer_owner,
+            clear_extra_owner=device_buffer_owner.zero_,
+        )
+
+        self.assertEqual(physical.used_pages, set())
+        self.assertTrue(torch.all(mapping[:-1] == 0))
+        self.assertTrue(torch.all(device_buffer_owner == 0))
+        self.assertEqual(coordinator_page_id, 1)
+
+        # release_kv_cache runs after coordinator cleanup and owns logical pages.
+        allocator.free(logical_locs)
+        self.assertEqual(physical.used_pages, set())
+
+    def test_dsv4_shared_allocator_releases_mirrored_page_once(self):
+        """Target and draft aliases on one allocator release a page once."""
+        page_size = 64
+        physical = _PhysicalPageAllocator(page_size=page_size)
+        shared_mapping = torch.zeros(page_size + 1, dtype=torch.int64)
+        ownership = _HiSparsePageOwnership(
+            mapping=shared_mapping,
+            child_allocator=physical,
+            page_size=page_size,
+        )
+        shared_page = physical.alloc(page_size)
+        shared_mapping[:page_size] = shared_page
+        target_buffer_owner = shared_page.clone()
+        draft_buffer_alias = shared_page.clone()
+
+        # The draft coordinator is only a mirror: detach its local alias first.
+        # It shares both the allocator and mapping with target, so it must not
+        # clear the canonical mapping or return physical pages.
+        draft_buffer_alias.zero_()
+
+        self.assertEqual(physical.used_pages, {1})
+        self.assertTrue(torch.all(shared_mapping[:page_size] == shared_page))
+        self.assertTrue(torch.all(draft_buffer_alias == 0))
+
+        # The target coordinator clears the shared mapping and its local owner,
+        # then returns the complete physical page exactly once.
+        ownership.release(
+            mapping_indices=torch.arange(page_size),
+            extra_owned_coordinates=target_buffer_owner,
+            clear_extra_owner=target_buffer_owner.zero_,
+        )
+        self.assertEqual(physical.used_pages, set())
+        self.assertTrue(torch.all(shared_mapping == 0))
+        self.assertTrue(torch.all(target_buffer_owner == 0))
+
     def test_forwards_swa_tail_allocation_to_logical_allocator(self):
         allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
         logical_allocator = MagicMock(spec=["alloc_extend_swa_tail"])
@@ -116,10 +327,12 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             alloc_logical_only=MagicMock(return_value=kv_loc),
         )
         regular_host_alloc = MagicMock(return_value=host_indices)
+        req_to_host_pool = torch.full((1, len(host_indices)), -1, dtype=torch.int64)
+        req_to_host_pool_allocated_len = torch.zeros(1, dtype=torch.int64)
         coordinator = SimpleNamespace(
             mem_pool_host=SimpleNamespace(alloc_paged_token_slots=regular_host_alloc),
-            req_to_host_pool=object(),
-            req_to_host_pool_allocated_len=object(),
+            req_to_host_pool=req_to_host_pool,
+            req_to_host_pool_allocated_len=req_to_host_pool_allocated_len,
             host_token_len=MagicMock(side_effect=lambda token_len: token_len // 4),
         )
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
@@ -151,7 +364,10 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         self.assertEqual(req.kv_committed_len, fill_len)
         self.assertEqual(req.extend_range.length, fill_len)
         self.assertEqual(len(req_to_token_pool.writes), 1)
-        coordinator.host_token_len.assert_called_once_with(fill_len)
+        self.assertEqual(
+            coordinator.host_token_len.call_args_list,
+            [unittest.mock.call(fill_len), unittest.mock.call(fill_len)],
+        )
         regular_host_alloc.assert_called_once_with(
             coordinator.req_to_host_pool,
             coordinator.req_to_host_pool_allocated_len,
