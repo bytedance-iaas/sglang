@@ -45,6 +45,7 @@ class SidpGraphProfiler:
         peak_shifting: bool,
         dummy_compute: bool = False,
         sync_strategy: str = "none",
+        weight_codec: str = "identity",
     ) -> None:
         self.dp_rank = dp_rank
         self.dp_size = dp_size
@@ -57,6 +58,7 @@ class SidpGraphProfiler:
         self.has_communication = any(cycle_layers.values())
         self.dummy_compute = dummy_compute
         self.sync_strategy = sync_strategy
+        self.weight_codec = weight_codec
         self.order = (
             "resident"
             if not self.has_communication
@@ -110,6 +112,7 @@ class SidpGraphProfiler:
                 "communication_enabled": self.has_communication,
                 "dummy_compute": self.dummy_compute,
                 "sync_strategy": self.sync_strategy,
+                "weight_codec": self.weight_codec,
             }
         )
 

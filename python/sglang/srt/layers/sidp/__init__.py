@@ -2,6 +2,7 @@
 
 from sglang.srt.layers.sidp.config import SidpConfig
 from sglang.srt.layers.sidp.sidp_manager import SidpManager
+from sglang.srt.layers.sidp.weight_codec import EncodedWeight, SidpWeightCodec
 
 _GLOBAL_SIDP_MANAGER = None
 
@@ -18,6 +19,8 @@ def set_global_sidp_manager(manager):
 __all__ = [
     "SidpManager",
     "SidpConfig",
+    "SidpWeightCodec",
+    "EncodedWeight",
     "get_global_sidp_manager",
     "set_global_sidp_manager",
 ]

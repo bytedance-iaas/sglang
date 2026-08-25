@@ -25,6 +25,10 @@ from sglang.srt.layers.sidp.sync_strategy import (
     NoSyncStrategy,
     build_peak_sync_strategy,
 )
+from sglang.srt.layers.sidp.weight_codec import (
+    EncodedWeight,
+    build_weight_codec,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +40,9 @@ def _reduce_tensor(t: torch.Tensor):
     return reduce_tensor(t)
 
 
-def _rebuild_tensor(payload: bytes, src_device: int) -> torch.Tensor:
-    """Rebuild a tensor from pickled (fn, args) on the source device context."""
-    fn, args = pickle.loads(payload)
+def _rebuild_tensor(reduced_tensor, src_device: int) -> torch.Tensor:
+    """Rebuild a tensor from a reducer ``(fn, args)`` on its source device."""
+    fn, args = reduced_tensor
     with torch.cuda.device(src_device):
         return fn(*args)
 
@@ -57,6 +61,8 @@ class SidpManager:
         self.enable_peak_shifting = config.enable_peak_shifting
         self.enable_graph_profiling = config.enable_graph_profiling
         self.profile_dummy_compute = config.profile_dummy_compute
+        self.transfer_dtype = config.transfer_dtype
+        self.weight_codec = build_weight_codec(self.transfer_dtype)
         self.peak_sync_strategy = config.peak_sync_strategy
         self.peak_sync_min_raw_bs = config.peak_sync_min_raw_bs
         self.peak_sync_max_replays = config.peak_sync_max_replays
@@ -81,7 +87,9 @@ class SidpManager:
 
         # Populated by setup()
         self.peer_views: Dict[int, Dict[str, torch.Tensor]] = {}
+        self._peer_codec_metadata: Dict[int, Dict[str, Any]] = {}
         self.buffers: Dict[int, Dict[str, torch.Tensor]] = {}
+        self._transfer_buffers: Dict[int, Dict[str, torch.Tensor]] = {}
         self._layer_to_slot: Dict[int, int] = {}
         self._non_local_layers: List[int] = []
         self._fetch_schedule: List[int] = []
@@ -95,6 +103,8 @@ class SidpManager:
         self._next_forward_cycle_zero_queued = False
         self._layers_ref: Dict[int, Any] = {}
         self._ipc_refs: List[torch.Tensor] = []
+        self._local_encoded_weights: Dict[int, Dict[str, EncodedWeight]] = {}
+        self._local_encoded_refs: List[torch.Tensor] = []
         self._graph_profiler: SidpGraphProfiler | None = None
         self._launch_sync_strategy = NoSyncStrategy()
 
@@ -178,6 +188,7 @@ class SidpManager:
                 peak_shifting=self.enable_peak_shifting,
                 dummy_compute=self.profile_dummy_compute,
                 sync_strategy=self._launch_sync_strategy.name,
+                weight_codec=self.weight_codec.name,
             )
             logger.warning(
                 f"[SiDP rank{self.dp_rank}] CUDA Graph profiling enabled; "
@@ -191,15 +202,56 @@ class SidpManager:
             f"order={'peak-shifting' if self.enable_peak_shifting else 'compute'}"
         )
 
-        # D3: Export owner layers' IPC handles into store
-        torch.cuda.synchronize()  # D11: ensure weights visible to IPC
-        logger.info(f"[SiDP rank{self.dp_rank}] publishing IPC handles...")
+        # D3/D10: Materialize every locally retained weight representation;
+        # only canonical owners export theirs through IPC. Identity transport
+        # returns the original model weight. A real codec must make the encoded
+        # tensor canonical local storage (not retain a second persistent BF16
+        # copy). Static inference weights are encoded once at setup, not once
+        # per prefetch.
+        torch.cuda.synchronize()  # D11: make model-loader writes IPC-visible.
+        codec_stream = torch.cuda.current_stream()
         for lid in local_layers:
-            if owner_of(lid, self.dp_size) == self.dp_rank:
-                layer = layers[lid]
-                for pname, param in self._get_ffn_params(layer):
-                    handle = pickle.dumps(_reduce_tensor(param.data))
-                    self.store.set(f"sidp/{self.dp_rank}/{lid}/{pname}", handle)
+            layer = layers[lid]
+            self._local_encoded_weights[lid] = {}
+            for pname, param in self._get_ffn_params(layer):
+                encoded = self.weight_codec.encode_for_storage(
+                    layer_id=lid,
+                    param_name=pname,
+                    weight=param.data,
+                    stream=codec_stream,
+                )
+                if not encoded.tensor.is_cuda or not encoded.tensor.is_contiguous():
+                    raise ValueError(
+                        "SiDP encoded weights must be contiguous CUDA tensors: "
+                        f"layer={lid}, param={pname}, codec={self.weight_codec.name}"
+                    )
+                # Validate metadata even for a k>1 local replica so every local
+                # encoded weight follows one lifecycle contract. CUDA tensor
+                # metadata needs a separate IPC lifecycle and is unsupported.
+                pickle.dumps(encoded.metadata)
+                self._local_encoded_weights[lid][pname] = encoded
+                self._local_encoded_refs.append(encoded.tensor)
+
+        # D11: all encode kernels must complete before peers can consume the
+        # published IPC storage. One setup-time synchronization covers them all.
+        codec_stream.synchronize()
+        logger.info(
+            f"[SiDP rank{self.dp_rank}] publishing IPC handles "
+            f"(weight_codec={self.weight_codec.name})..."
+        )
+        for lid, encoded_params in self._local_encoded_weights.items():
+            if owner_of(lid, self.dp_size) != self.dp_rank:
+                continue
+            for pname, encoded in encoded_params.items():
+                handle = pickle.dumps(
+                    {
+                        "version": 1,
+                        "codec": self.weight_codec.name,
+                        "tensor": _reduce_tensor(encoded.tensor),
+                        "metadata": encoded.metadata,
+                    }
+                )
+                self.store.set(f"sidp/{self.dp_rank}/{lid}/{pname}", handle)
         logger.info(
             f"[SiDP rank{self.dp_rank}] published handles for "
             f"{sum(1 for l in local_layers if owner_of(l, self.dp_size) == self.dp_rank)} layers"
@@ -210,11 +262,37 @@ class SidpManager:
         for lid in non_local_layers:
             src = owner_of(lid, self.dp_size)
             self.peer_views[lid] = {}
+            self._peer_codec_metadata[lid] = {}
             for pname, _ in self._get_ffn_params(layers[lid]):
                 key = f"sidp/{src}/{lid}/{pname}"
                 payload = self.store.get(key)
-                peer_view = _rebuild_tensor(payload, src_device=src)
+                wire_payload = pickle.loads(payload)
+                # Accept the pre-codec identity payload for easier rolling
+                # upgrades, while all new ranks publish the versioned format.
+                if isinstance(wire_payload, dict):
+                    if wire_payload.get("version") != 1:
+                        raise RuntimeError(
+                            "Unsupported SiDP weight payload version: "
+                            f"{wire_payload.get('version')}"
+                        )
+                    if wire_payload.get("codec") != self.weight_codec.name:
+                        raise RuntimeError(
+                            "SiDP weight codec mismatch across ranks: "
+                            f"local={self.weight_codec.name}, "
+                            f"remote={wire_payload.get('codec')}"
+                        )
+                    reduced_tensor = wire_payload["tensor"]
+                    metadata = wire_payload.get("metadata")
+                else:
+                    if self.weight_codec.name != "identity":
+                        raise RuntimeError(
+                            "Legacy SiDP IPC payload is only valid for identity codec"
+                        )
+                    reduced_tensor = wire_payload
+                    metadata = None
+                peer_view = _rebuild_tensor(reduced_tensor, src_device=src)
                 self.peer_views[lid][pname] = peer_view
+                self._peer_codec_metadata[lid][pname] = metadata
                 self._ipc_refs.append(peer_view)  # D11: prevent GC
         logger.info(
             f"[SiDP rank{self.dp_rank}] rebuilt {len(non_local_layers)} peer views"
@@ -291,8 +369,11 @@ class SidpManager:
         if self.enable_cycle_overlap and self._cycle_layers.get(0):
             self._initialize_cycle_zero()
 
-        # All layers know the forward boundary manager; only non-local layers
-        # execute per-layer RAW/WAR hooks.
+        # All layers know the forward boundary manager; the current identity
+        # path only needs per-layer RAW/WAR hooks on non-local layers. A real
+        # compressed codec must bind *all* layers so local owner weights are
+        # also decoded into the one rank-global BF16 materialization buffer
+        # immediately before their GEMM.
         for lid, layer in layers.items():
             layer._sidp_bound = lid in self.peer_views
             layer._sidp_mgr = self
@@ -306,8 +387,10 @@ class SidpManager:
         """Called BEFORE the MLP GEMM of a non-local layer.
 
         Cycle 0 is resident before the forward begins, so it has no in-forward
-        RAW edge. Later cycles wait only for their own slot's prefetch event.
-        The serial fallback issues this layer's DMA using fork/copy/join.
+        RAW edge. Later cycles wait only for their own compressed slot's
+        prefetch event. Decode is then enqueued on the compute stream directly
+        before the GEMM. The serial fallback issues this layer's DMA using
+        fork/copy/join and uses the same decode hook.
         """
         slot = self._layer_to_slot[layer_id]
         compute_stream = torch.cuda.current_stream()
@@ -316,6 +399,7 @@ class SidpManager:
             if layer_id // self.dp_size == 0:
                 # The previous forward's tail (or setup for the first forward)
                 # established the cycle-0-resident invariant.
+                self._decode_weight_before_compute(layer_id, slot, compute_stream)
                 return
             # RAW: this layer alone waits for its copy. Other cycle copies stay
             # in flight on comm_stream while earlier layers compute.
@@ -324,24 +408,20 @@ class SidpManager:
             compute_stream.wait_event(self._prefetch_events[slot])
             if self._graph_profiler is not None:
                 self._graph_profiler.record_wait_end(layer_id, compute_stream)
+            self._decode_weight_before_compute(layer_id, slot, compute_stream)
             return
 
         # fork: comm_stream starts after compute_stream's current point
         self.comm_stream.wait_stream(compute_stream)
 
-        # DMA copy peer weights into this slot's buffer on comm_stream
+        # DMA compressed peer weights into this slot on comm_stream.
         for pname, peer_view in self.peer_views[layer_id].items():
-            buf = self.buffers[slot][pname]
-            self.memcpy.async_copy(
-                buf.data_ptr(),
-                peer_view.data_ptr(),
-                peer_view.nbytes,
-                self.comm_stream.cuda_stream,
-            )
+            self._copy_encoded_weight(layer_id, pname, peer_view, slot)
         self._prefetch_events[slot].record(self.comm_stream)
 
         # join: compute waits for the prefetch to finish (RAW)
         compute_stream.wait_event(self._prefetch_events[slot])
+        self._decode_weight_before_compute(layer_id, slot, compute_stream)
 
     def record_compute_and_prefetch_next(self, layer_id: int):
         """Record buffer consumption and advance the cycle window."""
@@ -465,8 +545,58 @@ class SidpManager:
     # Internal methods
     # ------------------------------------------------------------------
 
+    def _copy_encoded_weight(
+        self,
+        layer_id: int,
+        param_name: str,
+        peer_view: torch.Tensor,
+        slot: int,
+    ) -> None:
+        """Copy one encoded representation into its two-cycle cache slot.
+
+        The caller records the prefetch RAW event after this DMA. Decode does
+        not belong on ``comm_stream``: it runs later on the compute stream,
+        after the encoded slot is RAW-ready and immediately before the GEMM.
+        """
+        receive_buffer = self._transfer_buffers[slot][param_name]
+        self.memcpy.async_copy(
+            receive_buffer.data_ptr(),
+            peer_view.data_ptr(),
+            peer_view.nbytes,
+            self.comm_stream.cuda_stream,
+        )
+
+    def _decode_weight_before_compute(
+        self,
+        layer_id: int,
+        slot: int,
+        compute_stream: torch.cuda.Stream,
+    ) -> None:
+        """Materialize one RAW-ready encoded layer immediately before GEMM.
+
+        Identity decode is a no-op and ``self.buffers[slot]`` aliases the
+        encoded cycle slot. When a real compressed codec is registered, the
+        compute buffers passed here must instead be the single rank-global set
+        of BF16 FFN buffers shared by every local and remote layer.
+
+        TODO(SiDP codec): after decode, record a compressed-slot consume event
+        so the slot may be refilled while GEMM reads the independent BF16
+        materialization buffer. The identity path must conservatively retain
+        its existing post-GEMM WAR edge because copy and compute buffers alias.
+        """
+        for param_name, peer_view in self.peer_views[layer_id].items():
+            self.weight_codec.decode_before_compute(
+                layer_id=layer_id,
+                param_name=param_name,
+                encoded=self._transfer_buffers[slot][param_name],
+                encoded_nbytes=peer_view.nbytes,
+                compute_buffer=self.buffers[slot][param_name],
+                metadata=self._peer_codec_metadata[layer_id][param_name],
+                stream=compute_stream,
+            )
+
     def _do_prefetch(self, layer_id: int, wait_for_consume: bool = True):
-        """Issue raw cudaMemcpyAsync on comm_stream for one layer's weights."""
+        """Issue one layer's encoded transport copy."""
         slot = self._layer_to_slot[layer_id]
 
         if wait_for_consume:
@@ -481,15 +611,10 @@ class SidpManager:
                 self.comm_stream,
             )
         for pname, peer_view in peer_params.items():
-            buf = self.buffers[slot][pname]
-            self.memcpy.async_copy(
-                buf.data_ptr(),
-                peer_view.data_ptr(),
-                peer_view.nbytes,
-                self.comm_stream.cuda_stream,
-            )
+            self._copy_encoded_weight(layer_id, pname, peer_view, slot)
 
-        # RAW: mark prefetch done for this slot
+        # RAW: the compressed transport representation is now resident. Decode
+        # happens on the compute stream immediately before the layer GEMM.
         if self._graph_profiler is not None:
             self._graph_profiler.record_copy_end(layer_id, self.comm_stream)
         self._prefetch_events[slot].record(self.comm_stream)
@@ -579,7 +704,13 @@ class SidpManager:
         }
 
     def _alloc_buffers(self, layers, non_local_layers):
-        """Allocate serial layer slots or the eager cycle cache."""
+        """Allocate identity slots and codec cycle-cache staging.
+
+        Today only identity is registered, so every transfer slot aliases its
+        compute-dtype model buffer and no extra memory is introduced. A real
+        codec must keep only two cycles of encoded slots here and allocate one
+        rank-global BF16 materialization-buffer set outside this slot loop.
+        """
         if self.enable_cycle_overlap:
             num_slots = self._cycle_cache_depth * len(self._remote_positions)
         else:
@@ -589,19 +720,6 @@ class SidpManager:
 
         self._prefetch_events = [torch.cuda.Event() for _ in range(num_slots)]
         self._consume_events = [torch.cuda.Event() for _ in range(num_slots)]
-
-        # Get shapes from the first non-local layer (weights still intact at this point)
-        ref_layer = layers[non_local_layers[0]]
-        param_shapes = {}
-        for pname, param in self._get_ffn_params(ref_layer):
-            param_shapes[pname] = (param.shape, param.dtype)
-
-        # Allocate num_slots buffers
-        device = torch.cuda.current_device()
-        for s in range(num_slots):
-            self.buffers[s] = {}
-            for pname, (shape, dtype) in param_shapes.items():
-                self.buffers[s][pname] = torch.empty(shape, dtype=dtype, device=device)
 
         if self.enable_cycle_overlap:
             remote_count = len(self._remote_positions)
@@ -615,6 +733,49 @@ class SidpManager:
             # Graph-safe serial fallback: layer slots are reused round-robin.
             for i, lid in enumerate(non_local_layers):
                 self._layer_to_slot[lid] = i % num_slots
+
+        # Get shapes from the first non-local layer (weights still intact at this point)
+        ref_layer = layers[non_local_layers[0]]
+        param_shapes = {}
+        for pname, param in self._get_ffn_params(ref_layer):
+            param_shapes[pname] = (param.shape, param.dtype)
+
+        # Allocate num_slots buffers
+        device = torch.cuda.current_device()
+        for s in range(num_slots):
+            self.buffers[s] = {}
+            self._transfer_buffers[s] = {}
+            for pname, (shape, dtype) in param_shapes.items():
+                compute_buffer = torch.empty(shape, dtype=dtype, device=device)
+                self.buffers[s][pname] = compute_buffer
+                slot_layers = [
+                    lid for lid in non_local_layers if self._layer_to_slot[lid] == s
+                ]
+                encoded_views = [
+                    self.peer_views[lid][pname] for lid in slot_layers
+                ]
+                encoded_metadata = [
+                    self._peer_codec_metadata[lid][pname] for lid in slot_layers
+                ]
+                receive_buffer = self.weight_codec.allocate_cycle_buffer(
+                    param_name=pname,
+                    encoded_views=encoded_views,
+                    encoded_metadata=encoded_metadata,
+                    direct_compute_buffer=compute_buffer,
+                )
+                if not receive_buffer.is_cuda or not receive_buffer.is_contiguous():
+                    raise ValueError(
+                        "SiDP codec receive buffers must be contiguous CUDA tensors: "
+                        f"slot={s}, param={pname}, codec={self.weight_codec.name}"
+                    )
+                max_transfer_bytes = max(view.nbytes for view in encoded_views)
+                if receive_buffer.nbytes < max_transfer_bytes:
+                    raise ValueError(
+                        "SiDP codec receive buffer is smaller than its encoded weight: "
+                        f"slot={s}, param={pname}, receive={receive_buffer.nbytes}, "
+                        f"required={max_transfer_bytes}"
+                    )
+                self._transfer_buffers[s][pname] = receive_buffer
 
     def _prime_routes(self, non_local_layers):
         """D6: One real copy per peer device to build peer page mapping."""
