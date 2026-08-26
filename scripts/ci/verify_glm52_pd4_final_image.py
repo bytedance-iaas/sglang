@@ -99,11 +99,18 @@ allocator_src = pathlib.Path(
 ).read_text()
 assert "class _HiSparsePageOwnership" in allocator_src
 assert "_stable_unique_page_ids" in allocator_src
+assert "def _released_page_ids" in allocator_src
 assert "release_hisparse_ownership" in allocator_src
+assert "remaining_page_ids" in allocator_src
 assert "Only the canonical HiSparse slot owner may abort staging requests" in (
     coordinator_src
 )
 assert "It must neither clear the canonical" in coordinator_src
+model_runner_src = pathlib.Path(
+    "/sgl-workspace/sglang/python/sglang/srt/model_executor/model_runner.py"
+).read_text()
+assert "def max_token_pool_size" in model_runner_src
+assert "num_tokens=self.max_token_pool_size + self.page_size" in model_runner_src
 
 print(
     json.dumps(
@@ -118,6 +125,8 @@ print(
             "mtp_dp_vote_fix": True,
             "hisparse_retract_fix": True,
             "hisparse_page_ownership_fix": True,
+            "hisparse_final_owner_fix": True,
+            "hisparse_host_backed_admission_fix": True,
         },
         sort_keys=True,
     )
