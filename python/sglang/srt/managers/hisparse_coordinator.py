@@ -416,18 +416,31 @@ class HiSparseCoordinator:
         if not self.debug_validate_lifecycle:
             return
         free_slots = self.mem_pool_host.free_slots
-        unique_free_slots = torch.unique(free_slots)
-        if unique_free_slots.numel() != free_slots.numel():
+        release_slots = getattr(self.mem_pool_host, "release_slots", [])
+        released_chunks = [
+            chunk.to(dtype=torch.int64, device=free_slots.device).flatten()
+            for chunk in release_slots
+            if chunk.numel() > 0
+        ]
+        all_free_slots = (
+            torch.cat([free_slots, *released_chunks])
+            if released_chunks
+            else free_slots
+        )
+        unique_free_slots = torch.unique(all_free_slots)
+        if unique_free_slots.numel() != all_free_slots.numel():
             raise RuntimeError(
                 "HiSparse host allocator free-list contains duplicates: "
                 f"stage={stage} req={req.rid} free={free_slots.numel()} "
+                f"deferred={all_free_slots.numel() - free_slots.numel()} "
                 f"unique={unique_free_slots.numel()}"
             )
         used_slots = int(self.mem_pool_host.slot_used.sum().item())
-        if free_slots.numel() + used_slots != self.mem_pool_host.size:
+        if all_free_slots.numel() + used_slots != self.mem_pool_host.size:
             raise RuntimeError(
                 "HiSparse host allocator accounting mismatch: "
                 f"stage={stage} req={req.rid} free={free_slots.numel()} "
+                f"deferred={all_free_slots.numel() - free_slots.numel()} "
                 f"used={used_slots} size={self.mem_pool_host.size}"
             )
         logger.warning(

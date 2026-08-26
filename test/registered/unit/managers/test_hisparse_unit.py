@@ -1484,6 +1484,25 @@ class TestHiSparseUnit(unittest.TestCase):
             torch.unique(physical.free_pages).numel(), physical.free_pages.numel()
         )
 
+    def test_debug_lifecycle_accepts_deferred_host_slot_release(self):
+        """Host slots staged in release_slots still count as allocator-free."""
+        req = _make_req("debug-deferred-host-release")
+        host_pool = self.coordinator.mem_pool_host
+        host_indices = host_pool.alloc(self.page_size)
+        self.assertIsNotNone(host_indices)
+        host_pool.free(host_indices)
+
+        old_debug = self.coordinator.debug_validate_lifecycle
+        self.coordinator.debug_validate_lifecycle = True
+        try:
+            self.coordinator._debug_validate_host_allocator_after_free(
+                req, host_indices.numel(), stage="test"
+            )
+        finally:
+            self.coordinator.debug_validate_lifecycle = old_debug
+
+        self.assertEqual(host_pool.available_size(), host_pool.size)
+
     def test_device_buffer_slot_cut_preserves_shared_physical_page(self):
         """A mapping hole must not free a page retained by the device buffer.
 
