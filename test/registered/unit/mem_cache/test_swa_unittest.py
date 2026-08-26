@@ -1,6 +1,7 @@
 import unittest
 from array import array
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import torch
 
@@ -380,6 +381,41 @@ class TestSWA(unittest.TestCase):
         print(tree.available_and_evictable_str())
         print(available_and_evictable_str(tree))
         tree.sanity_check()
+
+    def test_free_swa_group_owns_mapping_at_enqueue_time(self):
+        allocator = object.__new__(SWATokenToKVPoolAllocator)
+        allocator.page_size = 1
+        allocator.is_not_in_free_group = True
+        allocator.free_group = []
+        allocator.full_attn_allocator = MagicMock()
+        allocator.swa_attn_allocator = MagicMock()
+        allocator.full_to_swa_index_mapping = torch.tensor(
+            [0, 10, 20], dtype=torch.int64
+        )
+        old_full = torch.tensor([1], dtype=torch.int64)
+        new_full = torch.tensor([2], dtype=torch.int64)
+        old_swa = allocator.full_to_swa_index_mapping[old_full].clone()
+        new_swa = allocator.full_to_swa_index_mapping[new_full].clone()
+
+        allocator.free_group_begin()
+        allocator.free_swa(old_full)
+
+        # Cache reconciliation may install a replacement mapping before the
+        # group flushes. The deferred free still owns the old mapping.
+        allocator.set_full_to_swa_mapping(old_full, new_swa)
+        allocator.full_to_swa_index_mapping[new_full] = 0
+        allocator.free_group_end()
+
+        torch.testing.assert_close(
+            allocator.full_to_swa_index_mapping[old_full], new_swa
+        )
+        allocator.swa_attn_allocator.free.assert_called_once()
+        torch.testing.assert_close(
+            allocator.swa_attn_allocator.free.call_args.args[0], old_swa
+        )
+        self.assertFalse(
+            torch.equal(allocator.swa_attn_allocator.free.call_args.args[0], new_swa)
+        )
 
     def test_swa_radix_cache_eagle(self):
         # args

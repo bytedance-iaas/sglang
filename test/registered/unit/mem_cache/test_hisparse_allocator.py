@@ -99,6 +99,31 @@ class _C4Pool:
 
 
 class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
+    def test_dsv4_free_group_owns_req_to_token_views(self):
+        """Deferred finish frees must survive req-row reuse under overlap."""
+        logical_allocator = MagicMock()
+        allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
+        allocator.logical_attn_allocator = logical_allocator
+        allocator.is_not_in_free_group = True
+        allocator.free_group = []
+
+        req_to_token = torch.arange(256, dtype=torch.int64).reshape(2, 128)
+        committed = req_to_token[0, :64]
+        speculative_tail = req_to_token[0, 64:96]
+        expected = torch.cat((committed.clone(), speculative_tail.clone()))
+
+        allocator.free_group_begin()
+        allocator.free(committed)
+        allocator.free_segment(speculative_tail, start_pos=64)
+
+        # Overlap scheduling can recycle and rewrite the request row before the
+        # outer DSV4 allocator drains its batched free transaction.
+        req_to_token[0].copy_(req_to_token[1])
+        allocator.free_group_end()
+
+        logical_allocator.free.assert_called_once()
+        torch.testing.assert_close(logical_allocator.free.call_args.args[0], expected)
+
     def test_released_page_ids_includes_pd_staging_pages(self):
         allocator = SimpleNamespace(
             free_pages=torch.tensor([1, 2], dtype=torch.int64),
@@ -266,6 +291,80 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         self.assertEqual(physical.used_pages, set())
         self.assertEqual(physical.available_size(), physical.size)
         self.assertEqual(physical.free_pages.count(1), 1)
+
+    def test_generic_resident_finish_returns_spec_page_once(self):
+        """Coordinator finish detaches aliases before returning its side page."""
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        page_size = 64
+        logical = _LogicalPageAllocator(page_size=page_size, num_pages=2)
+        physical = _PhysicalPageAllocator(page_size=page_size, num_pages=2)
+        mapping = torch.zeros(logical.size + page_size + 1, dtype=torch.int64)
+        allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
+        allocator.page_size = page_size
+        allocator.logical_attn_allocator = logical
+        allocator.hisparse_attn_allocator = physical
+        allocator.full_to_hisparse_device_index_mapping = mapping
+        allocator.is_not_in_free_group = True
+        allocator.free_group = []
+        allocator._page_ownership = _HiSparsePageOwnership(
+            mapping=mapping, child_allocator=physical, page_size=page_size
+        )
+
+        side_page = physical.alloc(page_size)
+        allocator.claim_hisparse_ownership(side_page)
+        logical_locs = torch.arange(1, 8, dtype=torch.int64)
+        mapping[logical_locs] = side_page[: logical_locs.numel()]
+
+        coordinator = object.__new__(HiSparseCoordinator)
+        coordinator.page_size = page_size
+        coordinator.device_buffer_size = 4
+        coordinator.padded_buffer_size = coordinator.device_buffer_size + page_size
+        coordinator.req_to_device_buffer = torch.zeros(
+            (1, coordinator.padded_buffer_size), dtype=torch.int64
+        )
+        coordinator.req_to_device_buffer[0, coordinator.device_buffer_size :] = (
+            side_page
+        )
+        coordinator.req_device_buffer_size = torch.tensor(
+            [coordinator.padded_buffer_size], dtype=torch.int64
+        )
+        coordinator.req_device_buffer_tokens = torch.zeros(
+            (1, 1, coordinator.padded_buffer_size), dtype=torch.int32
+        )
+        coordinator.req_device_buffer_token_locs = torch.zeros_like(
+            coordinator.req_device_buffer_tokens
+        )
+        coordinator.lru_slots = torch.zeros(
+            (1, 1, coordinator.padded_buffer_size), dtype=torch.int16
+        )
+        coordinator._lru_init = torch.zeros(
+            coordinator.padded_buffer_size, dtype=torch.int16
+        )
+        coordinator.req_to_token_pool = SimpleNamespace(
+            req_to_token=logical_locs.unsqueeze(0)
+        )
+        coordinator.mem_pool_device = SimpleNamespace(
+            translate_loc_from_full_to_compressed=lambda locs: locs,
+            full_to_hisparse_device_index_mapping=mapping,
+        )
+        coordinator.token_to_kv_pool_allocator = allocator
+        req = SimpleNamespace(
+            rid="resident-finish",
+            req_pool_idx=0,
+            kv=SimpleNamespace(kv_allocated_len=logical_locs.numel()),
+        )
+
+        coordinator._free_resident_spec_page(req, free_physical=True)
+        self.assertTrue(torch.all(mapping[logical_locs] == 0))
+        self.assertEqual(physical.free_pages.count(1), 1)
+        self.assertEqual(physical.available_size(), physical.size)
+
+        # release_kv_cache follows coordinator cleanup. It now owns only the
+        # logical page and cannot return the physical page a second time.
+        allocator.free(logical_locs)
+        self.assertEqual(physical.free_pages.count(1), 1)
+        self.assertEqual(physical.available_size(), physical.size)
 
     def test_page_ownership_does_not_release_page_already_staged_for_reuse(self):
         """PD release_pages is part of the physical allocator's free set."""
