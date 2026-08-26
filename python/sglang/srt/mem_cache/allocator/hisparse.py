@@ -118,9 +118,13 @@ class _HiSparsePageOwnership:
         assert self.child_allocator.is_not_in_free_group
         coordinates = self.mapping[mapping_indices]
         extra_page_ids: set[int] = set()
+        extra_page_ids_tensor = torch.empty(
+            0, dtype=torch.int64, device=self.mapping.device
+        )
         if extra_owned_coordinates is not None:
             coordinates = torch.cat([coordinates, extra_owned_coordinates])
-            extra_page_ids = set(self._page_ids(extra_owned_coordinates).cpu().tolist())
+            extra_page_ids_tensor = self._page_ids(extra_owned_coordinates)
+            extra_page_ids = set(extra_page_ids_tensor.cpu().tolist())
             missing = extra_page_ids - self._extra_owner_page_ids
             if missing:
                 raise RuntimeError(
@@ -130,6 +134,25 @@ class _HiSparsePageOwnership:
         page_ids = self._page_ids(coordinates)
 
         self.mapping[mapping_indices] = 0
+        remaining_mask = self.mapping > 0
+        remaining_indices = torch.nonzero(remaining_mask, as_tuple=False).flatten()
+        remaining_coordinates = self.mapping[remaining_mask].to(torch.int64)
+        if extra_page_ids_tensor.numel() > 0 and remaining_coordinates.numel() > 0:
+            # A coordinator side buffer explicitly owns complete physical
+            # pages. EAGLE verify can leave logical aliases outside the
+            # request-visible kv_allocated_len, so request_finished cannot
+            # enumerate them through mapping_indices. Once the canonical
+            # side-buffer owner is released, every alias of those pages is
+            # stale and must be retired in the same transaction; otherwise
+            # the global remaining-owner scan below pins the pages forever.
+            remaining_page_ids = torch.div(
+                remaining_coordinates, self.page_size, rounding_mode="floor"
+            )
+            stale_extra_aliases = torch.isin(
+                remaining_page_ids, extra_page_ids_tensor
+            )
+            self.mapping[remaining_indices[stale_extra_aliases]] = 0
+            remaining_coordinates = remaining_coordinates[~stale_extra_aliases]
         self._extra_owner_page_ids.difference_update(extra_page_ids)
         if clear_extra_owner is not None:
             clear_extra_owner()
@@ -154,7 +177,6 @@ class _HiSparsePageOwnership:
         # in the same page and can be retired by a later release call. The page
         # allocator has no reference counts, so return only pages whose final
         # mapping owner was cleared by this transaction.
-        remaining_coordinates = self.mapping[self.mapping > 0].to(torch.int64)
         if remaining_coordinates.numel() > 0:
             remaining_page_ids = torch.unique(remaining_coordinates // self.page_size)
             page_ids = page_ids[~torch.isin(page_ids, remaining_page_ids)]

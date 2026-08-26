@@ -252,6 +252,37 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         self.assertEqual(child_allocator.used_pages, set())
         self.assertEqual(child_allocator.free_pages.count(1), 1)
 
+    def test_page_ownership_retires_stale_aliases_of_released_side_page(self):
+        """A side-buffer release owns and retires every alias of its full page."""
+        page_size = 4
+        mapping = torch.zeros(12, dtype=torch.int64)
+        side_buffer = torch.tensor([4, 5, 6, 7], dtype=torch.int64)
+        child_allocator = _PhysicalPageAllocator(page_size=page_size, num_pages=2)
+        allocated = child_allocator.alloc(page_size)
+        self.assertEqual(allocated.tolist(), side_buffer.tolist())
+        ownership = _HiSparsePageOwnership(
+            mapping=mapping, child_allocator=child_allocator, page_size=page_size
+        )
+        ownership.claim(side_buffer)
+
+        # request_finished can see only the committed req_to_token range.  An
+        # EAGLE verify tail may remain outside that range while still aliasing
+        # the coordinator-owned full page.  The explicit side-buffer owner is
+        # the canonical owner of the page, so dropping it must also retire
+        # those stale aliases rather than leaking the physical page forever.
+        mapping[1] = 4
+        mapping[9] = 7
+        mapping[10] = 9
+        ownership.release(
+            mapping_indices=torch.tensor([1]),
+            extra_owned_coordinates=side_buffer,
+        )
+
+        self.assertEqual(mapping[[1, 9]].tolist(), [0, 0])
+        self.assertEqual(mapping[10].item(), 9)
+        self.assertEqual(child_allocator.used_pages, set())
+        self.assertEqual(child_allocator.free_pages.count(1), 1)
+
     def test_generic_finish_order_survives_earlier_logical_alias_retirement(self):
         """Replay the production cache/coordinator/final-cache ownership order."""
         page_size = 64
