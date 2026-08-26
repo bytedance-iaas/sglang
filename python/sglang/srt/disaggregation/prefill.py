@@ -481,9 +481,6 @@ class PrefillBootstrapQueue:
         """Return ordered PP candidates without reserving local resources."""
         good_rids: List[str] = []
         failed_rids: List[str] = []
-        if len(self.queue) == 0:
-            return good_rids, failed_rids
-
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.queue],
             self.scheduler.attn_cp_cpu_group,
@@ -546,13 +543,14 @@ class SchedulerDisaggregationPrefillMixin:
         the post-forward bootstrap check.
         """
         candidates = [req for req in self.waiting_queue if not is_aborted(req)]
-        if not candidates:
-            return
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in candidates],
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
+            ordered_keys=[req.rid for req in candidates],
         )
+        if not candidates:
+            return
         failed = set()
         for req, poll in zip(candidates, polls):
             if poll == KVPoll.Failed:
@@ -873,9 +871,6 @@ class SchedulerDisaggregationPrefillMixin:
         Poll the requests in the middle of transfer. If done, return the request.
         transfer_status: For PP, the consensus success and failure request ids.
         """
-        if len(self.disagg_prefill_inflight_queue) == 0:
-            return []
-
         done_reqs = []
         success_rids = set(transfer_status[0]) if transfer_status is not None else set()
         failed_rids = set(transfer_status[1]) if transfer_status is not None else set()
@@ -886,6 +881,8 @@ class SchedulerDisaggregationPrefillMixin:
             self.attn_tp_cpu_group,
             ordered_keys=[req.rid for req in self.disagg_prefill_inflight_queue],
         )
+        if len(self.disagg_prefill_inflight_queue) == 0:
+            return []
 
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue

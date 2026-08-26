@@ -82,6 +82,49 @@ class TestDisaggregationWire(unittest.TestCase):
         poller_b.poll.assert_not_called()
         poller_a.poll.assert_called_once_with()
 
+    @patch("sglang.srt.disaggregation.utils.poll_and_all_reduce")
+    @patch("sglang.srt.disaggregation.utils.dist.all_reduce")
+    def test_globally_empty_keyed_queue_returns_after_signature_consensus(
+        self, all_reduce, poll_and_all_reduce
+    ):
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [],
+            "attn-cp",
+            "attn-tp",
+            ordered_keys=[],
+        )
+
+        self.assertEqual(polls, [])
+        self.assertEqual(all_reduce.call_count, 2)
+        poll_and_all_reduce.assert_not_called()
+
+    @patch("sglang.srt.disaggregation.utils.dist.get_world_size", return_value=2)
+    @patch("sglang.srt.disaggregation.utils.dist.all_gather_object")
+    @patch("sglang.srt.disaggregation.utils.dist.all_reduce")
+    def test_locally_empty_queue_still_joins_membership_consensus(
+        self, all_reduce, all_gather_object, _get_world_size
+    ):
+        def emulate_rank_mismatch(tensor, op=None, group=None):
+            if tensor.dtype == torch.int64:
+                tensor[2] -= 1
+
+        def emulate_remote_keys(output, local_keys, group=None):
+            output[0] = local_keys
+            output[1] = ["request-a"]
+
+        all_reduce.side_effect = emulate_rank_mismatch
+        all_gather_object.side_effect = emulate_remote_keys
+
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [],
+            "attn-cp",
+            "attn-tp",
+            ordered_keys=[],
+        )
+
+        self.assertEqual(polls, [])
+        self.assertEqual(all_gather_object.call_count, 2)
+
     def test_pd_bootstrap_summary_preserves_bytes_and_metadata(self):
         value = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
         summary = summarize_pd_bootstrap_tensor(value)

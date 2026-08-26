@@ -20,6 +20,31 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestPPPDConsensus(CustomTestCase):
+    def test_empty_bootstrap_queue_still_participates_in_poll_consensus(self):
+        queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
+        queue.queue = []
+        queue.scheduler = SimpleNamespace(
+            attn_cp_cpu_group=object(),
+            attn_tp_cpu_group=object(),
+        )
+        queue.req_to_metadata_buffer_idx_allocator = SimpleNamespace(
+            available_size=lambda: 1
+        )
+
+        with patch(
+            "sglang.srt.disaggregation.prefill."
+            "poll_and_all_reduce_attn_cp_tp_group",
+            return_value=[],
+        ) as poll:
+            self.assertEqual(queue.get_ready_bootstrapped_rids_for_pp(), ([], []))
+
+        poll.assert_called_once_with(
+            [],
+            queue.scheduler.attn_cp_cpu_group,
+            queue.scheduler.attn_tp_cpu_group,
+            ordered_keys=[],
+        )
+
     def test_transfer_failure_overrides_ordered_success_intersection(self):
         """A failure on one PP rank must terminate an otherwise successful rid."""
         status = _pp_merge_transfer_status(
