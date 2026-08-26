@@ -133,7 +133,9 @@ jobs:
               /tmp/test_hisparse_allocator.py \
               /tmp/test_hisparse_max_token_pool_size.py \
               /tmp/test_hisparse_pd_draft.py \
-              /tmp/test_eagle_worker_v2_topk1_fastpath.py
+              /tmp/test_eagle_worker_v2_topk1_fastpath.py::TestEagleWorkerV2Topk1FastPath::test_hisparse_finalizer_uses_distinct_draft_mirror \
+              /tmp/test_eagle_worker_v2_topk1_fastpath.py::TestEagleWorkerV2Topk1FastPath::test_hisparse_finalizer_skips_idle_or_unsupported_batches \
+              /tmp/test_eagle_worker_v2_topk1_fastpath.py::TestEagleWorkerV2Topk1FastPath::test_topk1_verify_reaches_hisparse_finalizer
 
       - name: Verify PP relay ordering regression
         shell: bash
