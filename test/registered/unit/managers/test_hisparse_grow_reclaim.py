@@ -71,6 +71,10 @@ class _FakeHisparseAllocator:
 class _FakeKVAllocator:
     def __init__(self, hisparse_attn_allocator):
         self.hisparse_attn_allocator = hisparse_attn_allocator
+        self.claimed = []
+
+    def claim_hisparse_ownership(self, coordinates):
+        self.claimed.extend(coordinates.tolist())
 
 
 class TestHiSparseGrowReclaim(CustomTestCase):
@@ -108,6 +112,7 @@ class TestHiSparseGrowReclaim(CustomTestCase):
 
         self.assertEqual(allocator.alloc_calls, 1)
         self.assertEqual(int(coord.req_device_buffer_size[0]), PADDED)
+        self.assertEqual(len(coord.token_to_kv_pool_allocator.claimed), PADDED)
 
     def test_reclaim_then_retry_succeeds_without_raise(self):
         coord = self._make_coordinator(available=0)
@@ -125,6 +130,7 @@ class TestHiSparseGrowReclaim(CustomTestCase):
         self.assertEqual(coord._demote_log, [PADDED])
         self.assertGreaterEqual(allocator.alloc_calls, 2)
         self.assertEqual(int(coord.req_device_buffer_size[0]), PADDED)
+        self.assertEqual(len(coord.token_to_kv_pool_allocator.claimed), PADDED)
         # Draft page (columns device_buffer_size..padded) must be materialized.
         self.assertTrue(
             torch.all(
