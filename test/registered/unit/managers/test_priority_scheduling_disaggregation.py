@@ -130,9 +130,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
         queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
-        queue._allocatable_token_budgets = MagicMock(
-            return_value=allocatable_tokens
-        )
+        queue._allocatable_token_budgets = MagicMock(return_value=allocatable_tokens)
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
 
         def pre_alloc_mock(req, prefix_indices=None, prefix_len=0, total_prefix_len=0):
@@ -268,9 +266,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
 
         self.assertEqual(preallocated, [])
         self.assertEqual(failed, [])
-        self.assertEqual(
-            [req.req.rid for req in queue.queue], ["long", "short"]
-        )
+        self.assertEqual([req.req.rid for req in queue.queue], ["long", "short"])
 
     def test_fit_first_does_not_bypass_higher_priority_request(self):
         high_priority_long = self._new_decode_req("high-long", 10, input_len=10)
@@ -308,9 +304,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
 
         self.assertEqual(preallocated, [])
         self.assertEqual(failed, [])
-        self.assertEqual(
-            [req.req.rid for req in queue.queue], ["long", "short"]
-        )
+        self.assertEqual([req.req.rid for req in queue.queue], ["long", "short"])
 
 
 class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
@@ -342,6 +336,7 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
             bootstrap_host="127.0.0.1",
             bootstrap_port=30000,
             bootstrap_room=7,
+            bootstrap_generation=None,
             priority=10,
             extra_key=None,
             routing_key=None,
@@ -360,6 +355,9 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
         self.assertTrue(all(type(x) is int for x in payload["input_ids"]))
         self.assertEqual(payload["sampling_params"]["max_new_tokens"], 1)
         self.assertEqual(payload["bootstrap_room"], 7)
+        # The decode receiver adds its authoritative generation immediately
+        # before dispatch; Req only owns the generation received by prefill.
+        self.assertNotIn("bootstrap_generation", payload)
         # The prefill /generate URL is derived from bootstrap info on the decode
         # side, not sent in the payload; and the boundary token is replayed via
         # the decode-side override, so neither belongs in the payload.

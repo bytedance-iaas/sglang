@@ -328,6 +328,9 @@ class PrefillBootstrapQueue:
 
         dest_tp_ranks = [self.tp_rank]
 
+        sender_kwargs = {}
+        if self.kv_manager.supports_request_generation:
+            sender_kwargs["generation"] = getattr(req, "bootstrap_generation", None)
         req.disagg_kv_sender = kv_sender_class(
             mgr=self.kv_manager,
             bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
@@ -335,6 +338,7 @@ class PrefillBootstrapQueue:
             dest_tp_ranks=dest_tp_ranks,
             pp_rank=self.pp_rank,
             req_has_disagg_prefill_dp_rank=req.disagg_prefill_dp_rank is not None,
+            **sender_kwargs,
         )
         self._process_req(req)
         req.pending_bootstrap = True
@@ -896,9 +900,7 @@ class SchedulerDisaggregationPrefillMixin:
                 (
                     KVPoll.Failed
                     if req.rid in failed_rids
-                    else KVPoll.Success
-                    if req.rid in success_rids
-                    else None
+                    else KVPoll.Success if req.rid in success_rids else None
                 )
                 for req in self.disagg_prefill_inflight_queue
             ]

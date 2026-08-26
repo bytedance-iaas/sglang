@@ -258,6 +258,8 @@ class GenerateReqInput:
     bootstrap_host: Optional[Union[List[Optional[str]], str]] = None
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[Optional[int]], int]] = None
+    # Internal PD true-retraction incarnation for a reused bootstrap_room.
+    bootstrap_generation: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_pair_key: Optional[Union[List[Optional[str]], str]] = None
     decode_tp_size: Optional[Union[List[Optional[int]], int]] = None
 
@@ -728,6 +730,16 @@ class GenerateReqInput:
         elif isinstance(self.bootstrap_room, list):
             self.bootstrap_room = self.bootstrap_room * self.parallel_sample_num
 
+        # Normalize bootstrap_generation
+        if self.bootstrap_generation is None:
+            self.bootstrap_generation = [None] * num
+        elif not isinstance(self.bootstrap_generation, list):
+            self.bootstrap_generation = [self.bootstrap_generation] * num
+        else:
+            self.bootstrap_generation = (
+                self.bootstrap_generation * self.parallel_sample_num
+            )
+
         # Normalize bootstrap_pair_key
         if self.bootstrap_pair_key is None:
             self.bootstrap_pair_key = [None] * num
@@ -810,6 +822,11 @@ class GenerateReqInput:
             ),
             bootstrap_room=(
                 self.bootstrap_room[i] if self.bootstrap_room is not None else None
+            ),
+            bootstrap_generation=(
+                self.bootstrap_generation[i]
+                if self.bootstrap_generation is not None
+                else None
             ),
             bootstrap_pair_key=(
                 self.bootstrap_pair_key[i]
@@ -899,6 +916,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     bootstrap_host: Optional[str] = None
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
+    bootstrap_generation: Optional[int] = None
     bootstrap_pair_key: Optional[str] = None
     decode_tp_size: Optional[int] = None
 

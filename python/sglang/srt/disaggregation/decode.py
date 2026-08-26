@@ -1444,9 +1444,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 **metadata_kwargs,
             )
             if decode_req.is_rebootstrap:
+                payload = decode_req.req.build_rebootstrap_payload()
+                payload["bootstrap_generation"] = decode_req.kv_receiver.generation
                 self.kv_manager.submit_prefill_recompute(
                     decode_req.kv_receiver,
-                    decode_req.req.build_rebootstrap_payload(),
+                    payload,
                 )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)

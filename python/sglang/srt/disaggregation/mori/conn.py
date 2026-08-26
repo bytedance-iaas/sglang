@@ -416,18 +416,23 @@ class MoriKVManager(CommonKVManager):
                 component_descs.append(desc)
             self.state_mem_descs.append(component_descs)
 
-    def update_status(self, bootstrap_room: int, status: KVPoll):
+    def update_status(
+        self,
+        bootstrap_room: int,
+        status: KVPoll,
+        generation: Optional[int] = None,
+    ):
         current = self.request_status.get(bootstrap_room)
         if current is None:
             # Room not yet created or already cleared.
             # Only allow initial creation: Bootstrapping (normal) or
             # WaitingForInput (dummy CP rank, see CommonKVSender.__init__).
             if status not in (KVPoll.Bootstrapping, KVPoll.WaitingForInput):
-                return
+                return False
         elif current == KVPoll.Failed and status != KVPoll.Failed:
             # Failed is terminal — never overwrite with non-Failed.
-            return
-        super().update_status(bootstrap_room, status)
+            return False
+        return super().update_status(bootstrap_room, status, generation)
 
     def enqueue_transfer(self, task: _TransferChunk) -> None:
         self._transfer_queues[task.sender.bootstrap_room % self._num_shards].put(task)

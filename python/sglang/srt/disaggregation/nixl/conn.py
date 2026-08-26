@@ -677,14 +677,21 @@ class NixlKVManager(CommonKVManager):
         )
         self._staging_ctx.prefetched_rooms.add(room)
 
-    def check_status(self, bootstrap_room: int):
+    def check_status(self, bootstrap_room: int, generation: Optional[int] = None):
+        if generation is not None:
+            return super().check_status(bootstrap_room, generation)
         return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
 
-    def update_status(self, bootstrap_room: int, status: KVPoll):
+    def update_status(
+        self,
+        bootstrap_room: int,
+        status: KVPoll,
+        generation: Optional[int] = None,
+    ):
         # Keep Failed sticky until the sender clears the room.
         if self.request_status.get(bootstrap_room) == KVPoll.Failed:
-            return
-        super().update_status(bootstrap_room, status)
+            return False
+        return super().update_status(bootstrap_room, status, generation)
 
     def _prep_equal_tp_dlist(
         self,

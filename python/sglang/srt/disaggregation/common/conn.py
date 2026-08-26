@@ -140,6 +140,8 @@ class PrefillRankInfo:
 
 
 class CommonKVManager(BaseKVManager):
+    supports_request_generation = False
+
     def __init__(
         self,
         args: KVArgs,
@@ -204,6 +206,14 @@ class CommonKVManager(BaseKVManager):
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
         self.request_status: Dict[int, KVPoll] = {}
+        # bootstrap_room is reused by PD true-retraction. Keep a local
+        # generation so a completed sender and its asynchronous transfer work
+        # cannot update or clear the next incarnation of the same room.
+        self.request_generation: Dict[int, int] = {}
+        self.next_request_generation: Dict[int, int] = {}
+        self.request_status_history: Dict[Tuple[int, int], KVPoll] = {}
+        self.request_failure_history: Dict[Tuple[int, int], str] = {}
+        self.request_status_lock = threading.RLock()
         self._socket_cache: Dict[str, zmq.Socket] = {}
         self._monitor_cache: Dict[str, zmq.Socket] = {}
         self._socket_send_locks: Dict[str, threading.Lock] = {}
@@ -306,29 +316,226 @@ class CommonKVManager(BaseKVManager):
             )
         return src_token_lens
 
-    def check_status(self, bootstrap_room: int) -> KVPoll:
-        return self.request_status[bootstrap_room]
+    def _ensure_request_lifecycle_state(self) -> None:
+        # Some unit tests construct managers with __new__. Keep these helpers
+        # usable without requiring a transport engine.
+        if not hasattr(self, "request_generation"):
+            self.request_generation = {}
+        if not hasattr(self, "next_request_generation"):
+            self.next_request_generation = {}
+        if not hasattr(self, "request_status_history"):
+            self.request_status_history = {}
+        if not hasattr(self, "request_failure_history"):
+            self.request_failure_history = {}
+        if not hasattr(self, "request_status_lock"):
+            self.request_status_lock = threading.RLock()
 
-    def update_status(self, bootstrap_room: int, status: KVPoll):
-        if bootstrap_room not in self.request_status:
-            # Do not resurrect a cleared entry with Failed: once clear() has
-            # popped the room from request_status, any late update_status(Failed)
-            # (e.g. from abort()) must be a no-op. Otherwise a Failed entry could
-            # pollute a future request that reuses the same bootstrap_room.
-            if status == KVPoll.Failed:
-                return
-            self.request_status[bootstrap_room] = status
-        else:
-            if status == KVPoll.Failed:
-                self.request_status[bootstrap_room] = KVPoll.Failed
-            else:
-                self.request_status[bootstrap_room] = max(
-                    self.request_status[bootstrap_room], status
-                )
-
-    def record_failure(self, bootstrap_room: int, failure_reason: str):
+    def _clear_request_payload_for_new_generation(self, bootstrap_room: int) -> None:
+        for attr in (
+            "req_to_decode_prefix_len",
+            "transfer_infos",
+            "required_prefill_response_num_table",
+            "prefill_response_tracker",
+        ):
+            table = getattr(self, attr, None)
+            if table is not None:
+                table.pop(bootstrap_room, None)
         with self.failure_lock:
-            self.failure_records[bootstrap_room] = failure_reason
+            self.failure_records.pop(bootstrap_room, None)
+
+    def _clear_request_payload(self, bootstrap_room: int) -> None:
+        for attr in (
+            "req_to_decode_prefix_len",
+            "transfer_infos",
+            "required_prefill_response_num_table",
+            "prefill_response_tracker",
+        ):
+            table = getattr(self, attr, None)
+            if table is not None:
+                table.pop(bootstrap_room, None)
+
+    def begin_request(
+        self,
+        bootstrap_room: int,
+        initial_status: KVPoll,
+        generation: Optional[int] = None,
+    ) -> Tuple[int, bool]:
+        """Join the active room generation or start a new one.
+
+        Decode metadata may arrive before the Prefill sender. Therefore an
+        active Bootstrapping/WaitingForInput state is joined, not reset. A
+        terminal state belongs to the previous transfer and starts a fresh
+        generation.
+        """
+        self._ensure_request_lifecycle_state()
+        with self.request_status_lock:
+            current = self.request_status.get(bootstrap_room)
+            current_generation = self.request_generation.get(bootstrap_room)
+            last_generation = self.next_request_generation.get(bootstrap_room, 0)
+            if generation is not None:
+                if current_generation is None and generation <= last_generation:
+                    # This generation has already been cleared. A duplicate or
+                    # delayed metadata packet must not resurrect it.
+                    return last_generation, False
+                if current_generation is not None and generation < current_generation:
+                    return current_generation, False
+                if (
+                    current_generation is not None
+                    and generation > current_generation
+                    and current not in (KVPoll.Success, KVPoll.Failed)
+                ):
+                    # A new incarnation must not overtake an in-flight transfer:
+                    # old RDMA writes could otherwise target buffers already
+                    # rebound by the new request. Reject the out-of-order join;
+                    # the caller will ignore metadata whose generation differs
+                    # from the returned active generation.
+                    return current_generation, False
+            started_new = (
+                generation is not None
+                and (current_generation is None or generation > current_generation)
+            ) or (
+                generation is None
+                and (current is None or current in (KVPoll.Success, KVPoll.Failed))
+            )
+            if started_new:
+                previous_generation = current_generation
+                if current is not None and previous_generation is not None:
+                    self.request_status_history[
+                        (bootstrap_room, previous_generation)
+                    ] = current
+                active_generation = (
+                    generation if generation is not None else last_generation + 1
+                )
+                self.request_generation[bootstrap_room] = active_generation
+                self.next_request_generation[bootstrap_room] = max(
+                    last_generation, active_generation
+                )
+                self.request_status[bootstrap_room] = initial_status
+                self._clear_request_payload_for_new_generation(bootstrap_room)
+            else:
+                active_generation = self.request_generation.setdefault(
+                    bootstrap_room, generation or 1
+                )
+                self.next_request_generation[bootstrap_room] = max(
+                    last_generation, active_generation
+                )
+                if initial_status == KVPoll.Failed:
+                    self.request_status[bootstrap_room] = KVPoll.Failed
+                elif current is None:
+                    self.request_status[bootstrap_room] = initial_status
+                elif current not in (KVPoll.Success, KVPoll.Failed):
+                    self.request_status[bootstrap_room] = max(current, initial_status)
+            return active_generation, started_new
+
+    def is_current_generation(
+        self, bootstrap_room: int, generation: Optional[int]
+    ) -> bool:
+        self._ensure_request_lifecycle_state()
+        with self.request_status_lock:
+            if generation is None:
+                active_generation = self.request_generation.get(bootstrap_room)
+                return bootstrap_room in self.request_status and (
+                    active_generation is None or active_generation <= 1
+                )
+            return (
+                self.request_generation.get(bootstrap_room) == generation
+                and bootstrap_room in self.request_status
+            )
+
+    def check_status(
+        self, bootstrap_room: int, generation: Optional[int] = None
+    ) -> KVPoll:
+        self._ensure_request_lifecycle_state()
+        with self.request_status_lock:
+            if (
+                generation is None
+                or self.request_generation.get(bootstrap_room) == generation
+            ):
+                return self.request_status[bootstrap_room]
+            return self.request_status_history[(bootstrap_room, generation)]
+
+    def update_status(
+        self,
+        bootstrap_room: int,
+        status: KVPoll,
+        generation: Optional[int] = None,
+    ) -> bool:
+        self._ensure_request_lifecycle_state()
+        with self.request_status_lock:
+            if (
+                generation is not None
+                and self.request_generation.get(bootstrap_room) != generation
+            ):
+                return False
+            if bootstrap_room not in self.request_status:
+                # Do not resurrect a cleared entry with Failed: once clear() has
+                # popped the room from request_status, any late failure must be
+                # a no-op. Otherwise it could pollute a future generation.
+                if status == KVPoll.Failed:
+                    return False
+                self.request_generation.setdefault(bootstrap_room, 1)
+                self.request_status[bootstrap_room] = status
+            else:
+                if status == KVPoll.Failed:
+                    self.request_status[bootstrap_room] = KVPoll.Failed
+                else:
+                    self.request_status[bootstrap_room] = max(
+                        self.request_status[bootstrap_room], status
+                    )
+            return True
+
+    def clear_request(self, bootstrap_room: int, generation: int) -> bool:
+        """Clear only the generation owned by the caller.
+
+        Returns True when the caller cleared the current generation. An old
+        sender only retires its archived status and cannot erase new metadata.
+        """
+        self._ensure_request_lifecycle_state()
+        with self.request_status_lock:
+            if self.request_generation.get(bootstrap_room) != generation:
+                self.request_status_history.pop((bootstrap_room, generation), None)
+                self.request_failure_history.pop((bootstrap_room, generation), None)
+                return False
+            self.request_status.pop(bootstrap_room, None)
+            self.request_generation.pop(bootstrap_room, None)
+            self.request_status_history.pop((bootstrap_room, generation), None)
+            self.request_failure_history.pop((bootstrap_room, generation), None)
+            self._clear_request_payload(bootstrap_room)
+            return True
+
+    def record_failure(
+        self,
+        bootstrap_room: int,
+        failure_reason: str,
+        generation: Optional[int] = None,
+    ):
+        if generation is None:
+            with self.failure_lock:
+                self.failure_records[bootstrap_room] = failure_reason
+            return
+
+        self._ensure_request_lifecycle_state()
+        # Keep the generation check and write atomic with respect to
+        # begin_request(). Otherwise a new generation can start between them
+        # and inherit the old failure reason.
+        with self.request_status_lock:
+            if not self.is_current_generation(bootstrap_room, generation):
+                return
+            self.request_failure_history[(bootstrap_room, generation)] = failure_reason
+
+    def pop_failure(
+        self, bootstrap_room: int, generation: Optional[int] = None
+    ) -> Optional[str]:
+        if generation is None:
+            with self.failure_lock:
+                return self.failure_records.pop(bootstrap_room, None)
+
+        self._ensure_request_lifecycle_state()
+        # The old sender may consume its failure after a new generation has
+        # already started, so failures are owned by (room, generation), not by
+        # whichever generation is current at pop time.
+        with self.request_status_lock:
+            return self.request_failure_history.pop((bootstrap_room, generation), None)
 
     def get_kv_replica_factor(self) -> int:
         if self._kv_replica_factor is None:
@@ -468,7 +675,14 @@ class CommonKVManager(BaseKVManager):
         ``AbortReq``.
         """
         kv_receiver.abort()
-        self.record_failure(kv_receiver.bootstrap_room, reason)
+        generation = getattr(kv_receiver, "generation", None)
+        if not isinstance(generation, int):
+            generation = None
+        self.record_failure(
+            kv_receiver.bootstrap_room,
+            reason,
+            generation,
+        )
 
     def _run_prefill_recompute(
         self, kv_receiver: CommonKVReceiver, prefill_url: str, payload: dict
@@ -1069,6 +1283,7 @@ class CommonKVSender(BaseKVSender):
         dest_tp_ranks: List[int],
         pp_rank: int,
         req_has_disagg_prefill_dp_rank: bool = False,
+        generation: Optional[int] = None,
     ):
         self.kv_mgr = mgr
         self.bootstrap_room = bootstrap_room
@@ -1081,12 +1296,32 @@ class CommonKVSender(BaseKVSender):
         # inner state
         self.curr_idx = 0
         self.init_time: Optional[float] = None
+        initial_status = (
+            KVPoll.WaitingForInput
+            if self.kv_mgr.is_dummy_cp_rank
+            else KVPoll.Bootstrapping
+        )
+        if self.kv_mgr.supports_request_generation:
+            active_generation, _ = self.kv_mgr.begin_request(
+                self.bootstrap_room, initial_status, generation
+            )
+            self.generation = (
+                generation if generation is not None else active_generation
+            )
+            if active_generation != self.generation:
+                self.conclude_state = KVPoll.Failed
+                self._generation_rejected_reason = (
+                    f"Request generation {self.generation} for bootstrap_room "
+                    f"{self.bootstrap_room} overlapped active generation "
+                    f"{active_generation}"
+                )
+                return
+        else:
+            self.generation = None
+            self.kv_mgr.update_status(self.bootstrap_room, initial_status)
         if self.kv_mgr.is_dummy_cp_rank:
             # Non-authoritative CP ranks are dummy participants.
-            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
             return
-
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
         if get_parallel().dp_size > 1 and not req_has_disagg_prefill_dp_rank:
             if get_parallel().load_balance_method != "follow_bootstrap_room":
                 self._register_prefill_dp_rank()
@@ -1105,8 +1340,11 @@ class CommonKVSender(BaseKVSender):
                         f"{self.bootstrap_room % get_parallel().dp_size}. "
                         f"Set SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1 "
                         f"to allow mixed routing.",
+                        self.generation,
                     )
-                    self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                    self.kv_mgr.update_status(
+                        self.bootstrap_room, KVPoll.Failed, self.generation
+                    )
                     return
 
     def _register_prefill_dp_rank(self):
@@ -1188,7 +1426,9 @@ class CommonKVSender(BaseKVSender):
             if not is_last_chunk:
                 return kv_indices, index_slice, is_last_chunk, True
             else:
-                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
+                self.kv_mgr.update_status(
+                    self.bootstrap_room, KVPoll.Success, self.generation
+                )
                 return kv_indices, index_slice, is_last_chunk, True
 
         return kv_indices, index_slice, is_last_chunk, False
@@ -1216,8 +1456,9 @@ class CommonKVSender(BaseKVSender):
             self.bootstrap_room,
             f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
             f"in KVPoll.Bootstrapping",
+            self.generation,
         )
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed, self.generation)
         return KVPoll.Failed
 
     def poll(self) -> KVPoll:
@@ -1227,6 +1468,10 @@ class CommonKVSender(BaseKVSender):
         raise Exception("Fake KVReceiver Exception")
 
     def clear(self) -> None:
+        generation = getattr(self, "generation", None)
+        if generation is not None:
+            self.kv_mgr.clear_request(self.bootstrap_room, generation)
+            return
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
             self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
@@ -1237,8 +1482,11 @@ class CommonKVSender(BaseKVSender):
         self.kv_mgr.record_failure(
             self.bootstrap_room,
             "Aborted by AbortReq.",
+            getattr(self, "generation", None),
         )
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        self.kv_mgr.update_status(
+            self.bootstrap_room, KVPoll.Failed, getattr(self, "generation", None)
+        )
         self.conclude_state = KVPoll.Failed
 
 
@@ -1262,16 +1510,25 @@ class CommonKVReceiver(BaseKVReceiver):
         self.init_time: Optional[float] = None
         self.abort_notified: bool = False
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
+        if self.kv_mgr.supports_request_generation:
+            self.generation, _ = self.kv_mgr.begin_request(
+                self.bootstrap_room, KVPoll.Bootstrapping
+            )
+        else:
+            self.generation = None
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
 
     def init(self, prefill_dp_rank: int):
         if self.bootstrap_addr not in self.kv_mgr.prefill_info_table:
             self.kv_mgr.record_failure(
                 self.bootstrap_room,
                 f"Prefill server with bootstrap_addr: {self.bootstrap_addr} is healthy before, but now it is down. Request (bootstrap_room: {self.bootstrap_room}) has been marked as failed.",
+                self.generation,
             )
             self.conclude_state = KVPoll.Failed
-            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            self.kv_mgr.update_status(
+                self.bootstrap_room, KVPoll.Failed, self.generation
+            )
             return
 
         # Read pre-computed rank mapping from prefill_info (computed in try_ensure_parallel_info)
@@ -1299,7 +1556,9 @@ class CommonKVReceiver(BaseKVReceiver):
         self._setup_bootstrap_infos()
         if self.conclude_state == KVPoll.Failed:
             return
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
+        self.kv_mgr.update_status(
+            self.bootstrap_room, KVPoll.WaitingForInput, self.generation
+        )
 
     def _setup_bootstrap_infos(self):
         all_bootstrap_infos = []
@@ -1336,10 +1595,11 @@ class CommonKVReceiver(BaseKVReceiver):
                             self.kv_mgr.record_failure(
                                 self.bootstrap_room,
                                 f"Could not fetch bootstrap info for: prefill_dp_rank: {self.prefill_dp_rank} prefill_cp_rank: {target_cp_rank} target_tp_rank: {target_tp_rank} and target_pp_rank {target_pp_rank}",
+                                self.generation,
                             )
                             self.conclude_state = KVPoll.Failed
                             self.kv_mgr.update_status(
-                                self.bootstrap_room, KVPoll.Failed
+                                self.bootstrap_room, KVPoll.Failed, self.generation
                             )
                             self.bootstrap_infos = None
                             return
@@ -1463,12 +1723,17 @@ class CommonKVReceiver(BaseKVReceiver):
             "Some requests fail to receive KV Cache transfer done signal after bootstrapping. "
             "If a greater mean TTFT is acceptable, you can 'export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
         )
-        self.kv_mgr.record_failure(
-            self.bootstrap_room,
+        failure_reason = (
             f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
-            f"in KVPoll.WaitingForInput",
+            f"in KVPoll.WaitingForInput"
         )
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        generation = getattr(self, "generation", None)
+        if generation is None:
+            self.kv_mgr.record_failure(self.bootstrap_room, failure_reason)
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        else:
+            self.kv_mgr.record_failure(self.bootstrap_room, failure_reason, generation)
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed, generation)
         if (
             not self.abort_notified
             and hasattr(self, "bootstrap_infos")
@@ -1482,6 +1747,10 @@ class CommonKVReceiver(BaseKVReceiver):
         raise Exception("Fake KVReceiver Exception")
 
     def clear(self) -> None:
+        generation = getattr(self, "generation", None)
+        if generation is not None:
+            self.kv_mgr.clear_request(self.bootstrap_room, generation)
+            return
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
@@ -1490,8 +1759,9 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr.record_failure(
             self.bootstrap_room,
             "Aborted by AbortReq.",
+            self.generation,
         )
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed, self.generation)
         self.conclude_state = KVPoll.Failed
         if (
             not self.abort_notified
@@ -1507,14 +1777,15 @@ class CommonKVReceiver(BaseKVReceiver):
             try:
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
                 with lock:
-                    sock.send_multipart(
-                        [
-                            b"ABORT",
-                            str(self.bootstrap_room).encode("ascii"),
-                            self.kv_mgr.local_ip.encode("ascii"),
-                            str(self.kv_mgr.rank_port).encode("ascii"),
-                        ]
-                    )
+                    message = [
+                        b"ABORT",
+                        str(self.bootstrap_room).encode("ascii"),
+                        self.kv_mgr.local_ip.encode("ascii"),
+                        str(self.kv_mgr.rank_port).encode("ascii"),
+                    ]
+                    if self.generation is not None:
+                        message.append(str(self.generation).encode("ascii"))
+                    sock.send_multipart(message)
                 logger.debug(
                     f"Sent abort notification for room {self.bootstrap_room} "
                     f"to {bootstrap_info.get('rank_ip', 'unknown')}:{bootstrap_info.get('rank_port', 'unknown')}"
