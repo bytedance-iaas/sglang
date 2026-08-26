@@ -7,15 +7,19 @@ slow path (`organize_draft_results`) for num_steps in {1, 2, 3, 4}.
 """
 
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
-
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 from sglang.srt.speculative.eagle_utils import organize_draft_results
+from sglang.srt.speculative.eagle_worker_common import (
+    _finalize_hisparse_accepted_tokens,
+    run_eagle_verify,
+)
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
 from sglang.test.ci.ci_register import (
     register_amd_ci,
@@ -138,6 +142,129 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         worker = _make_worker(num_steps=3, num_draft_tokens=3)
         with self.assertRaises(AssertionError):
             worker._rebuild_topk1_chain_buffers()
+
+    def test_hisparse_finalizer_uses_distinct_draft_mirror(self):
+        target = MagicMock()
+        target.supports_hisparse_draft_slots.return_value = True
+        draft = MagicMock()
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            hisparse_coordinator=target,
+            draft_hisparse_coordinator=draft,
+            req_pool_indices=torch.tensor([3], device=DEVICE),
+            seq_lens=torch.tensor([11], device=DEVICE),
+            out_cache_loc=torch.tensor([20, 21], device=DEVICE),
+        )
+        accept_index = torch.tensor([[0, 1]], device=DEVICE)
+
+        _finalize_hisparse_accepted_tokens(batch, accept_index)
+
+        target.finalize_accepted_tokens_spec_v2.assert_called_once_with(
+            req_pool_indices=batch.req_pool_indices,
+            seq_lens=batch.seq_lens,
+            verify_cache_locs=batch.out_cache_loc,
+            accept_index=accept_index,
+            mirror=draft,
+        )
+
+    def test_hisparse_finalizer_skips_idle_or_unsupported_batches(self):
+        for forward_mode, coordinator in (
+            (ForwardMode.IDLE, MagicMock()),
+            (ForwardMode.DECODE, None),
+            (ForwardMode.DECODE, MagicMock()),
+        ):
+            with self.subTest(forward_mode=forward_mode, coordinator=coordinator):
+                if coordinator is not None:
+                    coordinator.supports_hisparse_draft_slots.return_value = False
+                batch = SimpleNamespace(
+                    forward_mode=forward_mode,
+                    hisparse_coordinator=coordinator,
+                    draft_hisparse_coordinator=None,
+                )
+
+                _finalize_hisparse_accepted_tokens(
+                    batch, torch.empty((0,), dtype=torch.int64, device=DEVICE)
+                )
+
+                if coordinator is not None:
+                    coordinator.finalize_accepted_tokens_spec_v2.assert_not_called()
+
+    def test_topk1_verify_reaches_hisparse_finalizer(self):
+        batch = SimpleNamespace(
+            spec_info=SimpleNamespace(),
+            seq_lens=torch.tensor([11], device=DEVICE),
+            req_pool_indices=torch.tensor([3], device=DEVICE),
+            out_cache_loc=torch.tensor([20, 21], device=DEVICE),
+            input_ids=torch.tensor([7, 8], device=DEVICE),
+            forward_mode=ForwardMode.DECODE,
+            has_grammar=False,
+            return_logprob=False,
+        )
+        logits_output = SimpleNamespace(
+            next_token_logits=torch.zeros((2, 4), device=DEVICE),
+            hidden_states=None,
+        )
+        target_worker = SimpleNamespace(
+            server_args=SimpleNamespace(pp_size=1),
+            pp_group=SimpleNamespace(is_last_rank=True),
+            model_runner=SimpleNamespace(),
+            forward_batch_generation=MagicMock(
+                return_value=SimpleNamespace(
+                    logits_output=logits_output,
+                    routed_experts_output=None,
+                    indexer_topk_output=None,
+                )
+            ),
+        )
+        allocator = SimpleNamespace(
+            get_kvcache=lambda: SimpleNamespace(
+                clear_unaccepted_c128_draft_states=MagicMock()
+            )
+        )
+        predict = torch.tensor([7, 8], device=DEVICE)
+        accept_lens = torch.tensor([2], dtype=torch.int32, device=DEVICE)
+        accept_index = torch.tensor([[0, 1]], device=DEVICE)
+
+        with patch(
+            "sglang.srt.speculative.eagle_worker_common.torch.get_device_module",
+            return_value=SimpleNamespace(current_stream=lambda: object()),
+        ), patch(
+            "sglang.srt.speculative.eagle_worker_common.record_stream_for_v2_verify"
+        ), patch(
+            "sglang.srt.speculative.eagle_worker_common.record_stream_each"
+        ), patch(
+            "sglang.srt.speculative.eagle_worker_common.eagle_prepare_for_verify",
+            return_value=(SimpleNamespace(), True),
+        ), patch(
+            "sglang.srt.speculative.eagle_worker_common.eagle_sample",
+            return_value=(predict, accept_lens, accept_index),
+        ), patch(
+            "sglang.srt.speculative.eagle_worker_common.maybe_detect_nan"
+        ), patch(
+            "sglang.srt.speculative.eagle_worker_common.maybe_detect_inf"
+        ), patch(
+            "sglang.srt.speculative.eagle_worker_common.fill_bonus_tokens_func"
+        ), patch(
+            "sglang.srt.speculative.eagle_worker_common.commit_mamba_states_after_verify"
+        ), patch(
+            "sglang.srt.speculative.eagle_worker_common._finalize_hisparse_accepted_tokens"
+        ) as finalize:
+            run_eagle_verify(
+                batch,
+                target_worker=target_worker,
+                req_to_token_pool=object(),
+                token_to_kv_pool_allocator=allocator,
+                plan_stream=None,
+                plan_stream_ctx=nullcontext(),
+                topk=1,
+                num_steps=1,
+                num_draft_tokens=2,
+                device=DEVICE,
+                metadata_ready_pre_pad=False,
+                finalize_tree_path=True,
+            )
+
+        finalize.assert_called_once_with(batch, accept_index)
 
 
 class TestEagleWorkerV2BackendFallback(CustomTestCase):

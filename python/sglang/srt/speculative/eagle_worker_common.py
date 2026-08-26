@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
-
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_draft_cache_locs_contiguous,
 )
@@ -464,6 +463,29 @@ def _compact_accept_to_front(
     return out
 
 
+def _finalize_hisparse_accepted_tokens(
+    batch: ScheduleBatch, accept_index: torch.Tensor
+) -> None:
+    """Commit spec-v2 verify slots through the HiSparse ownership protocol."""
+    if batch.forward_mode.is_idle():
+        return
+
+    coordinator = batch.hisparse_coordinator
+    if coordinator is None or not coordinator.supports_hisparse_draft_slots():
+        return
+
+    draft_coordinator = batch.draft_hisparse_coordinator
+    coordinator.finalize_accepted_tokens_spec_v2(
+        req_pool_indices=batch.req_pool_indices,
+        seq_lens=batch.seq_lens,
+        verify_cache_locs=batch.out_cache_loc,
+        accept_index=accept_index,
+        mirror=(
+            draft_coordinator if draft_coordinator is not coordinator else None
+        ),
+    )
+
+
 def run_eagle_verify(
     batch: ScheduleBatch,
     *,
@@ -614,6 +636,11 @@ def run_eagle_verify(
             accept_lens,
             num_draft_tokens,
         )
+
+    # eagle_prepare_for_verify publishes graph-stable physical mappings for the
+    # logical verify slots.  Commit the accepted subset (and clear the rejected
+    # subset) before any later state can observe the post-verify sequence.
+    _finalize_hisparse_accepted_tokens(batch, accept_index)
 
     # Update mamba state for hybrid GDN models after verification
     commit_mamba_states_after_verify(
