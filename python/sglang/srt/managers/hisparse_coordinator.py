@@ -312,6 +312,12 @@ class HiSparseCoordinator:
         self._pending_draft_extend_backup = None
         self._debug_pending_draft_extend = None
         self._debug_last_generated_kv_bucket = -1
+        # Request-local C4 position up to which complete physical pages have
+        # been made durable in host memory and returned to the allocator.  PD
+        # reserves the whole host row up front, so its allocated length cannot
+        # serve as this written/retired watermark.
+        self._req_c4_retired_len = {}
+        self._req_c4_written_len = {}
         # In PD+speculative decode, target and draft buffers are registered
         # against one page-index vector. The target coordinator owns that
         # logical slot namespace; the draft coordinator mirrors request maps
@@ -423,9 +429,7 @@ class HiSparseCoordinator:
             if chunk.numel() > 0
         ]
         all_free_slots = (
-            torch.cat([free_slots, *released_chunks])
-            if released_chunks
-            else free_slots
+            torch.cat([free_slots, *released_chunks]) if released_chunks else free_slots
         )
         unique_free_slots = torch.unique(all_free_slots)
         if unique_free_slots.numel() != all_free_slots.numel():
@@ -925,6 +929,7 @@ class HiSparseCoordinator:
                 "Only the canonical HiSparse slot owner may admit staging requests"
             )
         req.hisparse_staging = True
+        self._initialize_dsv4_retire_watermark(req)
         self._set_residency_state(
             req.req_pool_idx,
             HiSparseResidencyState.INACTIVE,
@@ -991,6 +996,8 @@ class HiSparseCoordinator:
             self._admit_request_from_owner(req, device_slot_owner)
             return
 
+        self._initialize_dsv4_retire_watermark(req)
+
         if self.debug_validate_lifecycle:
             req_idx = req.req_pool_idx
             if req_idx in self.active_hisparse_reqs:
@@ -1008,9 +1015,7 @@ class HiSparseCoordinator:
                     f"req_pool_idx={req_idx} size={int(self.req_device_buffer_size[req_idx])}"
                 )
             host_len_for_trace = int(self.req_to_host_pool_allocated_len[req_idx])
-            host_locs_for_trace = self.req_to_host_pool[
-                req_idx, :host_len_for_trace
-            ]
+            host_locs_for_trace = self.req_to_host_pool[req_idx, :host_len_for_trace]
             unique_host_locs = torch.unique(host_locs_for_trace)
             if unique_host_locs.numel() != host_locs_for_trace.numel():
                 raise RuntimeError(
@@ -1026,15 +1031,21 @@ class HiSparseCoordinator:
                 req.rid,
                 req_idx,
                 host_locs_for_trace.numel(),
-                int(host_locs_for_trace.min().item())
-                if host_locs_for_trace.numel()
-                else -1,
-                int(host_locs_for_trace.max().item())
-                if host_locs_for_trace.numel()
-                else -1,
+                (
+                    int(host_locs_for_trace.min().item())
+                    if host_locs_for_trace.numel()
+                    else -1
+                ),
+                (
+                    int(host_locs_for_trace.max().item())
+                    if host_locs_for_trace.numel()
+                    else -1
+                ),
                 bool(
                     host_locs_for_trace.numel() <= 1
-                    or torch.all(host_locs_for_trace[1:] - host_locs_for_trace[:-1] == 1)
+                    or torch.all(
+                        host_locs_for_trace[1:] - host_locs_for_trace[:-1] == 1
+                    )
                 ),
                 self.mem_pool_host.available_size(),
             )
@@ -1071,6 +1082,7 @@ class HiSparseCoordinator:
     def _admit_request_from_owner(self, req: Req, owner: "HiSparseCoordinator") -> None:
         """Mirror the target coordinator's admission decision for MTP draft KV."""
         self._device_slot_owner = owner
+        self._initialize_dsv4_retire_watermark(req)
         owner_state = owner._state(req.req_pool_idx)
         host_len = self.host_token_len(req.kv.kv_allocated_len)
         if owner_state == HiSparseResidencyState.RESIDENT:
@@ -1420,6 +1432,164 @@ class HiSparseCoordinator:
             return kv_allocated_len // self.compress_ratio
         return kv_allocated_len
 
+    def _initialize_dsv4_retire_watermark(self, req: Req) -> None:
+        if not self.is_dsv4_hisparse:
+            return
+        # The complete prompt C4 pages were transferred to host by PD/staging.
+        # Keep the final partial page eligible: decode may fill its suffix on a
+        # newly allocated physical page that must later be backed up and freed.
+        transferred_len = min(
+            int(getattr(req, "kv_committed_len", 0)),
+            int(getattr(getattr(req, "kv", None), "kv_allocated_len", 0)),
+        )
+        committed_c4 = transferred_len // self.compress_ratio
+        self._req_c4_written_len[req.req_pool_idx] = committed_c4
+        self._req_c4_retired_len[req.req_pool_idx] = (
+            committed_c4 // self.page_size * self.page_size
+        )
+
+    def retire_committed_dsv4_pages(
+        self,
+        reqs: List[Req],
+        mirror: Optional["HiSparseCoordinator"] = None,
+    ) -> None:
+        """Persist and release fully committed DSV4 C4 allocation pages.
+
+        EAGLE reserves a logical full-KV page before verify.  The DSV4 C4
+        allocator consequently owns the corresponding physical page even when
+        only a few tokens have committed.  At the start of the next EAGLE
+        round, ``kv_committed_len`` is stable and no new reserve exists yet.
+        This method uses that boundary to back up complete request-local C4
+        pages in both target and draft pools, then clears every logical alias
+        and returns the canonical target page exactly once.
+        """
+        if not self.is_dsv4_hisparse:
+            return
+        if self._device_slot_owner is not self:
+            raise RuntimeError(
+                "Only the canonical DSV4 HiSparse owner may retire C4 pages"
+            )
+        if mirror is not None:
+            if not mirror.is_dsv4_hisparse:
+                raise RuntimeError(
+                    "DSV4 HiSparse target cannot retire pages with a non-DSV4 mirror"
+                )
+            if mirror._device_slot_owner is not self:
+                raise RuntimeError(
+                    "DSV4 HiSparse draft does not mirror the canonical target owner"
+                )
+
+        mapping = self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
+        for req in reqs:
+            req_idx = int(req.req_pool_idx)
+            if self._is_resident(req_idx):
+                # Resident mappings are the request's durable device copy.  The
+                # production calibration keeps dynamic residency disabled; a
+                # later demotion owns their host transition.
+                continue
+            if req_idx not in self._req_c4_retired_len:
+                self._initialize_dsv4_retire_watermark(req)
+
+            start = int(self._req_c4_retired_len[req_idx])
+            written = int(self._req_c4_written_len[req_idx])
+            committed_c4 = int(req.kv_committed_len) // self.compress_ratio
+            retire_end = committed_c4 // self.page_size * self.page_size
+            retirement_plan = []
+            while start < retire_end:
+                end = start + self.page_size
+                full_positions = torch.arange(
+                    start, end, dtype=torch.int64, device=self.device
+                ) * self.compress_ratio + (self.compress_ratio - 1)
+                if int(full_positions[-1]) >= req.kv.kv_allocated_len:
+                    raise RuntimeError(
+                        "Committed DSV4 C4 page exceeds the request allocation: "
+                        f"req={req.rid}, page=({start}, {end}), "
+                        f"committed={req.kv_committed_len}, "
+                        f"allocated={req.kv.kv_allocated_len}"
+                    )
+                full_locs = self.req_to_token_pool.req_to_token[
+                    req_idx, full_positions
+                ].to(torch.int64)
+                compressed_locs = (
+                    self.mem_pool_device.translate_loc_from_full_to_compressed(
+                        full_locs
+                    )
+                )
+                if compressed_locs.numel() != self.page_size:
+                    raise RuntimeError(
+                        "DSV4 C4 retirement lost request-local alignment: "
+                        f"req={req.rid}, expected={self.page_size}, "
+                        f"actual={compressed_locs.numel()}"
+                    )
+
+                device_locs = mapping[compressed_locs]
+                mapped_mask = device_locs > 0
+                c4_positions = torch.arange(
+                    start, end, dtype=torch.int64, device=self.device
+                )
+                missing_unwritten = (~mapped_mask) & (c4_positions >= written)
+                if torch.any(missing_unwritten):
+                    raise RuntimeError(
+                        "DSV4 C4 committed payload has neither host nor device "
+                        f"ownership: req={req.rid}, "
+                        f"positions={c4_positions[missing_unwritten].tolist()}, "
+                        f"written={written}"
+                    )
+                if torch.any(mapped_mask):
+                    mapped_locs = device_locs[mapped_mask].to(torch.int64)
+                    page_ids = torch.unique(mapped_locs // self.page_size)
+
+                    # A paged allocation gives one request-local C4 page
+                    # exclusive physical-page ownership.  Verify that EAGLE
+                    # did not leave an alias outside the now-committed page
+                    # before making the page reusable.
+                    positive = mapping > 0
+                    aliases = torch.nonzero(
+                        positive
+                        & torch.isin(
+                            torch.div(mapping, self.page_size, rounding_mode="floor"),
+                            page_ids,
+                        ),
+                        as_tuple=False,
+                    ).flatten()
+                    if torch.any(~torch.isin(aliases, compressed_locs)):
+                        raise RuntimeError(
+                            "DSV4 C4 physical page still has an uncommitted alias: "
+                            f"req={req.rid}, c4_page=({start}, {end}), "
+                            f"physical_pages={page_ids.tolist()}"
+                        )
+
+                    host_locs = self.req_to_host_pool[req_idx, start:end][mapped_mask]
+                    if torch.any(host_locs < 0):
+                        raise RuntimeError(
+                            "DSV4 C4 committed page has no host destination: "
+                            f"req={req.rid}, c4_page=({start}, {end})"
+                        )
+                    if mirror is not None:
+                        mirror._validate_mirror_device_locs(mapped_locs)
+                    retirement_plan.append((host_locs, mapped_locs, page_ids))
+
+                start = end
+                written = end
+
+            # Validate every page before starting DMA or freeing any owner. A
+            # corrupt future alias therefore cannot partially advance a request
+            # and leave target/draft watermarks at different boundaries.
+            for host_locs, mapped_locs, page_ids in retirement_plan:
+                self._backup_device_locs_to_host(host_locs, mapped_locs)
+                if mirror is not None:
+                    mirror._backup_device_locs_to_host(host_locs, mapped_locs)
+
+                # Both physical payloads are durable.  The target owns the
+                # shared numerical mapping and allocator free transaction.
+                self.token_to_kv_pool_allocator.release_hisparse_mapped_pages(page_ids)
+
+            self._req_c4_written_len[req_idx] = written
+            self._req_c4_retired_len[req_idx] = start
+            if mirror is not None:
+                mirror._req_c4_written_len[req_idx] = written
+                mirror._req_c4_retired_len[req_idx] = start
+
     def _preload_to_device_buffer(self, req: Req) -> None:
         """Preload all tokens from host pool into the device buffer."""
         n = self.host_token_len(req.kv.kv_allocated_len)
@@ -1761,8 +1931,7 @@ class HiSparseCoordinator:
         for req in residents:
             exceeds_limit = (
                 self.dynamic_residency_mode != "forced_resident"
-                and logical_lens[req.req_pool_idx]
-                > self.dynamic_residency_max_tokens
+                and logical_lens[req.req_pool_idx] > self.dynamic_residency_max_tokens
             )
             under_pressure = allocator.available_size() < low_tokens
             if not exceeds_limit and not under_pressure:
@@ -2046,16 +2215,15 @@ class HiSparseCoordinator:
         """Return byte-level row fingerprints for an opt-in correctness probe."""
         if rows.numel() == 0:
             return []
-        rows_u8 = rows.detach().contiguous().view(torch.uint8).reshape(rows.shape[0], -1)
+        rows_u8 = (
+            rows.detach().contiguous().view(torch.uint8).reshape(rows.shape[0], -1)
+        )
         rows_cpu = rows_u8.cpu()
         return [
-            hashlib.sha256(row.numpy().tobytes()).hexdigest()[:16]
-            for row in rows_cpu
+            hashlib.sha256(row.numpy().tobytes()).hexdigest()[:16] for row in rows_cpu
         ]
 
-    def _debug_device_row_fingerprints(
-        self, device_locs: torch.Tensor
-    ) -> List[str]:
+    def _debug_device_row_fingerprints(self, device_locs: torch.Tensor) -> List[str]:
         device_module.current_stream().synchronize()
         rows = self.mem_pool_device.kv_buffer[0][device_locs.to(torch.int64)]
         return self._debug_tensor_row_fingerprints(rows)
@@ -2482,9 +2650,7 @@ class HiSparseCoordinator:
                         bucket,
                         accepted_token_positions[needs_backup].tolist(),
                         post_backup_device_locs.clone(),
-                        self._debug_device_row_fingerprints(
-                            post_backup_device_locs
-                        ),
+                        self._debug_device_row_fingerprints(post_backup_device_locs),
                     )
 
     def _finalize_buffered_tokens_spec_v2(
@@ -2665,8 +2831,10 @@ class HiSparseCoordinator:
                     f"req_pool_idx={req_idx}, seq_len={seq_len}"
                 )
 
-            tail_free = self.page_size - 1 - int(
-                previous_device.remainder(self.page_size).item()
+            tail_free = (
+                self.page_size
+                - 1
+                - int(previous_device.remainder(self.page_size).item())
             )
             reuse_count = min(count, tail_free)
             row_parts = []
@@ -2683,15 +2851,11 @@ class HiSparseCoordinator:
 
             remaining = count - reuse_count
             if remaining:
-                new_page_count = (
-                    remaining + self.page_size - 1
-                ) // self.page_size
+                new_page_count = (remaining + self.page_size - 1) // self.page_size
                 new_pages = allocator.alloc(new_page_count * self.page_size)
                 if new_pages is None:
                     for allocated in new_page_parts:
-                        self.token_to_kv_pool_allocator.free_hisparse_indices(
-                            allocated
-                        )
+                        self.token_to_kv_pool_allocator.free_hisparse_indices(allocated)
                     raise RuntimeError(
                         "HiSparse resident spec-v2 permanent-page allocation "
                         f"failed: req_pool_idx={req_idx}, pages={new_page_count}"
@@ -2998,6 +3162,8 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         self._skip_first_backup[req.req_pool_idx] = False
+        getattr(self, "_req_c4_retired_len", {}).pop(req.req_pool_idx, None)
+        getattr(self, "_req_c4_written_len", {}).pop(req.req_pool_idx, None)
         req.hisparse_staging = False
         self._clear_residency_state(req.req_pool_idx)
 
@@ -3080,6 +3246,8 @@ class HiSparseCoordinator:
         self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
+        getattr(self, "_req_c4_retired_len", {}).pop(req.req_pool_idx, None)
+        getattr(self, "_req_c4_written_len", {}).pop(req.req_pool_idx, None)
         self.active_hisparse_reqs.pop(req.req_pool_idx, None)
         self._clear_residency_state(req.req_pool_idx)
 

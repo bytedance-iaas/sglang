@@ -412,6 +412,44 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         self.assertEqual(mapping.tolist(), [0, 0])
         child_allocator.free.assert_not_called()
 
+    def test_release_mapped_pages_retires_every_speculative_alias(self):
+        """A committed C4 page is returned only after all aliases are clear."""
+        page_size = 4
+        mapping = torch.tensor([0, 5, 0, 7, 9, 6, 0, 11], dtype=torch.int64)
+        child_allocator = _PhysicalPageAllocator(page_size=page_size, num_pages=3)
+        child_allocator.alloc(page_size)
+        child_allocator.alloc(page_size)
+        ownership = _HiSparsePageOwnership(
+            mapping=mapping, child_allocator=child_allocator, page_size=page_size
+        )
+
+        ownership.release_mapped_pages(torch.tensor([1, 1], dtype=torch.int64))
+
+        self.assertEqual(mapping.tolist(), [0, 0, 0, 0, 9, 0, 0, 11])
+        self.assertEqual(child_allocator.used_pages, {2})
+        self.assertEqual(child_allocator.free_pages.count(1), 1)
+
+        # A repeated lifecycle cleanup observes the page in the allocator's
+        # reusable set and must not return it a second time.
+        ownership.release_mapped_pages(torch.tensor([1], dtype=torch.int64))
+        self.assertEqual(child_allocator.free_pages.count(1), 1)
+
+    def test_release_mapped_pages_rejects_side_buffer_owner(self):
+        page_size = 4
+        mapping = torch.tensor([0, 5, 6, 7], dtype=torch.int64)
+        child_allocator = _PhysicalPageAllocator(page_size=page_size, num_pages=2)
+        side_page = child_allocator.alloc(page_size)
+        ownership = _HiSparsePageOwnership(
+            mapping=mapping, child_allocator=child_allocator, page_size=page_size
+        )
+        ownership.claim(side_page)
+
+        with self.assertRaisesRegex(RuntimeError, "coordinator-owned pages"):
+            ownership.release_mapped_pages(torch.tensor([1], dtype=torch.int64))
+
+        self.assertEqual(mapping.tolist(), [0, 5, 6, 7])
+        self.assertEqual(child_allocator.used_pages, {1})
+
     def test_dsv4_finish_releases_composite_and_coordinator_c4_pages(self):
         """Finish must release both physical owners before logical free."""
         logical = _LogicalPageAllocator()
@@ -466,6 +504,157 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         # release_kv_cache runs after coordinator cleanup and owns logical pages.
         allocator.free(logical_locs)
         self.assertEqual(physical.used_pages, set())
+
+    def test_dsv4_extend_allocates_owner_for_direct_pd_partial_page(self):
+        """A host-only prompt tail must not continue in sentinel page zero."""
+        compress_ratio = 4
+        c4_page_size = 16
+        logical = MagicMock()
+        logical.available_size.return_value = 1024
+        logical.alloc_extend.return_value = torch.arange(326, 384, dtype=torch.int64)
+        physical = MagicMock()
+        physical.is_not_in_free_group = True
+        physical.available_size.return_value = 16 * 8
+        partial_page = torch.arange(48, 64, dtype=torch.int64)
+        physical.alloc.return_value = partial_page
+        physical.alloc_extend.return_value = torch.arange(49, 64, dtype=torch.int64)
+        mapping = torch.zeros(256, dtype=torch.int64)
+        c4_pool = SimpleNamespace(
+            translate_loc_from_full_to_compressed=lambda locs: locs[
+                (locs + 1) % compress_ratio == 0
+            ]
+            // compress_ratio,
+            # Reproduce a tail already mis-mapped to a positive slot in sentinel
+            # page zero. Page ownership, not coordinate sign, decides validity.
+            _translate_loc_to_hisparse_device=lambda locs: torch.ones_like(locs),
+        )
+
+        allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
+        allocator.compress_ratio = compress_ratio
+        allocator.page_size = 64
+        allocator.hisparse_page_size = c4_page_size
+        allocator.logical_attn_allocator = logical
+        allocator.hisparse_attn_allocator = physical
+        allocator.hisparse_kvcache = c4_pool
+        allocator.full_to_hisparse_device_index_mapping = mapping
+        allocator._ensure_hisparse_available = MagicMock(return_value=True)
+
+        result = allocator.alloc_extend(
+            prefix_lens=torch.tensor([70], dtype=torch.int64),
+            prefix_lens_cpu=torch.tensor([70], dtype=torch.int64),
+            seq_lens=torch.tensor([128], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([128], dtype=torch.int64),
+            last_loc=torch.tensor([325], dtype=torch.int64),
+            extend_num_tokens=58,
+        )
+
+        torch.testing.assert_close(result, logical.alloc_extend.return_value)
+        physical.alloc.assert_called_once_with(c4_page_size)
+        self.assertEqual(physical.alloc_extend.call_args.kwargs["num_new_pages"], 0)
+        # C4 prefix length is 17, so generated position 17 must continue at
+        # offset one of the newly owned page: predecessor = 48 + 1 - 1.
+        passed_last_loc = physical.alloc_extend.call_args.args[4]
+        self.assertEqual(passed_last_loc.tolist(), [48])
+        self.assertNotEqual(passed_last_loc.tolist(), [1])
+
+    def test_dsv4_extend_rolls_back_new_pages_after_c4_failure(self):
+        """A composite allocation failure must preserve both old tail pages."""
+        compress_ratio = 4
+        c4_page_size = 16
+        logical = MagicMock()
+        logical.available_size.return_value = 1024
+        # Prefix token 69 lives in logical page 5. The extension reuses its tail
+        # and allocates logical page 6, which is the only page rollback may free.
+        logical.alloc_extend.return_value = torch.arange(326, 448, dtype=torch.int64)
+        physical = MagicMock()
+        physical.is_not_in_free_group = True
+        physical.available_size.return_value = c4_page_size * 8
+        partial_page = torch.arange(48, 64, dtype=torch.int64)
+        physical.alloc.return_value = partial_page
+        physical.alloc_extend.return_value = None
+        mapping = torch.zeros(256, dtype=torch.int64)
+        c4_pool = SimpleNamespace(
+            translate_loc_from_full_to_compressed=lambda locs: locs[
+                (locs + 1) % compress_ratio == 0
+            ]
+            // compress_ratio,
+            _translate_loc_to_hisparse_device=lambda locs: mapping[locs],
+        )
+
+        allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
+        allocator.compress_ratio = compress_ratio
+        allocator.page_size = 64
+        allocator.hisparse_page_size = c4_page_size
+        allocator.logical_attn_allocator = logical
+        allocator.hisparse_attn_allocator = physical
+        allocator.hisparse_kvcache = c4_pool
+        allocator.full_to_hisparse_device_index_mapping = mapping
+        allocator._ensure_hisparse_available = MagicMock(return_value=True)
+
+        with self.assertRaisesRegex(RuntimeError, "alloc_extend"):
+            allocator.alloc_extend(
+                prefix_lens=torch.tensor([70], dtype=torch.int64),
+                prefix_lens_cpu=torch.tensor([70], dtype=torch.int64),
+                seq_lens=torch.tensor([192], dtype=torch.int64),
+                seq_lens_cpu=torch.tensor([192], dtype=torch.int64),
+                last_loc=torch.tensor([325], dtype=torch.int64),
+                extend_num_tokens=122,
+            )
+
+        # The new direct-PD C4 owner is returned. The reused logical page 5 is
+        # kept, while only the newly allocated logical page 6 is rolled back.
+        torch.testing.assert_close(physical.free.call_args.args[0], partial_page)
+        torch.testing.assert_close(
+            logical.free.call_args.args[0], torch.arange(384, 448, dtype=torch.int64)
+        )
+        self.assertTrue(torch.all(mapping == 0))
+
+    def test_dsv4_extend_rolls_back_logical_page_when_partial_owner_fails(self):
+        """The direct-PD owner allocation is part of the same transaction."""
+        compress_ratio = 4
+        c4_page_size = 16
+        logical = MagicMock()
+        logical.available_size.return_value = 1024
+        logical.alloc_extend.return_value = torch.arange(326, 448, dtype=torch.int64)
+        physical = MagicMock()
+        physical.is_not_in_free_group = True
+        physical.available_size.return_value = c4_page_size * 8
+        physical.alloc.return_value = None
+        mapping = torch.zeros(256, dtype=torch.int64)
+        c4_pool = SimpleNamespace(
+            translate_loc_from_full_to_compressed=lambda locs: locs[
+                (locs + 1) % compress_ratio == 0
+            ]
+            // compress_ratio,
+            _translate_loc_to_hisparse_device=lambda locs: mapping[locs],
+        )
+
+        allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
+        allocator.compress_ratio = compress_ratio
+        allocator.page_size = 64
+        allocator.hisparse_page_size = c4_page_size
+        allocator.logical_attn_allocator = logical
+        allocator.hisparse_attn_allocator = physical
+        allocator.hisparse_kvcache = c4_pool
+        allocator.full_to_hisparse_device_index_mapping = mapping
+        allocator._ensure_hisparse_available = MagicMock(return_value=True)
+
+        with self.assertRaisesRegex(RuntimeError, "partial-page owners"):
+            allocator.alloc_extend(
+                prefix_lens=torch.tensor([70], dtype=torch.int64),
+                prefix_lens_cpu=torch.tensor([70], dtype=torch.int64),
+                seq_lens=torch.tensor([192], dtype=torch.int64),
+                seq_lens_cpu=torch.tensor([192], dtype=torch.int64),
+                last_loc=torch.tensor([325], dtype=torch.int64),
+                extend_num_tokens=122,
+            )
+
+        physical.alloc_extend.assert_not_called()
+        physical.free.assert_not_called()
+        torch.testing.assert_close(
+            logical.free.call_args.args[0], torch.arange(384, 448, dtype=torch.int64)
+        )
+        self.assertTrue(torch.all(mapping == 0))
 
     def test_dsv4_shared_allocator_releases_mirrored_page_once(self):
         """Target and draft aliases on one allocator release a page once."""

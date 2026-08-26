@@ -908,6 +908,20 @@ def eagle_sample(
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
 
+    # The previous verify's accepted length is committed before this function
+    # runs, while the next speculative reserve has not been allocated yet.
+    # DSV4 HiSparse uses this transaction boundary to persist complete C4 pages
+    # and return their temporary physical allocation.
+    if batch.hisparse_coordinator is not None:
+        batch.hisparse_coordinator.retire_committed_dsv4_pages(
+            batch.reqs,
+            mirror=(
+                batch.draft_hisparse_coordinator
+                if batch.draft_hisparse_coordinator is not batch.hisparse_coordinator
+                else None
+            ),
+        )
+
     bs = batch.batch_size()
 
     # Accumulate penalty

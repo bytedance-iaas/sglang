@@ -106,6 +106,53 @@ class _HiSparsePageOwnership:
                 f"pages={sorted(claimed)}"
             )
 
+    def release_mapped_pages(self, page_ids: torch.Tensor) -> None:
+        """Clear every logical alias before returning canonical pages.
+
+        DSV4 speculative allocation reserves a full logical page and can leave
+        aliases outside the currently visible verify window.  Once the whole
+        physical page is host-backed, the physical owner -- rather than one
+        logical slice -- must retire all of those aliases in one transaction.
+        """
+        assert self.child_allocator.is_not_in_free_group
+        page_ids = _stable_unique_page_ids(page_ids.to(dtype=torch.int64))
+        if page_ids.numel() == 0:
+            return
+
+        claimed = set(page_ids.cpu().tolist()) & self._extra_owner_page_ids
+        if claimed:
+            raise RuntimeError(
+                "HiSparse attempted to retire coordinator-owned pages: "
+                f"pages={sorted(claimed)}"
+            )
+
+        positive = self.mapping > 0
+        aliases = positive & torch.isin(
+            torch.div(self.mapping, self.page_size, rounding_mode="floor"),
+            page_ids,
+        )
+        self.mapping[aliases] = 0
+
+        # Physical page zero is the allocator sentinel. A non-page-aligned PD
+        # prefix can make the first generated C4 tail use positive coordinates
+        # 1..page_size-1 in that page; retire their mappings, but never return
+        # the sentinel page to the allocator.
+        page_ids = page_ids[page_ids > 0]
+        already_released = _released_page_ids(
+            self.child_allocator, device=page_ids.device
+        )
+        if already_released.numel() > 0:
+            page_ids = page_ids[~torch.isin(page_ids, already_released)]
+        if page_ids.numel() == 0:
+            return
+
+        offsets = torch.arange(
+            self.page_size, dtype=torch.int64, device=page_ids.device
+        )
+        self.child_allocator.free(
+            (page_ids[:, None] * self.page_size + offsets).reshape(-1)
+        )
+
     def release(
         self,
         *,
@@ -148,9 +195,7 @@ class _HiSparsePageOwnership:
             remaining_page_ids = torch.div(
                 remaining_coordinates, self.page_size, rounding_mode="floor"
             )
-            stale_extra_aliases = torch.isin(
-                remaining_page_ids, extra_page_ids_tensor
-            )
+            stale_extra_aliases = torch.isin(remaining_page_ids, extra_page_ids_tensor)
             self.mapping[remaining_indices[stale_extra_aliases]] = 0
             remaining_coordinates = remaining_coordinates[~stale_extra_aliases]
         self._extra_owner_page_ids.difference_update(extra_page_ids)
@@ -479,6 +524,9 @@ class HiSparseTokenToKVPoolAllocator(HiSparseDemotionMixin, BaseTokenToKVPoolAll
 
     def claim_hisparse_ownership(self, coordinates: torch.Tensor) -> None:
         self._page_ownership.claim(coordinates)
+
+    def release_hisparse_mapped_pages(self, page_ids: torch.Tensor) -> None:
+        self._page_ownership.release_mapped_pages(page_ids)
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
         return last_locs
@@ -900,6 +948,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(
     def claim_hisparse_ownership(self, coordinates: torch.Tensor) -> None:
         self._page_ownership.claim(coordinates)
 
+    def release_hisparse_mapped_pages(self, page_ids: torch.Tensor) -> None:
+        self._page_ownership.release_mapped_pages(page_ids)
+
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
         return (last_locs - 3) // self.compress_ratio
 
@@ -927,17 +978,37 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(
             page_size=self.hisparse_page_size,
             prefix_lens=prefix_lens_cpu // self.compress_ratio,
         )
+        hisparse_prefix_lens_cpu = prefix_lens_cpu // self.compress_ratio
+        hisparse_seq_lens_cpu = seq_lens_cpu // self.compress_ratio
+        hisparse_last_loc = self.get_last_loc_hisparse_device(last_loc)
+        old_hisparse_page_ids = torch.unique(
+            hisparse_last_loc[hisparse_last_loc > 0] // self.hisparse_page_size
+        )
+        # Direct PD admission stores the prompt C4 payload only in host memory,
+        # so the shared device mapping for its final logical location is zero.
+        # PagedTokenToKVPoolAllocator would interpret that zero as a valid old
+        # partial-page predecessor and continue at slots 1..N in sentinel page
+        # zero. Multiple requests would then overwrite the same physical slots.
+        # Explicitly acquire one page for every such missing partial-page owner
+        # and synthesize its predecessor before the normal paged extension.
+        missing_partial_owner = (
+            (hisparse_seq_lens_cpu > hisparse_prefix_lens_cpu)
+            & (hisparse_prefix_lens_cpu % self.hisparse_page_size != 0)
+            & (hisparse_last_loc.to(device="cpu") // self.hisparse_page_size == 0)
+        )
+        num_missing_partial_pages = int(missing_partial_owner.sum().item())
         if (
             num_new_pages_logical
             > self.logical_attn_allocator.available_size() // self.page_size
         ):
             return None
         if (
-            num_new_pages_hisparse
+            num_new_pages_hisparse + num_missing_partial_pages
             > self.hisparse_attn_allocator.available_size() // self.hisparse_page_size
         ):
             if not self._ensure_hisparse_available(
-                num_new_pages_hisparse * self.hisparse_page_size
+                (num_new_pages_hisparse + num_missing_partial_pages)
+                * self.hisparse_page_size
             ):
                 return None
 
@@ -954,22 +1025,99 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(
         compressed_logical_indices = (
             self.hisparse_kvcache.translate_loc_from_full_to_compressed(logical_indices)
         )
-        hisparse_last_loc = self.get_last_loc_hisparse_device(last_loc)
-        hisparse_indices = self.hisparse_attn_allocator.alloc_extend(
-            prefix_lens // self.compress_ratio,
-            prefix_lens_cpu // self.compress_ratio,
-            seq_lens // self.compress_ratio,
-            seq_lens_cpu // self.compress_ratio,
-            hisparse_last_loc,
-            len(compressed_logical_indices),
-        )
-        assert (
-            hisparse_indices is not None
-        ), "Hisparse allocation failed in alloc_extend"
+        partial_page_indices = None
+        hisparse_indices = None
+        committed = False
+        try:
+            if num_missing_partial_pages > 0:
+                partial_page_indices = self.hisparse_attn_allocator.alloc(
+                    num_missing_partial_pages * self.hisparse_page_size
+                )
+                if partial_page_indices is None:
+                    raise RuntimeError(
+                        "Hisparse allocation failed for direct-PD partial-page owners"
+                    )
+                page_starts = partial_page_indices.reshape(
+                    num_missing_partial_pages, self.hisparse_page_size
+                )[:, 0]
+                prefix_offsets = (
+                    hisparse_prefix_lens_cpu[missing_partial_owner]
+                    % self.hisparse_page_size
+                ).to(device=page_starts.device)
+                hisparse_last_loc = hisparse_last_loc.clone()
+                hisparse_last_loc[
+                    missing_partial_owner.to(hisparse_last_loc.device)
+                ] = (page_starts + prefix_offsets - 1).to(hisparse_last_loc.dtype)
+            hisparse_indices = self.hisparse_attn_allocator.alloc_extend(
+                prefix_lens // self.compress_ratio,
+                prefix_lens_cpu // self.compress_ratio,
+                seq_lens // self.compress_ratio,
+                seq_lens_cpu // self.compress_ratio,
+                hisparse_last_loc,
+                len(compressed_logical_indices),
+                num_new_pages=num_new_pages_hisparse,
+            )
+            if hisparse_indices is None:
+                raise RuntimeError("Hisparse allocation failed in alloc_extend")
 
-        self.full_to_hisparse_device_index_mapping[compressed_logical_indices] = (
-            hisparse_indices.to(torch.int64)
-        )
+            self.full_to_hisparse_device_index_mapping[compressed_logical_indices] = (
+                hisparse_indices.to(torch.int64)
+            )
+            committed = True
+        finally:
+            if not committed:
+                # Only pages not owned before this call may be returned.  Both
+                # paged allocators can reuse the request's existing tail page,
+                # so freeing the complete alloc_extend result would corrupt the
+                # live prefix rather than roll the transaction back.
+                self.full_to_hisparse_device_index_mapping[
+                    compressed_logical_indices
+                ] = 0
+                physical_chunks = [
+                    chunk
+                    for chunk in (partial_page_indices, hisparse_indices)
+                    if chunk is not None and chunk.numel() > 0
+                ]
+                if physical_chunks:
+                    physical_page_ids = torch.unique(
+                        torch.cat(physical_chunks) // self.hisparse_page_size
+                    )
+                    if old_hisparse_page_ids.numel() > 0:
+                        physical_page_ids = physical_page_ids[
+                            ~torch.isin(physical_page_ids, old_hisparse_page_ids)
+                        ]
+                    if physical_page_ids.numel() > 0:
+                        offsets = torch.arange(
+                            self.hisparse_page_size,
+                            dtype=torch.int64,
+                            device=physical_page_ids.device,
+                        )
+                        self.hisparse_attn_allocator.free(
+                            (
+                                physical_page_ids[:, None] * self.hisparse_page_size
+                                + offsets
+                            ).reshape(-1)
+                        )
+
+                logical_page_ids = torch.unique(logical_indices // self.page_size)
+                old_logical_page_ids = torch.unique(
+                    last_loc[last_loc > 0] // self.page_size
+                )
+                if old_logical_page_ids.numel() > 0:
+                    logical_page_ids = logical_page_ids[
+                        ~torch.isin(logical_page_ids, old_logical_page_ids)
+                    ]
+                if logical_page_ids.numel() > 0:
+                    offsets = torch.arange(
+                        self.page_size,
+                        dtype=torch.int64,
+                        device=logical_page_ids.device,
+                    )
+                    self.logical_attn_allocator.free(
+                        (logical_page_ids[:, None] * self.page_size + offsets).reshape(
+                            -1
+                        )
+                    )
         return logical_indices
 
     def alloc_decode(
