@@ -15,6 +15,7 @@ from sglang.srt.disaggregation.decode import (  # noqa: E402
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
 from sglang.srt.runtime_context import get_context  # noqa: E402
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -233,6 +234,102 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
             [failed_low.req], failed_low.req.return_logprob
         )
 
+    def test_rebootstrap_admission_timeout_streams_terminal_abort(self):
+        decode_req = self._new_decode_req("stuck-rebootstrap", 1)
+        decode_req.is_rebootstrap = True
+        decode_req.rebootstrap_started_at = 10.0
+        decode_req.req.bootstrap_room = 17
+        decode_req.req.finished = lambda: decode_req.req.finished_reason is not None
+        queue = self._new_queue([decode_req])
+        queue.kv_manager.waiting_timeout = 5
+
+        with patch(
+            "sglang.srt.disaggregation.decode.time.time", return_value=20.0
+        ):
+            preallocated, failed = queue.pop_preallocated()
+
+        self.assertEqual(preallocated, [])
+        self.assertEqual(failed, [decode_req])
+        self.assertIsInstance(decode_req.req.finished_reason, FINISH_ABORT)
+        self.assertIn("rebootstrap timed out", decode_req.req.finished_reason.message)
+        decode_req.kv_receiver.abort.assert_called_once_with()
+        queue.scheduler.output_streamer.stream_output.assert_called_once_with(
+            [decode_req.req], False
+        )
+
+    def test_rebootstrap_timeout_becomes_uniform_pp_bad_consensus(self):
+        rid = "stuck-rebootstrap"
+        stage0_req = self._new_decode_req(rid, 1)
+        stage1_req = self._new_decode_req(rid, 1)
+        for decode_req, started_at in ((stage0_req, 10.0), (stage1_req, 19.0)):
+            decode_req.is_rebootstrap = True
+            decode_req.rebootstrap_started_at = started_at
+            decode_req.req.bootstrap_room = 17
+            decode_req.req.finished = (
+                lambda req=decode_req.req: req.finished_reason is not None
+            )
+
+        stage0_queue = self._new_queue([stage0_req])
+        stage1_queue = self._new_queue([stage1_req])
+        for queue, decode_req in (
+            (stage0_queue, stage0_req),
+            (stage1_queue, stage1_req),
+        ):
+            queue.pp_size = 2
+            queue.pending_reqs = [decode_req]
+            queue.kv_manager.waiting_timeout = 5
+            queue.tp_rank = 0
+            queue.scheduler.metrics_reporter.enable_metrics = False
+            queue._update_handshake_waiters = (
+                lambda rids_to_check=None, pp_good_rids=None, pp_bad_rids=None, q=queue: DecodePreallocQueue._update_handshake_waiters(
+                    q, rids_to_check, pp_good_rids, pp_bad_rids
+                )
+            )
+
+        stage0 = SimpleNamespace(
+            pp_group=SimpleNamespace(is_first_rank=True),
+            disagg_decode_prealloc_queue=stage0_queue,
+            get_rids=MagicMock(return_value=([], [])),
+            _route_aborts_to_bad=SchedulerPPMixin._route_aborts_to_bad,
+        )
+        stage1 = SimpleNamespace(
+            pp_group=SimpleNamespace(is_first_rank=False),
+            disagg_decode_prealloc_queue=stage1_queue,
+            get_rids=MagicMock(return_value=([rid], [])),
+            _route_aborts_to_bad=SchedulerPPMixin._route_aborts_to_bad,
+        )
+
+        with patch(
+            "sglang.srt.disaggregation.decode.time.time", return_value=20.0
+        ):
+            stage0_consensus = SchedulerPPMixin._pp_pd_get_prealloc_ids(stage0)
+            stage1._pp_recv_pyobj_from_prev_stage = MagicMock(
+                return_value=stage0_consensus
+            )
+            final_consensus = SchedulerPPMixin._pp_pd_get_prealloc_ids(stage1)
+
+            self.assertEqual(stage0_consensus, [[], [rid]])
+            self.assertEqual(final_consensus, [[], [rid]])
+            self.assertIsInstance(stage0_req.req.finished_reason, FINISH_ABORT)
+            self.assertIsNone(stage1_req.req.finished_reason)
+
+            for queue, decode_req in (
+                (stage0_queue, stage0_req),
+                (stage1_queue, stage1_req),
+            ):
+                preallocated, failed = queue.pop_preallocated(
+                    pp_good_rids=final_consensus[0],
+                    pp_bad_rids=final_consensus[1],
+                )
+                self.assertEqual(preallocated, [])
+                self.assertEqual(failed, [decode_req])
+                self.assertEqual(queue.queue, [])
+                self.assertEqual(queue.pending_reqs, [])
+                self.assertIsNone(decode_req.kv_receiver)
+                queue.scheduler.output_streamer.stream_output.assert_called_once_with(
+                    [decode_req.req], False
+                )
+
     def test_fit_first_admits_short_request_behind_memory_blocked_head(self):
         long_req = self._new_decode_req("long", 0, input_len=10)
         short_req = self._new_decode_req("short", 0, input_len=3)
@@ -364,6 +461,20 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
         self.assertNotIn("pd_rebootstrap_prefill_url", payload)
         self.assertNotIn("pd_rebootstrap_forced_output_id", payload)
         # Must be JSON-serializable (numpy scalars would raise here).
+        json.dumps(payload)
+
+    def test_build_rebootstrap_payload_uses_internal_generation_rid(self):
+        req = self._new_req()
+
+        payload = Req.build_rebootstrap_payload(req, bootstrap_generation=3)
+
+        self.assertEqual(
+            payload["rid"],
+            "__sglang_pd_rebootstrap__:7:3",
+        )
+        self.assertEqual(payload["bootstrap_generation"], 3)
+        # Caller-visible identity remains unchanged on the decode Req.
+        self.assertEqual(req.rid, "rid-0")
         json.dumps(payload)
 
 

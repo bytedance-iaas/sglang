@@ -1671,7 +1671,9 @@ class Req(ReqDllmMixin):
         )
         del self.kv_cache_cpu
 
-    def build_rebootstrap_payload(self) -> dict:
+    def build_rebootstrap_payload(
+        self, bootstrap_generation: Optional[int] = None
+    ) -> dict:
         """Build the prefill ``/generate`` payload that asks the original prefill
         worker to recompute this request's prefix KV under the current weights
         (PD true-retraction rebootstrap).
@@ -1690,6 +1692,20 @@ class Req(ReqDllmMixin):
         # the rebootstrap recompute would not reproduce the original prefix KV
         # for multi-modal requests. Add multi-modal support before enabling it.
         sp = self.sampling_params
+        # The original prefill HTTP request and the decode request intentionally
+        # keep ``self.rid`` alive until the caller-visible stream terminates.  A
+        # true-retraction recompute is a separate, internal prefill lifecycle;
+        # reusing the caller RID races TokenizerManager.rid_to_state and is
+        # rejected as a duplicate while the original request is still live.
+        # bootstrap_room is globally unique for the logical PD request and the
+        # generation distinguishes each reuse, so this internal identity is
+        # deterministic on every rank without changing the decode/client RID.
+        rebootstrap_rid = self.rid
+        if bootstrap_generation is not None:
+            rebootstrap_rid = (
+                f"__sglang_pd_rebootstrap__:{self.bootstrap_room}:"
+                f"{bootstrap_generation}"
+            )
         return {
             "input_ids": [int(x) for x in self.origin_input_ids]
             + [int(x) for x in self.output_ids],
@@ -1709,10 +1725,15 @@ class Req(ReqDllmMixin):
             },
             "return_logprob": False,
             "stream": False,
-            "rid": self.rid,
+            "rid": rebootstrap_rid,
             "bootstrap_host": self.bootstrap_host,
             "bootstrap_port": self.bootstrap_port,
             "bootstrap_room": self.bootstrap_room,
+            **(
+                {"bootstrap_generation": bootstrap_generation}
+                if bootstrap_generation is not None
+                else {}
+            ),
             "priority": self.priority,
             "extra_key": self.extra_key,
             "routing_key": self.routing_key,

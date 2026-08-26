@@ -275,6 +275,11 @@ class DecodeRequest:
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
     is_rebootstrap: bool = False
+    # End-to-end deadline starts when the retracted request re-enters the
+    # decode admission path, not only after metadata is sent.  Otherwise a
+    # request stuck before preallocation has no timeout and can leave the
+    # caller's SSE open forever.
+    rebootstrap_started_at: Optional[float] = None
     admission_bypass_count: int = 0
 
     # HiCache Status
@@ -702,7 +707,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
         decode_req = DecodeRequest(
-            req=req, kv_receiver=kv_receiver, is_rebootstrap=is_rebootstrap
+            req=req,
+            kv_receiver=kv_receiver,
+            is_rebootstrap=is_rebootstrap,
+            rebootstrap_started_at=time.time() if is_rebootstrap else None,
         )
         self.queue.append(decode_req)
         return decode_req
@@ -996,6 +1004,36 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         for decode_req, prefill_dp_rank in resolved:
             decode_req.kv_receiver.init(prefill_dp_rank)
 
+    def expire_rebootstrap_requests(self) -> List[str]:
+        """Abort rebootstrap requests whose end-to-end deadline expired.
+
+        This must run before PP preallocation consensus so a timeout observed on
+        any stage is routed through the bad-rid union in the same consensus
+        round.  ``pop_preallocated`` also calls it for the non-PP path and as a
+        defensive check before queue cleanup.
+        """
+        now = time.time()
+        expired_rids = []
+        for decode_req in self.queue:
+            if (
+                getattr(decode_req, "is_rebootstrap", False)
+                and getattr(decode_req, "rebootstrap_started_at", None) is not None
+                and now - decode_req.rebootstrap_started_at
+                >= self.kv_manager.waiting_timeout
+                and not decode_req.req.finished()
+            ):
+                elapsed = now - decode_req.rebootstrap_started_at
+                prepare_abort(
+                    decode_req.req,
+                    "PD retract rebootstrap timed out before transfer "
+                    f"completion after {elapsed:.1f}s "
+                    f"(bootstrap_room={decode_req.req.bootstrap_room})",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                decode_req.kv_receiver.abort()
+                expired_rids.append(decode_req.req.rid)
+        return expired_rids
+
     def pop_preallocated(
         self,
         rids_to_check: Optional[List[str]] = None,
@@ -1015,6 +1053,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             raise ValueError("PP consensus is required when pp_size > 1")
         if is_pp_mode and rids_to_check is not None:
             raise ValueError("rids_to_check cannot be used in PP mode")
+
+        self.expire_rebootstrap_requests()
 
         self._resolve_pending_reqs()
         self._update_handshake_waiters(rids_to_check, pp_good_rids, pp_bad_rids)
@@ -1444,8 +1484,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 **metadata_kwargs,
             )
             if decode_req.is_rebootstrap:
-                payload = decode_req.req.build_rebootstrap_payload()
-                payload["bootstrap_generation"] = decode_req.kv_receiver.generation
+                payload = decode_req.req.build_rebootstrap_payload(
+                    bootstrap_generation=decode_req.kv_receiver.generation
+                )
                 self.kv_manager.submit_prefill_recompute(
                     decode_req.kv_receiver,
                     payload,

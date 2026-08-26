@@ -1957,6 +1957,10 @@ class SchedulerPPMixin:
             return list(set(prev_retract_rids) & set(curr_retract_rids))
 
     def _pp_pd_get_prealloc_ids(self: Scheduler):
+        # Mark local rebootstrap deadlines before sampling receiver state.  The
+        # bad-rid union below then propagates a timeout from any PP stage to all
+        # stages in this same consensus round.
+        self.disagg_decode_prealloc_queue.expire_rebootstrap_requests()
         # communicate pre-consensus prealloc reqs
         if self.pp_group.is_first_rank:
             # First rank, pop the preallocated reqs from the prealloc queue

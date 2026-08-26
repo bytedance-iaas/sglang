@@ -352,6 +352,24 @@ class TestInitReqStateDuplicateDetection(CustomTestCase):
         tm._init_req_state(obj)
         self.assertIn(rid, tm.rid_to_state)
 
+    def test_internal_rebootstrap_rid_does_not_collide_with_live_client_rid(self):
+        tm = _make_tokenizer_manager()
+        client_rid = "client-rid"
+        tm.rid_to_state[client_rid] = _make_req_state(client_rid)
+
+        obj = Mock(spec=GenerateReqInput)
+        obj.rid = "__sglang_pd_rebootstrap__:17:2"
+        obj.is_single = True
+        obj.received_time = 0.0
+        obj.external_trace_header = None
+        obj.bootstrap_room = 17
+
+        tm._init_req_state(obj)
+
+        self.assertIn(client_rid, tm.rid_to_state)
+        self.assertIn(obj.rid, tm.rid_to_state)
+        self.assertIsNot(tm.rid_to_state[client_rid], tm.rid_to_state[obj.rid])
+
     def test_batch_duplicate_preflight_does_not_insert_partial_state(self):
         tm = _make_tokenizer_manager()
         existing_rid = "existing"
