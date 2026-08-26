@@ -1058,6 +1058,28 @@ class Scheduler(
         self.attn_tp_cpu_group = self.attn_tp_group.cpu_group
         self.attn_cp_group = get_parallel().attn_cp_group
         self.attn_cp_cpu_group = self.attn_cp_group.cpu_group
+        self.pp_disagg_prefill_poll_groups = {}
+        if get_disagg().disaggregation_mode == "prefill" and self.ps.pp_size > 1:
+            # Bootstrap and inflight-transfer polls have different request sets
+            # and state domains.  They must not share an untagged Gloo sequence
+            # space: a missing/extra poll on one rank would otherwise let a
+            # transfer Success reduce pair with the next bootstrap poll.
+            for phase in ("bootstrap", "transfer"):
+                self.pp_disagg_prefill_poll_groups[phase] = {
+                    "attn_tp": create_custom_parallel_group(
+                        self.attn_tp_group.ranks, backend="gloo"
+                    ),
+                    "attn_cp": create_custom_parallel_group(
+                        self.attn_cp_group.ranks, backend="gloo"
+                    ),
+                }
+                logger.info(
+                    "Initialized PP prefill poll groups: phase=%s "
+                    "attn_tp_ranks=%s attn_cp_ranks=%s",
+                    phase,
+                    self.attn_tp_group.ranks,
+                    self.attn_cp_group.ranks,
+                )
         self.pp_group = get_pp_group()
         self.pp_output_group = get_pp_output_group()
         self.world_group = get_world_group()

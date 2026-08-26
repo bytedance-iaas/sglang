@@ -481,10 +481,11 @@ class PrefillBootstrapQueue:
         """Return ordered PP candidates without reserving local resources."""
         good_rids: List[str] = []
         failed_rids: List[str] = []
+        poll_groups = self.scheduler.pp_disagg_prefill_poll_groups["bootstrap"]
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.queue],
-            self.scheduler.attn_cp_cpu_group,
-            self.scheduler.attn_tp_cpu_group,
+            poll_groups["attn_cp"],
+            poll_groups["attn_tp"],
             ordered_keys=[req.rid for req in self.queue],
         )
         metadata_credits = self.req_to_metadata_buffer_idx_allocator.available_size()
@@ -875,14 +876,32 @@ class SchedulerDisaggregationPrefillMixin:
         success_rids = set(transfer_status[0]) if transfer_status is not None else set()
         failed_rids = set(transfer_status[1]) if transfer_status is not None else set()
 
-        polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
-            ordered_keys=[req.rid for req in self.disagg_prefill_inflight_queue],
-        )
         if len(self.disagg_prefill_inflight_queue) == 0:
             return []
+
+        if transfer_status is None:
+            polls = poll_and_all_reduce_attn_cp_tp_group(
+                [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
+                self.attn_cp_cpu_group,
+                self.attn_tp_cpu_group,
+                ordered_keys=[req.rid for req in self.disagg_prefill_inflight_queue],
+            )
+        else:
+            # PP already polled every local rank in the fixed transfer phase and
+            # merged the result across all pipeline stages.  Re-polling here is
+            # both redundant and unsafe: release readiness is rank-local, so a
+            # subset of attention ranks can enter this call while peers advance
+            # to the next tick's bootstrap poll on the same Gloo group.
+            polls = [
+                (
+                    KVPoll.Failed
+                    if req.rid in failed_rids
+                    else KVPoll.Success
+                    if req.rid in success_rids
+                    else None
+                )
+                for req in self.disagg_prefill_inflight_queue
+            ]
 
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
@@ -894,21 +913,6 @@ class SchedulerDisaggregationPrefillMixin:
                     continue
 
                 if req.rid not in success_rids:
-                    undone_reqs.append(req)
-                    continue
-
-                # In PP mode, the previous rank may have reached a terminal
-                # state (Success/Failed) while this rank's local poll is still
-                # in a transient state due to clock skew or propagation delay.
-                # Treat non-terminal states as undone instead of crashing.
-                if poll not in (
-                    KVPoll.Success,
-                    KVPoll.Failed,
-                ):
-                    logger.warning_once(
-                        f"PP rank {self.ps.pp_rank}: unexpected poll state {poll} for rid {req.rid} "
-                        f"from consensus; treating as undone",
-                    )
                     undone_reqs.append(req)
                     continue
 
@@ -1014,10 +1018,11 @@ class SchedulerDisaggregationPrefillMixin:
         Used by PP, advance optimistic bootstrap and inspect terminal transfer
         states without popping transfer-complete requests.
         """
+        poll_groups = self.pp_disagg_prefill_poll_groups["transfer"]
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
+            poll_groups["attn_cp"],
+            poll_groups["attn_tp"],
             ordered_keys=[req.rid for req in self.disagg_prefill_inflight_queue],
         )
 
