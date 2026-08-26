@@ -91,6 +91,10 @@ assert "Every participant proved that this keyed queue is empty" in (
     disagg_utils_src
 )
 assert "ordered_keys=[req.rid for req in candidates]" in prefill_src
+assert 'pp_disagg_prefill_poll_groups["bootstrap"]' in prefill_src
+assert 'pp_disagg_prefill_poll_groups["transfer"]' in prefill_src
+assert "PP already polled every local rank" in prefill_src
+assert "Initialized PP prefill poll groups" in scheduler_src
 
 print(
     json.dumps(
@@ -107,6 +111,7 @@ print(
             "hisparse_page_ownership_fix": True,
             "hisparse_eagle_v2_finalizer_fix": True,
             "pp_empty_poll_consensus_fix": True,
+            "pp_poll_phase_isolation_fix": True,
         },
         sort_keys=True,
     )
