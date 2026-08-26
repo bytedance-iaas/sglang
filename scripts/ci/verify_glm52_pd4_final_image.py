@@ -96,6 +96,18 @@ assert 'pp_disagg_prefill_poll_groups["transfer"]' in prefill_src
 assert "PP already polled every local rank" in prefill_src
 assert "Initialized PP prefill poll groups" in scheduler_src
 
+common_conn_src = pathlib.Path(
+    "/sgl-workspace/sglang/python/sglang/srt/disaggregation/common/conn.py"
+).read_text()
+mooncake_conn_src = pathlib.Path(
+    "/sgl-workspace/sglang/python/sglang/srt/disaggregation/mooncake/conn.py"
+).read_text()
+assert "def begin_request(" in common_conn_src
+assert "request_failure_history" in common_conn_src
+assert "bootstrap_generation" in schedule_batch_src
+assert "supports_request_generation = True" in mooncake_conn_src
+assert "Ignoring stale status for room" in mooncake_conn_src
+
 print(
     json.dumps(
         {
@@ -112,6 +124,7 @@ print(
             "hisparse_eagle_v2_finalizer_fix": True,
             "pp_empty_poll_consensus_fix": True,
             "pp_poll_phase_isolation_fix": True,
+            "request_generation_isolation_fix": True,
         },
         sort_keys=True,
     )
