@@ -242,6 +242,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         decode_req.req.finished = lambda: decode_req.req.finished_reason is not None
         queue = self._new_queue([decode_req])
         queue.kv_manager.waiting_timeout = 5
+        receiver = decode_req.kv_receiver
 
         with patch(
             "sglang.srt.disaggregation.decode.time.time", return_value=20.0
@@ -252,7 +253,8 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         self.assertEqual(failed, [decode_req])
         self.assertIsInstance(decode_req.req.finished_reason, FINISH_ABORT)
         self.assertIn("rebootstrap timed out", decode_req.req.finished_reason.message)
-        decode_req.kv_receiver.abort.assert_called_once_with()
+        receiver.abort.assert_called_once_with()
+        self.assertIsNone(decode_req.kv_receiver)
         queue.scheduler.output_streamer.stream_output.assert_called_once_with(
             [decode_req.req], False
         )
