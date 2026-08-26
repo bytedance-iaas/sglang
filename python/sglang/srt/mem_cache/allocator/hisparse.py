@@ -32,6 +32,30 @@ def _stable_unique_page_ids(page_ids: torch.Tensor) -> torch.Tensor:
     return unique_page_ids[torch.argsort(first_positions)]
 
 
+def _released_page_ids(
+    allocator: PagedTokenToKVPoolAllocator, *, device: torch.device
+) -> torch.Tensor:
+    """Return every page already reusable by a paged allocator.
+
+    Disaggregated allocators stage newly returned pages in ``release_pages``
+    until a later merge, so ``free_pages`` alone is not the free set.
+    """
+    released_page_sets = []
+    for name in ("free_pages", "release_pages"):
+        released = getattr(allocator, name, None)
+        if isinstance(released, torch.Tensor):
+            released_page_sets.append(
+                released.to(device=device, dtype=torch.int64)
+            )
+        elif isinstance(released, (list, tuple)) and released:
+            released_page_sets.append(
+                torch.as_tensor(released, device=device, dtype=torch.int64)
+            )
+    if not released_page_sets:
+        return torch.empty(0, device=device, dtype=torch.int64)
+    return torch.cat(released_page_sets)
+
+
 class _HiSparsePageOwnership:
     """Release physical pages only after every logical/buffer owner is clear."""
 
@@ -69,6 +93,32 @@ class _HiSparsePageOwnership:
         self.mapping[mapping_indices] = 0
         if clear_extra_owner is not None:
             clear_extra_owner()
+        if page_ids.numel() == 0:
+            return
+
+        # Paged allocations can expose only part of a physical page through one
+        # logical range. Another range may therefore still own a different slot
+        # in the same page and can be retired by a later release call. The page
+        # allocator has no reference counts, so return only pages whose final
+        # mapping owner was cleared by this transaction.
+        remaining_coordinates = self.mapping[self.mapping > 0].to(torch.int64)
+        if remaining_coordinates.numel() > 0:
+            remaining_page_ids = torch.unique(
+                remaining_coordinates // self.page_size
+            )
+            page_ids = page_ids[~torch.isin(page_ids, remaining_page_ids)]
+        if page_ids.numel() == 0:
+            return
+
+        # In disaggregated mode PagedTokenToKVPoolAllocator stages returned
+        # pages in release_pages until the next merge. A stale logical owner can
+        # survive beyond the release which already returned its page; checking
+        # both containers prevents that later owner from returning it twice.
+        already_released = _released_page_ids(
+            self.child_allocator, device=page_ids.device
+        )
+        if already_released.numel() > 0:
+            page_ids = page_ids[~torch.isin(page_ids, already_released)]
         if page_ids.numel() == 0:
             return
 
@@ -260,7 +310,10 @@ class HiSparseTokenToKVPoolAllocator(HiSparseDemotionMixin, BaseTokenToKVPoolAll
             # falls in the retained prefix it becomes a use-after-free instead.
             mapped_pages = hisparse_indices // self.page_size
             stale = torch.isin(
-                mapped_pages, self.hisparse_attn_allocator.free_pages
+                mapped_pages,
+                _released_page_ids(
+                    self.hisparse_attn_allocator, device=mapped_pages.device
+                ),
             )
             if torch.any(stale):
                 hisparse_indices = hisparse_indices[~stale]
@@ -317,7 +370,12 @@ class HiSparseTokenToKVPoolAllocator(HiSparseDemotionMixin, BaseTokenToKVPoolAll
         if self.debug_validate_lifecycle:
             pages = torch.unique(buffer_indices // self.page_size)
             already_free = pages[
-                torch.isin(pages, self.hisparse_attn_allocator.free_pages)
+                torch.isin(
+                    pages,
+                    _released_page_ids(
+                        self.hisparse_attn_allocator, device=pages.device
+                    ),
+                )
             ]
             if already_free.numel() > 0:
                 raise RuntimeError(
@@ -328,7 +386,9 @@ class HiSparseTokenToKVPoolAllocator(HiSparseDemotionMixin, BaseTokenToKVPoolAll
                 )
         self.hisparse_attn_allocator.free(buffer_indices)
         if self.debug_validate_lifecycle:
-            free_pages = self.hisparse_attn_allocator.free_pages
+            free_pages = _released_page_ids(
+                self.hisparse_attn_allocator, device=buffer_indices.device
+            )
             if torch.unique(free_pages).numel() != free_pages.numel():
                 raise RuntimeError(
                     "HiSparse physical free list contains duplicate pages after free"

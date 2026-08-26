@@ -1002,7 +1002,7 @@ class ModelRunner:
             RoutedExpertsCapturer.create(
                 model=self.model,
                 model_config=self.model_config,
-                num_tokens=self.max_total_num_tokens + self.page_size,
+                num_tokens=self.max_token_pool_size + self.page_size,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
             )
@@ -1012,7 +1012,7 @@ class ModelRunner:
         set_global_indexer_capturer(
             create_indexer_capturer(
                 model_config=self.model_config,
-                num_tokens=self.max_total_num_tokens + self.page_size,
+                num_tokens=self.max_token_pool_size + self.page_size,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
             )
@@ -1232,15 +1232,32 @@ class ModelRunner:
     def effective_max_total_num_tokens(self):
         """Return the max token pool size considering hybrid swa settings."""
         if self.enable_hisparse:
-            # HiSparse keeps only a physical working set on device while its
-            # allocator owns a larger logical token space backed by host KV.
-            # Request-length admission must use that logical space, not the
-            # device pool profiled by max_total_num_tokens.
-            return self.token_to_kv_pool_allocator.size
+            # Worker-info and prefill admission consume this property directly.
+            # They must expose the same host-backed logical capacity as decode.
+            logical_size = getattr(
+                self.token_to_kv_pool_allocator, "size_full", None
+            ) or getattr(self.token_to_kv_pool_allocator, "size", None)
+            if logical_size is not None:
+                return logical_size
         if self.is_hybrid_swa:
             return self.full_max_total_num_tokens or self.swa_max_total_num_tokens
         else:
             return self.max_total_num_tokens
+
+    @property
+    def max_token_pool_size(self):
+        """Return the addressable token-pool size for runtime metadata.
+
+        HiSparse keeps only a working set on device, but request admission and
+        token-indexed capturers must cover its host-backed logical pool.
+        """
+        if self.enable_hisparse:
+            logical_size = getattr(
+                self.token_to_kv_pool_allocator, "size_full", None
+            ) or getattr(self.token_to_kv_pool_allocator, "size", None)
+            if logical_size is not None:
+                return logical_size
+        return self.effective_max_total_num_tokens
 
     def configure_kv_cache_dtype(self):
         spec_algorithm = getattr(self, "spec_algorithm", None)

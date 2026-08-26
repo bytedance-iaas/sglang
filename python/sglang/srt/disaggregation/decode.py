@@ -753,7 +753,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
         input_len = self._rebootstrap_prefill_len(req)
         token_capacity = (
-            self.token_to_kv_pool_allocator.size
+            self.scheduler.tp_worker.model_runner.max_token_pool_size
             if self.scheduler.enable_hisparse
             else self.max_total_num_tokens
         )

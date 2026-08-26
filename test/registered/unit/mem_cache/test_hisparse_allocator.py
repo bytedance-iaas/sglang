@@ -8,7 +8,9 @@ import torch
 
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
+    HiSparseTokenToKVPoolAllocator,
     _HiSparsePageOwnership,
+    _released_page_ids,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -97,6 +99,39 @@ class _C4Pool:
 
 
 class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
+    def test_released_page_ids_includes_pd_staging_pages(self):
+        allocator = SimpleNamespace(
+            free_pages=torch.tensor([1, 2], dtype=torch.int64),
+            release_pages=torch.tensor([7, 8], dtype=torch.int64),
+        )
+
+        self.assertEqual(
+            _released_page_ids(allocator, device=torch.device("cpu")).tolist(),
+            [1, 2, 7, 8],
+        )
+
+    def test_device_buffer_discards_mapping_to_pd_staged_page(self):
+        allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
+        allocator.page_size = 4
+        allocator.full_to_hisparse_device_index_mapping = torch.tensor(
+            [0, 5, 6, 7], dtype=torch.int64
+        )
+        allocator.hisparse_attn_allocator = SimpleNamespace(
+            free_pages=torch.tensor([2], dtype=torch.int64),
+            release_pages=torch.tensor([1], dtype=torch.int64),
+            alloc=MagicMock(
+                return_value=torch.tensor([12, 13, 14, 15], dtype=torch.int64)
+            ),
+        )
+
+        result = allocator.alloc_device_buffer(torch.tensor([1, 2, 3]), 4)
+
+        self.assertEqual(result.tolist(), [12, 13, 14, 15])
+        allocator.hisparse_attn_allocator.alloc.assert_called_once_with(4)
+        self.assertEqual(
+            allocator.full_to_hisparse_device_index_mapping.tolist(), [0, 0, 0, 0]
+        )
+
     def test_page_ownership_clears_all_owners_before_stable_page_free(self):
         mapping = torch.zeros(8, dtype=torch.int64)
         mapping[torch.tensor([1, 2, 3])] = torch.tensor([9, 5, 11])
@@ -136,6 +171,46 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             ownership.release(mapping_indices=torch.tensor([1]))
 
         self.assertEqual(mapping.tolist(), [0, 4])
+        child_allocator.free.assert_not_called()
+
+    def test_page_ownership_releases_shared_page_after_last_mapping_owner(self):
+        """Separate release calls must not return a still-referenced C4 page."""
+        page_size = 4
+        mapping = torch.zeros(8, dtype=torch.int64)
+        # Two independently retired logical ranges refer to different slots in
+        # the same physical page. This happens when page-aligned allocation
+        # outlives the request-visible compressed range.
+        mapping[1] = 5
+        mapping[6] = 7
+        child_allocator = MagicMock(is_not_in_free_group=True)
+        ownership = _HiSparsePageOwnership(
+            mapping=mapping, child_allocator=child_allocator, page_size=page_size
+        )
+
+        ownership.release(mapping_indices=torch.tensor([1]))
+
+        self.assertEqual(mapping[1].item(), 0)
+        self.assertEqual(mapping[6].item(), 7)
+        child_allocator.free.assert_not_called()
+
+        ownership.release(mapping_indices=torch.tensor([6]))
+
+        child_allocator.free.assert_called_once()
+        self.assertEqual(child_allocator.free.call_args.args[0].tolist(), [4, 5, 6, 7])
+
+    def test_page_ownership_does_not_release_page_already_staged_for_reuse(self):
+        """PD release_pages is part of the physical allocator's free set."""
+        mapping = torch.tensor([0, 5], dtype=torch.int64)
+        child_allocator = MagicMock(is_not_in_free_group=True)
+        child_allocator.free_pages = torch.tensor([2], dtype=torch.int64)
+        child_allocator.release_pages = torch.tensor([1], dtype=torch.int64)
+        ownership = _HiSparsePageOwnership(
+            mapping=mapping, child_allocator=child_allocator, page_size=4
+        )
+
+        ownership.release(mapping_indices=torch.tensor([1]))
+
+        self.assertEqual(mapping.tolist(), [0, 0])
         child_allocator.free.assert_not_called()
 
     def test_dsv4_finish_releases_composite_and_coordinator_c4_pages(self):
