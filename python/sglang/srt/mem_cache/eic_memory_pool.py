@@ -437,28 +437,24 @@ class EICKVClient:
                 logger.info(
                     f"async batch set cost { cost_time * 1e3}.2f ms, {len(keys)} keys"
                 )
+            return True
         else:
-            objs = []
-            if obj_inputs is not None:
-                objs = [item.cpu() for item in obj_inputs]
-            elif device_indices is not None and copy_func is not None:
-                large_tensor = torch.empty(
-                    (count,) + self.kv_cache_shape,
-                    dtype=self.kv_cache_dtype,
-                    device="cpu",
+            # Write pool exhausted: the consumer thread is behind (EIC backend slow
+            # or failing). Drop this batch instead of allocating an unbounded host
+            # tensor per call -- under a backend stall the old fallback accumulated
+            # 1000+ large mallocs in seconds and OOM-killed the rank. Dropping is a
+            # benign L2/L3 cache miss (recomputed later). Rank-safe: assign_page_data
+            # returns False without blocking, so every TP rank still reaches the
+            # write_operation_shared all_reduce, which reconciles the failed result.
+            self._write_drop_ct = getattr(self, "_write_drop_ct", 0) + 1
+            if self._write_drop_ct == 1 or self._write_drop_ct % 128 == 0:
+                logger.warning(
+                    "eic async write pool exhausted, dropping %d keys "
+                    "(total dropped batches: %d)",
+                    len(keys),
+                    self._write_drop_ct,
                 )
-                objs = [large_tensor[i] for i in range(len(keys))]
-                copy_func(device_indices, objs)
-            else:
-                logger.error(
-                    "async set impl input obj_inputs and device_indices are both None"
-                )
-                return False
-            self.write_queue.put((keys, objs, None))
-            logger.warning(
-                f"async batch set fallback to malloc, cost {(time.perf_counter() - start_time) * 1e3}.2f ms, {len(keys)} keys"
-            )
-        return True
+            return False
 
     def exists(self, key: str) -> bool:
         logger.debug(f"eic exists {key}")
@@ -683,15 +679,18 @@ class EICKVClient:
         set_option.ns = self.eic_namespace
         set_option.ttl_second = self.kv_set_ttl_option
         status_code, set_outcome = self.connection.mset(keys_vec, vals_vec, set_option)
+
+        # Free slots before any early exit: the write mempool never refills, so an
+        # mset-error bail leaks them permanently.
+        if registered:
+            for item in objs:
+                self.kv_cache_write_mem_pool.free_to_mempool(item.data_ptr())
+
         if status_code != eic.StatusCode.SUCCESS:
             logger.error(f"eic mset {len(keys)} failed, status_code {status_code}")
             return False
         else:
             logger.debug(f"eic mset {len(keys)} success")
-
-        if registered:
-            for item in objs:
-                self.kv_cache_write_mem_pool.free_to_mempool(item.data_ptr())
 
         failed = [
             (i, err_code)
@@ -1618,6 +1617,8 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
             storage_backend=None,
             pp_rank=params.pp_rank,
             pp_size=params.pp_size,
+            # EIC host pages are device-indexed; see _deepseek_v4_num_host_pages.
+            device_indexed=True,
         )
         # The assembler creates a temporary HiCache controller that registers a
         # layer-transfer counter on DSv4. Native EIC load completes before the
