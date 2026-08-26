@@ -510,7 +510,16 @@ class EICHiRadixCache(RadixCache):
             result.append(result_list[i] == 0)
         return result
 
-    def writing_check(self, write_back=False):
+    def writing_check(self, write_back=None):
+        # Derive write_back from policy, not the caller. write_back nodes are never
+        # inc_lock_ref'd (write_backup skips it), so dec_lock_ref must be skipped too.
+        # The evict() throttle and check_hicache_events call sites default the flag,
+        # so under write_back policy they used to dec_lock_ref lock_ref==0 nodes --
+        # walking to the root and moving a running request's still-protected ancestor
+        # pages into evictable_, double-counting them (available + evictable > total)
+        # and crashing the scheduler with "pool memory leak detected".
+        if write_back is None:
+            write_back = self.cache_controller.write_policy == "write_back"
         if len(self.ongoing_write_through) == 0:
             return
         write_check_start_time = time.perf_counter()

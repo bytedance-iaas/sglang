@@ -682,6 +682,40 @@ class TestEICHiCacheRegression(unittest.TestCase):
         self.assertEqual(len(req.prefix_indices), 4)  # device-only admit
         self.assertEqual(s.ongoing_load_admit, {})
 
+    def test_device_indexed_host_pages_ignore_hicache_ratio(self):
+        # EIC shared-page mode is device-indexed, so pages beyond device_pages are
+        # unreachable: device_indexed=True must clamp to device_pages+1 regardless of
+        # --hicache-ratio, while the non-EIC path keeps honoring the ratio.
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+            _deepseek_v4_num_host_pages,
+        )
+
+        page_size = swa_page_size = 256
+        kv = SimpleNamespace(size=339968, swa_size=271872, swa_page_size=swa_page_size)
+        params = SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace(size_full=339968)
+        )
+        args = SimpleNamespace(hicache_size=0, hicache_ratio=2.0)
+        kwargs = dict(
+            params=params,
+            server_args=args,
+            kvcache=kv,
+            page_size=page_size,
+            swa_page_size=swa_page_size,
+        )
+        device_full = 339968 // page_size
+        device_swa = 271872 // swa_page_size
+
+        self.assertEqual(
+            _deepseek_v4_num_host_pages(**kwargs, device_indexed=True),
+            (device_full + 1, device_swa + 1),
+        )
+        # Non-EIC host cache genuinely uses mem_pool_host.alloc(), so ratio must hold.
+        self.assertEqual(
+            _deepseek_v4_num_host_pages(**kwargs, device_indexed=False),
+            (device_full * 2, device_swa * 2),
+        )
+
     def test_finalize_asserts_on_verdict_before_ack(self):
         # I5 enforcement: a FINAL verdict may never land before the local ack
         # when a load was kicked -- silent free of in-flight DMA otherwise.
@@ -782,6 +816,96 @@ class TestEICHiCacheRegression(unittest.TestCase):
     def test_reconciler_epoch_never_reused(self):
         r = self._make_reconciler(0, self.FakeStore())
         self.assertEqual([r.bump_epoch("r"), r.bump_epoch("r")], [1, 2])
+
+    def _make_writing_check_cache(self, write_policy):
+        # Minimal EICPagedHiRadixCache for exercising writing_check's dec_lock_ref
+        # gating. One acked node in ongoing_write_through, TP=1 (no all_reduce).
+        cache = object.__new__(EICPagedHiRadixCache)
+        cache.tp_group = None
+        node = SimpleNamespace(id=7, host_value=object())
+        cache.ongoing_write_through = {7: node}
+        ackq = Queue()
+        ackq.put((7, True))
+        cache.cache_controller = SimpleNamespace(
+            write_policy=write_policy, ack_write_queue=ackq
+        )
+        cache.dec_lock_ref = mock.Mock()
+        return cache
+
+    def test_writing_check_skips_dec_lock_ref_under_write_back_policy(self):
+        # The device-pool double-count crash: under write_back policy nodes are never
+        # inc_lock_ref'd, so writing_check() (evict throttle / check_hicache_events,
+        # which pass no flag) must NOT dec_lock_ref -- doing so drains a running req's
+        # protected pages into evictable ("pool memory leak detected").
+        import torch as _torch
+
+        cache = self._make_writing_check_cache("write_back")
+        with mock.patch.object(
+            _torch.distributed, "get_world_size", return_value=1
+        ):
+            EICPagedHiRadixCache.writing_check(cache)  # no explicit flag
+        cache.dec_lock_ref.assert_not_called()
+        self.assertEqual(cache.ongoing_write_through, {})
+
+    def test_writing_check_dec_lock_ref_under_write_through_policy(self):
+        # write_through nodes ARE inc_lock_ref'd, so the release must still fire.
+        import torch as _torch
+
+        cache = self._make_writing_check_cache("write_through")
+        with mock.patch.object(
+            _torch.distributed, "get_world_size", return_value=1
+        ):
+            EICPagedHiRadixCache.writing_check(cache)
+        cache.dec_lock_ref.assert_called_once()
+        self.assertEqual(cache.ongoing_write_through, {})
+
+    def test_async_batch_set_drops_when_write_pool_exhausted(self):
+        # Backend-failure OOM guard: when the async write pool is exhausted (the
+        # consumer thread is behind a slow/failing EIC backend), async_batch_set must
+        # DROP the batch, not allocate an unbounded host tensor per call. The old
+        # fallback accumulated 1000+ mallocs in seconds and OOM-killed the rank.
+        from sglang.srt.mem_cache.eic_memory_pool import EICKVClient
+
+        c = object.__new__(EICKVClient)
+        c.kv_cache_write_mem_pool = SimpleNamespace(left_count=lambda: 0)
+        c.write_queue = Queue()
+        copied = []
+        ret = EICKVClient.async_batch_set(
+            c,
+            keys=["a", "b", "c"],
+            obj_inputs=None,
+            device_indices=torch.arange(3),
+            copy_func=lambda idx, objs: copied.append(idx),
+        )
+        self.assertFalse(ret)  # dropped
+        self.assertTrue(c.write_queue.empty())  # nothing enqueued
+        self.assertEqual(copied, [])  # no device->host copy / malloc
+
+    def test_async_batch_set_enqueues_when_pool_has_room(self):
+        # Normal path unchanged: with pool headroom the batch allocates registered
+        # slots and is enqueued for the write thread.
+        from sglang.srt.mem_cache.eic_memory_pool import EICKVClient
+
+        c = object.__new__(EICKVClient)
+        slots = [torch.zeros(2) for _ in range(3)]
+        c.kv_cache_write_mem_pool = SimpleNamespace(
+            left_count=lambda: 8,
+            try_allocate_kv_cache=lambda shape, dtype, count: (slots[:count], None),
+        )
+        c.kv_cache_shape = (2,)
+        c.kv_cache_dtype = torch.float32
+        c.write_queue = Queue()
+        copied = []
+        ret = EICKVClient.async_batch_set(
+            c,
+            keys=["a", "b", "c"],
+            obj_inputs=None,
+            device_indices=torch.arange(3),
+            copy_func=lambda idx, objs: copied.append(idx),
+        )
+        self.assertTrue(ret)
+        self.assertEqual(c.write_queue.qsize(), 1)
+        self.assertEqual(len(copied), 1)  # copy_func invoked once
 
 
 if __name__ == "__main__":
