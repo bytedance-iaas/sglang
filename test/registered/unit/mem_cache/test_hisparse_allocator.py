@@ -150,6 +150,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         ownership = _HiSparsePageOwnership(
             mapping=mapping, child_allocator=child_allocator, page_size=4
         )
+        ownership.claim(buffer_owner)
 
         ownership.release(
             mapping_indices=torch.tensor([1, 2, 3]),
@@ -198,6 +199,74 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         child_allocator.free.assert_called_once()
         self.assertEqual(child_allocator.free.call_args.args[0].tolist(), [4, 5, 6, 7])
 
+    def test_page_ownership_pins_side_buffer_across_logical_free_transactions(self):
+        """A detached logical alias must not make a live buffer page reusable."""
+        page_size = 4
+        mapping = torch.zeros(8, dtype=torch.int64)
+        mapping[1] = 5
+        side_buffer = torch.tensor([4, 5, 6, 7], dtype=torch.int64)
+        child_allocator = _PhysicalPageAllocator(page_size=page_size, num_pages=2)
+        allocated = child_allocator.alloc(page_size)
+        self.assertEqual(allocated.tolist(), side_buffer.tolist())
+        ownership = _HiSparsePageOwnership(
+            mapping=mapping, child_allocator=child_allocator, page_size=page_size
+        )
+        ownership.claim(side_buffer)
+
+        # A cache transaction can retire an accepted/rejected logical alias
+        # before request_finished drops the coordinator's side-buffer owner.
+        ownership.release(mapping_indices=torch.tensor([1]))
+        self.assertEqual(mapping[1].item(), 0)
+        self.assertEqual(child_allocator.used_pages, {1})
+        self.assertEqual(child_allocator.free_pages, [2])
+
+        ownership.release(
+            mapping_indices=torch.empty(0, dtype=torch.int64),
+            extra_owned_coordinates=side_buffer,
+        )
+        self.assertEqual(child_allocator.used_pages, set())
+        self.assertEqual(child_allocator.free_pages.count(1), 1)
+
+    def test_generic_finish_order_survives_earlier_logical_alias_retirement(self):
+        """Replay the production cache/coordinator/final-cache ownership order."""
+        page_size = 64
+        logical = _LogicalPageAllocator(page_size=page_size, num_pages=2)
+        physical = _PhysicalPageAllocator(page_size=page_size, num_pages=2)
+        mapping = torch.zeros(logical.size + page_size + 1, dtype=torch.int64)
+        allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
+        allocator.page_size = page_size
+        allocator.logical_attn_allocator = logical
+        allocator.hisparse_attn_allocator = physical
+        allocator.full_to_hisparse_device_index_mapping = mapping
+        allocator.is_not_in_free_group = True
+        allocator.free_group = []
+        allocator._page_ownership = _HiSparsePageOwnership(
+            mapping=mapping, child_allocator=physical, page_size=page_size
+        )
+
+        side_buffer = physical.alloc(page_size)
+        logical_locs = torch.arange(page_size, dtype=torch.int64)
+        mapping[logical_locs[:7]] = side_buffer[:7]
+        allocator.claim_hisparse_ownership(side_buffer)
+
+        # A speculative/cache transaction retires the temporary aliases while
+        # req_to_device_buffer still owns the whole page.  Before this fix the
+        # page became reusable here and request finish returned it again.
+        allocator.free_hisparse(logical_locs[:7])
+        self.assertEqual(physical.used_pages, {1})
+        self.assertEqual(physical.available_size(), page_size)
+
+        # Production finish first drops the coordinator owner, then the chunk
+        # cache frees the request's logical KV indices.
+        allocator.release_hisparse_ownership(
+            mapping_indices=logical_locs,
+            extra_owned_coordinates=side_buffer,
+        )
+        allocator.free(logical_locs)
+        self.assertEqual(physical.used_pages, set())
+        self.assertEqual(physical.available_size(), physical.size)
+        self.assertEqual(physical.free_pages.count(1), 1)
+
     def test_page_ownership_does_not_release_page_already_staged_for_reuse(self):
         """PD release_pages is part of the physical allocator's free set."""
         mapping = torch.tensor([0, 5], dtype=torch.int64)
@@ -238,6 +307,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
 
         # The target coordinator canonically owns one fixed C4 side-buffer page.
         coordinator_page = physical.alloc(physical.page_size)
+        allocator.claim_hisparse_ownership(coordinator_page)
         coordinator_page_id = int(coordinator_page[0] // physical.page_size)
 
         logical_locs = allocator.alloc_extend(
@@ -281,6 +351,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         shared_mapping[:page_size] = shared_page
         target_buffer_owner = shared_page.clone()
         draft_buffer_alias = shared_page.clone()
+        ownership.claim(target_buffer_owner)
 
         # The draft coordinator is only a mirror: detach its local alias first.
         # It shares both the allocator and mapping with target, so it must not

@@ -71,6 +71,42 @@ class _HiSparsePageOwnership:
         self.mapping = mapping
         self.child_allocator = child_allocator
         self.page_size = page_size
+        # Coordinator device buffers outlive individual logical mappings.  A
+        # page can therefore have no mapping owner while it is still reachable
+        # through req_to_device_buffer.  Keep those cross-transaction owners
+        # here; inspecting only ``mapping`` during free creates a use-after-free
+        # window in which the page can be reallocated and later returned twice.
+        self._extra_owner_page_ids: set[int] = set()
+
+    def clear(self) -> None:
+        self._extra_owner_page_ids.clear()
+
+    def _page_ids(self, coordinates: torch.Tensor) -> torch.Tensor:
+        positive_coordinates = coordinates[coordinates > 0].to(torch.int64)
+        return _stable_unique_page_ids(positive_coordinates // self.page_size)
+
+    def claim(self, coordinates: torch.Tensor) -> None:
+        """Persist ownership held outside the logical mapping tensor."""
+        page_ids = self._page_ids(coordinates)
+        if page_ids.numel() == 0:
+            return
+        page_id_set = set(page_ids.cpu().tolist())
+        duplicate = page_id_set & self._extra_owner_page_ids
+        if duplicate:
+            raise RuntimeError(
+                "HiSparse physical pages acquired by multiple side-buffer owners: "
+                f"pages={sorted(duplicate)}"
+            )
+        self._extra_owner_page_ids.update(page_id_set)
+
+    def assert_unclaimed(self, coordinates: torch.Tensor) -> None:
+        page_ids = set(self._page_ids(coordinates).cpu().tolist())
+        claimed = page_ids & self._extra_owner_page_ids
+        if claimed:
+            raise RuntimeError(
+                "HiSparse attempted direct free of side-buffer-owned pages: "
+                f"pages={sorted(claimed)}"
+            )
 
     def release(
         self,
@@ -83,16 +119,37 @@ class _HiSparsePageOwnership:
         # transaction. Fail before mutating any owner if that invariant breaks.
         assert self.child_allocator.is_not_in_free_group
         coordinates = self.mapping[mapping_indices]
+        extra_page_ids: set[int] = set()
         if extra_owned_coordinates is not None:
             coordinates = torch.cat([coordinates, extra_owned_coordinates])
-        positive_coordinates = coordinates[coordinates > 0].to(torch.int64)
-        page_ids = _stable_unique_page_ids(
-            positive_coordinates // self.page_size
-        )
+            extra_page_ids = set(
+                self._page_ids(extra_owned_coordinates).cpu().tolist()
+            )
+            missing = extra_page_ids - self._extra_owner_page_ids
+            if missing:
+                raise RuntimeError(
+                    "HiSparse released side-buffer pages without ownership: "
+                    f"pages={sorted(missing)}"
+                )
+        page_ids = self._page_ids(coordinates)
 
         self.mapping[mapping_indices] = 0
+        self._extra_owner_page_ids.difference_update(extra_page_ids)
         if clear_extra_owner is not None:
             clear_extra_owner()
+        if page_ids.numel() == 0:
+            return
+
+        # A page with a live coordinator-side owner must not become reusable,
+        # even when all of its current logical aliases were cleared by an
+        # earlier cache transaction.
+        if self._extra_owner_page_ids:
+            claimed_page_ids = torch.tensor(
+                sorted(self._extra_owner_page_ids),
+                dtype=torch.int64,
+                device=page_ids.device,
+            )
+            page_ids = page_ids[~torch.isin(page_ids, claimed_page_ids)]
         if page_ids.numel() == 0:
             return
 
@@ -367,6 +424,7 @@ class HiSparseTokenToKVPoolAllocator(HiSparseDemotionMixin, BaseTokenToKVPoolAll
         buffer_indices = buffer_indices[buffer_indices > 0]
         if buffer_indices.numel() == 0:
             return
+        self._page_ownership.assert_unclaimed(buffer_indices)
         if self.debug_validate_lifecycle:
             pages = torch.unique(buffer_indices // self.page_size)
             already_free = pages[
@@ -406,6 +464,9 @@ class HiSparseTokenToKVPoolAllocator(HiSparseDemotionMixin, BaseTokenToKVPoolAll
             extra_owned_coordinates=extra_owned_coordinates,
             clear_extra_owner=clear_extra_owner,
         )
+
+    def claim_hisparse_ownership(self, coordinates: torch.Tensor) -> None:
+        self._page_ownership.claim(coordinates)
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
         return last_locs
@@ -539,6 +600,7 @@ class HiSparseTokenToKVPoolAllocator(HiSparseDemotionMixin, BaseTokenToKVPoolAll
         self.hisparse_attn_allocator.clear()
         # Note: the last item is -1, we don't clear it, see the comment in __init__
         self.full_to_hisparse_device_index_mapping[:-1].fill_(0)
+        self._page_ownership.clear()
         self.is_not_in_free_group = True
         self.free_group = []
 
@@ -807,7 +869,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(
 
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):
         assert self.hisparse_attn_allocator.is_not_in_free_group
-        self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
+        buffer_indices = buffer_indices[buffer_indices > 0]
+        self._page_ownership.assert_unclaimed(buffer_indices)
+        self.hisparse_attn_allocator.free(buffer_indices)
 
     def release_hisparse_ownership(
         self,
@@ -821,6 +885,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(
             extra_owned_coordinates=extra_owned_coordinates,
             clear_extra_owner=clear_extra_owner,
         )
+
+    def claim_hisparse_ownership(self, coordinates: torch.Tensor) -> None:
+        self._page_ownership.claim(coordinates)
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
         return (last_locs - 3) // self.compress_ratio
@@ -918,6 +985,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(
         self.hisparse_attn_allocator.clear()
 
         self.full_to_hisparse_device_index_mapping[:-1].fill_(0)
+        self._page_ownership.clear()
         self.is_not_in_free_group = True
         self.free_group = []
 

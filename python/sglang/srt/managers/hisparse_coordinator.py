@@ -1334,7 +1334,7 @@ class HiSparseCoordinator:
         current_cap = int(self.req_device_buffer_size[req.req_pool_idx])
         if free_physical and current_cap > 0:
             buffer_locs = self.req_to_device_buffer[req.req_pool_idx, :current_cap]
-            buffer_locs = torch.unique(buffer_locs[buffer_locs > 0])
+            buffer_locs = buffer_locs[buffer_locs > 0]
             if buffer_locs.numel() > 0:
                 # Promotion replaces the committed prefix with newly allocated
                 # resident pages, but speculative decoding can leave logical
@@ -1344,7 +1344,12 @@ class HiSparseCoordinator:
                 # follows the stale mapping at request finish and frees the
                 # same physical page a second time.
                 self._detach_request_mappings_to_physical_pages(req, buffer_locs)
-                self.token_to_kv_pool_allocator.free_hisparse_indices(buffer_locs)
+                self.token_to_kv_pool_allocator.release_hisparse_ownership(
+                    mapping_indices=torch.empty(
+                        0, dtype=torch.int64, device=buffer_locs.device
+                    ),
+                    extra_owned_coordinates=buffer_locs,
+                )
         self.req_to_device_buffer[req.req_pool_idx, :] = 0
         self.req_device_buffer_size[req.req_pool_idx] = 0
         self.req_device_buffer_tokens[:, req.req_pool_idx, :] = -1
@@ -1389,7 +1394,7 @@ class HiSparseCoordinator:
             req_idx, self.device_buffer_size : self.padded_buffer_size
         ]
         if free_physical:
-            page_locs = torch.unique(page_locs[page_locs > 0])
+            page_locs = page_locs[page_locs > 0]
             if page_locs.numel() > 0:
                 # Verify slots are deliberately over-allocated and can still
                 # point at this graph-stable page when residency changes or a
@@ -1398,7 +1403,12 @@ class HiSparseCoordinator:
                 # or the generic allocator.free() path observes the stale
                 # mapping and frees the same page a second time.
                 self._detach_request_mappings_to_physical_pages(req, page_locs)
-                self.token_to_kv_pool_allocator.free_hisparse_indices(page_locs)
+                self.token_to_kv_pool_allocator.release_hisparse_ownership(
+                    mapping_indices=torch.empty(
+                        0, dtype=torch.int64, device=page_locs.device
+                    ),
+                    extra_owned_coordinates=page_locs,
+                )
         self.req_to_device_buffer[req_idx, :] = 0
         self.req_device_buffer_size[req_idx] = 0
         self.req_device_buffer_tokens[:, req_idx, :] = -1
@@ -1539,6 +1549,7 @@ class HiSparseCoordinator:
             )
             raise RuntimeError("HiSparse alloc_device_buffer returned None")
 
+        self.token_to_kv_pool_allocator.claim_hisparse_ownership(buffer_indices)
         buffer_indices = buffer_indices.to(torch.int32)
         self.req_to_device_buffer[req.req_pool_idx, :alloc_size] = buffer_indices
         self.req_device_buffer_size[req.req_pool_idx] = alloc_size
@@ -1653,6 +1664,9 @@ class HiSparseCoordinator:
                         f"HiSparse _grow_device_buffers failed (total_grow={total_grow})"
                     )
 
+                self.token_to_kv_pool_allocator.claim_hisparse_ownership(
+                    all_new_indices
+                )
                 offset = 0
                 for req_idx, current_cap, new_cap, grow_size in zip(
                     req_idxs, old_caps, new_caps, grow_sizes
@@ -2176,6 +2190,7 @@ class HiSparseCoordinator:
                     "admitted beyond reclaim-adjusted HiSparse device-pool capacity."
                 )
 
+        self.token_to_kv_pool_allocator.claim_hisparse_ownership(all_new)
         offset = 0
         for req_idx, current_cap, resident, grow_size in grow_reqs:
             chunk = all_new[offset : offset + grow_size]
