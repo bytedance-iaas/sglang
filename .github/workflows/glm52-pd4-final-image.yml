@@ -1,4 +1,4 @@
-name: Build GLM-5.2 PD4 HiSparse rebootstrap-lifecycle image
+name: Build GLM-5.2 PD4 HiSparse ownership image
 
 on:
   workflow_dispatch:
@@ -18,9 +18,9 @@ jobs:
     runs-on: x64-docker-build-node
     env:
       BASE_IMAGE: iaas-gpu-cn-beijing.cr.volces.com/serving/sglang:v0.5.15.post1.iaas.dev.202607201127@sha256:a322afaa9aa032810aa559d2497ed57fe91b71ac6d470c8b843923fadf7075d3
-      DEST_IMAGE: iaas-gpu-cn-beijing.cr.volces.com/serving/sglang:glm52-pd4-rebootstrap-lifecycle
-      SOURCE_COMMIT: 82e33fd871cf80d15c30af6d1d05597f21f701a9
-      SOURCE_TREE: e12633c7baf28e97fb3e8ea0873ff2a575892c88
+      DEST_IMAGE: iaas-gpu-cn-beijing.cr.volces.com/serving/sglang:glm52-pd4-hisparse-free-ownership
+      SOURCE_COMMIT: d59437517a250e31ec083c6474b3b4cade4cc944
+      SOURCE_TREE: 392fda4a4b8e5bd1b9f9d324cb85a318d0d7b566
       VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
       VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
       NO_PROXY: localhost,127.0.0.1,::1,iaas-gpu-cn-beijing.cr.volces.com,ai-containers-cn-beijing.cr.volces.com
@@ -122,6 +122,8 @@ jobs:
             --volume "$PWD/test/registered/unit/managers/test_hisparse_grow_reclaim.py:/tmp/test_hisparse_grow_reclaim.py:ro" \
             --volume "$PWD/test/registered/unit/managers/test_hisparse_lifecycle_debug.py:/tmp/test_hisparse_lifecycle_debug.py:ro" \
             --volume "$PWD/test/registered/unit/mem_cache/test_hisparse_allocator.py:/tmp/test_hisparse_allocator.py:ro" \
+            --volume "$PWD/test/registered/unit/mem_cache/test_paged_free_segment.py:/tmp/test_paged_free_segment.py:ro" \
+            --volume "$PWD/test/registered/unit/mem_cache/test_swa_unittest.py:/tmp/test_swa_unittest.py:ro" \
             --volume "$PWD/test/registered/unit/mem_cache/test_hisparse_max_token_pool_size.py:/tmp/test_hisparse_max_token_pool_size.py:ro" \
             --volume "$PWD/test/registered/unit/disaggregation/test_hisparse_pd_draft.py:/tmp/test_hisparse_pd_draft.py:ro" \
             --volume "$PWD/test/registered/unit/managers/test_priority_scheduling_disaggregation.py:/tmp/test_priority_scheduling_disaggregation.py:ro" \
@@ -135,6 +137,8 @@ jobs:
               /tmp/test_hisparse_grow_reclaim.py \
               /tmp/test_hisparse_lifecycle_debug.py \
               /tmp/test_hisparse_allocator.py \
+              /tmp/test_paged_free_segment.py \
+              /tmp/test_swa_unittest.py::TestSWA::test_free_swa_group_owns_mapping_at_enqueue_time \
               /tmp/test_hisparse_max_token_pool_size.py \
               /tmp/test_hisparse_pd_draft.py \
               /tmp/test_priority_scheduling_disaggregation.py \
@@ -176,7 +180,7 @@ jobs:
         shell: bash
         run: |
           {
-            echo '### GLM-5.2 PD4 HiSparse rebootstrap-lifecycle image'
+            echo '### GLM-5.2 PD4 HiSparse ownership image'
             echo
             echo "- Source commit: \`$SOURCE_COMMIT\`"
             echo "- Source tree: \`$SOURCE_TREE\`"
