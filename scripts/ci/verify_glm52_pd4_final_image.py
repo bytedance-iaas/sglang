@@ -81,6 +81,17 @@ assert "def _finalize_hisparse_accepted_tokens" in eagle_common_src
 assert "coordinator.finalize_accepted_tokens_spec_v2(" in eagle_common_src
 assert eagle_common_src.count("_finalize_hisparse_accepted_tokens(") >= 2
 
+disagg_utils_src = pathlib.Path(
+    "/sgl-workspace/sglang/python/sglang/srt/disaggregation/utils.py"
+).read_text()
+prefill_src = pathlib.Path(
+    "/sgl-workspace/sglang/python/sglang/srt/disaggregation/prefill.py"
+).read_text()
+assert "Every participant proved that this keyed queue is empty" in (
+    disagg_utils_src
+)
+assert "ordered_keys=[req.rid for req in candidates]" in prefill_src
+
 print(
     json.dumps(
         {
@@ -95,6 +106,7 @@ print(
             "hisparse_retract_fix": True,
             "hisparse_page_ownership_fix": True,
             "hisparse_eagle_v2_finalizer_fix": True,
+            "pp_empty_poll_consensus_fix": True,
         },
         sort_keys=True,
     )
