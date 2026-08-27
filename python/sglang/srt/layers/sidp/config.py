@@ -16,7 +16,7 @@ class SidpConfig:
     enable_debug_logging: bool = False
     enable_graph_profiling: bool = False
     profile_dummy_compute: bool = False
-    peak_sync_strategy: str = "force_sync"
+    peak_sync_strategy: str = "none"
     peak_sync_min_raw_bs: int = 64
     peak_sync_max_replays: int = 0
     peak_sync_timeout_s: float = 30.0

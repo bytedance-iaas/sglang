@@ -44,13 +44,13 @@ class NoSyncStrategy:
 
 
 class ForceSyncStrategy:
-    """Synchronize every launch after all ranks reach the configured bulk batch.
+    """Experimental all-rank synchronization reference; not for production.
 
-    This is the first functional strategy because it establishes the common
-    wave phase required by static peak-shifting. It intentionally couples DP
-    ranks and is only validated for a fixed, balanced bulk workload. Future
-    strategies can implement one-shot, periodic, or adaptive re-synchronization
-    behind the same interface.
+    The strategy establishes the common wave phase required by static
+    peak-shifting, but it blindly couples every DP rank and is only validated
+    for fixed, balanced mechanism experiments. A single-rank warmup or a
+    dynamically idle rank can make its barrier time out. Keep this path as a
+    reference until coordinated scheduling or dynamic shifting is implemented.
     """
 
     name = "force_sync"
@@ -81,7 +81,8 @@ class ForceSyncStrategy:
             raise RuntimeError(
                 f"SiDP force_sync timed out during {phase} at rank "
                 f"{self.dp_rank}; the current strategy requires every DP rank "
-                "to keep launching decode Graphs"
+                "to keep launching decode Graphs. force_sync is an experimental "
+                "reference and must not be used in production"
             ) from exc
 
     def before_launch(self, *, raw_batch_size: int, graph_batch_size: int) -> dict:

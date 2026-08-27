@@ -228,6 +228,7 @@ class TestSidpServerArgs(CustomTestCase):
             ["--model-path", "dummy", "--sidp-enable-peak-shifting"]
         )
         self.assertTrue(parsed.sidp_enable_peak_shifting)
+        self.assertEqual(parsed.sidp_peak_sync_strategy, "none")
 
     def test_graph_profiling_parameters(self):
         args = self._make_sidp_args(
@@ -309,11 +310,18 @@ class TestSidpServerArgs(CustomTestCase):
             sidp_enable_peak_shifting=True,
             sidp_peak_sync_strategy="force_sync",
         )
-        with patch.dict(
-            os.environ,
-            {"PYTORCH_CUDA_ALLOC_CONF": "", "PYTORCH_ALLOC_CONF": ""},
+        with (
+            patch.dict(
+                os.environ,
+                {"PYTORCH_CUDA_ALLOC_CONF": "", "PYTORCH_ALLOC_CONF": ""},
+            ),
+            self.assertLogs(server_args_module.logger, level="WARNING") as logs,
         ):
             args._handle_sidp()
+        warning = "\n".join(logs.output)
+        self.assertIn("experimental reference strategy", warning)
+        self.assertIn("MUST NOT be used in production", warning)
+        self.assertIn("--sidp-peak-sync-strategy none", warning)
 
     def test_invalid_peak_sync_parameters(self):
         cases = [

@@ -1131,14 +1131,14 @@ class ServerArgs:
         str,
         Arg(
             help="Cross-rank CUDA Graph launch synchronization for SiDP "
-            "peak-shifting. 'force_sync' aligns every launch after all ranks "
-            "reach the configured bulk batch; 'none' preserves unsynchronized "
-            "behavior for A/B comparison. The strategy is ignored when "
-            "peak-shifting is disabled.",
+            "peak-shifting. 'none' is the supported default. 'force_sync' is "
+            "an experimental reference that blindly waits for every DP rank "
+            "and must not be used in production. The strategy is ignored "
+            "when peak-shifting is disabled.",
             choices=["none", "force_sync"],
         ),
         NS("parallel"),
-    ] = "force_sync"
+    ] = "none"
     sidp_peak_sync_min_raw_bs: A[
         int,
         Arg(
@@ -6611,6 +6611,18 @@ class ServerArgs:
         assert self.sidp_peak_sync_timeout_s > 0, (
             "sidp_peak_sync_timeout_s must be positive"
         )
+        if (
+            self.sidp_enable_peak_shifting
+            and self.sidp_peak_sync_strategy == "force_sync"
+        ):
+            logger.warning(
+                "SiDP force_sync is an experimental reference strategy and "
+                "MUST NOT be used in production. It performs blind all-DP-rank "
+                "barriers and can time out when warmup, health checks, or "
+                "dynamic load imbalance leave any rank without a decode Graph. "
+                "Use compute-order (disable peak-shifting) or peak-shifting "
+                "with --sidp-peak-sync-strategy none."
+            )
 
         # CUDA IPC cannot export allocations backed by expandable segments.
         for var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
