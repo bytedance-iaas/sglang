@@ -54,7 +54,7 @@ jobs:
       VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
       VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
       NYDUS_VERSION: "2.3.0"
-      DEFAULT_SGLANG_VERSION: "0.5.18"
+      DEFAULT_SGLANG_VERSION: "0.0.0dev"
     steps:
       - name: Delete huge unnecessary tools folder
         run: rm -rf /opt/hostedtoolcache
