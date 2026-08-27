@@ -3194,9 +3194,19 @@ class HiSparseCoordinator:
                 req, free_physical=self._device_slot_owner is self
             )
             current_cap = 0
-        if (current_cap > 0 and not is_resident_req) or (
-            self.is_dsv4_hisparse and is_resident_req
-        ):
+        # DSV4 C4 mappings are independent physical owners. Complete pages can
+        # leave the coordinator side buffer before the request finishes, so a
+        # zero current_cap does not mean that the request has no live mapping.
+        # The canonical owner must always enumerate the request-visible mapping
+        # before release_kv_cache frees its logical slots. Draft mirrors only
+        # clear local buffer state and never mutate the canonical mapping.
+        should_release_device_ownership = (
+            current_cap > 0 and not is_resident_req
+        ) or (
+            self.is_dsv4_hisparse
+            and (is_resident_req or self._device_slot_owner is self)
+        )
+        if should_release_device_ownership:
             allocated_locs = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :allocated_len
             ]

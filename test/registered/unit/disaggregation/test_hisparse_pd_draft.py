@@ -11,6 +11,10 @@ from sglang.srt.managers.hisparse_coordinator import (
     HiSparseCoordinator,
     HiSparseResidencyState,
 )
+from sglang.srt.managers.schedule_batch import (
+    ScheduleBatch,
+    retract_hisparse_request,
+)
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -246,6 +250,53 @@ def test_finished_request_releases_target_and_draft_hisparse_state():
     SchedulerBatchResultProcessor._finish_hisparse_request(processor, req)
 
     assert calls == [("target", req), ("draft", req)]
+
+
+def test_retracted_request_releases_target_and_draft_hisparse_state():
+    calls = []
+    target = SimpleNamespace(retract_req=lambda req: calls.append(("target", req)))
+    draft = SimpleNamespace(retract_req=lambda req: calls.append(("draft", req)))
+    req = object()
+
+    retract_hisparse_request(req, target, draft)
+
+    assert calls == [("target", req), ("draft", req)]
+
+
+def test_retracted_request_deduplicates_shared_hisparse_coordinator():
+    calls = []
+    coordinator = SimpleNamespace(retract_req=lambda req: calls.append(req))
+    req = object()
+
+    retract_hisparse_request(req, coordinator, coordinator)
+
+    assert calls == [req]
+
+
+def test_schedule_batch_retraction_forwards_draft_hisparse_coordinator():
+    tree = ast.parse(textwrap.dedent(inspect.getsource(ScheduleBatch.release_req)))
+    draft_keywords = [
+        keyword
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        for keyword in node.keywords
+        if keyword.arg == "draft_hisparse_coordinator"
+    ]
+
+    assert len(draft_keywords) == 1
+
+
+def test_pause_retraction_forwards_draft_hisparse_coordinator():
+    tree = ast.parse(textwrap.dedent(inspect.getsource(Scheduler.pause_generation)))
+    draft_keywords = [
+        keyword
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        for keyword in node.keywords
+        if keyword.arg == "draft_hisparse_coordinator"
+    ]
+
+    assert len(draft_keywords) == 1
 
 
 @pytest.mark.parametrize(

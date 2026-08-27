@@ -1859,6 +1859,21 @@ def set_mamba_track_indices_from_reqs(
     )
 
 
+def retract_hisparse_request(
+    req: Req,
+    hisparse_coordinator: Optional[HiSparseCoordinator],
+    draft_hisparse_coordinator: Optional[HiSparseCoordinator],
+) -> None:
+    """Release target and draft HiSparse state exactly once on retraction."""
+    if hisparse_coordinator is not None:
+        hisparse_coordinator.retract_req(req)
+    if (
+        draft_hisparse_coordinator is not None
+        and draft_hisparse_coordinator is not hisparse_coordinator
+    ):
+        draft_hisparse_coordinator.retract_req(req)
+
+
 def release_req(
     *,
     req: Req,
@@ -1868,10 +1883,13 @@ def release_req(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
+    draft_hisparse_coordinator: Optional[HiSparseCoordinator] = None,
     offload_kv: bool = True,
 ) -> None:
-    if hisparse_coordinator is not None and not req.finished():
-        hisparse_coordinator.retract_req(req)
+    if not req.finished():
+        retract_hisparse_request(
+            req, hisparse_coordinator, draft_hisparse_coordinator
+        )
 
     # In decode disaggregation the retracted KV can be offloaded to host so it can
     # be restored later without recompute (see resume_retracted_reqs/load_kv_cache).
@@ -1906,6 +1924,7 @@ def retract_all(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
+    draft_hisparse_coordinator: Optional[HiSparseCoordinator] = None,
     offload_kv: bool = True,
 ) -> None:
     for idx in range(len(reqs)):
@@ -1917,6 +1936,7 @@ def retract_all(
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
             hisparse_coordinator=hisparse_coordinator,
+            draft_hisparse_coordinator=draft_hisparse_coordinator,
             offload_kv=offload_kv,
         )
 
@@ -2882,6 +2902,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
+            draft_hisparse_coordinator=self.draft_hisparse_coordinator,
         )
 
     def prepare_encoder_info_decode(self):

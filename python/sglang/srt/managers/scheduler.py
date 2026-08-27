@@ -4778,6 +4778,9 @@ class Scheduler(
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 tree_cache=self.tree_cache,
                 hisparse_coordinator=self.hisparse_coordinator,
+                draft_hisparse_coordinator=getattr(
+                    self, "draft_hisparse_coordinator", None
+                ),
                 offload_kv=False,
             )
         self.running_batch.reqs = []
