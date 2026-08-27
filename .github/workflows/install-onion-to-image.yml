@@ -1,0 +1,292 @@
+name: Install Onion into Existing Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_image:
+        description: "Existing source image. An immutable repo@sha256:... reference is recommended."
+        required: true
+        type: string
+      target_image:
+        description: "New Volcengine CR image reference with an explicit tag (for example, .../sglang:<tag>-onion)."
+        required: true
+        type: string
+      allow_overwrite:
+        description: "Allow replacing an existing target tag. The source image must still be different."
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: install-onion-${{ inputs.target_image }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  install-onion:
+    if: github.repository == 'bytedance-iaas/sglang'
+    runs-on: x64-docker-build-node
+    environment: prod
+    timeout-minutes: 60
+    env:
+      SOURCE_IMAGE: ${{ inputs.source_image }}
+      TARGET_IMAGE: ${{ inputs.target_image }}
+      ALLOW_OVERWRITE: ${{ inputs.allow_overwrite }}
+      VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
+      VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
+      VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
+      ONION_APT_BASE_URL: ${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_APT_URL || 'http://mirrors.ivolces.com/extra-tools/ubuntu' }}
+      ONION_GPG_URL: ${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL || 'https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system' }}
+    steps:
+      - name: Delete huge unnecessary tools folder
+        run: rm -rf /opt/hostedtoolcache
+
+      - name: Validate image references and registry configuration
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+
+          source = os.environ["SOURCE_IMAGE"]
+          target = os.environ["TARGET_IMAGE"]
+          registry = os.environ["VOLCENGINE_CR_REGISTRY"]
+
+          for name, value in (("source_image", source), ("target_image", target)):
+              if not value or re.search(r"\s", value):
+                  raise SystemExit(f"{name} must be one non-empty image reference without whitespace")
+              if value.startswith("/") or "//" in value:
+                  raise SystemExit(f"invalid {name}: {value!r}")
+              if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]*", value):
+                  raise SystemExit(f"invalid characters in {name}: {value!r}")
+
+          if not registry:
+              raise SystemExit("VOLCENGINE_CR_REGISTRY is required")
+          if not target.startswith(f"{registry}/"):
+              raise SystemExit(
+                  "target_image must be hosted by the configured Volcengine CR: "
+                  f"{registry}"
+              )
+          if "@" in target:
+              raise SystemExit("target_image must use a writable tag, not a digest")
+          target_name = target.rsplit("/", 1)[-1]
+          if ":" not in target_name or not target_name.rsplit(":", 1)[-1]:
+              raise SystemExit("target_image must include an explicit non-empty tag")
+          if source == target:
+              raise SystemExit(
+                  "source_image and target_image must differ; use a new tag so the "
+                  "original image remains recoverable"
+              )
+          PY
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=host
+
+      - name: Login to Volcengine CR
+        run: |
+          set -euo pipefail
+          if [ -z "${VOLCENGINE_CR_USERNAME}" ] || [ -z "${VOLCENGINE_CR_PASSWORD}" ]; then
+            echo "::error::Volcengine CR credentials are required"
+            exit 1
+          fi
+          echo "${VOLCENGINE_CR_PASSWORD}" | docker login "${VOLCENGINE_CR_REGISTRY}" \
+            --username "${VOLCENGINE_CR_USERNAME}" --password-stdin
+
+      - name: Refuse an existing target tag by default
+        run: |
+          set -euo pipefail
+          set +e
+          inspect_output="$(docker buildx imagetools inspect "${TARGET_IMAGE}" 2>&1)"
+          inspect_status=$?
+          set -e
+          if [ "${inspect_status}" -eq 0 ]; then
+            if [ "${ALLOW_OVERWRITE}" != "true" ]; then
+              echo "::error::target image already exists: ${TARGET_IMAGE}"
+              echo "Choose a new tag or explicitly set allow_overwrite=true."
+              exit 1
+            fi
+            echo "::warning::replacing existing target tag ${TARGET_IMAGE}"
+          elif printf '%s' "${inspect_output}" | grep -Eqi 'not found|manifest unknown|name unknown|no such manifest'; then
+            echo "Target tag does not exist; proceeding with a new image."
+          else
+            echo "${inspect_output}" >&2
+            echo "::error::could not reliably determine whether the target tag exists"
+            exit 1
+          fi
+
+      - name: Inspect source image and prepare Onion overlay
+        id: source
+        run: |
+          set -euo pipefail
+          docker pull --platform linux/amd64 "${SOURCE_IMAGE}"
+
+          SOURCE_ARCH="$(docker image inspect --format '{{.Architecture}}' "${SOURCE_IMAGE}")"
+          if [ "${SOURCE_ARCH}" != "amd64" ]; then
+            echo "::error::source image must provide linux/amd64; got ${SOURCE_ARCH}"
+            exit 1
+          fi
+
+          ORIGINAL_USER="$(docker image inspect --format '{{.Config.User}}' "${SOURCE_IMAGE}")"
+          if [ -n "${ORIGINAL_USER}" ] && ! [[ "${ORIGINAL_USER}" =~ ^[A-Za-z0-9_.-]+(:[A-Za-z0-9_.-]+)?$ ]]; then
+            echo "::error::cannot safely preserve source image USER '${ORIGINAL_USER}'"
+            exit 1
+          fi
+          RESOLVED_SOURCE_IMAGE="$(docker image inspect --format '{{index .RepoDigests 0}}' "${SOURCE_IMAGE}")"
+          if [[ "${RESOLVED_SOURCE_IMAGE}" != *@sha256:* ]]; then
+            echo "::error::could not resolve source image to an immutable digest"
+            exit 1
+          fi
+
+          mkdir -p /tmp/onion-image-context
+          {
+            printf 'ARG BASE_IMAGE\n'
+            printf 'FROM ${BASE_IMAGE}\n'
+            case "${ORIGINAL_USER%%:*}" in
+              ""|root|0) ;;
+              *) printf 'USER root\n' ;;
+            esac
+            cat <<'DOCKERFILE'
+          ARG ONION_APT_BASE_URL
+          ARG ONION_GPG_URL
+          RUN set -eux; \
+              . /etc/os-release; \
+              test "${ID}" = ubuntu; \
+              test -n "${VERSION_CODENAME:-}"; \
+              apt-get update; \
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl gpg; \
+              curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 2 "${ONION_GPG_URL}" \
+                | gpg --batch --yes --dearmor -o /etc/apt/trusted.gpg.d/volc-extra-tools.gpg; \
+              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/trusted.gpg.d/volc-extra-tools.gpg] ${ONION_APT_BASE_URL} ${VERSION_CODENAME} main" \
+                > /etc/apt/sources.list.d/volctools.list; \
+              apt-get update; \
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends onion-ai-data; \
+              command -v oniond; \
+              oniond --help >/dev/null; \
+              rm -rf /var/lib/apt/lists/*; \
+              apt-get clean
+          LABEL ai.sglang.onion.package="onion-ai-data"
+          DOCKERFILE
+            case "${ORIGINAL_USER%%:*}" in
+              ""|root|0) ;;
+              *) printf 'USER %s\n' "${ORIGINAL_USER}" ;;
+            esac
+          } > /tmp/onion-image-context/Dockerfile
+
+          echo "source_user=${ORIGINAL_USER}" >> "${GITHUB_OUTPUT}"
+          echo "resolved_image=${RESOLVED_SOURCE_IMAGE}" >> "${GITHUB_OUTPUT}"
+          echo "Source architecture: ${SOURCE_ARCH}"
+          echo "Source user: ${ORIGINAL_USER:-<empty/root>}"
+          echo "Resolved source: ${RESOLVED_SOURCE_IMAGE}"
+
+      - name: Build and push Onion image
+        id: build
+        env:
+          RESOLVED_SOURCE_IMAGE: ${{ steps.source.outputs.resolved_image }}
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --platform linux/amd64 \
+            --pull \
+            --no-cache \
+            --build-arg "BASE_IMAGE=${RESOLVED_SOURCE_IMAGE}" \
+            --build-arg "ONION_APT_BASE_URL=${ONION_APT_BASE_URL}" \
+            --build-arg "ONION_GPG_URL=${ONION_GPG_URL}" \
+            --label "ai.sglang.onion.base-image=${SOURCE_IMAGE}" \
+            --label "ai.sglang.onion.base-image-digest=${RESOLVED_SOURCE_IMAGE}" \
+            --label "ai.sglang.onion.workflow=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --tag "${TARGET_IMAGE}" \
+            --push \
+            --metadata-file /tmp/onion-image-metadata.json \
+            /tmp/onion-image-context
+
+          IMAGE_DIGEST="$(python3 - <<'PY'
+          import json
+
+          with open("/tmp/onion-image-metadata.json", encoding="utf-8") as source:
+              metadata = json.load(source)
+          digest = metadata.get("containerimage.digest", "")
+          if not digest.startswith("sha256:"):
+              raise SystemExit(f"missing pushed image digest in build metadata: {digest!r}")
+          print(digest)
+          PY
+          )"
+          echo "digest=${IMAGE_DIGEST}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify Onion in the pushed image
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          ORIGINAL_USER: ${{ steps.source.outputs.source_user }}
+          RESOLVED_SOURCE_IMAGE: ${{ steps.source.outputs.resolved_image }}
+        run: |
+          set -euo pipefail
+          TARGET_REPOSITORY="${TARGET_IMAGE%:*}"
+          IMMUTABLE_IMAGE="${TARGET_REPOSITORY}@${IMAGE_DIGEST}"
+          docker pull --platform linux/amd64 "${IMMUTABLE_IMAGE}"
+
+          ACTUAL_USER="$(docker image inspect --format '{{.Config.User}}' "${IMMUTABLE_IMAGE}")"
+          if [ "${ACTUAL_USER}" != "${ORIGINAL_USER}" ]; then
+            echo "::error::source USER was not preserved: expected '${ORIGINAL_USER}', got '${ACTUAL_USER}'"
+            exit 1
+          fi
+          SOURCE_CONFIG="$(docker image inspect --format '{{json .Config}}' "${SOURCE_IMAGE}")"
+          TARGET_CONFIG="$(docker image inspect --format '{{json .Config}}' "${IMMUTABLE_IMAGE}")"
+          SOURCE_CONFIG="${SOURCE_CONFIG}" TARGET_CONFIG="${TARGET_CONFIG}" python3 - <<'PY'
+          import json
+          import os
+
+          source = json.loads(os.environ["SOURCE_CONFIG"])
+          target = json.loads(os.environ["TARGET_CONFIG"])
+          for field in ("Entrypoint", "Cmd", "WorkingDir"):
+              if source.get(field) != target.get(field):
+                  raise SystemExit(
+                      f"source {field} was not preserved: "
+                      f"{source.get(field)!r} != {target.get(field)!r}"
+                  )
+          PY
+
+          docker run --rm --user root --entrypoint sh "${IMMUTABLE_IMAGE}" -c '
+            set -eu
+            command -v oniond
+            oniond --help >/dev/null
+            dpkg-query -W -f="onion-ai-data version: ${Version}\n" onion-ai-data
+          '
+          docker image inspect "${IMMUTABLE_IMAGE}" | \
+            EXPECTED_BASE="${SOURCE_IMAGE}" EXPECTED_BASE_DIGEST="${RESOLVED_SOURCE_IMAGE}" python3 -c '
+          import json
+          import os
+          import sys
+
+          labels = (json.load(sys.stdin)[0].get("Config", {}).get("Labels") or {})
+          expected = os.environ["EXPECTED_BASE"]
+          actual = labels.get("ai.sglang.onion.base-image")
+          if actual != expected:
+              raise SystemExit(f"base-image provenance mismatch: expected {expected!r}, got {actual!r}")
+          expected_digest = os.environ["EXPECTED_BASE_DIGEST"]
+          actual_digest = labels.get("ai.sglang.onion.base-image-digest")
+          if actual_digest != expected_digest:
+              raise SystemExit(
+                  f"base-image digest mismatch: expected {expected_digest!r}, got {actual_digest!r}"
+              )
+          '
+
+          {
+            echo "### Onion image published"
+            echo "- Source: ${SOURCE_IMAGE}"
+            echo "- Resolved source: ${RESOLVED_SOURCE_IMAGE}"
+            echo "- Target: ${TARGET_IMAGE}"
+            echo "- Digest: ${IMAGE_DIGEST}"
+            echo "- Platform: linux/amd64"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Remove local images
+        if: always()
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          TARGET_REPOSITORY="${TARGET_IMAGE%:*}"
+          IMMUTABLE_IMAGE="${TARGET_REPOSITORY}@${IMAGE_DIGEST:-}"
+          docker image rm "${SOURCE_IMAGE}" "${TARGET_IMAGE}" "${IMMUTABLE_IMAGE}" 2>/dev/null || true
