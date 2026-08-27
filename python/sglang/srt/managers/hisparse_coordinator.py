@@ -457,6 +457,38 @@ class HiSparseCoordinator:
             self.mem_pool_host.available_size(),
         )
 
+    def _debug_device_lifecycle_snapshot(
+        self, req: Req, buffer_locs: torch.Tensor, *, stage: str
+    ) -> None:
+        if (
+            not getattr(self, "debug_validate_lifecycle", False)
+            or self._device_slot_owner is not self
+        ):
+            return
+        snapshot = self.token_to_kv_pool_allocator.debug_hisparse_ownership(
+            buffer_locs
+        )
+        logger.warning(
+            "HISPARSE_DEVICE_LIFECYCLE stage=%s req=%s req_pool_idx=%d "
+            "available=%d capacity=%d free_pages=%d release_pages=%d "
+            "mapping_slots=%d mapping_pages=%d extra_owner_pages=%d "
+            "request_pages=%s request_claimed_pages=%s "
+            "request_mapping_pages=%s",
+            stage,
+            req.rid,
+            req.req_pool_idx,
+            snapshot["available"],
+            snapshot["capacity"],
+            snapshot["free_pages"],
+            snapshot["release_pages"],
+            snapshot["mapping_slots"],
+            snapshot["mapping_pages"],
+            snapshot["extra_owner_pages"],
+            snapshot["request_pages"],
+            snapshot["request_claimed_pages"],
+            snapshot["request_mapping_pages"],
+        )
+
     def _resident_request_count(self) -> int:
         return sum(
             state == HiSparseResidencyState.RESIDENT
@@ -3215,6 +3247,12 @@ class HiSparseCoordinator:
                     allocated_locs
                 )
             )
+            buffer_locs = self.req_to_device_buffer[
+                req.req_pool_idx, :current_cap
+            ].clone()
+            self._debug_device_lifecycle_snapshot(
+                req, buffer_locs, stage="finish_before"
+            )
 
             def clear_device_buffer_owner() -> None:
                 self.req_device_buffer_tokens[:, req.req_pool_idx, :] = -1
@@ -3225,10 +3263,11 @@ class HiSparseCoordinator:
             if self._device_slot_owner is self:
                 self.token_to_kv_pool_allocator.release_hisparse_ownership(
                     mapping_indices=compressed_locs,
-                    extra_owned_coordinates=self.req_to_device_buffer[
-                        req.req_pool_idx, :current_cap
-                    ],
+                    extra_owned_coordinates=buffer_locs,
                     clear_extra_owner=clear_device_buffer_owner,
+                )
+                self._debug_device_lifecycle_snapshot(
+                    req, buffer_locs, stage="finish_after"
                 )
             else:
                 # Target owns the numerical physical-slot namespace shared by

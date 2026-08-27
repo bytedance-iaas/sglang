@@ -284,6 +284,43 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         self.assertEqual(child_allocator.used_pages, set())
         self.assertEqual(child_allocator.free_pages.count(1), 1)
 
+    def test_consecutive_natural_finish_restores_physical_capacity(self):
+        """Reusing one request slot must not leak its side-buffer pages."""
+        page_size = 4
+        mapping = torch.zeros(16, dtype=torch.int64)
+        physical = _PhysicalPageAllocator(page_size=page_size, num_pages=3)
+        ownership = _HiSparsePageOwnership(
+            mapping=mapping, child_allocator=physical, page_size=page_size
+        )
+        initial_available = physical.available_size()
+        logical_locs = torch.tensor([1, 5, 9], dtype=torch.int64)
+
+        for _ in range(8):
+            side_page = physical.alloc(page_size)
+            side_page_id = int(side_page[0] // page_size)
+            ownership.claim(side_page)
+            # Natural EAGLE completion can leave request-visible and verify-tail
+            # aliases to the coordinator-owned side page.
+            mapping[logical_locs] = side_page[: logical_locs.numel()]
+            mapping[13] = side_page[-1]
+
+            before = ownership.debug_snapshot(side_page)
+            self.assertEqual(before["request_claimed_pages"], [side_page_id])
+            self.assertEqual(before["request_mapping_pages"], [side_page_id])
+
+            ownership.release(
+                mapping_indices=logical_locs,
+                extra_owned_coordinates=side_page,
+            )
+
+            after = ownership.debug_snapshot(side_page)
+            self.assertEqual(after["request_claimed_pages"], [])
+            self.assertEqual(after["request_mapping_pages"], [])
+            self.assertEqual(after["extra_owner_pages"], 0)
+            self.assertEqual(after["mapping_slots"], 0)
+            self.assertEqual(after["available"], initial_available)
+            self.assertEqual(physical.free_pages.count(side_page_id), 1)
+
     def test_generic_finish_order_survives_earlier_logical_alias_retirement(self):
         """Replay the production cache/coordinator/final-cache ownership order."""
         page_size = 64
@@ -617,6 +654,81 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         self.assertTrue(torch.all(mapping[compressed_locs] == 0))
         self.assertEqual(physical.used_pages, set())
         self.assertEqual(physical.available_size(), physical.size)
+
+    def test_dsv4_consecutive_natural_finish_restores_side_page_capacity(self):
+        """The real coordinator finish path must survive request-slot reuse."""
+        page_size = 4
+        logical = _LogicalPageAllocator(page_size=16, num_pages=2)
+        physical = _PhysicalPageAllocator(page_size=page_size, num_pages=3)
+        mapping = torch.zeros(32, dtype=torch.int64)
+        allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
+        allocator.compress_ratio = 4
+        allocator.page_size = logical.page_size
+        allocator.hisparse_page_size = page_size
+        allocator.logical_attn_allocator = logical
+        allocator.hisparse_attn_allocator = physical
+        allocator.full_to_hisparse_device_index_mapping = mapping
+        allocator.is_not_in_free_group = True
+        allocator.free_group = []
+        allocator._page_ownership = _HiSparsePageOwnership(
+            mapping=mapping, child_allocator=physical, page_size=page_size
+        )
+
+        logical_locs = torch.tensor([1, 5, 9], dtype=torch.int64)
+        coordinator = object.__new__(HiSparseCoordinator)
+        coordinator.debug_validate_lifecycle = False
+        coordinator.decode_producer_stream = None
+        coordinator.wait_for_pending_backup = lambda: None
+        coordinator.clear_pending_draft_extend_backup = lambda: None
+        coordinator.is_dsv4_hisparse = True
+        coordinator._device_slot_owner = coordinator
+        coordinator._host_slot_owner = coordinator
+        coordinator._is_resident = lambda req_idx: False
+        coordinator.req_device_buffer_size = torch.zeros(1, dtype=torch.int64)
+        coordinator.req_to_device_buffer = torch.zeros((1, 4), dtype=torch.int64)
+        coordinator.req_device_buffer_tokens = torch.full(
+            (1, 1, 4), -1, dtype=torch.int32
+        )
+        coordinator.req_device_buffer_token_locs = torch.full(
+            (1, 1, 4), -1, dtype=torch.int32
+        )
+        coordinator.req_to_token_pool = SimpleNamespace(
+            req_to_token=logical_locs.unsqueeze(0)
+        )
+        coordinator.mem_pool_device = SimpleNamespace(
+            translate_loc_from_full_to_compressed=lambda locs: locs,
+            full_to_hisparse_device_index_mapping=mapping,
+        )
+        coordinator.token_to_kv_pool_allocator = allocator
+        coordinator.req_to_host_pool = torch.full((1, 4), -1, dtype=torch.int64)
+        coordinator.req_to_host_pool_allocated_len = torch.zeros(1, dtype=torch.int64)
+        coordinator.lru_slots = torch.zeros((1, 1, 4), dtype=torch.int16)
+        coordinator._lru_init = torch.zeros(4, dtype=torch.int16)
+        coordinator._skip_first_backup = torch.zeros(1, dtype=torch.bool)
+        coordinator._req_c4_retired_len = {}
+        coordinator._req_c4_written_len = {}
+        coordinator._clear_residency_state = lambda req_idx: None
+        initial_available = physical.available_size()
+
+        for request_index in range(8):
+            side_page = physical.alloc(page_size)
+            allocator.claim_hisparse_ownership(side_page)
+            coordinator.req_to_device_buffer[0].copy_(side_page)
+            coordinator.req_device_buffer_size[0] = page_size
+            mapping[logical_locs] = side_page[: logical_locs.numel()]
+            coordinator.active_hisparse_reqs = {0: object()}
+            req = SimpleNamespace(
+                rid=f"natural-finish-{request_index}",
+                req_pool_idx=0,
+                kv=SimpleNamespace(kv_allocated_len=logical_locs.numel()),
+            )
+
+            HiSparseCoordinator.request_finished(coordinator, req)
+
+            self.assertEqual(physical.available_size(), initial_available)
+            self.assertEqual(allocator._page_ownership._extra_owner_page_ids, set())
+            self.assertTrue(torch.all(mapping == 0))
+            self.assertTrue(torch.all(coordinator.req_to_device_buffer == 0))
 
     def test_dsv4_extend_allocates_owner_for_direct_pd_partial_page(self):
         """A host-only prompt tail must not continue in sentinel page zero."""

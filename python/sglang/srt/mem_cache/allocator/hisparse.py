@@ -79,6 +79,55 @@ class _HiSparsePageOwnership:
     def clear(self) -> None:
         self._extra_owner_page_ids.clear()
 
+    def debug_snapshot(
+        self, extra_owned_coordinates: torch.Tensor | None = None
+    ) -> dict[str, object]:
+        """Return a synchronized ownership snapshot for lifecycle diagnosis.
+
+        This helper is intentionally called only behind
+        ``SGLANG_HISPARSE_DEBUG_LIFECYCLE``.  It performs device-to-host
+        synchronization and a full mapping scan, so it must not be used by the
+        normal allocation path.
+        """
+        allocator = self.child_allocator
+        mapping_coordinates = self.mapping[self.mapping > 0]
+        mapping_page_ids = self._page_ids(mapping_coordinates)
+        request_page_ids = (
+            self._page_ids(extra_owned_coordinates)
+            if extra_owned_coordinates is not None
+            else torch.empty(0, dtype=torch.int64, device=self.mapping.device)
+        )
+        request_page_id_set = set(request_page_ids.cpu().tolist())
+        mapping_page_id_set = set(mapping_page_ids.cpu().tolist())
+
+        def _page_count(name: str) -> int:
+            pages = getattr(allocator, name, None)
+            if isinstance(pages, torch.Tensor):
+                return int(pages.numel())
+            if isinstance(pages, (list, tuple)):
+                return sum(
+                    int(page.numel()) if isinstance(page, torch.Tensor) else 1
+                    for page in pages
+                )
+            return 0
+
+        return {
+            "available": int(allocator.available_size()),
+            "capacity": int(allocator.size),
+            "free_pages": _page_count("free_pages"),
+            "release_pages": _page_count("release_pages"),
+            "mapping_slots": int(mapping_coordinates.numel()),
+            "mapping_pages": len(mapping_page_id_set),
+            "extra_owner_pages": len(self._extra_owner_page_ids),
+            "request_pages": sorted(request_page_id_set),
+            "request_claimed_pages": sorted(
+                request_page_id_set & self._extra_owner_page_ids
+            ),
+            "request_mapping_pages": sorted(
+                request_page_id_set & mapping_page_id_set
+            ),
+        }
+
     def _page_ids(self, coordinates: torch.Tensor) -> torch.Tensor:
         positive_coordinates = coordinates[coordinates > 0].to(torch.int64)
         return _stable_unique_page_ids(positive_coordinates // self.page_size)
@@ -529,6 +578,11 @@ class HiSparseTokenToKVPoolAllocator(HiSparseDemotionMixin, BaseTokenToKVPoolAll
             clear_extra_owner=clear_extra_owner,
         )
 
+    def debug_hisparse_ownership(
+        self, extra_owned_coordinates: torch.Tensor | None = None
+    ) -> dict[str, object]:
+        return self._page_ownership.debug_snapshot(extra_owned_coordinates)
+
     def claim_hisparse_ownership(self, coordinates: torch.Tensor) -> None:
         self._page_ownership.claim(coordinates)
 
@@ -951,6 +1005,11 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(
             extra_owned_coordinates=extra_owned_coordinates,
             clear_extra_owner=clear_extra_owner,
         )
+
+    def debug_hisparse_ownership(
+        self, extra_owned_coordinates: torch.Tensor | None = None
+    ) -> dict[str, object]:
+        return self._page_ownership.debug_snapshot(extra_owned_coordinates)
 
     def claim_hisparse_ownership(self, coordinates: torch.Tensor) -> None:
         self._page_ownership.claim(coordinates)
