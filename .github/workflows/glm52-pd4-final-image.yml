@@ -26,7 +26,13 @@ jobs:
       NO_PROXY: localhost,127.0.0.1,::1,iaas-gpu-cn-beijing.cr.volces.com,ai-containers-cn-beijing.cr.volces.com
     steps:
       - name: Clean build workspace
-        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+          docker buildx prune --filter "until=72h" -f || true
+          docker system prune -af --filter "until=72h" || true
+          df -h /data /
 
       - name: Check out the image-build branch
         uses: actions/checkout@v4
