@@ -916,6 +916,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
+    def _renew_bootstrap_leases(self, excluded_indices: set[int]) -> None:
+        """Renew live handshakes that are still waiting for physical admission."""
+        for i, decode_req in enumerate(self.queue):
+            if i in excluded_indices or not decode_req.waiting_for_input:
+                continue
+            renew = getattr(decode_req.kv_receiver, "renew_bootstrap_lease", None)
+            if renew is not None:
+                renew()
+
     def _ensure_prefill_info(
         self, addr_to_reqs: Dict[str, List[DecodeRequest]]
     ) -> Tuple[Dict[str, List[DecodeRequest]], List[DecodeRequest]]:
@@ -1128,12 +1137,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # Renew only live receivers whose handshake is complete but whose
         # physical preallocation has not happened yet. Missing/dead decode peers
         # send no renewal and retain the existing bounded timeout behavior.
-        for i, decode_req in enumerate(self.queue):
-            if i in indices_to_remove or not decode_req.waiting_for_input:
-                continue
-            renew = getattr(decode_req.kv_receiver, "renew_bootstrap_lease", None)
-            if renew is not None:
-                renew()
+        self._renew_bootstrap_leases(indices_to_remove)
 
         # HiSparse physical constraint: max requests by device buffer capacity.
         # Each admitted req needs padded_buffer_size from hisparse device pool.

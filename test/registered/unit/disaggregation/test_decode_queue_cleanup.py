@@ -81,27 +81,25 @@ class TestDecodeQueueCleanup(CustomTestCase):
         )
 
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
-        queue.pp_size = 1
         queue.queue = [decode_req]
-        queue.pending_reqs = []
-        queue.retracted_queue = []
-        queue._resolve_pending_reqs = MagicMock()
-        queue._update_handshake_waiters = MagicMock()
-        queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
-        queue._allocatable_token_budgets = MagicMock(return_value=0)
-        queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
 
-        scheduler = MagicMock()
-        scheduler.running_batch.reqs = []
-        scheduler.enable_priority_scheduling = False
-        scheduler.enable_hisparse = False
-        queue.scheduler = scheduler
+        queue._renew_bootstrap_leases(set())
 
-        preallocated, failed = queue.pop_preallocated()
-
-        self.assertEqual(preallocated, [])
-        self.assertEqual(failed, [])
         self.assertEqual(receiver.renew_called, 1)
+
+    def test_aborted_request_is_excluded_from_bootstrap_lease_renewal(self):
+        receiver = FakeReceiver()
+        decode_req = SimpleNamespace(
+            req=SimpleNamespace(rid="aborted"),
+            kv_receiver=receiver,
+            waiting_for_input=True,
+        )
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.queue = [decode_req]
+
+        queue._renew_bootstrap_leases({0})
+
+        self.assertFalse(hasattr(receiver, "renew_called"))
 
     def test_prealloc_abort_also_drops_from_pending_reqs(self):
         # Same DecodeRequest lives in both queue and pending_reqs (add() slow
