@@ -448,7 +448,7 @@ class HiSparseCoordinator:
                 f"used={used_slots} size={self.mem_pool_host.size}"
             )
         logger.warning(
-            "HISPARSE_LIFECYCLE_TRACE stage=%s req=%s req_pool_idx=%d "
+            "HISPARSE_LIFECYCLE_TRACE stage=%s req=%s req_pool_idx=%s "
             "released_host_slots=%d host_available=%d",
             stage,
             req.rid,

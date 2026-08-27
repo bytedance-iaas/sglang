@@ -208,6 +208,8 @@ class TestHiSparseUnit(unittest.TestCase):
         self.coordinator._demotion_reclaimed_bytes = 0
         self.coordinator._demotion_transition_seconds = 0.0
         self.coordinator._repromotion_suppressed_count = 0
+        self.coordinator._device_slot_mirrors.clear()
+        self.coordinator._device_slot_owner = self.coordinator
         for i in range(len(self.coordinator._skip_first_backup)):
             self.coordinator._skip_first_backup[i] = False
 
@@ -389,8 +391,10 @@ class TestHiSparseUnit(unittest.TestCase):
     def _admit_direct_to_buffer(self, req):
         """Force direct admission to exercise the HBM-full fallback path."""
         allocator = self.allocator.hisparse_attn_allocator
-        buffer_size = self.coordinator._device_buffer_alloc_size(req.kv_allocated_len)
-        host_len = self.coordinator.host_token_len(req.kv_allocated_len)
+        buffer_size = self.coordinator._device_buffer_alloc_size(
+            req.kv.kv_allocated_len
+        )
+        host_len = self.coordinator.host_token_len(req.kv.kv_allocated_len)
         promotion_size = (
             (host_len + self.page_size - 1) // self.page_size
         ) * self.page_size
@@ -898,7 +902,7 @@ class TestHiSparseUnit(unittest.TestCase):
         # The last three already-allocated logical slots model target-verify
         # over-allocation beyond the committed sequence span.
         extra_locs = kv_loc[-3:]
-        req.kv_allocated_len = fill_len
+        req.kv.kv_allocated_len = fill_len
         req.kv_committed_len = committed_len
 
         mapping = self.allocator.full_to_hisparse_device_index_mapping
@@ -1090,7 +1094,7 @@ class TestHiSparseUnit(unittest.TestCase):
             self.req_to_token_pool.write(
                 (req_idx, slice(fill_len, fill_len + 3)), verify_locs
             )
-            req.kv_allocated_len = fill_len + 3
+            req.kv.kv_allocated_len = fill_len + 3
             req.kv_committed_len = fill_len + 3
             for lid in range(LAYER_NUM):
                 for pos in range(3):
@@ -1149,7 +1153,7 @@ class TestHiSparseUnit(unittest.TestCase):
             self.coordinator.request_finished(req)
             draft.request_finished(req)
             allocated_locs = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : req.kv_allocated_len
+                req.req_pool_idx, : req.kv.kv_allocated_len
             ].clone()
             self.allocator.free(allocated_locs)
             self._free_req_slot(req)
@@ -1276,7 +1280,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(fill_len, fill_len + 3)), verify_locs
         )
-        req.kv_allocated_len = fill_len + 3
+        req.kv.kv_allocated_len = fill_len + 3
         self.assertTrue(
             torch.all(
                 self.allocator.full_to_hisparse_device_index_mapping[verify_locs]
@@ -1298,7 +1302,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self.coordinator.request_finished(req)
         self.allocator.free(
             self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : req.kv_allocated_len
+                req.req_pool_idx, : req.kv.kv_allocated_len
             ].clone()
         )
         self._free_req_slot(req)
@@ -1383,7 +1387,7 @@ class TestHiSparseUnit(unittest.TestCase):
         )
 
         def commit_three_tokens():
-            start = req.kv_allocated_len
+            start = req.kv.kv_allocated_len
             device_slots = self.coordinator.get_draft_device_slots_variable(
                 req_pool_indices,
                 torch.tensor([3], dtype=torch.int64),
@@ -1404,7 +1408,7 @@ class TestHiSparseUnit(unittest.TestCase):
             self.req_to_token_pool.write(
                 (req.req_pool_idx, slice(start, start + 3)), verify_locs
             )
-            req.kv_allocated_len = start + 3
+            req.kv.kv_allocated_len = start + 3
             req.kv_committed_len = start + 3
             all_locs.append(verify_locs)
 
@@ -1641,7 +1645,7 @@ class TestHiSparseUnit(unittest.TestCase):
             self.req_to_token_pool.write(
                 (req.req_pool_idx, slice(fill_len, fill_len + 3)), row_locs
             )
-            req.kv_allocated_len = fill_len + 3
+            req.kv.kv_allocated_len = fill_len + 3
             req.kv_committed_len = fill_len + 3
         for lid in range(LAYER_NUM):
             for pos, slot in enumerate(device_slots):
@@ -1685,7 +1689,7 @@ class TestHiSparseUnit(unittest.TestCase):
         for req in reqs:
             allocated_locs.append(
                 self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, : req.kv_allocated_len
+                    req.req_pool_idx, : req.kv.kv_allocated_len
                 ].clone()
             )
             self.coordinator.request_finished(req)
@@ -1759,7 +1763,7 @@ class TestHiSparseUnit(unittest.TestCase):
                 ),
             )
             self.req_to_token_pool.req_to_token[req.req_pool_idx, start + 2] = 0
-            req.kv_allocated_len = start + 2
+            req.kv.kv_allocated_len = start + 2
             req.kv_committed_len = start + 2
 
         available_after_commits = (
@@ -1806,7 +1810,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(fill_len, fill_len + 3)), verify_locs
         )
-        req.kv_allocated_len = fill_len + 3
+        req.kv.kv_allocated_len = fill_len + 3
         req.kv_committed_len = fill_len + 3
         mapping_before = self.allocator.full_to_hisparse_device_index_mapping[
             verify_locs
@@ -1841,7 +1845,7 @@ class TestHiSparseUnit(unittest.TestCase):
 
         self.allocator.clear_device_mapping(verify_locs)
         self.allocator.logical_attn_allocator.free(verify_locs)
-        req.kv_allocated_len = fill_len
+        req.kv.kv_allocated_len = fill_len
         self.coordinator.request_finished(req)
         self.allocator.free(kv_loc)
         self._free_req_slot(req)
@@ -2299,7 +2303,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self.req_to_token_pool.write(
             (req_idx, slice(fill_len, fill_len + draft_num)), draft_cache_locs
         )
-        req.kv_allocated_len = fill_len + draft_num
+        req.kv.kv_allocated_len = fill_len + draft_num
         req.kv_committed_len = fill_len + draft_num
 
         for lid in range(LAYER_NUM):
@@ -2401,7 +2405,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self.req_to_token_pool.write(
             (req_idx, slice(seq_len, seq_len + draft_num)), draft_cache_locs
         )
-        req.kv_allocated_len = seq_len + draft_num
+        req.kv.kv_allocated_len = seq_len + draft_num
         req.kv_committed_len = seq_len + draft_num
         for lid in range(LAYER_NUM):
             for pos in range(draft_num):
@@ -2481,7 +2485,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self.req_to_token_pool.write(
             (req_idx, slice(fill_len, fill_len + draft_num)), draft_cache_locs
         )
-        req.kv_allocated_len = fill_len + draft_num
+        req.kv.kv_allocated_len = fill_len + draft_num
         req.kv_committed_len = fill_len + draft_num
 
         accepted_cache_locs = draft_cache_locs[:2]
