@@ -3250,8 +3250,8 @@ class HiSparseCoordinator:
             buffer_locs = self.req_to_device_buffer[
                 req.req_pool_idx, :current_cap
             ].clone()
-            self._debug_device_lifecycle_snapshot(
-                req, buffer_locs, stage="finish_before"
+            HiSparseCoordinator._debug_device_lifecycle_snapshot(
+                self, req, buffer_locs, stage="finish_before"
             )
 
             def clear_device_buffer_owner() -> None:
@@ -3266,8 +3266,8 @@ class HiSparseCoordinator:
                     extra_owned_coordinates=buffer_locs,
                     clear_extra_owner=clear_device_buffer_owner,
                 )
-                self._debug_device_lifecycle_snapshot(
-                    req, buffer_locs, stage="finish_after"
+                HiSparseCoordinator._debug_device_lifecycle_snapshot(
+                    self, req, buffer_locs, stage="finish_after"
                 )
             else:
                 # Target owns the numerical physical-slot namespace shared by
