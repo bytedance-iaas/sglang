@@ -7,6 +7,7 @@ import numpy as np
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVSender
+from sglang.srt.disaggregation.fake.conn import FakeKVSender
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVManager,
     MooncakeKVReceiver,
@@ -36,6 +37,19 @@ def make_manager():
 
 
 class TestRequestGeneration(unittest.TestCase):
+    def test_fake_sender_accepts_request_generation_for_health_requests(self):
+        sender = FakeKVSender(
+            MagicMock(),
+            "127.0.0.1:8998",
+            25,
+            [0],
+            0,
+            generation=7,
+        )
+
+        self.assertEqual(sender.generation, 7)
+        self.assertEqual(sender.poll(), KVPoll.WaitingForInput)
+
     @patch(
         "sglang.srt.disaggregation.mooncake.conn.envs."
         "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get",

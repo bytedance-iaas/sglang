@@ -44,8 +44,10 @@ class FakeKVSender(BaseKVSender):
         dest_tp_ranks: List[int],
         pp_rank: int,
         req_has_disagg_prefill_dp_rank: bool = False,
+        generation: Optional[int] = None,
     ):
         self.kv_mgr = mgr
+        self.generation = generation
         self.has_sent = False
         self.conclude_state: Optional[KVPoll] = None
 
