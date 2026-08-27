@@ -201,6 +201,13 @@ class _HiSparsePageOwnership:
         self._extra_owner_page_ids.difference_update(extra_page_ids)
         if clear_extra_owner is not None:
             clear_extra_owner()
+
+        # Physical page zero is the allocator sentinel.  A non-page-aligned
+        # PD prefix can still expose positive coordinates 1..page_size-1 from
+        # that page through the logical mapping.  Those aliases must be
+        # cleared above, but page zero must never be returned to the child
+        # allocator or its available size will exceed its physical capacity.
+        page_ids = page_ids[page_ids > 0]
         if page_ids.numel() == 0:
             return
 

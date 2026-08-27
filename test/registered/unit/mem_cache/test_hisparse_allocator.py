@@ -413,6 +413,49 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         self.assertEqual(mapping.tolist(), [0, 0])
         child_allocator.free.assert_not_called()
 
+    def test_page_ownership_never_returns_positive_sentinel_coordinates(self):
+        """A non-page-aligned PD tail may map into positive slots of page zero."""
+        page_size = 4
+        mapping = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
+        child_allocator = MagicMock(is_not_in_free_group=True)
+        child_allocator.free_pages = torch.tensor([1, 2], dtype=torch.int64)
+        child_allocator.release_pages = torch.empty(0, dtype=torch.int64)
+        ownership = _HiSparsePageOwnership(
+            mapping=mapping, child_allocator=child_allocator, page_size=page_size
+        )
+
+        ownership.release(mapping_indices=torch.tensor([1, 2, 3]))
+
+        self.assertEqual(mapping.tolist(), [0, 0, 0, 0])
+        child_allocator.free.assert_not_called()
+
+    def test_non_page_aligned_pd_finish_keeps_physical_capacity_bounded(self):
+        """Coordinator cleanup followed by cache free must not credit page zero."""
+        page_size = 4
+        logical = _LogicalPageAllocator(page_size=page_size, num_pages=2)
+        physical = _PhysicalPageAllocator(page_size=page_size, num_pages=2)
+        mapping = torch.tensor([0, 1, 2, 3, 0, 0, 0, 0], dtype=torch.int64)
+        allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
+        allocator.page_size = page_size
+        allocator.logical_attn_allocator = logical
+        allocator.hisparse_attn_allocator = physical
+        allocator.full_to_hisparse_device_index_mapping = mapping
+        allocator.is_not_in_free_group = True
+        allocator.free_group = []
+        allocator._page_ownership = _HiSparsePageOwnership(
+            mapping=mapping, child_allocator=physical, page_size=page_size
+        )
+        logical_locs = torch.tensor([1, 2, 3], dtype=torch.int64)
+
+        # This is the runtime finish order: the coordinator first retires its
+        # request-visible aliases, then ChunkCache releases the logical KV.
+        allocator.release_hisparse_ownership(mapping_indices=logical_locs)
+        allocator.free(logical_locs)
+
+        self.assertEqual(mapping.tolist(), [0] * mapping.numel())
+        self.assertEqual(physical.available_size(), physical.size)
+        self.assertEqual(physical.free_pages, [1, 2])
+
     def test_release_mapped_pages_retires_every_speculative_alias(self):
         """A committed C4 page is returned only after all aliases are clear."""
         page_size = 4
