@@ -2758,7 +2758,10 @@ class HiSparseCoordinator:
         mapping[verify_cache_locs] = device_slots
 
     def finish_pending_verify_page_retirement(self) -> None:
-        pending = self._pending_verify_page_retirement
+        # Some teardown-only coordinators (and lightweight test doubles) are
+        # constructed without the full spec-v2 state.  They have no pending
+        # ownership transaction to finish.
+        pending = getattr(self, "_pending_verify_page_retirement", None)
         if pending is None:
             return
         replaced_coordinates, completed_mapping_indices = pending
@@ -3424,7 +3427,7 @@ class HiSparseCoordinator:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
         self.wait_for_pending_backup()
         self.clear_pending_draft_extend_backup()
-        self.finish_pending_verify_page_retirement()
+        HiSparseCoordinator.finish_pending_verify_page_retirement(self)
 
         # Use kv_allocated_len (not seqlen): speculative decoding may reserve
         # beyond the committed length. The canonical owner must retire every
