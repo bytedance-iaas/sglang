@@ -213,6 +213,11 @@ class CommonKVManager(BaseKVManager):
         self.next_request_generation: Dict[int, int] = {}
         self.request_status_history: Dict[Tuple[int, int], KVPoll] = {}
         self.request_failure_history: Dict[Tuple[int, int], str] = {}
+        # Decode may wait in its admission queue substantially longer than one
+        # prefill forward for very long requests.  Track an explicit,
+        # generation-scoped liveness lease so that healthy admission backpressure
+        # is not mistaken for a lost decode peer by the prefill sender.
+        self.request_bootstrap_activity: Dict[Tuple[int, int], float] = {}
         self.request_status_lock = threading.RLock()
         self._socket_cache: Dict[str, zmq.Socket] = {}
         self._monitor_cache: Dict[str, zmq.Socket] = {}
@@ -327,6 +332,8 @@ class CommonKVManager(BaseKVManager):
             self.request_status_history = {}
         if not hasattr(self, "request_failure_history"):
             self.request_failure_history = {}
+        if not hasattr(self, "request_bootstrap_activity"):
+            self.request_bootstrap_activity = {}
         if not hasattr(self, "request_status_lock"):
             self.request_status_lock = threading.RLock()
 
@@ -342,6 +349,11 @@ class CommonKVManager(BaseKVManager):
                 table.pop(bootstrap_room, None)
         with self.failure_lock:
             self.failure_records.pop(bootstrap_room, None)
+        self.request_bootstrap_activity = {
+            key: timestamp
+            for key, timestamp in self.request_bootstrap_activity.items()
+            if key[0] != bootstrap_room
+        }
 
     def _clear_request_payload(self, bootstrap_room: int) -> None:
         for attr in (
@@ -353,6 +365,11 @@ class CommonKVManager(BaseKVManager):
             table = getattr(self, attr, None)
             if table is not None:
                 table.pop(bootstrap_room, None)
+        activity = getattr(self, "request_bootstrap_activity", None)
+        if activity is not None:
+            stale_keys = [key for key in activity if key[0] == bootstrap_room]
+            for key in stale_keys:
+                activity.pop(key, None)
 
     def begin_request(
         self,
@@ -495,13 +512,51 @@ class CommonKVManager(BaseKVManager):
             if self.request_generation.get(bootstrap_room) != generation:
                 self.request_status_history.pop((bootstrap_room, generation), None)
                 self.request_failure_history.pop((bootstrap_room, generation), None)
+                self.request_bootstrap_activity.pop((bootstrap_room, generation), None)
                 return False
             self.request_status.pop(bootstrap_room, None)
             self.request_generation.pop(bootstrap_room, None)
             self.request_status_history.pop((bootstrap_room, generation), None)
             self.request_failure_history.pop((bootstrap_room, generation), None)
+            self.request_bootstrap_activity.pop((bootstrap_room, generation), None)
             self._clear_request_payload(bootstrap_room)
             return True
+
+    def renew_bootstrap_activity(
+        self,
+        bootstrap_room: int,
+        generation: Optional[int],
+        timestamp: Optional[float] = None,
+    ) -> bool:
+        """Renew a live decode admission lease for the current request.
+
+        A renewal is accepted only while the matching generation is still in
+        ``Bootstrapping``.  It never creates a room, advances protocol state,
+        or lets a delayed packet extend a reused room's deadline.
+        """
+        self._ensure_request_lifecycle_state()
+        with self.request_status_lock:
+            if not self.is_current_generation(bootstrap_room, generation):
+                return False
+            if self.request_status.get(bootstrap_room) != KVPoll.Bootstrapping:
+                return False
+            active_generation = self.request_generation[bootstrap_room]
+            self.request_bootstrap_activity[(bootstrap_room, active_generation)] = (
+                time.time() if timestamp is None else timestamp
+            )
+            return True
+
+    def get_bootstrap_activity(
+        self, bootstrap_room: int, generation: Optional[int]
+    ) -> Optional[float]:
+        self._ensure_request_lifecycle_state()
+        with self.request_status_lock:
+            if not self.is_current_generation(bootstrap_room, generation):
+                return None
+            active_generation = self.request_generation[bootstrap_room]
+            return self.request_bootstrap_activity.get(
+                (bootstrap_room, active_generation)
+            )
 
     def record_failure(
         self,
@@ -1444,7 +1499,11 @@ class CommonKVSender(BaseKVSender):
     def _check_bootstrap_timeout(self) -> Optional[KVPoll]:
         if self.init_time is None:
             return None
-        elapsed = time.time() - self.init_time
+        last_activity = self.kv_mgr.get_bootstrap_activity(
+            self.bootstrap_room, self.generation
+        )
+        deadline_start = max(self.init_time, last_activity or self.init_time)
+        elapsed = time.time() - deadline_start
         if elapsed < self.kv_mgr.bootstrap_timeout:
             return None
         logger.warning_once(

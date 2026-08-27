@@ -2022,6 +2022,11 @@ class MooncakeKVManager(CommonKVManager):
                             f"Failed to send ABORT_ACK for room {room_to_be_aborted}: {e}"
                         )
                     continue
+                if room == "BOOTSTRAP_KEEPALIVE":
+                    room_to_renew = int(waiting_req_bytes[1].decode("ascii"))
+                    generation = int(waiting_req_bytes[2].decode("ascii"))
+                    self.renew_bootstrap_activity(room_to_renew, generation)
+                    continue
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
                     decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
@@ -2448,7 +2453,50 @@ class MooncakeKVReceiver(CommonKVReceiver):
     ):
         self.session_id = mgr.get_session_id()
         self.init_time = None
+        self._last_bootstrap_keepalive_time = 0.0
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
+
+    def renew_bootstrap_lease(self, force: bool = False) -> bool:
+        """Tell prefill that this request is alive in decode admission."""
+        if self.conclude_state is not None or not hasattr(self, "bootstrap_infos"):
+            return False
+        if (
+            self.kv_mgr.check_status(self.bootstrap_room, self.generation)
+            != KVPoll.WaitingForInput
+        ):
+            return False
+
+        now = time.monotonic()
+        interval = min(
+            30.0, max(1.0, envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get() / 3)
+        )
+        if not force and now - self._last_bootstrap_keepalive_time < interval:
+            return False
+
+        sent = False
+        for bootstrap_info in self.bootstrap_infos:
+            try:
+                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+                with lock:
+                    sock.send_multipart(
+                        [
+                            b"BOOTSTRAP_KEEPALIVE",
+                            str(self.bootstrap_room).encode("ascii"),
+                            str(self.generation).encode("ascii"),
+                        ]
+                    )
+                sent = True
+            except Exception as e:
+                logger.debug(
+                    "Failed to renew bootstrap lease for room %s via %s:%s: %s",
+                    self.bootstrap_room,
+                    bootstrap_info.get("rank_ip", "unknown"),
+                    bootstrap_info.get("rank_port", "unknown"),
+                    e,
+                )
+        if sent:
+            self._last_bootstrap_keepalive_time = now
+        return sent
 
     def _register_kv_args(self) -> bool:
         for bootstrap_info in self.bootstrap_infos:

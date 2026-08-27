@@ -1,12 +1,17 @@
 import threading
+import time
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVSender
-from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, TransferInfo
+from sglang.srt.disaggregation.mooncake.conn import (
+    MooncakeKVManager,
+    MooncakeKVReceiver,
+    TransferInfo,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -19,6 +24,7 @@ def make_manager():
     manager.next_request_generation = {}
     manager.request_status_history = {}
     manager.request_failure_history = {}
+    manager.request_bootstrap_activity = {}
     manager.request_status_lock = threading.RLock()
     manager.failure_records = {}
     manager.failure_lock = threading.Lock()
@@ -30,6 +36,78 @@ def make_manager():
 
 
 class TestRequestGeneration(unittest.TestCase):
+    @patch(
+        "sglang.srt.disaggregation.mooncake.conn.envs."
+        "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get",
+        return_value=600,
+    )
+    @patch(
+        "sglang.srt.disaggregation.mooncake.conn.time.monotonic",
+        return_value=31.0,
+    )
+    def test_decode_admission_keepalive_is_generation_scoped_and_throttled(
+        self, _monotonic, _timeout
+    ):
+        receiver = object.__new__(MooncakeKVReceiver)
+        receiver.bootstrap_room = 24
+        receiver.generation = 7
+        receiver.conclude_state = None
+        receiver.bootstrap_infos = [{"rank_ip": "127.0.0.1", "rank_port": 5000}]
+        receiver._last_bootstrap_keepalive_time = 0.0
+        receiver.kv_mgr = MagicMock()
+        receiver.kv_mgr.check_status.return_value = KVPoll.WaitingForInput
+        sock = MagicMock()
+        lock = MagicMock()
+        lock.__enter__.return_value = lock
+        lock.__exit__.return_value = False
+
+        with patch.object(
+            receiver, "_connect_to_bootstrap_server", return_value=(sock, lock)
+        ):
+            self.assertTrue(receiver.renew_bootstrap_lease())
+            self.assertFalse(receiver.renew_bootstrap_lease())
+
+        sock.send_multipart.assert_called_once_with(
+            [b"BOOTSTRAP_KEEPALIVE", b"24", b"7"]
+        )
+
+    def test_bootstrap_lease_renews_only_current_bootstrapping_generation(self):
+        manager = make_manager()
+        generation, _ = manager.begin_request(21, KVPoll.Bootstrapping)
+
+        self.assertTrue(manager.renew_bootstrap_activity(21, generation, 123.0))
+        self.assertEqual(manager.get_bootstrap_activity(21, generation), 123.0)
+
+        manager.update_status(21, KVPoll.WaitingForInput, generation)
+        self.assertFalse(manager.renew_bootstrap_activity(21, generation, 456.0))
+        self.assertEqual(manager.get_bootstrap_activity(21, generation), 123.0)
+
+    def test_stale_bootstrap_lease_cannot_renew_reused_room(self):
+        manager = make_manager()
+        old_generation, _ = manager.begin_request(22, KVPoll.Bootstrapping)
+        manager.update_status(22, KVPoll.Success, old_generation)
+        new_generation, _ = manager.begin_request(22, KVPoll.Bootstrapping)
+
+        self.assertFalse(manager.renew_bootstrap_activity(22, old_generation, 456.0))
+        self.assertIsNone(manager.get_bootstrap_activity(22, old_generation))
+        self.assertIsNone(manager.get_bootstrap_activity(22, new_generation))
+
+    def test_sender_timeout_uses_latest_decode_admission_lease(self):
+        manager = make_manager()
+        manager.bootstrap_timeout = 10
+        generation, _ = manager.begin_request(23, KVPoll.Bootstrapping)
+        sender = object.__new__(CommonKVSender)
+        sender.kv_mgr = manager
+        sender.bootstrap_room = 23
+        sender.generation = generation
+        sender.init_time = time.time() - 20
+
+        manager.renew_bootstrap_activity(23, generation, time.time())
+        self.assertIsNone(sender._check_bootstrap_timeout())
+
+        manager.request_bootstrap_activity[(23, generation)] = time.time() - 20
+        self.assertEqual(sender._check_bootstrap_timeout(), KVPoll.Failed)
+
     def test_sender_and_metadata_race_join_one_generation(self):
         for _ in range(100):
             manager = make_manager()

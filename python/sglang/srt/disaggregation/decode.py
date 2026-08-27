@@ -1123,6 +1123,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 r for r in self.pending_reqs if id(r) not in failed_ids
             ]
 
+        # A healthy request can remain here longer than the prefill bootstrap
+        # timeout while earlier long-context requests own decode KV capacity.
+        # Renew only live receivers whose handshake is complete but whose
+        # physical preallocation has not happened yet. Missing/dead decode peers
+        # send no renewal and retain the existing bounded timeout behavior.
+        for i, decode_req in enumerate(self.queue):
+            if i in indices_to_remove or not decode_req.waiting_for_input:
+                continue
+            renew = getattr(decode_req.kv_receiver, "renew_bootstrap_lease", None)
+            if renew is not None:
+                renew()
+
         # HiSparse physical constraint: max requests by device buffer capacity.
         # Each admitted req needs padded_buffer_size from hisparse device pool.
         # waiting_queue reqs already have device buffers (allocated in admit_request_direct),

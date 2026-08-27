@@ -28,6 +28,10 @@ class FakeReceiver:
     def failure_exception(self):
         return None
 
+    def renew_bootstrap_lease(self):
+        self.renew_called = getattr(self, "renew_called", 0) + 1
+        return True
+
 
 class TestDecodeQueueCleanup(CustomTestCase):
     def test_prealloc_abort_clears_receiver_before_removing_request(self):
@@ -64,9 +68,40 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertEqual(queue.queue, [])
         self.assertTrue(receiver.clear_called)
         self.assertIsNone(decode_req.kv_receiver)
+        self.assertFalse(hasattr(receiver, "renew_called"))
         scheduler.output_streamer.stream_output.assert_called_once_with(
             [req], req.return_logprob
         )
+
+    def test_capacity_blocked_request_renews_bootstrap_lease(self):
+        receiver = FakeReceiver()
+        req = SimpleNamespace(rid="capacity-blocked", finished_reason=None)
+        decode_req = SimpleNamespace(
+            req=req, kv_receiver=receiver, waiting_for_input=True
+        )
+
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.pp_size = 1
+        queue.queue = [decode_req]
+        queue.pending_reqs = []
+        queue.retracted_queue = []
+        queue._resolve_pending_reqs = MagicMock()
+        queue._update_handshake_waiters = MagicMock()
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+        queue._allocatable_token_budgets = MagicMock(return_value=0)
+        queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
+
+        scheduler = MagicMock()
+        scheduler.running_batch.reqs = []
+        scheduler.enable_priority_scheduling = False
+        scheduler.enable_hisparse = False
+        queue.scheduler = scheduler
+
+        preallocated, failed = queue.pop_preallocated()
+
+        self.assertEqual(preallocated, [])
+        self.assertEqual(failed, [])
+        self.assertEqual(receiver.renew_called, 1)
 
     def test_prealloc_abort_also_drops_from_pending_reqs(self):
         # Same DecodeRequest lives in both queue and pending_reqs (add() slow
