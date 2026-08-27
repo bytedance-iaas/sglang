@@ -310,6 +310,7 @@ class HiSparseCoordinator:
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_req_slots
         self._pending_draft_extend_backup = None
+        self._pending_verify_page_retirement = None
         self._debug_pending_draft_extend = None
         self._debug_last_generated_kv_bucket = -1
         # Request-local C4 position up to which complete physical pages have
@@ -465,9 +466,7 @@ class HiSparseCoordinator:
             or self._device_slot_owner is not self
         ):
             return
-        snapshot = self.token_to_kv_pool_allocator.debug_hisparse_ownership(
-            buffer_locs
-        )
+        snapshot = self.token_to_kv_pool_allocator.debug_hisparse_ownership(buffer_locs)
         logger.warning(
             "HISPARSE_DEVICE_LIFECYCLE stage=%s req=%s req_pool_idx=%d "
             "available=%d capacity=%d free_pages=%d release_pages=%d "
@@ -2202,9 +2201,7 @@ class HiSparseCoordinator:
                 new_cap = self.padded_buffer_size
             net_extra = new_cap - old_cap - page_size
             assert net_extra >= 0
-            growths.append(
-                (boundary_index, req_index, old_cap, new_cap, net_extra)
-            )
+            growths.append((boundary_index, req_index, old_cap, new_cap, net_extra))
 
         growth_mask_values = [False] * len(boundary_batch_indices_cpu)
         for boundary_index, *_ in growths:
@@ -2252,12 +2249,12 @@ class HiSparseCoordinator:
                 allocator.claim_hisparse_ownership(extra_indices)
             extra_offset = 0
             for boundary_index, req_index, old_cap, new_cap, net_extra in growths:
-                self.req_to_device_buffer[
-                    req_index, old_cap : old_cap + page_size
-                ] = temporary_blocks[boundary_index]
-                self.req_to_device_buffer[
-                    req_index, old_cap + page_size : new_cap
-                ] = extra_indices[extra_offset : extra_offset + net_extra]
+                self.req_to_device_buffer[req_index, old_cap : old_cap + page_size] = (
+                    temporary_blocks[boundary_index]
+                )
+                self.req_to_device_buffer[req_index, old_cap + page_size : new_cap] = (
+                    extra_indices[extra_offset : extra_offset + net_extra]
+                )
                 extra_offset += net_extra
                 self.req_device_buffer_size[req_index] = new_cap
 
@@ -2267,9 +2264,9 @@ class HiSparseCoordinator:
             install_retained_owner=install_growth_rows,
         )
         for _, req_index, old_cap, new_cap, _ in growths:
-            self.req_device_buffer_token_locs[
-                :, req_index, old_cap:new_cap
-            ] = self.req_to_device_buffer[req_index, old_cap:new_cap].to(torch.int32)
+            self.req_device_buffer_token_locs[:, req_index, old_cap:new_cap] = (
+                self.req_to_device_buffer[req_index, old_cap:new_cap].to(torch.int32)
+            )
         mapping[mapping_index_blocks] = destinations
 
     def _eager_backup_previous_token(
@@ -2720,9 +2717,56 @@ class HiSparseCoordinator:
                 "HiSparse spec-v2 verify slot mismatch: "
                 f"logical={verify_cache_locs.numel()}, device={device_slots.numel()}"
             )
-        self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping[
-            verify_cache_locs
-        ] = device_slots
+        allocator = self.token_to_kv_pool_allocator
+        mapping = allocator.full_to_hisparse_device_index_mapping
+        # Spec-v2 reserves page-aligned logical/physical ranges, but target
+        # verify consumes only the moving draft window.  When this window
+        # replaces the final alias in a logical page, transfer ownership away
+        # from the temporary physical page after target verify completes.
+        # prepare may run on the overlap plan stream, so returning the page to
+        # the allocator here could race with the preceding draft GPU work.
+        if self._pending_verify_page_retirement is not None:
+            raise RuntimeError(
+                "HiSparse target verify started before the previous temporary "
+                "page retirement completed"
+            )
+        replaced_coordinates = mapping[verify_cache_locs].clone()
+        page_size = allocator.page_size
+        completed_page_ends = verify_cache_locs[
+            verify_cache_locs.remainder(page_size) == page_size - 1
+        ]
+        if completed_page_ends.numel() > 0:
+            completed_page_starts = torch.unique(
+                completed_page_ends - (page_size - 1), sorted=False
+            )
+            completed_page_ids = completed_page_starts // page_size
+            replaced_from_completed_pages = replaced_coordinates[
+                torch.isin(verify_cache_locs // page_size, completed_page_ids)
+            ]
+            completed_mapping_indices = (
+                completed_page_starts[:, None]
+                + torch.arange(
+                    page_size,
+                    dtype=torch.int64,
+                    device=verify_cache_locs.device,
+                )[None, :]
+            ).reshape(-1)
+            self._pending_verify_page_retirement = (
+                replaced_from_completed_pages,
+                completed_mapping_indices,
+            )
+        mapping[verify_cache_locs] = device_slots
+
+    def finish_pending_verify_page_retirement(self) -> None:
+        pending = self._pending_verify_page_retirement
+        if pending is None:
+            return
+        replaced_coordinates, completed_mapping_indices = pending
+        self.token_to_kv_pool_allocator.retire_replaced_hisparse_mapping_pages(
+            replaced_coordinates=replaced_coordinates,
+            completed_mapping_indices=completed_mapping_indices,
+        )
+        self._pending_verify_page_retirement = None
 
     def finalize_accepted_tokens(
         self,
@@ -3228,6 +3272,11 @@ class HiSparseCoordinator:
                     mapping[buffered_verify_locs] = mapping_snapshot
             self._finalize_buffered_tokens_spec_v2(*buffered_inputs)
 
+        # Target verify and both target/draft finalization paths have consumed
+        # the temporary page.  Releasing it on the main stream here closes the
+        # owner transfer without exposing it to reuse during plan-stream work.
+        self.finish_pending_verify_page_retirement()
+
     def naive_load_topk(
         self,
         req_pool_indices: torch.Tensor,
@@ -3375,6 +3424,7 @@ class HiSparseCoordinator:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
         self.wait_for_pending_backup()
         self.clear_pending_draft_extend_backup()
+        self.finish_pending_verify_page_retirement()
 
         # Use kv_allocated_len (not seqlen): speculative decoding may reserve
         # beyond the committed length. The canonical owner must retire every
@@ -3396,9 +3446,7 @@ class HiSparseCoordinator:
         # The canonical owner must always enumerate the request-visible mapping
         # before release_kv_cache frees its logical slots. Draft mirrors only
         # clear local buffer state and never mutate the canonical mapping.
-        should_release_device_ownership = (
-            current_cap > 0 and not is_resident_req
-        ) or (
+        should_release_device_ownership = (current_cap > 0 and not is_resident_req) or (
             self.is_dsv4_hisparse
             and (is_resident_req or self._device_slot_owner is self)
         )

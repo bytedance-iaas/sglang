@@ -123,9 +123,7 @@ class _HiSparsePageOwnership:
             "request_claimed_pages": sorted(
                 request_page_id_set & self._extra_owner_page_ids
             ),
-            "request_mapping_pages": sorted(
-                request_page_id_set & mapping_page_id_set
-            ),
+            "request_mapping_pages": sorted(request_page_id_set & mapping_page_id_set),
         }
 
     def _page_ids(self, coordinates: torch.Tensor) -> torch.Tensor:
@@ -231,6 +229,89 @@ class _HiSparsePageOwnership:
             ~torch.isin(owned_page_ids, retained_page_ids)
         ]
         self.release_mapped_pages(released_page_ids)
+
+    def retire_replaced_mapping_pages(
+        self,
+        *,
+        replaced_coordinates: torch.Tensor,
+        completed_mapping_indices: torch.Tensor,
+    ) -> None:
+        """Return temporary pages after their complete logical page is rebound.
+
+        Paged speculative decode reserves a whole physical page, while target
+        verify replaces only the currently visible token window with stable
+        coordinator slots.  The final replacement in a logical page removes
+        the last mapping owner of that temporary physical page.  Retire that
+        page here, at the ownership transition, rather than trying to discover
+        orphaned pages when the request eventually finishes.
+
+        ``completed_mapping_indices`` must contain complete logical pages.
+        Coordinator-owned side pages and candidate pages that still have a
+        mapping owner are explicitly excluded.  The latter is a valid state
+        when a partial prompt tail and its generated continuation share one
+        physical page.
+        """
+        candidate_page_ids = self._page_ids(replaced_coordinates)
+        if candidate_page_ids.numel() == 0:
+            return
+
+        if self._extra_owner_page_ids:
+            claimed_page_ids = torch.tensor(
+                sorted(self._extra_owner_page_ids),
+                dtype=torch.int64,
+                device=candidate_page_ids.device,
+            )
+            candidate_page_ids = candidate_page_ids[
+                ~torch.isin(candidate_page_ids, claimed_page_ids)
+            ]
+        candidate_page_ids = candidate_page_ids[candidate_page_ids > 0]
+        if candidate_page_ids.numel() == 0:
+            return
+
+        completed_mapping_indices = completed_mapping_indices.to(torch.int64)
+        if completed_mapping_indices.numel() % self.page_size != 0:
+            raise RuntimeError(
+                "HiSparse replaced-owner retirement requires complete logical pages"
+            )
+        completed_blocks = completed_mapping_indices.reshape(-1, self.page_size)
+        expected_offsets = torch.arange(
+            self.page_size,
+            dtype=torch.int64,
+            device=completed_mapping_indices.device,
+        )
+        if torch.any(
+            completed_blocks
+            != (completed_blocks[:, :1] // self.page_size) * self.page_size
+            + expected_offsets
+        ):
+            raise RuntimeError(
+                "HiSparse replaced-owner retirement received a partial logical page"
+            )
+
+        remaining_coordinates = self.mapping[completed_mapping_indices]
+        remaining_page_ids = self._page_ids(remaining_coordinates)
+        candidate_page_ids = candidate_page_ids[
+            ~torch.isin(candidate_page_ids, remaining_page_ids)
+        ]
+        if candidate_page_ids.numel() == 0:
+            return
+
+        already_released = _released_page_ids(
+            self.child_allocator, device=candidate_page_ids.device
+        )
+        if already_released.numel() > 0:
+            candidate_page_ids = candidate_page_ids[
+                ~torch.isin(candidate_page_ids, already_released)
+            ]
+        if candidate_page_ids.numel() == 0:
+            return
+
+        offsets = torch.arange(
+            self.page_size, dtype=torch.int64, device=candidate_page_ids.device
+        )
+        self.child_allocator.free(
+            (candidate_page_ids[:, None] * self.page_size + offsets).reshape(-1)
+        )
 
     def release(
         self,
@@ -634,6 +715,17 @@ class HiSparseTokenToKVPoolAllocator(HiSparseDemotionMixin, BaseTokenToKVPoolAll
             mapping_indices=mapping_indices,
             retained_page_ids=retained_page_ids,
             install_retained_owner=install_retained_owner,
+        )
+
+    def retire_replaced_hisparse_mapping_pages(
+        self,
+        *,
+        replaced_coordinates: torch.Tensor,
+        completed_mapping_indices: torch.Tensor,
+    ) -> None:
+        self._page_ownership.retire_replaced_mapping_pages(
+            replaced_coordinates=replaced_coordinates,
+            completed_mapping_indices=completed_mapping_indices,
         )
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):

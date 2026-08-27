@@ -7,6 +7,7 @@ import torch
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
+    HiSparseTokenToKVPoolAllocator,
     _HiSparsePageOwnership,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -203,6 +204,157 @@ class TestDSV4HiSparseDecodeTransaction(unittest.TestCase):
         mirror._backup_device_locs_to_host.assert_not_called()
         self.assertEqual(physical.used_pages, {1, 2, 3})
         self.assertEqual(owner._req_c4_retired_len[0], 16)
+
+
+class TestGenericHiSparseSpecV2Transaction(unittest.TestCase):
+    def test_verify_rebind_retires_final_temporary_page_owner(self) -> None:
+        """A page-aligned spec reserve must not become orphaned.
+
+        Production reserves a complete physical page, then target verify
+        rebinds a moving six-token window to the coordinator's stable side
+        page. Once the final alias is rebound, the temporary page has no
+        mapping or side-buffer owner and must return to the physical pool.
+        """
+        page_size = 64
+        generated_pages = 24  # 1,500 generated tokens cross about 23 pages.
+        physical = _PhysicalPageAllocator(
+            page_size=page_size, num_pages=generated_pages + 2
+        )
+        mapping = torch.zeros((generated_pages + 2) * page_size, dtype=torch.int64)
+
+        allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
+        allocator.page_size = page_size
+        allocator.hisparse_attn_allocator = physical
+        allocator.full_to_hisparse_device_index_mapping = mapping
+        allocator._page_ownership = _HiSparsePageOwnership(
+            mapping=mapping, child_allocator=physical, page_size=page_size
+        )
+
+        side_page = physical.alloc(page_size)
+        allocator.claim_hisparse_ownership(side_page)
+
+        owner = object.__new__(HiSparseCoordinator)
+        owner.token_to_kv_pool_allocator = allocator
+        owner._pending_verify_page_retirement = None
+        owner.get_draft_device_slots = MagicMock(
+            side_effect=lambda _reqs, width, _starts: side_page[:width]
+        )
+
+        req_pool_indices = torch.tensor([0], dtype=torch.int64)
+        retired_page_ids = []
+        for page in range(generated_pages):
+            logical_start = (page + 1) * page_size
+            logical_end = logical_start + page_size
+            temporary_page = physical.alloc(page_size)
+            self.assertIsNotNone(temporary_page)
+            mapping[logical_start:logical_end] = temporary_page
+            temporary_page_id = int(temporary_page[0].item()) // page_size
+
+            for start in range(logical_start, logical_end, 6):
+                width = min(6, logical_end - start)
+                verify_locs = torch.arange(start, start + width, dtype=torch.int64)
+                owner.prepare_verify_slots_spec_v2(
+                    req_pool_indices=req_pool_indices,
+                    verify_cache_locs=verify_locs,
+                    num_tokens_per_req=width,
+                    start_positions_cpu=torch.tensor([start], dtype=torch.int64),
+                )
+                if start + width == logical_end:
+                    self.assertIsNotNone(owner._pending_verify_page_retirement)
+                    self.assertIn(temporary_page_id, physical.used_pages)
+                else:
+                    self.assertIsNone(owner._pending_verify_page_retirement)
+                # Production closes this transaction after target verify and
+                # target/draft finalization have consumed the old slots.
+                owner.finish_pending_verify_page_retirement()
+
+                mapping_pages = set(
+                    torch.unique(mapping[mapping > 0] // page_size).tolist()
+                )
+                owned_pages = (
+                    mapping_pages | allocator._page_ownership._extra_owner_page_ids
+                )
+                orphan_pages = physical.used_pages - owned_pages
+                self.assertEqual(
+                    orphan_pages,
+                    set(),
+                    f"temporary page lost at logical position {start}: "
+                    f"orphans={sorted(orphan_pages)}",
+                )
+
+            self.assertNotIn(temporary_page_id, physical.used_pages)
+            retired_page_ids.append(temporary_page_id)
+
+        side_page_id = int(side_page[0].item()) // page_size
+        self.assertIn(side_page_id, physical.used_pages)
+        self.assertTrue(
+            all(page_id in physical.free_pages for page_id in retired_page_ids)
+        )
+
+    def test_verify_rebind_keeps_incomplete_temporary_page_live(self) -> None:
+        page_size = 64
+        physical = _PhysicalPageAllocator(page_size=page_size, num_pages=3)
+        mapping = torch.zeros(3 * page_size, dtype=torch.int64)
+        allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
+        allocator.page_size = page_size
+        allocator.hisparse_attn_allocator = physical
+        allocator.full_to_hisparse_device_index_mapping = mapping
+        allocator._page_ownership = _HiSparsePageOwnership(
+            mapping=mapping, child_allocator=physical, page_size=page_size
+        )
+
+        temporary_page = physical.alloc(page_size)
+        side_page = physical.alloc(page_size)
+        logical_start = page_size
+        mapping[logical_start : logical_start + page_size] = temporary_page
+        allocator.claim_hisparse_ownership(side_page)
+
+        owner = object.__new__(HiSparseCoordinator)
+        owner.token_to_kv_pool_allocator = allocator
+        owner._pending_verify_page_retirement = None
+        owner.get_draft_device_slots = MagicMock(return_value=side_page[:6])
+        owner.prepare_verify_slots_spec_v2(
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            verify_cache_locs=torch.arange(
+                logical_start, logical_start + 6, dtype=torch.int64
+            ),
+            num_tokens_per_req=6,
+            start_positions_cpu=torch.tensor([logical_start], dtype=torch.int64),
+        )
+        owner.finish_pending_verify_page_retirement()
+        self.assertIsNone(owner._pending_verify_page_retirement)
+
+        temporary_page_id = int(temporary_page[0].item()) // page_size
+        self.assertIn(temporary_page_id, physical.used_pages)
+        self.assertTrue(
+            torch.all(
+                mapping[logical_start + 6 : logical_start + page_size]
+                == temporary_page[6:]
+            )
+        )
+
+    def test_retirement_keeps_page_with_a_remaining_mapping_owner(self) -> None:
+        page_size = 64
+        physical = _PhysicalPageAllocator(page_size=page_size, num_pages=2)
+        mapping = torch.zeros(2 * page_size, dtype=torch.int64)
+        temporary_page = physical.alloc(page_size)
+        logical_page = torch.arange(page_size, 2 * page_size, dtype=torch.int64)
+
+        # The final verify window replaced the tail, but an earlier committed
+        # prefix still owns coordinates from the same physical page.  This is
+        # legal for a prompt-tail page and must defer retirement.
+        mapping[logical_page[:32]] = temporary_page[:32]
+        ownership = _HiSparsePageOwnership(
+            mapping=mapping, child_allocator=physical, page_size=page_size
+        )
+        ownership.retire_replaced_mapping_pages(
+            replaced_coordinates=temporary_page[32:],
+            completed_mapping_indices=logical_page,
+        )
+
+        temporary_page_id = int(temporary_page[0].item()) // page_size
+        self.assertIn(temporary_page_id, physical.used_pages)
+        torch.testing.assert_close(mapping[logical_page[:32]], temporary_page[:32])
 
 
 if __name__ == "__main__":
