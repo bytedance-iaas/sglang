@@ -5,9 +5,9 @@ import heapq
 import json
 import logging
 import os
+import queue
 import threading
 import time
-from queue import Empty
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
@@ -1478,8 +1478,8 @@ class HiMambaRadixCache(MambaRadixCache):
 
     def _drain_storage_control_queues_local(self):
         self._drain_storage_control_queues_impl(
-            n_revoke=None,
             n_storage_hit=0,
+            n_ack_prefetch=None,
             n_backup=None,
             n_release=None,
             log_metrics=False,
@@ -1499,27 +1499,21 @@ class HiMambaRadixCache(MambaRadixCache):
 
     def _drain_storage_control_queues_impl(
         self,
-        n_revoke: Optional[int],
         n_storage_hit: Optional[int],
+        n_ack_prefetch: Optional[int],
         n_backup: Optional[int],
         n_release: Optional[int],
         log_metrics: bool,
     ):
         cc = self.cache_controller
 
-        def _drain_queue(q, limit: Optional[int]):
-            drained = 0
-            while limit is None or drained < limit:
-                try:
-                    item = q.get_nowait()
-                except Empty:
-                    break
-                drained += 1
-                yield item
-
-        def _drain_revoke():
-            for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
-                self._revoke_pending_prefetch(req_id)
+        def _drain_queue(q: queue.Queue, count: Optional[int]):
+            if count is None:
+                while not q.empty():
+                    yield q.get()
+            else:
+                for _ in range(count):
+                    yield q.get()
 
         def _drain_and_alloc_storage_hit():
             # The L3 hit count is now known, so reserve exactly that much host
@@ -1537,6 +1531,14 @@ class HiMambaRadixCache(MambaRadixCache):
                 if operation.is_terminated():
                     # request was aborted while the storage query was in flight
                     self._revoke_pending_prefetch(req_id)
+                    continue
+                if operation.storage_hit_count < self.prefetch_threshold:
+                    self._revoke_pending_prefetch(req_id)
+                    logger.debug(
+                        "Revoking prefetch for request %s due to insufficient hits (%d).",
+                        req_id,
+                        operation.storage_hit_count,
+                    )
                     continue
 
                 alloc_len = operation.storage_hit_count
@@ -1571,6 +1573,27 @@ class HiMambaRadixCache(MambaRadixCache):
                 )
                 cc.prefetch_buffer.put(operation)
 
+        def _drain_ack_prefetch():
+            for ack in _drain_queue(cc.ack_prefetch_queue, n_ack_prefetch):
+                operation = ack.operation
+                req_id = operation.request_id
+                if ack.completed_tokens is not None and req_id in self.ongoing_prefetch:
+                    assert operation.completed_tokens <= ack.completed_tokens
+                    operation.completed_tokens = ack.completed_tokens
+                if ack.pool_hits is not None and req_id in self.ongoing_prefetch:
+                    operation.pool_storage_result.update_extra_pool_hit_pages(
+                        ack.pool_hits
+                    )
+                    operation.pool_transfers_done = True
+                if ack.completed_req:
+                    if req_id in self.ongoing_prefetch:
+                        self._handle_prefetch_result(operation)
+                    if operation.host_indices is not None:
+                        tail = operation.host_indices[operation.completed_tokens :]
+                        cc.mem_pool_host.free(tail)
+                    if not operation.pool_transfers_done:
+                        self.prefetch_abort(operation.pool_transfers)
+
         def _drain_backup():
             for operation in _drain_queue(cc.ack_backup_queue, n_backup):
                 ack_id = operation.id
@@ -1591,8 +1614,8 @@ class HiMambaRadixCache(MambaRadixCache):
                 host_indices = torch.cat(host_indices_list, dim=0)
                 cc.mem_pool_host.free(host_indices)
 
-        _drain_revoke()
         _drain_and_alloc_storage_hit()
+        _drain_ack_prefetch()
         _drain_backup()
         _drain_release()
 
@@ -1702,8 +1725,8 @@ class HiMambaRadixCache(MambaRadixCache):
 
         qsizes = torch.tensor(
             [
-                cc.prefetch_revoke_queue.qsize(),
                 cc.prefetch_hit_queue.qsize(),
+                cc.ack_prefetch_queue.qsize(),
                 cc.ack_backup_queue.qsize(),
                 cc.host_mem_release_queue.qsize(),
             ],
@@ -1714,10 +1737,10 @@ class HiMambaRadixCache(MambaRadixCache):
                 qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
             )
 
-        n_revoke, n_storage_hit, n_backup, n_release = map(int, qsizes.tolist())
+        n_storage_hit, n_ack_prefetch, n_backup, n_release = map(int, qsizes.tolist())
         self._drain_storage_control_queues_impl(
-            n_revoke=n_revoke,
             n_storage_hit=n_storage_hit,
+            n_ack_prefetch=n_ack_prefetch,
             n_backup=n_backup,
             n_release=n_release,
             log_metrics=True,
@@ -1730,43 +1753,14 @@ class HiMambaRadixCache(MambaRadixCache):
         return time.monotonic() - operation.start_time > timeout
 
     def can_terminate_prefetch(self, operation: PrefetchOperation):
-        can_terminate = True
-
         if self.prefetch_stop_policy == "best_effort":
-            return can_terminate
-
-        if len(operation.hash_value) == 0:
-            completed = False
-        else:
-            completed = (
-                operation.completed_tokens == len(operation.hash_value) * self.page_size
-            )
-
+            return True
         if self.prefetch_stop_policy == "wait_complete":
-            can_terminate = completed
+            return False
         elif self.prefetch_stop_policy == "timeout":
-            can_terminate = completed or self.is_prefetch_timeout(operation)
+            return self._prefetch_timeout_check_linear_func(operation)
         else:
             return True
-
-        if completed and operation.pool_transfers and not operation.pool_transfers_done:
-            can_terminate = False
-
-        operation_terminated = operation.is_terminated()
-        if self.tp_world_size > 1:
-            states = torch.tensor(
-                [1 - int(can_terminate), int(operation_terminated)],
-                dtype=torch.int,
-            )
-            torch.distributed.all_reduce(
-                states,
-                op=torch.distributed.ReduceOp.MAX,
-                group=self.tp_group,
-            )
-            can_terminate = states[0].item() == 0
-            operation_terminated = states[1].item() == 1
-        can_terminate = can_terminate or operation_terminated
-        return can_terminate
 
     def terminate_prefetch(self, req_id: str):
         if req_id not in self.ongoing_prefetch:
@@ -1847,36 +1841,36 @@ class HiMambaRadixCache(MambaRadixCache):
         if req_id not in self.ongoing_prefetch:
             return True
 
-        last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[
-            req_id
-        ]
-
-        if not self.can_terminate_prefetch(operation):
+        _, _, _, operation = self.ongoing_prefetch[req_id]
+        should_terminate = operation.is_terminated() or self.can_terminate_prefetch(
+            operation
+        )
+        should_terminate_tensor = torch.tensor(int(should_terminate), dtype=torch.int)
+        if self.tp_world_size > 1:
+            torch.distributed.all_reduce(
+                should_terminate_tensor,
+                op=torch.distributed.ReduceOp.MAX,
+                group=self.tp_group,
+            )
+        if should_terminate_tensor.item() != 1:
             return False
 
+        self.cache_controller.terminate_prefetch(operation)
         if operation.host_indices is None:
             # Stopping before host memory was committed (best_effort, timeout,
             # or still mid-query): signal the worker to stop, then release the request.
-            self.cache_controller.terminate_prefetch(operation)
             self._revoke_pending_prefetch(req_id)
-            return True
+        else:
+            self._handle_prefetch_result(operation)
+        return True
 
+    def _handle_prefetch_result(self, operation: PrefetchOperation) -> None:
+        req_id = operation.request_id
+        last_host_node, token_ids, _, operation = self.ongoing_prefetch.pop(req_id)
         host_indices = operation.host_indices
-        completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
-            operation
-        )
-
+        completed_tokens = operation.completed_tokens
         min_completed_tokens = completed_tokens
-        if self.tp_world_size > 1:
-            completed_tokens_tensor = torch.tensor(
-                min_completed_tokens, dtype=torch.int
-            )
-            torch.distributed.all_reduce(
-                completed_tokens_tensor,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
-            )
-            min_completed_tokens = completed_tokens_tensor.item()
+        hash_value = operation.hash_value
 
         mamba_host_indices = None
         mamba_loaded = False
@@ -1907,18 +1901,13 @@ class HiMambaRadixCache(MambaRadixCache):
 
         # Free host KV memory: matched portion is already in tree, tail was unused
         self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
-        self.cache_controller.append_host_mem_release(
-            host_indices[min_completed_tokens:completed_tokens]
-        )
-
         # Free mamba host slot if it wasn't inserted into the tree
-        if mamba_host_indices is not None:
+        if mamba_host_indices is not None and operation.pool_transfers_done:
             inserted_new = matched_length < min_completed_tokens
             if not inserted_new or not mamba_loaded:
                 self.mamba_pool_host.free(mamba_host_indices)
 
         self._release_host_node(last_host_node)
-        del self.ongoing_prefetch[req_id]
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
 
         loaded_from_storage = min_completed_tokens - matched_length
@@ -1934,7 +1923,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 int(mamba_loaded),
             )
 
-        return True
+        return
 
     def _insert_helper_host(
         self,
@@ -2005,13 +1994,14 @@ class HiMambaRadixCache(MambaRadixCache):
             self._revoke_pending_prefetch(rid)
             return
 
-        completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
-        if self.tp_world_size > 1:
-            torch.distributed.barrier(group=self.tp_group)
+        self.cache_controller.terminate_prefetch(operation)
         self._release_host_node(last_host_node)
         del self.ongoing_prefetch[rid]
-        self.cache_controller.append_host_mem_release(host_indices[:completed_tokens])
-        self.prefetch_abort(operation.pool_transfers)
+        self.cache_controller.append_host_mem_release(
+            host_indices[: operation.completed_tokens]
+        )
+        if operation.pool_transfers_done:
+            self.prefetch_abort(operation.pool_transfers)
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
 
     def _flush_pending_storage_backups_before_reset(self) -> None:

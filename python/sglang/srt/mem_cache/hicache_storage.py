@@ -131,18 +131,17 @@ class PoolTransferResult:
         """Accumulate kv_hit_pages across batches (max = last successful batch)."""
         self.kv_hit_pages = max(self.kv_hit_pages, kv_hit_pages)
 
-    def update_extra_pool_hit_pages(self, results: dict[str, List[bool]]) -> None:
-        """Record actual load/write success counts per extra pool.
+    def update_extra_pool_hit_pages(self, results: dict[str, int]) -> None:
+        """Record actual load/write success counts per extra pool."""
+        self.extra_pool_hit_pages.update(results)
 
-        Every extra pool contributes a prefix that must be contiguous from the
-        start, so count the leading run of successes
-        """
-        self.extra_pool_hit_pages.update(
-            {
-                name: (rs.index(False) if False in rs else len(rs))
-                for name, rs in results.items()
-            }
-        )
+
+def count_pool_hits(results: dict[str, List[bool]]) -> dict[str, int]:
+    """Count the leading contiguous successful pages for each pool."""
+    return {
+        name: (rs.index(False) if False in rs else len(rs))
+        for name, rs in results.items()
+    }
 
 
 class HiCacheStorage(ABC):
