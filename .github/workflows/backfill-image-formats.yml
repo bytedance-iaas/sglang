@@ -54,6 +54,7 @@ jobs:
       VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
       VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
       NYDUS_VERSION: "2.3.0"
+      DEFAULT_SGLANG_VERSION: "0.5.18"
     steps:
       - name: Delete huge unnecessary tools folder
         run: rm -rf /opt/hostedtoolcache
@@ -201,9 +202,10 @@ jobs:
               fi
 
               if [ -z "${version}" ]; then
-                echo "  ERROR: unable to determine a non-placeholder sglang version from the tag, container, build commit, or image metadata" >&2
+                version="${DEFAULT_SGLANG_VERSION}"
+                echo "  WARNING: unable to determine a non-placeholder sglang version from the tag, container, build commit, or image metadata" >&2
                 echo "  Source image: ${source_ref}" >&2
-                return 1
+                echo "  Falling back to default sglang version: ${version}" >&2
               fi
             fi
             echo "  Using sglang version: ${version}" >&2
