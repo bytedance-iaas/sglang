@@ -730,6 +730,167 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             self.assertTrue(torch.all(mapping == 0))
             self.assertTrue(torch.all(coordinator.req_to_device_buffer == 0))
 
+    def test_dsv4_page_boundary_rehomes_24_temporary_pages_without_leak(self):
+        """Every speculative C4 page is released before its mapping is replaced.
+
+        A 1,500-token generation crosses about 24 logical 64-token boundaries.
+        At each boundary EAGLE has reserved a complete temporary C4 page, while
+        only its first semantic slot is about to be remapped to the stable
+        request buffer.  Repeating that transaction must not strand one page per
+        boundary.
+        """
+        c4_page_size = 16
+        num_boundaries = 24
+        physical = _PhysicalPageAllocator(
+            page_size=c4_page_size, num_pages=num_boundaries + 2
+        )
+        mapping = torch.zeros(
+            num_boundaries * c4_page_size + c4_page_size, dtype=torch.int64
+        )
+        allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
+        allocator.compress_ratio = 4
+        allocator.page_size = 64
+        allocator.hisparse_page_size = c4_page_size
+        allocator.hisparse_attn_allocator = physical
+        allocator.full_to_hisparse_device_index_mapping = mapping
+        allocator._page_ownership = _HiSparsePageOwnership(
+            mapping=mapping, child_allocator=physical, page_size=c4_page_size
+        )
+        allocator.get_last_loc_compressed = lambda locs: locs.to(torch.int64)
+
+        coordinator = object.__new__(HiSparseCoordinator)
+        coordinator.device = torch.device("cpu")
+        coordinator.token_to_kv_pool_allocator = allocator
+        coordinator.mem_pool_device = SimpleNamespace(
+            page_size=c4_page_size,
+            full_to_hisparse_device_index_mapping=mapping,
+        )
+        coordinator.is_dsv4_hisparse = True
+        coordinator.compress_ratio = 4
+        coordinator.device_buffer_size = c4_page_size
+        coordinator.padded_buffer_size = 2 * c4_page_size
+        coordinator.req_to_device_buffer = torch.zeros(
+            (1, coordinator.padded_buffer_size), dtype=torch.int64
+        )
+        coordinator.req_device_buffer_size = torch.tensor(
+            [coordinator.padded_buffer_size], dtype=torch.int64
+        )
+        coordinator.req_device_buffer_token_locs = torch.zeros(
+            (1, 1, coordinator.padded_buffer_size), dtype=torch.int32
+        )
+        coordinator.req_device_buffer_tokens = torch.full(
+            (1, 1, coordinator.padded_buffer_size), -1, dtype=torch.int32
+        )
+        coordinator._eager_backup_previous_token = lambda *args: None
+        coordinator.advance_dynamic_residency = lambda *args: None
+        coordinator._is_resident = lambda req_idx: False
+        coordinator._grow_device_buffers = (
+            lambda *args: coordinator.req_to_device_buffer[
+                torch.tensor([0]), torch.tensor([coordinator.device_buffer_size])
+            ]
+        )
+
+        stable_buffer = torch.cat(
+            [physical.alloc(c4_page_size), physical.alloc(c4_page_size)]
+        )
+        allocator.claim_hisparse_ownership(stable_buffer)
+        coordinator.req_to_device_buffer[0].copy_(stable_buffer)
+        initial_available = physical.size
+        expected_during_request = initial_available - stable_buffer.numel()
+
+        for boundary in range(num_boundaries):
+            mapping_start = boundary * c4_page_size
+            temporary_page = physical.alloc(c4_page_size)
+            mapping[mapping_start : mapping_start + c4_page_size] = temporary_page
+            full_seq_len = (mapping_start + 1) * allocator.compress_ratio
+
+            coordinator.map_last_loc_to_buffer(
+                seq_lens=torch.tensor([full_seq_len], dtype=torch.int64),
+                out_cache_loc=torch.tensor([mapping_start], dtype=torch.int64),
+                req_pool_indices=torch.tensor([0], dtype=torch.int64),
+                seq_lens_cpu=torch.tensor([full_seq_len], dtype=torch.int64),
+                req_pool_indices_cpu=torch.tensor([0], dtype=torch.int64),
+            )
+
+            self.assertEqual(
+                physical.available_size(),
+                expected_during_request,
+                f"temporary C4 page leaked at boundary {boundary}",
+            )
+
+        allocator.release_hisparse_ownership(
+            mapping_indices=torch.arange(mapping.numel(), dtype=torch.int64),
+            extra_owned_coordinates=stable_buffer,
+            clear_extra_owner=lambda: coordinator.req_to_device_buffer.zero_(),
+        )
+        self.assertEqual(physical.available_size(), initial_available)
+        self.assertEqual(physical.used_pages, set())
+        self.assertEqual(len(physical.free_pages), len(set(physical.free_pages)))
+        self.assertTrue(torch.all(mapping == 0))
+
+    def test_dsv4_boundary_rehome_rejects_existing_side_buffer_alias(self):
+        """A temporary page cannot simultaneously have two canonical owners."""
+        c4_page_size = 16
+        physical = _PhysicalPageAllocator(page_size=c4_page_size, num_pages=3)
+        mapping = torch.zeros(2 * c4_page_size, dtype=torch.int64)
+        allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
+        allocator.compress_ratio = 4
+        allocator.page_size = 64
+        allocator.hisparse_page_size = c4_page_size
+        allocator.hisparse_attn_allocator = physical
+        allocator.full_to_hisparse_device_index_mapping = mapping
+        allocator._page_ownership = _HiSparsePageOwnership(
+            mapping=mapping, child_allocator=physical, page_size=c4_page_size
+        )
+        allocator.get_last_loc_compressed = lambda locs: locs.to(torch.int64)
+
+        temporary_page = physical.alloc(c4_page_size)
+        mapping[:c4_page_size] = temporary_page
+        stable_page = physical.alloc(c4_page_size)
+
+        coordinator = object.__new__(HiSparseCoordinator)
+        coordinator.device = torch.device("cpu")
+        coordinator.token_to_kv_pool_allocator = allocator
+        coordinator.mem_pool_device = SimpleNamespace(
+            page_size=c4_page_size,
+            full_to_hisparse_device_index_mapping=mapping,
+        )
+        coordinator.is_dsv4_hisparse = True
+        coordinator.compress_ratio = 4
+        coordinator.device_buffer_size = c4_page_size
+        coordinator.padded_buffer_size = 2 * c4_page_size
+        coordinator.req_to_device_buffer = torch.zeros(
+            (1, coordinator.padded_buffer_size), dtype=torch.int64
+        )
+        coordinator.req_to_device_buffer[0, :c4_page_size] = temporary_page
+        coordinator.req_to_device_buffer[0, c4_page_size:] = stable_page
+        coordinator.req_device_buffer_size = torch.tensor(
+            [coordinator.padded_buffer_size], dtype=torch.int64
+        )
+        coordinator.req_device_buffer_token_locs = torch.zeros(
+            (1, 1, coordinator.padded_buffer_size), dtype=torch.int32
+        )
+        coordinator.req_device_buffer_tokens = torch.full(
+            (1, 1, coordinator.padded_buffer_size), -1, dtype=torch.int32
+        )
+        coordinator._eager_backup_previous_token = lambda *args: None
+        coordinator.advance_dynamic_residency = lambda *args: None
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "temporary pages must not already belong to a device buffer",
+        ):
+            coordinator.map_last_loc_to_buffer(
+                seq_lens=torch.tensor([4], dtype=torch.int64),
+                out_cache_loc=torch.tensor([0], dtype=torch.int64),
+                req_pool_indices=torch.tensor([0], dtype=torch.int64),
+                seq_lens_cpu=torch.tensor([4], dtype=torch.int64),
+                req_pool_indices_cpu=torch.tensor([0], dtype=torch.int64),
+            )
+
+        self.assertTrue(torch.equal(mapping[:c4_page_size], temporary_page))
+        self.assertEqual(physical.used_pages, {1, 2})
+
     def test_dsv4_extend_allocates_owner_for_direct_pd_partial_page(self):
         """A host-only prompt tail must not continue in sentinel page zero."""
         compress_ratio = 4

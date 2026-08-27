@@ -202,6 +202,36 @@ class _HiSparsePageOwnership:
             (page_ids[:, None] * self.page_size + offsets).reshape(-1)
         )
 
+    def rehome_temporary_pages(
+        self,
+        *,
+        mapping_indices: torch.Tensor,
+        retained_page_ids: torch.Tensor,
+        install_retained_owner: Callable[[], None],
+    ) -> None:
+        """Transfer or release complete temporary pages before remapping them."""
+        assert self.child_allocator.is_not_in_free_group
+        coordinates = self.mapping[mapping_indices]
+        owned_page_ids = self._page_ids(coordinates)
+        retained_page_ids = _stable_unique_page_ids(
+            retained_page_ids.to(device=owned_page_ids.device, dtype=torch.int64)
+        )
+        if retained_page_ids.numel() > 0 and torch.any(
+            ~torch.isin(retained_page_ids, owned_page_ids)
+        ):
+            raise RuntimeError(
+                "Retained HiSparse pages must belong to the temporary mapping owner"
+            )
+
+        # Remove the temporary mapping owner first.  The callback then installs
+        # the durable side-buffer owner before any released page can be reused.
+        self.mapping[mapping_indices] = 0
+        install_retained_owner()
+        released_page_ids = owned_page_ids[
+            ~torch.isin(owned_page_ids, retained_page_ids)
+        ]
+        self.release_mapped_pages(released_page_ids)
+
     def release(
         self,
         *,
@@ -408,6 +438,10 @@ class HiSparseTokenToKVPoolAllocator(HiSparseDemotionMixin, BaseTokenToKVPoolAll
     def size(self) -> int:
         return self._size_full
 
+    @property
+    def hisparse_device_page_size(self) -> int:
+        return self.page_size
+
     def available_size(self) -> int:
         return min(
             self.logical_attn_allocator.available_size(),
@@ -588,6 +622,19 @@ class HiSparseTokenToKVPoolAllocator(HiSparseDemotionMixin, BaseTokenToKVPoolAll
 
     def release_hisparse_mapped_pages(self, page_ids: torch.Tensor) -> None:
         self._page_ownership.release_mapped_pages(page_ids)
+
+    def rehome_temporary_hisparse_pages(
+        self,
+        *,
+        mapping_indices: torch.Tensor,
+        retained_page_ids: torch.Tensor,
+        install_retained_owner: Callable[[], None],
+    ) -> None:
+        self._page_ownership.rehome_temporary_pages(
+            mapping_indices=mapping_indices,
+            retained_page_ids=retained_page_ids,
+            install_retained_owner=install_retained_owner,
+        )
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
         return last_locs
@@ -853,6 +900,10 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(
         return self.logical_attn_allocator.size_swa
 
     @property
+    def hisparse_device_page_size(self) -> int:
+        return self.hisparse_page_size
+
+    @property
     def full_to_swa_index_mapping(self):
         return self.logical_attn_allocator.full_to_swa_index_mapping
 
@@ -1016,6 +1067,19 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(
 
     def release_hisparse_mapped_pages(self, page_ids: torch.Tensor) -> None:
         self._page_ownership.release_mapped_pages(page_ids)
+
+    def rehome_temporary_hisparse_pages(
+        self,
+        *,
+        mapping_indices: torch.Tensor,
+        retained_page_ids: torch.Tensor,
+        install_retained_owner: Callable[[], None],
+    ) -> None:
+        self._page_ownership.rehome_temporary_pages(
+            mapping_indices=mapping_indices,
+            retained_page_ids=retained_page_ids,
+            install_retained_owner=install_retained_owner,
+        )
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
         return (last_locs - 3) // self.compress_ratio
