@@ -42,12 +42,37 @@ RUN if [ -n "$UBUNTU_MIRROR" ]; then \
     sed -i "s|http://.*security.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list; \
 fi
 
+RUN cat <<'EOF' >/usr/local/bin/apt-install-with-retry
+#!/bin/sh
+set -eu
+
+attempt=1
+max_attempts="${APT_INSTALL_MAX_ATTEMPTS:-3}"
+
+while :; do
+    rm -rf /var/lib/apt/lists/*
+    if apt-get -o Acquire::Retries=5 -o Acquire::http::No-Cache=true -o Acquire::https::No-Cache=true update \
+        && apt-get -o Acquire::Retries=5 -o Acquire::http::No-Cache=true -o Acquire::https::No-Cache=true install -y --no-install-recommends "$@"; then
+        exit 0
+    fi
+
+    if [ "$attempt" -ge "$max_attempts" ]; then
+        exit 1
+    fi
+
+    sleep $((attempt * 10))
+    attempt=$((attempt + 1))
+done
+EOF
+
+RUN chmod +x /usr/local/bin/apt-install-with-retry
+
 # Python setup (combined with apt update to reduce layers)
 # Ubuntu 24.04 ships Python 3.12 in main, so we no longer need the deadsnakes
 # PPA. Dropping it avoids transient Launchpad 504s in `add-apt-repository`.
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
-    apt update && apt install -y --no-install-recommends wget software-properties-common \
-    && apt install -y --no-install-recommends python3.12-full python3.12-dev \
+    apt-install-with-retry wget software-properties-common \
+    && apt-install-with-retry python3.12-full python3.12-dev \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
     && wget -q https://bootstrap.pypa.io/get-pip.py \
@@ -61,7 +86,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
 
 # Install system dependencies (organized by category for better caching)
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
-    apt-get update && apt-get install -y --no-install-recommends \
+    apt-install-with-retry \
     # Core system utilities
     ca-certificates \
     software-properties-common \

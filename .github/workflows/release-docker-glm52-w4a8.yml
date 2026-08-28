@@ -83,6 +83,7 @@ jobs:
             --build-arg BRANCH_TYPE=local \
             --build-arg GRACE_BLACKWELL=0 \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com \
             --build-arg CMAKE_BUILD_PARALLEL_LEVEL="$(nproc)" \
             --build-arg SGLANG_BUILD_COMMIT="$SOURCE_COMMIT" \
             --build-arg SGLANG_SOURCE_TREE="$SOURCE_TREE" \
