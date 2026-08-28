@@ -20,6 +20,7 @@ jobs:
     env:
       IMAGE_REPO: iaas-gpu-cn-beijing.cr.volces.com/serving/sglang
       REGISTRY_HOST: iaas-gpu-cn-beijing.cr.volces.com
+      SGL_DEEP_GEMM_COMMIT: aee79a715951a3d47dbbbdbd5387d8be8a131d53
       VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
       VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
     steps:
@@ -83,6 +84,7 @@ jobs:
             --build-arg BRANCH_TYPE=local \
             --build-arg GRACE_BLACKWELL=0 \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            --build-arg SGL_DEEP_GEMM_COMMIT="$SGL_DEEP_GEMM_COMMIT" \
             --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com \
             --build-arg CMAKE_BUILD_PARALLEL_LEVEL="$(nproc)" \
             --build-arg SGLANG_BUILD_COMMIT="$SOURCE_COMMIT" \
@@ -118,5 +120,7 @@ jobs:
             git -C /glm52/sglang diff --quiet -- .
             git -C /glm52/sglang diff --cached --quiet -- .
             test "$(readlink -f /sgl-workspace/sglang)" = /glm52/sglang
+            test "$(cat /opt/sgl-deep-gemm/source-commit)" = "$3"
             PYTHONPATH=/glm52/sglang/python python3 -c '\''import importlib.machinery, pathlib; expected = pathlib.Path("/glm52/sglang/python/sglang/__init__.py"); actual = pathlib.Path(importlib.machinery.PathFinder.find_spec("sglang").origin).resolve(); assert actual == expected'\''
-          ' -- "$SOURCE_COMMIT" "$SOURCE_TREE"
+            python3 -c '\''import deep_gemm, deep_gemm._C as C; assert callable(getattr(deep_gemm, "fp8_fp4_mega_moe", None)); assert callable(getattr(deep_gemm, "mega_moe_pre_dispatch_sm90", None)); assert callable(getattr(C, "fp8_fp4_mega_moe_sm90", None))'\''
+          ' -- "$SOURCE_COMMIT" "$SOURCE_TREE" "$SGL_DEEP_GEMM_COMMIT"
