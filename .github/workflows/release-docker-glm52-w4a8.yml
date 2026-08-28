@@ -30,6 +30,14 @@ jobs:
       - name: Cleanup workspace
         run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
 
+      - name: Prune stale Docker data
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx prune --filter "until=72h" -f
+          docker system prune -af --filter "until=72h"
+          df -h /
+
       - name: Checkout exact task branch
         uses: actions/checkout@v4
         with:
@@ -85,7 +93,9 @@ jobs:
             --build-arg GRACE_BLACKWELL=0 \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
             --build-arg SGL_DEEP_GEMM_COMMIT="$SGL_DEEP_GEMM_COMMIT" \
-            --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com \
+            --build-arg UBUNTU_MIRROR=https://mirrors.byted.org \
+            --build-arg DISABLE_CUDA_APT_REPOSITORY=1 \
+            --build-arg INSTALL_NSIGHT_SYSTEMS=0 \
             --build-arg CMAKE_BUILD_PARALLEL_LEVEL="$(nproc)" \
             --build-arg SGLANG_BUILD_COMMIT="$SOURCE_COMMIT" \
             --build-arg SGLANG_SOURCE_TREE="$SOURCE_TREE" \

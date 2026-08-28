@@ -18,6 +18,8 @@ ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
+ARG DISABLE_CUDA_APT_REPOSITORY=0
+ARG INSTALL_NSIGHT_SYSTEMS=1
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
 ARG FLASHINFER_VERSION=0.6.15.post1
@@ -37,11 +39,31 @@ ENV DEBIAN_FRONTEND=noninteractive \
 ENV PATH="${PATH}:/usr/local/nvidia/bin" \
     LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
 
-# Replace Ubuntu sources if specified
-RUN if [ -n "$UBUNTU_MIRROR" ]; then \
-    sed -i "s|http://.*archive.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list && \
-    sed -i "s|http://.*security.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list; \
-fi
+# Replace both legacy and Ubuntu 24.04 deb822 sources when requested. The
+# CUDA base image already contains the runtime/toolkit; qualification builds
+# may disable its external apt repository when only Ubuntu packages are needed.
+RUN set -eux; \
+    if [ -n "$UBUNTU_MIRROR" ]; then \
+        for sources_file in \
+            /etc/apt/sources.list \
+            /etc/apt/sources.list.d/ubuntu.sources; do \
+            if [ -f "$sources_file" ]; then \
+                sed -i \
+                    -e "s|http://[^[:space:]/]*archive.ubuntu.com/ubuntu|$UBUNTU_MIRROR/ubuntu|g" \
+                    -e "s|http://[^[:space:]/]*security.ubuntu.com/ubuntu|$UBUNTU_MIRROR/ubuntu|g" \
+                    "$sources_file"; \
+            fi; \
+        done; \
+    fi; \
+    if [ "$DISABLE_CUDA_APT_REPOSITORY" = "1" ]; then \
+        mkdir -p /etc/apt/sources.list.d.disabled; \
+        for cuda_source in /etc/apt/sources.list.d/*; do \
+            [ -f "$cuda_source" ] || continue; \
+            if grep -q 'developer.download.nvidia.com/compute/cuda/repos' "$cuda_source"; then \
+                mv "$cuda_source" /etc/apt/sources.list.d.disabled/; \
+            fi; \
+        done; \
+    fi
 
 RUN cat <<'EOF' >/usr/local/bin/apt-install-with-retry
 #!/bin/sh
@@ -551,6 +573,7 @@ ARG GITHUB_ARTIFACTORY
 ARG MOONCAKE_VERSION
 ARG MOONCAKE_COMPILE_ARG
 ARG MSCCLPP_VERSION
+ARG INSTALL_NSIGHT_SYSTEMS
 
 WORKDIR /sgl-workspace
 
@@ -629,12 +652,14 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
 
 # Install NVIDIA development tools
 RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
-    apt update -y \
-    && apt install -y --no-install-recommends gnupg \
-    && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
-    && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "x86_64"; fi)/7fa2af80.pub \
-    && apt update -y \
-    && apt install -y --no-install-recommends nsight-systems-cli \
+    if [ "$INSTALL_NSIGHT_SYSTEMS" = "1" ]; then \
+        apt update -y \
+        && apt install -y --no-install-recommends gnupg \
+        && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
+        && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "x86_64"; fi)/7fa2af80.pub \
+        && apt update -y \
+        && apt install -y --no-install-recommends nsight-systems-cli; \
+    fi \
     && rm -rf /var/lib/apt/lists/*
 
 # =============================================================================
