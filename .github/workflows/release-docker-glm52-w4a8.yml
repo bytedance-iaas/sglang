@@ -93,7 +93,7 @@ jobs:
             --build-arg GRACE_BLACKWELL=0 \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
             --build-arg SGL_DEEP_GEMM_COMMIT="$SGL_DEEP_GEMM_COMMIT" \
-            --build-arg UBUNTU_MIRROR=https://mirrors.byted.org \
+            --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com \
             --build-arg DISABLE_CUDA_APT_REPOSITORY=1 \
             --build-arg INSTALL_NSIGHT_SYSTEMS=0 \
             --build-arg CMAKE_BUILD_PARALLEL_LEVEL="$(nproc)" \
