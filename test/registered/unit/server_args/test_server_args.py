@@ -93,11 +93,14 @@ class TestPrepareServerArgs(CustomTestCase):
                 "fit_first",
                 "--disaggregation-decode-admission-max-bypasses",
                 "4",
+                "--disaggregation-decode-max-inflight-transfers",
+                "6",
             ]
         )
 
         self.assertEqual(args.disaggregation_decode_admission_policy, "fit_first")
         self.assertEqual(args.disaggregation_decode_admission_max_bypasses, 4)
+        self.assertEqual(args.disaggregation_decode_max_inflight_transfers, 6)
 
     def test_config_nested_dict_args_are_json(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
@@ -383,6 +386,49 @@ class TestLoadBalanceMethod(unittest.TestCase):
             "--disaggregation-decode-admission-max-bypasses must be >= 0",
         ):
             server_args._handle_pd_disaggregation()
+
+    def test_pd_decode_rejects_invalid_transfer_window(self):
+        for invalid_value in (0, -1, True, 1.5):
+            with self.subTest(invalid_value=invalid_value):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    disaggregation_mode="decode",
+                    disaggregation_decode_max_inflight_transfers=invalid_value,
+                )
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "--disaggregation-decode-max-inflight-transfers must be an "
+                    "integer > 0",
+                ):
+                    server_args._handle_pd_disaggregation()
+
+    def test_pd_decode_transfer_window_requires_pp1(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_max_inflight_transfers=4,
+            pp_size=2,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "--disaggregation-decode-max-inflight-transfers currently requires "
+            "--pp-size 1",
+        ):
+            server_args._handle_pd_disaggregation()
+
+    def test_pd_decode_transfer_window_accepts_pp1(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_max_inflight_transfers=4,
+            pp_size=1,
+        )
+
+        server_args._handle_pd_disaggregation()
+
+        self.assertEqual(server_args.disaggregation_decode_max_inflight_transfers, 4)
 
 
 class TestSkipTokenizerInit(unittest.TestCase):

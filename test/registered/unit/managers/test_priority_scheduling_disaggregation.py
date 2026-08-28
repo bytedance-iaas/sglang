@@ -120,6 +120,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         priority_scheduling: bool = True,
         admission_policy: str = "fifo",
         admission_max_bypasses: int = 8,
+        max_inflight_transfers: int | None = None,
         allocatable_tokens: int = 1000,
     ):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
@@ -167,6 +168,9 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         scheduler.server_args.disaggregation_decode_admission_policy = admission_policy
         scheduler.server_args.disaggregation_decode_admission_max_bypasses = (
             admission_max_bypasses
+        )
+        scheduler.server_args.disaggregation_decode_max_inflight_transfers = (
+            max_inflight_transfers
         )
         scheduler.enable_hisparse = False
         scheduler.waiting_queue = []
@@ -244,9 +248,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue.kv_manager.waiting_timeout = 5
         receiver = decode_req.kv_receiver
 
-        with patch(
-            "sglang.srt.disaggregation.decode.time.time", return_value=20.0
-        ):
+        with patch("sglang.srt.disaggregation.decode.time.time", return_value=20.0):
             preallocated, failed = queue.pop_preallocated()
 
         self.assertEqual(preallocated, [])
@@ -282,10 +284,8 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
             queue.kv_manager.waiting_timeout = 5
             queue.tp_rank = 0
             queue.scheduler.metrics_reporter.enable_metrics = False
-            queue._update_handshake_waiters = (
-                lambda rids_to_check=None, pp_good_rids=None, pp_bad_rids=None, q=queue: DecodePreallocQueue._update_handshake_waiters(
-                    q, rids_to_check, pp_good_rids, pp_bad_rids
-                )
+            queue._update_handshake_waiters = lambda rids_to_check=None, pp_good_rids=None, pp_bad_rids=None, q=queue: DecodePreallocQueue._update_handshake_waiters(
+                q, rids_to_check, pp_good_rids, pp_bad_rids
             )
 
         stage0 = SimpleNamespace(
@@ -301,9 +301,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
             _route_aborts_to_bad=SchedulerPPMixin._route_aborts_to_bad,
         )
 
-        with patch(
-            "sglang.srt.disaggregation.decode.time.time", return_value=20.0
-        ):
+        with patch("sglang.srt.disaggregation.decode.time.time", return_value=20.0):
             stage0_consensus = SchedulerPPMixin._pp_pd_get_prealloc_ids(stage0)
             stage1._pp_recv_pyobj_from_prev_stage = MagicMock(
                 return_value=stage0_consensus
@@ -404,6 +402,109 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         self.assertEqual(preallocated, [])
         self.assertEqual(failed, [])
         self.assertEqual([req.req.rid for req in queue.queue], ["long", "short"])
+
+    def test_full_transfer_window_keeps_request_before_metadata(self):
+        queued = self._new_decode_req("queued", 0)
+        queue = self._new_queue(
+            [queued],
+            priority_scheduling=False,
+            max_inflight_transfers=2,
+        )
+        queue.transfer_queue.queue = [object(), object()]
+
+        with patch("sglang.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 0):
+            preallocated, failed = queue.pop_preallocated()
+
+        self.assertEqual(preallocated, [])
+        self.assertEqual(failed, [])
+        self.assertEqual(queue.queue, [queued])
+        queue._pre_alloc.assert_not_called()
+        queued.kv_receiver.send_metadata.assert_not_called()
+        queued.kv_receiver.renew_bootstrap_lease.assert_called_once_with()
+
+    def test_transfer_window_counts_new_admissions_in_same_poll(self):
+        first = self._new_decode_req("first", 0)
+        second = self._new_decode_req("second", 0)
+        queue = self._new_queue(
+            [first, second],
+            priority_scheduling=False,
+            max_inflight_transfers=1,
+        )
+
+        with patch("sglang.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 0):
+            preallocated, failed = queue.pop_preallocated()
+
+        self.assertEqual([req.req.rid for req in preallocated], ["first"])
+        self.assertEqual(failed, [])
+        self.assertEqual(queue.queue, [second])
+        first.kv_receiver.send_metadata.assert_called_once()
+        second.kv_receiver.send_metadata.assert_not_called()
+
+    def test_transfer_window_reopens_after_queue_entry_is_drained(self):
+        first = self._new_decode_req("first", 0)
+        second = self._new_decode_req("second", 0)
+        queue = self._new_queue(
+            [first, second],
+            priority_scheduling=False,
+            max_inflight_transfers=1,
+        )
+
+        with patch("sglang.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 0):
+            admitted, failed = queue.pop_preallocated()
+            queue.transfer_queue.queue.extend(admitted)
+            blocked, blocked_failed = queue.pop_preallocated()
+            queue.transfer_queue.queue.clear()
+            reopened, reopened_failed = queue.pop_preallocated()
+
+        self.assertEqual([req.req.rid for req in admitted], ["first"])
+        self.assertEqual(failed, [])
+        self.assertEqual(blocked, [])
+        self.assertEqual(blocked_failed, [])
+        self.assertEqual([req.req.rid for req in reopened], ["second"])
+        self.assertEqual(reopened_failed, [])
+        self.assertEqual(queue.queue, [])
+        first.kv_receiver.send_metadata.assert_called_once()
+        second.kv_receiver.send_metadata.assert_called_once()
+        second.kv_receiver.renew_bootstrap_lease.assert_called()
+
+    def test_transfer_window_runtime_guard_rejects_pp(self):
+        queued = self._new_decode_req("queued", 0)
+        queue = self._new_queue(
+            [queued],
+            priority_scheduling=False,
+            max_inflight_transfers=1,
+        )
+        queue.pp_size = 2
+
+        with self.assertRaisesRegex(
+            RuntimeError, "transfer admission windows require pp_size=1"
+        ):
+            queue.pop_preallocated(pp_good_rids=["queued"], pp_bad_rids=[])
+
+        queue._pre_alloc.assert_not_called()
+        queued.kv_receiver.send_metadata.assert_not_called()
+
+    def test_transfer_window_does_not_consume_credit_when_slot_pool_is_full(self):
+        first = self._new_decode_req("first", 0)
+        second = self._new_decode_req("second", 0)
+        queue = self._new_queue(
+            [first, second],
+            priority_scheduling=False,
+            max_inflight_transfers=1,
+        )
+        queue.req_to_token_pool.available_size.side_effect = [0, 100]
+
+        with patch("sglang.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 0):
+            blocked, blocked_failed = queue.pop_preallocated()
+            admitted, admitted_failed = queue.pop_preallocated()
+
+        self.assertEqual(blocked, [])
+        self.assertEqual(blocked_failed, [])
+        self.assertEqual([req.req.rid for req in admitted], ["first"])
+        self.assertEqual(admitted_failed, [])
+        self.assertEqual([req.req.rid for req in queue.queue], ["second"])
+        first.kv_receiver.send_metadata.assert_called_once()
+        second.kv_receiver.send_metadata.assert_not_called()
 
 
 class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):

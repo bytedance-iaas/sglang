@@ -1058,6 +1058,28 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         remains authoritative: only requests with the same priority may pass.
         """
         is_pp_mode = self.pp_size > 1
+        max_inflight_transfers = getattr(
+            self.scheduler.server_args,
+            "disaggregation_decode_max_inflight_transfers",
+            None,
+        )
+        # ``type(...) is int`` intentionally excludes bool and preserves
+        # compatibility with lightweight test doubles whose missing attributes
+        # may materialize as mocks. Real ServerArgs values are validated in the
+        # PD hook before scheduler construction.
+        configured_transfer_window = (
+            max_inflight_transfers if type(max_inflight_transfers) is int else None
+        )
+        if configured_transfer_window is not None:
+            if configured_transfer_window <= 0:
+                raise ValueError(
+                    "Decode transfer admission window must be an integer > 0"
+                )
+            if is_pp_mode:
+                raise RuntimeError(
+                    "Decode transfer admission windows require pp_size=1; "
+                    "rank-local transfer queue occupancy is not PP-consistent"
+                )
         if is_pp_mode and (pp_good_rids is None or pp_bad_rids is None):
             raise ValueError("PP consensus is required when pp_size > 1")
         if is_pp_mode and rids_to_check is not None:
@@ -1151,6 +1173,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 - len(self.transfer_queue.queue),
             )
 
+        # ``send_metadata`` starts the receiver's WaitingForInput timeout.  A
+        # large long-context burst can otherwise move every request across that
+        # boundary even though Prefill can only make progress on a much smaller
+        # set.  Keep excess requests in this preallocation queue: their
+        # generation-scoped bootstrap lease is renewed above, while requests
+        # that did cross the boundary retain the bounded transfer watchdog.
+        if configured_transfer_window is not None:
+            transfer_window_budget = max(
+                0, configured_transfer_window - len(self.transfer_queue.queue)
+            )
+        else:
+            # Compatibility with older configs and lightweight test doubles.
+            transfer_window_budget = float("inf")
+
         admission_policy = getattr(
             self.scheduler.server_args,
             "disaggregation_decode_admission_policy",
@@ -1174,6 +1210,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             if not decode_req.waiting_for_input:
                 continue
+
+            if transfer_window_budget <= 0:
+                break
 
             if memory_blocked_reqs:
                 if any(
@@ -1509,6 +1548,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
+            transfer_window_budget -= 1
             for blocked_req in memory_blocked_reqs:
                 blocked_req.admission_bypass_count += 1
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()

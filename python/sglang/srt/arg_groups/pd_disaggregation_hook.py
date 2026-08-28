@@ -20,6 +20,26 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             "--disaggregation-decode-admission-max-bypasses must be >= 0, "
             f"got {server_args.disaggregation_decode_admission_max_bypasses}"
         )
+    max_inflight_transfers = server_args.disaggregation_decode_max_inflight_transfers
+    if max_inflight_transfers is not None and (
+        isinstance(max_inflight_transfers, bool)
+        or not isinstance(max_inflight_transfers, int)
+        or max_inflight_transfers <= 0
+    ):
+        raise ValueError(
+            "--disaggregation-decode-max-inflight-transfers must be an integer "
+            f"> 0, got {max_inflight_transfers!r}"
+        )
+    if (
+        server_args.disaggregation_mode == "decode"
+        and max_inflight_transfers is not None
+        and server_args.pp_size > 1
+    ):
+        raise ValueError(
+            "--disaggregation-decode-max-inflight-transfers currently requires "
+            "--pp-size 1 on decode servers; PP stages can have different "
+            "local transfer-queue occupancy"
+        )
 
     # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP
     # so mooncake installs TcpTransport instead of RDMA, rewrite the backend to
@@ -59,6 +79,11 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             )
 
     if server_args.disaggregation_mode == "decode":
+        if max_inflight_transfers is not None:
+            logger.info(
+                "Decode post-metadata KV transfers are bounded to %d per DP worker",
+                max_inflight_transfers,
+            )
         if server_args.disaggregation_decode_admission_policy == "fit_first":
             logger.warning(
                 "EXPERIMENTAL: fit-first decode admission is enabled; only "

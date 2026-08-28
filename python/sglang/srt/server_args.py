@@ -3016,6 +3016,11 @@ class ServerArgs:
         int,
         "Maximum number of later same-priority requests that may pass a memory-blocked decode request under the fit_first admission policy.",
     ] = 8
+    disaggregation_decode_max_inflight_transfers: A[
+        Optional[int],
+        "Maximum number of post-metadata KV transfers per decode DP worker. Requests beyond this window remain in decode preallocation, where the generation-scoped bootstrap lease keeps a healthy Prefill handshake alive. Unset preserves the resource-capacity-only behavior.",
+        NS("disagg"),
+    ] = None
     disaggregation_decode_enable_offload_kvcache: A[
         bool,
         "Enable async KV cache offloading on decode server (PD mode).",

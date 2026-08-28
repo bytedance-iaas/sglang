@@ -134,6 +134,7 @@ jobs:
             --volume "$PWD/test/registered/unit/mem_cache/test_hisparse_max_token_pool_size.py:/tmp/test_hisparse_max_token_pool_size.py:ro" \
             --volume "$PWD/test/registered/unit/disaggregation/test_hisparse_pd_draft.py:/tmp/test_hisparse_pd_draft.py:ro" \
             --volume "$PWD/test/registered/unit/managers/test_priority_scheduling_disaggregation.py:/tmp/test_priority_scheduling_disaggregation.py:ro" \
+            --volume "$PWD/test/registered/unit/server_args/test_server_args.py:/tmp/test_server_args.py:ro" \
             --volume "$PWD/test/registered/unit/managers/test_tokenizer_manager_rid_cleanup.py:/tmp/test_tokenizer_manager_rid_cleanup.py:ro" \
             --volume "$PWD/test/registered/unit/spec/test_eagle_worker_v2_topk1_fastpath.py:/tmp/test_eagle_worker_v2_topk1_fastpath.py:ro" \
             --workdir /tmp \
@@ -150,6 +151,10 @@ jobs:
               /tmp/test_hisparse_max_token_pool_size.py \
               /tmp/test_hisparse_pd_draft.py \
               /tmp/test_priority_scheduling_disaggregation.py \
+              /tmp/test_server_args.py::TestPrepareServerArgs::test_pd_decode_admission_args_parse \
+              /tmp/test_server_args.py::TestLoadBalanceMethod::test_pd_decode_rejects_invalid_transfer_window \
+              /tmp/test_server_args.py::TestLoadBalanceMethod::test_pd_decode_transfer_window_requires_pp1 \
+              /tmp/test_server_args.py::TestLoadBalanceMethod::test_pd_decode_transfer_window_accepts_pp1 \
               /tmp/test_tokenizer_manager_rid_cleanup.py \
               /tmp/test_eagle_worker_v2_topk1_fastpath.py::TestEagleWorkerV2Topk1FastPath::test_hisparse_finalizer_uses_distinct_draft_mirror \
               /tmp/test_eagle_worker_v2_topk1_fastpath.py::TestEagleWorkerV2Topk1FastPath::test_hisparse_finalizer_skips_idle_or_unsupported_batches \
