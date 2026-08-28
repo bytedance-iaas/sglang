@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.mega_moe_sm90 import (
+    _resolve_sm90_fp4_weight_transform,
     build_sm90_fp4_mega_moe_experts_weights,
     run_sm90_mega_routed,
 )
@@ -274,12 +275,13 @@ class TestMxfp4PackedLoaderContract(CustomTestCase):
 
 
 class TestSm90Fp4MegaMoEContract(CustomTestCase):
-    def test_weight_builder_uses_sm90_fp4_transform(self):
+    @staticmethod
+    def _make_experts():
         experts = torch.nn.Module()
         experts.register_parameter(
             "w13_weight",
             torch.nn.Parameter(
-                torch.zeros((2, 128, 32), dtype=torch.int8), requires_grad=False
+                torch.zeros((2, 128, 64), dtype=torch.int8), requires_grad=False
             ),
         )
         experts.register_parameter(
@@ -291,7 +293,7 @@ class TestSm90Fp4MegaMoEContract(CustomTestCase):
         experts.register_parameter(
             "w13_weight_scale_inv",
             torch.nn.Parameter(
-                torch.ones((2, 128, 2), dtype=torch.float32), requires_grad=False
+                torch.ones((2, 128, 4), dtype=torch.float32), requires_grad=False
             ),
         )
         experts.register_parameter(
@@ -300,10 +302,19 @@ class TestSm90Fp4MegaMoEContract(CustomTestCase):
                 torch.ones((2, 64, 4), dtype=torch.float32), requires_grad=False
             ),
         )
+        return experts
+
+    def test_weight_builder_uses_sm90_fp4_transform(self):
+        experts = self._make_experts()
         l1 = (torch.ones((1,), dtype=torch.int8), torch.ones((1,)))
         l2 = (torch.ones((1,), dtype=torch.int8), torch.ones((1,)))
         transform = mock.Mock(return_value=(l1, l2))
-        deep_gemm = SimpleNamespace(transform_weights_for_mega_moe_sm90_fp4=transform)
+        deep_gemm = SimpleNamespace(
+            transform_weights_for_mega_moe_sm90_fp4=transform,
+            fp8_fp4_mega_moe=mock.Mock(),
+            mega_moe_pre_dispatch_sm90=mock.Mock(),
+            _C=SimpleNamespace(fp8_fp4_mega_moe_sm90=mock.Mock()),
+        )
 
         with (
             mock.patch.dict("sys.modules", {"deep_gemm": deep_gemm}),
@@ -320,6 +331,107 @@ class TestSm90Fp4MegaMoEContract(CustomTestCase):
         self.assertIs(experts.mega_l2_weights, l2)
         self.assertTrue(experts._mega_moe_sm90_fp4_weights)
         self.assertTrue(experts._mega_moe_weights_built)
+
+    def test_weight_builder_compat_transform_matches_pr53_layout(self):
+        deep_gemm = SimpleNamespace(
+            fp8_fp4_mega_moe=mock.Mock(),
+            mega_moe_pre_dispatch_sm90=mock.Mock(),
+            _C=SimpleNamespace(fp8_fp4_mega_moe_sm90=mock.Mock()),
+        )
+        transform = _resolve_sm90_fp4_weight_transform(deep_gemm)
+
+        l1_weight = torch.arange(32 * 4, dtype=torch.uint8).reshape(1, 32, 4)
+        l2_weight = torch.arange(8 * 4, dtype=torch.uint8).reshape(1, 8, 4)
+        l1_scale = (
+            torch.pow(2.0, torch.arange(32, dtype=torch.float32))
+            .reshape(1, 32, 1)
+            .expand(-1, -1, 4)
+            .contiguous()
+        )
+        l2_scale = (
+            torch.pow(2.0, torch.arange(8, dtype=torch.float32))
+            .reshape(1, 8, 1)
+            .expand(-1, -1, 4)
+            .contiguous()
+        )
+
+        (l1_weight_out, l1_scale_out), (l2_weight_out, l2_scale_out) = transform(
+            (l1_weight, l1_scale), (l2_weight, l2_scale)
+        )
+
+        row_order = torch.tensor(
+            list(range(0, 8))
+            + list(range(16, 24))
+            + list(range(8, 16))
+            + list(range(24, 32))
+        )
+        torch.testing.assert_close(
+            l1_weight_out, l1_weight.index_select(1, row_order).view(torch.int8)
+        )
+        torch.testing.assert_close(l2_weight_out, l2_weight.view(torch.int8))
+
+        expected_l1_exponents = (127 + row_order).to(torch.uint8)
+        expected_l2_exponents = (127 + torch.arange(8)).to(torch.uint8)
+        torch.testing.assert_close(
+            l1_scale_out.view(torch.uint8),
+            expected_l1_exponents.reshape(1, 32, 1).expand(-1, -1, 4),
+        )
+        torch.testing.assert_close(
+            l2_scale_out.view(torch.uint8),
+            expected_l2_exponents.reshape(1, 8, 1).expand(-1, -1, 4),
+        )
+        self.assertEqual(l1_scale_out.dtype, torch.int32)
+        self.assertEqual(l2_scale_out.dtype, torch.int32)
+        self.assertTrue(l1_scale_out.is_contiguous())
+        self.assertTrue(l2_scale_out.is_contiguous())
+
+    def test_weight_builder_does_not_require_native_transform_helper(self):
+        experts = self._make_experts()
+        deep_gemm = SimpleNamespace(
+            fp8_fp4_mega_moe=mock.Mock(),
+            mega_moe_pre_dispatch_sm90=mock.Mock(),
+            _C=SimpleNamespace(fp8_fp4_mega_moe_sm90=mock.Mock()),
+        )
+        with (
+            mock.patch.dict("sys.modules", {"deep_gemm": deep_gemm}),
+            mock.patch(
+                "sglang.srt.layers.moe.mega_moe_sm90.envs."
+                "SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get",
+                return_value=False,
+            ),
+        ):
+            build_sm90_fp4_mega_moe_experts_weights(experts)
+
+        self.assertEqual(experts.mega_l1_weights[1].dtype, torch.int32)
+        self.assertEqual(experts.mega_l2_weights[1].dtype, torch.int32)
+        self.assertTrue(experts._mega_moe_sm90_fp4_weights)
+        self.assertTrue(experts._mega_moe_weights_built)
+
+    def test_compat_transform_fails_closed_on_bad_scale_shape(self):
+        deep_gemm = SimpleNamespace(
+            fp8_fp4_mega_moe=mock.Mock(),
+            mega_moe_pre_dispatch_sm90=mock.Mock(),
+            _C=SimpleNamespace(fp8_fp4_mega_moe_sm90=mock.Mock()),
+        )
+        transform = _resolve_sm90_fp4_weight_transform(deep_gemm)
+        weight = torch.zeros((1, 16, 4), dtype=torch.int8)
+        bad_scale = torch.ones((1, 16, 3), dtype=torch.float32)
+        with self.assertRaisesRegex(AssertionError, "must be a multiple of 4"):
+            transform((weight, bad_scale), (weight, bad_scale))
+
+    def test_weight_builder_fails_closed_without_sm90_fp4_kernel(self):
+        deep_gemm = SimpleNamespace(mega_moe_pre_dispatch_sm90=mock.Mock())
+        with self.assertRaisesRegex(RuntimeError, "missing fp8_fp4_mega_moe"):
+            _resolve_sm90_fp4_weight_transform(deep_gemm)
+
+    def test_weight_builder_fails_closed_without_native_sm90_fp4_kernel(self):
+        deep_gemm = SimpleNamespace(
+            fp8_fp4_mega_moe=mock.Mock(),
+            mega_moe_pre_dispatch_sm90=mock.Mock(),
+            _C=SimpleNamespace(),
+        )
+        with self.assertRaisesRegex(RuntimeError, "_C.fp8_fp4_mega_moe_sm90"):
+            _resolve_sm90_fp4_weight_transform(deep_gemm)
 
     def test_dispatch_uses_fp8_fp4_kernel_not_fp8_kernel(self):
         pre_dispatch = mock.Mock()

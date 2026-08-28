@@ -78,6 +78,7 @@ from sglang.srt.utils import (
     is_sm100_supported,
     print_warning_once,
 )
+from sglang.srt.utils.async_probe import maybe_detect_oob
 
 # Opt-in (default off): route the fp8 sparse-MLA prefill path through the Triton
 # per-query flash kernel instead of TileLang. Validated on gfx950 (GLM-5.1 @
@@ -165,6 +166,61 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
         # view — we want (N_total, 1) regardless.
         seqlens_32 = seqlens_32.reshape(-1)
     return seqlens_32.contiguous().view(-1, 1)
+
+
+def _validate_flashmla_kv_decode_shapes(
+    *,
+    q: torch.Tensor,
+    indices: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    num_splits: torch.Tensor,
+    expected_topk: int,
+) -> None:
+    """Fail closed on the host-visible FlashMLA sparse-decode shape contract.
+
+    Shape and rank queries do not read device data or synchronize CUDA. Index
+    values are deliberately not inspected here: the producer must normalize
+    invalid entries to ``-1``, and checking CUDA tensor values on this hot path
+    would introduce a device-to-host synchronization.
+    """
+    if q.ndim != 4:
+        raise ValueError(f"FlashMLA q must have rank 4, got shape={tuple(q.shape)}")
+    if indices.ndim != 3:
+        raise ValueError(
+            f"FlashMLA indices must have rank 3, got shape={tuple(indices.shape)}"
+        )
+    if cache_seqlens.ndim != 1:
+        raise ValueError(
+            "FlashMLA cache_seqlens must have rank 1, "
+            f"got shape={tuple(cache_seqlens.shape)}"
+        )
+    if num_splits.ndim != 1:
+        raise ValueError(
+            "FlashMLA num_splits must have rank 1, "
+            f"got shape={tuple(num_splits.shape)}"
+        )
+
+    batch_size, seq_len_q = q.shape[:2]
+    expected = {
+        "q": (batch_size, seq_len_q),
+        "indices": tuple(indices.shape[:2]),
+        "cache_seqlens": (cache_seqlens.shape[0],),
+        "num_splits": (num_splits.shape[0] - 1,),
+    }
+    if not (
+        tuple(indices.shape[:2]) == (batch_size, seq_len_q)
+        and cache_seqlens.shape[0] == batch_size
+        and num_splits.shape[0] == batch_size + 1
+    ):
+        raise ValueError(
+            "FlashMLA sparse decode query-axis mismatch: "
+            + ", ".join(f"{name}={shape}" for name, shape in expected.items())
+        )
+    if indices.shape[-1] != expected_topk:
+        raise ValueError(
+            "FlashMLA sparse decode top-k mismatch: "
+            f"indices_topk={indices.shape[-1]}, expected_topk={expected_topk}"
+        )
 
 
 @dataclass(frozen=True)
@@ -2813,10 +2869,6 @@ class DeepseekSparseAttnBackend(
         cache_seqlens = metadata.dsa_cache_seqlens_int32[:live_num_tokens]
         assert metadata.flashmla_metadata is not None
         num_splits = metadata.flashmla_metadata.num_splits
-        assert num_splits.shape[0] == live_num_tokens + 1, (
-            "FlashMLA num_splits must match the physical query axis: "
-            f"q_tokens={live_num_tokens}, num_splits={num_splits.shape[0]}"
-        )
 
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
         q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
@@ -2831,17 +2883,27 @@ class DeepseekSparseAttnBackend(
         else:
             q_input = q_all
 
+        indices = page_table_1.unsqueeze(1)
+        _validate_flashmla_kv_decode_shapes(
+            q=q_input,
+            indices=indices,
+            cache_seqlens=cache_seqlens,
+            num_splits=num_splits,
+            expected_topk=self.dsa_index_topk,
+        )
+        maybe_detect_oob(
+            indices,
+            -1,
+            kv_cache.shape[0],
+            f"FlashMLA sparse decode selected physical KV slot layer={layer.layer_id}",
+        )
+
         kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
         assert self.real_page_size == 64, "only page size 64 is supported"
 
         if not self.dsa_kv_cache_store_fp8:
             # inefficiently quantize the whole cache
             kv_cache = quantize_k_cache(kv_cache)
-
-        indices = page_table_1.unsqueeze(1)
-        assert (
-            indices.shape[-1] == self.dsa_index_topk
-        )  # requirement of FlashMLA decode kernel
 
         o, _ = flash_mla_with_kvcache(
             q=q_input,
