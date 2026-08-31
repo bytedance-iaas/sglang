@@ -291,7 +291,14 @@ jobs:
             if docker manifest inspect "${target_ref}" >/dev/null 2>&1; then
               echo "  Target already exists, using existing: ${target_ref}"
             else
-              retry crane copy "${source_ref}" "${target_ref}"
+              # Both registries are reachable directly from the self-hosted
+              # runner. Its inherited proxy returns a gateway timeout for the
+              # production CR endpoint, so keep this registry-to-registry copy
+              # on the internal route.
+              retry env \
+                HTTPS_PROXY= HTTP_PROXY= ALL_PROXY= \
+                https_proxy= http_proxy= all_proxy= \
+                crane copy "${source_ref}" "${target_ref}"
               echo "  Copied: ${target_ref}"
             fi
             backfill_one "${target_ref}"
