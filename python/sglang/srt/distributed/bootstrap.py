@@ -1,5 +1,6 @@
 import logging
 import os
+import socket
 import time
 from typing import List, Optional
 
@@ -10,6 +11,7 @@ import torch.distributed as dist
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import (
     get_default_distributed_backend,
+    get_moe_ep_group,
     get_pp_group,
     get_tp_group,
     get_world_group,
@@ -208,6 +210,16 @@ def _init_parallel_groups(
 ) -> None:
     is_ep_joiner = server_args.is_ep_joiner
     is_scale_joiner = server_args.is_ep_scale_joiner
+    uses_megamoe = "megamoe" in (
+        server_args.moe_a2a_backend,
+        server_args.speculative_moe_a2a_backend,
+    )
+    if uses_megamoe and is_ep_joiner:
+        raise RuntimeError(
+            "MegaMoE does not support elastic EP joiners: its current "
+            "symmetric-buffer implementation is restricted to a static, "
+            "single-node MoE expert-parallel group."
+        )
     rank_offset = server_args.ep_join_rank_offset if is_scale_joiner else 0
     world_size = (
         rank_offset + tp_size * pp_size if is_scale_joiner else tp_size * pp_size
@@ -239,12 +251,50 @@ def _init_parallel_groups(
         rank_offset=rank_offset,
         max_world_size=server_args.max_ep_size,
     )
+    if uses_megamoe:
+        _validate_megamoe_single_node_topology(node_rank=server_args.node_rank)
     initialize_dp_attention(
         server_args=server_args,
         model_config=model_config,
     )
     if is_npu():
         register_sgl_tp_rank(gpu_id)
+
+
+def _validate_megamoe_single_node_topology(*, node_rank: int) -> None:
+    """Fail fast when a MegaMoE EP group spans multiple hosts.
+
+    The current MegaMoE symmetric-buffer implementation only supports
+    intra-node communication. Pipeline-parallel stages may live on different
+    hosts, but every individual MoE expert-parallel group must remain local to
+    one host.
+    """
+    moe_ep_group = get_moe_ep_group()
+    local_topology = {
+        "rank": dist.get_rank(),
+        "rank_in_group": moe_ep_group.rank_in_group,
+        "hostname": socket.gethostname(),
+        "node_rank": node_rank,
+    }
+    group_topology = moe_ep_group.all_gather_object(local_topology)
+    node_ranks = {entry["node_rank"] for entry in group_topology}
+
+    if len(node_ranks) != 1:
+        raise RuntimeError(
+            "MegaMoE only supports a single-node MoE expert-parallel group, "
+            f"but ranks span multiple hosts: {group_topology}. "
+            "Pipeline-parallel stages may span hosts only when each MoE EP "
+            "group remains on one host."
+        )
+
+    if moe_ep_group.rank_in_group == 0:
+        logger.info(
+            "Validated single-node MegaMoE topology: node_rank=%s, "
+            "group_size=%s, global_ranks=%s",
+            node_rank,
+            moe_ep_group.world_size,
+            moe_ep_group.ranks,
+        )
 
 
 def _prewarm_nccl(*, tp_size: int, pp_size: int, moe_ep_size: int) -> None:

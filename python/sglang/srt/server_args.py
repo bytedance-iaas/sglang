@@ -2293,7 +2293,11 @@ class ServerArgs:
             "pplx",
         ],
         Arg(
-            help="Choose the backend for MoE A2A.",
+            help=(
+                "Choose the backend for MoE A2A. MegaMoE currently requires "
+                "every MoE expert-parallel group to stay within one node; "
+                "pipeline-parallel stages may span nodes."
+            ),
             choices=MOE_A2A_BACKEND_CHOICES,
             resolvable=True,
         ),
