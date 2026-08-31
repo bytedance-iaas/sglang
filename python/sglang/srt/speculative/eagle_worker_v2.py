@@ -1307,46 +1307,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Decode
         if batch.forward_mode.is_idle():
-            capture_mode = (
-                CaptureHiddenMode.NULL
-                if self.speculative_algorithm.is_standalone()
-                else CaptureHiddenMode.LAST
-            )
-            hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
-                self.draft_worker.draft_runner
-            )
-            batch.spec_info = EagleDraftInput.create_idle_input(
-                device=self.device,
-                hidden_size=hidden_size,
-                dtype=hidden_dtype,
-                topk=self.topk,
-                capture_hidden_mode=capture_mode,
-                vocab_size=self.target_worker.model_config.vocab_size,
-            )
-            if batch.global_num_tokens is not None and (
-                _should_force_symmetric_spec_moe_padding(
-                    spec_algorithm=batch.spec_algorithm,
-                    spec_info=batch.spec_info,
-                    is_extend_in_batch=batch.is_extend_in_batch,
-                    global_num_tokens=batch.global_num_tokens,
-                )
-            ):
-                with (
-                    self.draft_worker.draft_tp_context(
-                        self.draft_worker.draft_runner.tp_group
-                    ),
-                    speculative_moe_backend_context(),
-                    speculative_moe_a2a_backend_context(),
-                    spec_stage_span("draft"),
-                ):
-                    verify_input = self.draft_worker.draft(batch)
-            else:
-                verify_input = EagleVerifyInput.create_idle_input(
-                    self.topk,
-                    self.speculative_num_steps,
-                    self.speculative_num_draft_tokens,
-                    device=self.device,
-                )
+            verify_input = self._build_idle_verify_input(batch)
         elif self._pp_enabled:
             # Under PP the verify input is built from the raw draft tree relayed
             # from the last PP rank of the previous iteration. A PD decode
@@ -1460,6 +1421,75 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
         return batch_output
+
+    def _build_idle_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
+        # PP non-last ranks intentionally have no draft model. They only need
+        # an idle target-verify input to stay aligned with active DP peers.
+        if self._draft_worker is None:
+            return EagleVerifyInput.create_idle_input(
+                self.topk,
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
+                device=self.device,
+            )
+
+        if self._pp_enabled:
+            # PP active ranks consume the raw tree relayed from the previous
+            # iteration and therefore do not draft before target verify. Keep
+            # idle ranks in the same phase: every last-stage rank drafts once,
+            # after verify, to produce the next iteration's relay tree.
+            return EagleVerifyInput.create_idle_input(
+                self.topk,
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
+                device=self.device,
+            )
+
+        # Without PP, active DP peers draft before target verify. A sparse idle
+        # peer must participate in that same draft phase when the speculative
+        # MoE backend requires symmetric dispatch generations.
+        capture_mode = (
+            CaptureHiddenMode.NULL
+            if self.speculative_algorithm.is_standalone()
+            else CaptureHiddenMode.LAST
+        )
+        hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
+            self.draft_worker.draft_runner
+        )
+        batch.spec_info = EagleDraftInput.create_idle_input(
+            device=self.device,
+            hidden_size=hidden_size,
+            dtype=hidden_dtype,
+            topk=self.topk,
+            capture_hidden_mode=capture_mode,
+            vocab_size=self.target_worker.model_config.vocab_size,
+        )
+        if batch.global_num_tokens is not None and (
+            _should_force_symmetric_spec_moe_padding(
+                spec_algorithm=batch.spec_algorithm,
+                spec_info=batch.spec_info,
+                is_extend_in_batch=batch.is_extend_in_batch,
+                global_num_tokens=batch.global_num_tokens,
+            )
+        ):
+            with (
+                self.draft_worker.draft_tp_context(
+                    self.draft_worker.draft_runner.tp_group
+                ),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft"),
+            ):
+                # Participation keeps MoE collectives in lockstep; target verify
+                # still consumes an explicit idle EagleVerifyInput.
+                self.draft_worker.draft(batch)
+
+        return EagleVerifyInput.create_idle_input(
+            self.topk,
+            self.speculative_num_steps,
+            self.speculative_num_draft_tokens,
+            device=self.device,
+        )
 
     def _build_verify_input_from_pp_raw(self, batch: ScheduleBatch):
         """Build EagleVerifyInput from EaglePPVerifyInputRaw (PP non-last rank).

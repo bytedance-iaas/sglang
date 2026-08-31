@@ -1,7 +1,7 @@
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -10,7 +10,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 from sglang.srt.layers.attention.verify_mask import VerifyMask
-from sglang.srt.speculative.eagle_info import EaglePPVerifyInputRaw
+from sglang.srt.speculative.eagle_info import EaglePPVerifyInputRaw, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import TreeMaskMode
 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 
@@ -250,6 +250,41 @@ class TestEaglePPLastRankDraftOwnership(unittest.TestCase):
 
         self.assertIs(worker.draft_worker, sentinel)
         draft_worker_cls.assert_called_once()
+
+    def test_non_last_idle_builds_verify_without_draft_worker(self):
+        worker = SimpleNamespace(
+            _draft_worker=None,
+            topk=1,
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            device="cpu",
+        )
+
+        verify_input = EAGLEWorkerV2._build_idle_verify_input(worker, SimpleNamespace())
+
+        self.assertIsInstance(verify_input, EagleVerifyInput)
+        self.assertTrue(verify_input.is_verify_input())
+        self.assertEqual(verify_input.draft_token_num, 4)
+
+    def test_last_rank_pp_idle_skips_head_draft(self):
+        draft = Mock()
+        draft_worker = SimpleNamespace(draft=draft)
+        worker = SimpleNamespace(
+            _draft_worker=draft_worker,
+            draft_worker=draft_worker,
+            _pp_enabled=True,
+            topk=1,
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            device="cpu",
+        )
+
+        verify_input = EAGLEWorkerV2._build_idle_verify_input(worker, SimpleNamespace())
+
+        draft.assert_not_called()
+        self.assertIsInstance(verify_input, EagleVerifyInput)
+        self.assertTrue(verify_input.is_verify_input())
+        self.assertEqual(verify_input.draft_token_num, 4)
 
 
 if __name__ == "__main__":
