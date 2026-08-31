@@ -2082,6 +2082,13 @@ class DeepseekV2AttentionMLA(
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
+        if forward_batch.symmetric_spec_moe_dummy:
+            # The synthetic row exists only for symmetric MegaMoE/DeepEP
+            # participation and has no real request KV to attend.
+            if isinstance(hidden_states, tuple):
+                hidden_states = hidden_states[0]
+            return hidden_states, None, forward_batch, None
+
         if self.attn_mha.kv_b_proj is None:
             self.attn_mha.kv_b_proj = self.kv_b_proj
 

@@ -216,7 +216,26 @@ def _update_gather_batch(
     skip_all_gather=False,
 ):
     # TODO: handle the case when moe_dense_tp_size != 1
-    if not require_mlp_tp_gather:
+    # The scattered DP path normally publishes only the rank-local count.
+    # Sparse EAGLE rounds are the exception for symmetric MoE collectives:
+    # ForwardBatch needs the peer census to choose one MAX_LEN geometry and
+    # materialize idle ranks. This is narrower than enabling MLP TP gather,
+    # which would change buffer and CUDA-graph semantics for every forward.
+    from sglang.srt.layers.moe.utils import (
+        moe_a2a_requires_symmetric_spec_padding,
+    )
+
+    peer_counts = mlp_sync_info.global_num_tokens or []
+    keep_peer_counts_for_symmetric_spec_moe = (
+        not require_mlp_tp_gather
+        and moe_a2a_requires_symmetric_spec_padding(mlp_sync_info.is_extend_in_batch)
+        and batch.spec_algorithm is not None
+        and batch.spec_algorithm.is_eagle()
+        and bool(peer_counts)
+        and min(peer_counts) == 0
+        and max(peer_counts) > 0
+    )
+    if not require_mlp_tp_gather and not keep_peer_counts_for_symmetric_spec_moe:
         batch.global_num_tokens = [mlp_sync_info.num_tokens]
         batch.global_num_tokens_for_logprob = [mlp_sync_info.num_tokens_for_logprob]
     else:

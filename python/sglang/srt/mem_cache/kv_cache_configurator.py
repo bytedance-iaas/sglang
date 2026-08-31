@@ -1981,6 +1981,15 @@ def calculate_mla_kv_cache_dim(
     ):
         return kv_cache_dim
 
+    # The CUDA TileLang FP8 kernel consumes raw nope+rope bytes. Argument
+    # validation guarantees that both consumers are TileLang, so it is safe
+    # to select this layout for the shared pool.
+    if not _is_hip and (
+        server_args.dsa_prefill_backend == "tilelang"
+        and server_args.dsa_decode_backend == "tilelang"
+    ):
+        return kv_cache_dim
+
     quant_block_size = DSATokenToKVPool.quant_block_size
     rope_storage_dtype = DSATokenToKVPool.rope_storage_dtype
     # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout

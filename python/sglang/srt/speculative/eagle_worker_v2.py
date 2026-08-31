@@ -41,6 +41,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    _should_force_symmetric_spec_moe_padding,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner import (
@@ -128,6 +129,31 @@ _is_xpu = is_xpu()
 
 
 logger = logging.getLogger(__name__)
+
+
+def _slice_draft_output_to_local_tokens(
+    next_token_logits: torch.Tensor,
+    hidden_states: Optional[torch.Tensor],
+    positions: torch.Tensor,
+    num_local_tokens: int,
+) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+    """Discard DP-attention padding rows before eager draft postprocessing."""
+    for name, tensor in (
+        ("next_token_logits", next_token_logits),
+        ("hidden_states", hidden_states),
+        ("positions", positions),
+    ):
+        if tensor is not None and tensor.shape[0] < num_local_tokens:
+            raise RuntimeError(
+                f"EAGLE draft {name} has {tensor.shape[0]} rows, "
+                f"but {num_local_tokens} local tokens need postprocessing"
+            )
+
+    return (
+        next_token_logits[:num_local_tokens],
+        hidden_states[:num_local_tokens] if hidden_states is not None else None,
+        positions[:num_local_tokens],
+    )
 
 
 class EagleDraftWorker(EagleDraftWorkerBase):
@@ -515,6 +541,30 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.speculative_num_steps,
         )
         if (
+            forward_batch.forward_mode.is_idle()
+            and forward_batch.original_global_num_tokens_cpu is not None
+            and _should_force_symmetric_spec_moe_padding(
+                spec_algorithm=forward_batch.spec_algorithm,
+                spec_info=forward_batch.spec_info,
+                is_extend_in_batch=forward_batch.is_extend_in_batch,
+                global_num_tokens=forward_batch.original_global_num_tokens_cpu,
+            )
+        ):
+            # Materialize one request-shaped draft row so an otherwise idle
+            # rank executes the same MegaMoE collective generations. There is
+            # no real request KV, so attention bypasses this synthetic row.
+            forward_batch._original_forward_mode = forward_batch.forward_mode
+            forward_batch.forward_mode = ForwardMode.DECODE
+            forward_batch.symmetric_spec_moe_dummy = True
+            forward_batch.batch_size = 1
+            forward_batch._pad_inputs_to_size(self.draft_runner, 1, 1)
+            forward_batch.out_cache_loc = forward_batch.out_cache_loc.new_zeros(
+                self.topk * self.speculative_num_steps
+            )
+            if forward_batch.num_token_non_padded is not None:
+                forward_batch.num_token_non_padded.fill_(1)
+            forward_batch.num_token_non_padded_cpu = 1
+        if (
             can_run_decode_cuda_graph
             and not forward_batch.forward_mode.is_idle()
             and self.seed_dsa_topk_from_draft_extend
@@ -566,7 +616,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
             # CUDA Graph buffers are reused; clone before flattening so the
             # relayed raw tokens survive the next replay.
-            if can_cuda_graph:
+            if can_run_decode_cuda_graph:
                 parent_list = parent_list.clone()
                 top_scores_index = top_scores_index.clone()
                 draft_tokens = draft_tokens.clone()
@@ -666,7 +716,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if i == self.speculative_num_steps - 1:
                 break
 
-            # Set inputs
+            # Set inputs. Preserve the rank-local row count because eager
+            # DP-attention may pad the model output to a larger peer batch.
+            num_local_tokens = input_ids.shape[0]
             forward_batch.input_ids = input_ids
             # Qwen3-MoE MTP uses a fused RoPE + KV-store path whose cache_loc
             # argument must be contiguous.
@@ -695,47 +747,53 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 canary_index_ctx,
             ):
                 logits_output = self.draft_runner.forward(forward_batch).logits_output
-            maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
-            maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
+            next_token_logits, next_hidden_states, local_positions = (
+                _slice_draft_output_to_local_tokens(
+                    logits_output.next_token_logits,
+                    logits_output.hidden_states,
+                    forward_batch.positions,
+                    num_local_tokens,
+                )
+            )
+            maybe_detect_nan(next_token_logits, f"draft_forward step {i}")
+            maybe_detect_inf(next_token_logits, f"draft_forward step {i}")
             if get_spec().speculative_use_rejection_sampling:
                 probs, topk_p, topk_index = sample_draft_proposal(
-                    logits_output.next_token_logits,
+                    next_token_logits,
                     forward_batch.sampling_info.temperatures,
                 )
                 draft_probs_list.append(probs)
-                forward_batch.positions.add_(1)
+                local_positions.add_(1)
             elif self.topk == 1 and not _is_hip:
                 if _is_cuda:
                     # The positions advance is fused into the kernel.
                     topk_p, topk_index = draft_topk1_postprocess(
-                        logits_output.next_token_logits,
-                        forward_batch.positions,
+                        next_token_logits,
+                        local_positions,
                         draft_tokens_topk1,
                         i + 1,
                     )
                 else:
-                    topk_index = torch.argmax(
-                        logits_output.next_token_logits, dim=-1, keepdim=True
-                    )
+                    topk_index = torch.argmax(next_token_logits, dim=-1, keepdim=True)
                     topk_p = torch.ones_like(topk_index, dtype=torch.float32)
-                    forward_batch.positions.add_(1)
+                    local_positions.add_(1)
             else:
                 probs = renorm_draft_probs(
-                    logits_output.next_token_logits,
+                    next_token_logits,
                     forward_batch.sampling_info,
                     get_spec().speculative_use_rejection_sampling,
                 )
                 topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-                forward_batch.positions.add_(1)
+                local_positions.add_(1)
             maybe_detect_oob(
                 topk_index,
                 0,
-                logits_output.next_token_logits.shape[-1],
-                f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
+                next_token_logits.shape[-1],
+                f"draft_forward step {i}: topk_index OOB vs vocab_size={next_token_logits.shape[-1]}",
             )
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
-            hidden_states = logits_output.hidden_states
+            hidden_states = next_hidden_states
 
         if self.index_share_for_mtp_iteration:
             spec_info.dsa_topk_indices = None
@@ -1249,12 +1307,46 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Decode
         if batch.forward_mode.is_idle():
-            verify_input = EagleVerifyInput.create_idle_input(
-                self.topk,
-                self.speculative_num_steps,
-                self.speculative_num_draft_tokens,
-                device=self.device,
+            capture_mode = (
+                CaptureHiddenMode.NULL
+                if self.speculative_algorithm.is_standalone()
+                else CaptureHiddenMode.LAST
             )
+            hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
+                self.draft_worker.draft_runner
+            )
+            batch.spec_info = EagleDraftInput.create_idle_input(
+                device=self.device,
+                hidden_size=hidden_size,
+                dtype=hidden_dtype,
+                topk=self.topk,
+                capture_hidden_mode=capture_mode,
+                vocab_size=self.target_worker.model_config.vocab_size,
+            )
+            if batch.global_num_tokens is not None and (
+                _should_force_symmetric_spec_moe_padding(
+                    spec_algorithm=batch.spec_algorithm,
+                    spec_info=batch.spec_info,
+                    is_extend_in_batch=batch.is_extend_in_batch,
+                    global_num_tokens=batch.global_num_tokens,
+                )
+            ):
+                with (
+                    self.draft_worker.draft_tp_context(
+                        self.draft_worker.draft_runner.tp_group
+                    ),
+                    speculative_moe_backend_context(),
+                    speculative_moe_a2a_backend_context(),
+                    spec_stage_span("draft"),
+                ):
+                    verify_input = self.draft_worker.draft(batch)
+            else:
+                verify_input = EagleVerifyInput.create_idle_input(
+                    self.topk,
+                    self.speculative_num_steps,
+                    self.speculative_num_draft_tokens,
+                    device=self.device,
+                )
         elif self._pp_enabled:
             # Under PP the verify input is built from the raw draft tree relayed
             # from the last PP rank of the previous iteration. A PD decode

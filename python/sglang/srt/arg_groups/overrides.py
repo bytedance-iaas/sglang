@@ -1555,21 +1555,43 @@ def _check_tilelang_dsa_fp8_kv(
     decode_backend: Optional[str],
     *,
     hip: bool,
+    dcp_size: int = 1,
 ) -> None:
-    """tilelang's fp8 KV path is ROCm-only; the CUDA kernel hardcodes bfloat16.
-    Reject here instead of crashing at decode CUDA-graph capture."""
+    """Validate the raw-FP8 TileLang DSA layout on CUDA.
+
+    All consumers of one pool must use TileLang because other CUDA FP8
+    backends expect the scaled 656-byte layout. The raw writer also does not
+    implement the DCP rank filter.
+    """
     if (
-        not hip
-        and kv_cache_dtype == "fp8_e4m3"
-        and "tilelang" in {prefill_backend, decode_backend}
+        hip
+        or kv_cache_dtype != "fp8_e4m3"
+        or "tilelang" not in {prefill_backend, decode_backend}
     ):
+        return
+    if dcp_size > 1:
         raise ValueError(
-            "The tilelang DSA prefill/decode kernels only support an fp8_e4m3 KV "
-            "cache on ROCm/HIP; on CUDA they require a bfloat16 KV cache. Use "
-            "--kv-cache-dtype bfloat16 with the tilelang backend, or keep "
-            "--kv-cache-dtype fp8_e4m3 and pick an fp8-capable DSA backend "
-            "(flashmla_kv on Hopper, trtllm on Blackwell)."
+            "The CUDA TileLang DSA fp8_e4m3 raw KV writer does not apply the "
+            "DCP rank filter and is incompatible with --dcp-size > 1."
         )
+    if prefill_backend != decode_backend:
+        raise ValueError(
+            "On CUDA, an fp8_e4m3 KV cache with TileLang DSA requires both "
+            "--dsa-prefill-backend and --dsa-decode-backend to be tilelang; "
+            "other CUDA backends consume a different scaled KV layout."
+        )
+    import torch
+
+    major, minor = torch.cuda.get_device_capability()
+    if major * 10 + minor < 89:
+        raise ValueError(
+            "The CUDA TileLang DSA fp8_e4m3 path requires FP8 tensor-core "
+            f"MMA (SM89+); got sm_{major}{minor}."
+        )
+    logger.warning(
+        "Enabling CUDA TileLang DSA with raw fp8_e4m3 KV storage; both "
+        "prefill and decode will consume the 576-byte MLA layout."
+    )
 
 
 @register_post_process
@@ -1649,7 +1671,13 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
-    _check_tilelang_dsa_fp8_kv(kv_cache_dtype, prefill, decode, hip=is_hip())
+    _check_tilelang_dsa_fp8_kv(
+        kv_cache_dtype,
+        prefill,
+        decode,
+        hip=is_hip(),
+        dcp_size=getattr(view, "dcp_size", 1) or 1,
+    )
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "
         f"prefill={prefill}, decode={decode}."

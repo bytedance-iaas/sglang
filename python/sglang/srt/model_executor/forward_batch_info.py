@@ -95,6 +95,64 @@ def _elastic_should_preserve_local_token_counts(
     return uneven_token_count
 
 
+def _should_materialize_idle_spec_moe(
+    *,
+    forward_mode: ForwardMode,
+    spec_info: Optional[SpecInput],
+    dp_padding_mode: DpPaddingMode,
+    num_tokens: int,
+    force_symmetric_spec_moe_padding: bool,
+) -> bool:
+    """Whether an idle speculative rank needs real rows for symmetric MoE A2A."""
+    return (
+        forward_mode.is_idle()
+        and dp_padding_mode.is_max_len()
+        and num_tokens > 0
+        and spec_info is not None
+        and force_symmetric_spec_moe_padding
+    )
+
+
+def _should_force_symmetric_spec_moe_padding(
+    *,
+    spec_algorithm: Optional[SpeculativeAlgorithm],
+    spec_info: Optional[SpecInput],
+    is_extend_in_batch: bool,
+    global_num_tokens: List[int],
+) -> bool:
+    """Keep mixed active/idle EAGLE ranks in one symmetric MoE geometry."""
+    if (
+        spec_algorithm is None
+        or not spec_algorithm.is_eagle()
+        or spec_info is None
+        or len(global_num_tokens) <= 1
+        or min(global_num_tokens) > 0
+        or max(global_num_tokens) == 0
+    ):
+        return False
+
+    from sglang.srt.layers.moe.utils import (
+        moe_a2a_requires_symmetric_spec_padding,
+    )
+
+    return moe_a2a_requires_symmetric_spec_padding(is_extend_in_batch)
+
+
+def _should_bypass_attention_for_symmetric_spec_moe_dummy(
+    *,
+    forward_mode: ForwardMode,
+    spec_info: Optional[SpecInput],
+    force_symmetric_spec_moe_padding: bool,
+) -> bool:
+    """Whether an idle draft row exists only for symmetric MoE participation."""
+    return (
+        forward_mode.is_idle()
+        and force_symmetric_spec_moe_padding
+        and spec_info is not None
+        and spec_info.is_draft_input()
+    )
+
+
 class ForwardMode(IntEnum):
     # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
     # It is also called "prefill" in common terminology.
@@ -520,6 +578,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Gate for reusing the first MTP draft step's indexer topk across steps;
     # the carried topk lives on spec_info (see EagleDraftInput.dsa_topk_indices).
     reuse_dsa_topk_indices: Optional[bool] = False
+    # Sparse EAGLE ranks may carry one synthetic draft row solely to enter the
+    # same symmetric MoE collectives as active peers. It has no request KV and
+    # must not run DSA attention.
+    symmetric_spec_moe_dummy: bool = False
 
     minimax_m3_precached_sparse_layers: Optional[Set[int]] = None
 
@@ -1267,6 +1329,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
         )
+        force_symmetric_spec_moe_padding = _should_force_symmetric_spec_moe_padding(
+            spec_algorithm=self.spec_algorithm,
+            spec_info=self.spec_info,
+            is_extend_in_batch=self.is_extend_in_batch,
+            global_num_tokens=global_num_tokens,
+        )
+        if force_symmetric_spec_moe_padding:
+            # MegaMoE and DeepEP low-latency require every EP rank to enter
+            # the same speculative collective generation, including idle DP
+            # ranks. MAX_LEN supplies one common physical token geometry.
+            dp_padding_mode = DpPaddingMode.MAX_LEN
         if _elastic_should_preserve_local_token_counts(
             model_runner=model_runner,
             dp_padding_mode=dp_padding_mode,
@@ -1346,10 +1419,34 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 hybrid_ssm
                 and self.spec_info is not None
                 and not self.spec_info.is_draft_input()
+            ) or _should_materialize_idle_spec_moe(
+                forward_mode=self.forward_mode,
+                spec_info=self.spec_info,
+                dp_padding_mode=dp_padding_mode,
+                num_tokens=num_tokens,
+                force_symmetric_spec_moe_padding=force_symmetric_spec_moe_padding,
             ):
                 if self.forward_mode.is_idle():
+                    self.symmetric_spec_moe_dummy = (
+                        _should_bypass_attention_for_symmetric_spec_moe_dummy(
+                            forward_mode=self.forward_mode,
+                            spec_info=self.spec_info,
+                            force_symmetric_spec_moe_padding=(
+                                force_symmetric_spec_moe_padding
+                            ),
+                        )
+                    )
                     self._original_forward_mode = self.forward_mode
-                    self.forward_mode = ForwardMode.TARGET_VERIFY
+                    self.forward_mode = (
+                        ForwardMode.DECODE
+                        if self.spec_info.is_draft_input()
+                        else ForwardMode.TARGET_VERIFY
+                    )
+                    # Count the synthetic rows as real for MoE routing. They
+                    # are removed again after the collective forward.
+                    if self.num_token_non_padded is not None:
+                        self.num_token_non_padded.fill_(num_tokens)
+                    self.num_token_non_padded_cpu = num_tokens
                 # Invert the spec_scale_global_num_tokens scaling.
                 bs = self.batch_size = num_tokens // self.spec_info.num_tokens_per_req
             elif self.is_extend_in_batch and dp_padding_mode.is_max_len():
@@ -1595,6 +1692,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     ]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_extend() or self.forward_mode.is_idle():
+                if self.symmetric_spec_moe_dummy:
+                    self.positions = self.positions[:bs]
+                    self.seq_lens = self.seq_lens[:bs]
+                    self.req_pool_indices = self.req_pool_indices[:bs]
+                    if self.seq_lens_cpu is not None:
+                        self.seq_lens_cpu = self.seq_lens_cpu[:bs]
                 if logits_output.next_token_logits is not None:
                     logits_output.next_token_logits = logits_output.next_token_logits[
                         :bs
@@ -1605,6 +1708,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.spec_info.hidden_states = self.hidden_states_backup
             if hasattr(self, "output_cache_loc_backup"):
                 self.out_cache_loc = self.output_cache_loc_backup
+            if self.symmetric_spec_moe_dummy:
+                # This ForwardBatch is normally one-shot, but restore the idle
+                # token census and padded inputs so retries or diagnostics can
+                # never observe a fabricated request after the collective.
+                if self.num_token_non_padded is not None:
+                    self.num_token_non_padded.zero_()
+                self.num_token_non_padded_cpu = 0
+                if self._original_num_tokens is not None:
+                    self.input_ids = self.input_ids[: self._original_num_tokens]
+                self.seq_lens_sum = 0
+                self.symmetric_spec_moe_dummy = False
 
         elif self.forward_mode.is_decode() or self.forward_mode.is_idle():
             logits_output.next_token_logits = logits_output.next_token_logits[:bs]

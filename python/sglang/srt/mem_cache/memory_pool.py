@@ -4050,9 +4050,25 @@ class MLATokenToKVPool(KVCache):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ) -> None:
-        if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
-            # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
+        if self.use_dsa and self.dtype == fp8_dtype and not self.dsa_kv_cache_store_fp8:
+            # HIP and CUDA TileLang FP8 paths use raw MLA KV layout
+            # (nope + rope) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
+            if cache_k_rope is None:
+                cache_k_rope = cache_k_nope.new_empty((*cache_k_nope.shape[:-1], 0))
+            raw_kv_dim = self.kv_lora_rank + self.qk_rope_head_dim
+            input_kv_dim = cache_k_nope.shape[-1] + cache_k_rope.shape[-1]
+            if self.kv_cache_dim != raw_kv_dim or dst_buffer.shape[-1] != raw_kv_dim:
+                raise RuntimeError(
+                    "Raw FP8 MLA KV writes require an unscaled nope+rope pool: "
+                    f"expected dim {raw_kv_dim}, got configured "
+                    f"{self.kv_cache_dim} and destination {dst_buffer.shape[-1]}"
+                )
+            if input_kv_dim != raw_kv_dim:
+                raise RuntimeError(
+                    "Raw FP8 MLA KV input width mismatch: "
+                    f"expected {raw_kv_dim}, got {input_kv_dim}"
+                )
             set_mla_kv_buffer_triton_fp8_quant(
                 dst_buffer,
                 loc,

@@ -71,6 +71,12 @@ def fast_round_scale(amax, fp8_max_inv):
     return fast_pow2(fast_log2_ceil(amax * fp8_max_inv))
 
 
+@lru_cache(maxsize=16)
+def _cuda_sm_count(device_index: int) -> int:
+    """Return the SM count for one CUDA device without cross-device reuse."""
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
 @lru_cache(maxsize=8)
 def _pick_inner_iter(seq: int, ni: int, cu: int, block_per_cu: int) -> int:
     """
@@ -1328,12 +1334,22 @@ def tilelang_sparse_fwd(
     topk = indices.shape[-1]
     assert topk == 2048
 
-    if _is_hip:
-        is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    if _is_hip or is_fp8_kv:
         if is_fp8_kv:
             if q.dtype != kv.dtype:
                 q = q.to(kv.dtype)
-            if _is_gfx95_supported:
+            if not _is_hip:
+                # The generic TileLang fp8 kernel also works on CUDA SM89+.
+                # H20 SM90 measurements favor the same 32/128 shape validated
+                # on GB10; 256 threads is not a legal warp shape here.
+                block_I, threads, block_per_cu, cu = (
+                    32,
+                    128,
+                    1,
+                    _cuda_sm_count(torch.cuda.current_device()),
+                )
+            elif _is_gfx95_supported:
                 block_I, threads, block_per_cu, cu = 64, 256, 2, 256
             else:
                 block_I, threads, block_per_cu, cu = 64, 256, 1, 304

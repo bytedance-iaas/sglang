@@ -66,7 +66,95 @@ class TestFlashMLAKVDecodeShapeContract(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     _validate_flashmla_kv_decode_shapes(**inputs)
 
-    def test_caller_rejects_bad_metadata_before_native_launch(self):
+    def test_caller_rejects_metadata_larger_than_physical_batch(self):
+        backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+        backend.flashmla_kv_num_q_heads = 4
+        backend.real_page_size = 64
+        backend.kv_cache_dim = 16
+        backend.dsa_kv_cache_store_fp8 = True
+        backend.dsa_index_topk = 8
+        layer = SimpleNamespace(tp_q_head_num=4, head_dim=16, layer_id=7)
+        metadata = SimpleNamespace(
+            dsa_cache_seqlens_int32=torch.zeros(3, dtype=torch.int32),
+            flashmla_metadata=SimpleNamespace(
+                flashmla_metadata=torch.empty((1, 1), dtype=torch.int32),
+                num_splits=torch.zeros(4, dtype=torch.int32),
+            ),
+        )
+
+        with (
+            patch("sgl_kernel.flash_mla.flash_mla_with_kvcache") as native_flashmla,
+            self.assertRaisesRegex(AssertionError, "exceeds q batch size"),
+        ):
+            backend._forward_flashmla_kv(
+                q_all=torch.empty((2, 4, 16)),
+                kv_cache=torch.empty((64, 16)),
+                v_head_dim=16,
+                sm_scale=1.0,
+                layer=layer,
+                metadata=metadata,
+                page_table_1=torch.full((2, 8), -1, dtype=torch.int32),
+            )
+        native_flashmla.assert_not_called()
+
+    def test_caller_trims_legal_physical_padding_and_restores_output(self):
+        backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+        backend.flashmla_kv_num_q_heads = 4
+        backend.real_page_size = 64
+        backend.kv_cache_dim = 16
+        backend.dsa_kv_cache_store_fp8 = True
+        backend.dsa_index_topk = 8
+        layer = SimpleNamespace(tp_q_head_num=4, head_dim=16, layer_id=7)
+
+        for physical_rows, real_rows in ((8, 4), (2, 1)):
+            with self.subTest(physical_rows=physical_rows, real_rows=real_rows):
+                metadata = SimpleNamespace(
+                    dsa_cache_seqlens_int32=torch.arange(real_rows, dtype=torch.int32),
+                    flashmla_metadata=SimpleNamespace(
+                        flashmla_metadata=torch.empty((1, 1), dtype=torch.int32),
+                        num_splits=torch.zeros(real_rows + 1, dtype=torch.int32),
+                    ),
+                )
+                native_output = torch.ones((real_rows, 1, 4, 16))
+
+                with (
+                    patch(
+                        "sglang.srt.environ.envs.SGLANG_ENABLE_ASYNC_ASSERT.get",
+                        return_value=False,
+                    ),
+                    patch.object(torch, "_assert_async") as async_assert,
+                    patch(
+                        "sgl_kernel.flash_mla.flash_mla_with_kvcache",
+                        return_value=(
+                            native_output,
+                            torch.empty((real_rows, 4, 1)),
+                        ),
+                    ) as native_flashmla,
+                ):
+                    output = backend._forward_flashmla_kv(
+                        q_all=torch.empty((physical_rows, 4, 16)),
+                        kv_cache=torch.empty((64, 16)),
+                        v_head_dim=16,
+                        sm_scale=1.0,
+                        layer=layer,
+                        metadata=metadata,
+                        page_table_1=torch.full(
+                            (physical_rows, 8), -1, dtype=torch.int32
+                        ),
+                    )
+
+                self.assertEqual(output.shape, (physical_rows, 1, 4, 16))
+                self.assertTrue(torch.equal(output[:real_rows], native_output))
+                self.assertTrue(torch.all(output[real_rows:] == 0))
+                native_flashmla.assert_called_once()
+                call = native_flashmla.call_args.kwargs
+                self.assertEqual(call["q"].shape[:2], (real_rows, 1))
+                self.assertEqual(call["indices"].shape, (real_rows, 1, 8))
+                self.assertEqual(call["cache_seqlens"].shape, (real_rows,))
+                self.assertEqual(call["num_splits"].shape, (real_rows + 1,))
+                async_assert.assert_not_called()
+
+    def test_caller_rejects_num_splits_mismatch_after_padding_trim(self):
         backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
         backend.flashmla_kv_num_q_heads = 4
         backend.real_page_size = 64
@@ -87,62 +175,15 @@ class TestFlashMLAKVDecodeShapeContract(unittest.TestCase):
             self.assertRaisesRegex(ValueError, "query-axis mismatch"),
         ):
             backend._forward_flashmla_kv(
-                q_all=torch.empty((2, 4, 16)),
+                q_all=torch.empty((4, 4, 16)),
                 kv_cache=torch.empty((64, 16)),
                 v_head_dim=16,
                 sm_scale=1.0,
                 layer=layer,
                 metadata=metadata,
-                page_table_1=torch.full((2, 8), -1, dtype=torch.int32),
+                page_table_1=torch.full((4, 8), -1, dtype=torch.int32),
             )
         native_flashmla.assert_not_called()
-
-    def test_caller_launches_for_legal_physical_padding(self):
-        backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
-        backend.flashmla_kv_num_q_heads = 4
-        backend.real_page_size = 64
-        backend.kv_cache_dim = 16
-        backend.dsa_kv_cache_store_fp8 = True
-        backend.dsa_index_topk = 8
-        layer = SimpleNamespace(tp_q_head_num=4, head_dim=16, layer_id=7)
-        metadata = SimpleNamespace(
-            dsa_cache_seqlens_int32=torch.tensor([17, 0], dtype=torch.int32),
-            flashmla_metadata=SimpleNamespace(
-                flashmla_metadata=torch.empty((1, 1), dtype=torch.int32),
-                num_splits=torch.zeros(3, dtype=torch.int32),
-            ),
-        )
-        native_output = torch.empty((2, 1, 4, 16))
-
-        with (
-            patch(
-                "sglang.srt.environ.envs.SGLANG_ENABLE_ASYNC_ASSERT.get",
-                return_value=False,
-            ),
-            patch.object(torch, "_assert_async") as async_assert,
-            patch(
-                "sgl_kernel.flash_mla.flash_mla_with_kvcache",
-                return_value=(native_output, torch.empty((2, 4, 1))),
-            ) as native_flashmla,
-        ):
-            output = backend._forward_flashmla_kv(
-                q_all=torch.empty((2, 4, 16)),
-                kv_cache=torch.empty((64, 16)),
-                v_head_dim=16,
-                sm_scale=1.0,
-                layer=layer,
-                metadata=metadata,
-                page_table_1=torch.full((2, 8), -1, dtype=torch.int32),
-            )
-
-        self.assertIs(output, native_output)
-        native_flashmla.assert_called_once()
-        call = native_flashmla.call_args.kwargs
-        self.assertEqual(call["q"].shape[:2], (2, 1))
-        self.assertEqual(call["indices"].shape, (2, 1, 8))
-        self.assertEqual(call["cache_seqlens"].shape, (2,))
-        self.assertEqual(call["num_splits"].shape, (3,))
-        async_assert.assert_not_called()
 
     def test_enabled_selected_index_probe_precedes_native_launch(self):
         backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)

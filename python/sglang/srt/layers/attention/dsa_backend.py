@@ -168,6 +168,42 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
     return seqlens_32.contiguous().view(-1, 1)
 
 
+def _trim_trtllm_decode_dp_padding(
+    q_all: torch.Tensor,
+    topk_indices: Optional[torch.Tensor],
+    real_batch_size: int,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], int]:
+    """Trim eager DP rows not represented by precomputed DSA metadata."""
+    physical_batch_size = q_all.shape[0]
+    assert real_batch_size <= physical_batch_size, (
+        f"DSA metadata batch size ({real_batch_size}) exceeds q batch size "
+        f"({physical_batch_size})"
+    )
+    if topk_indices is not None:
+        assert real_batch_size <= topk_indices.shape[0], (
+            f"DSA metadata batch size ({real_batch_size}) exceeds topk batch size "
+            f"({topk_indices.shape[0]})"
+        )
+    num_padding_rows = physical_batch_size - real_batch_size
+    if num_padding_rows == 0:
+        return q_all, topk_indices, 0
+    return (
+        q_all[:real_batch_size],
+        topk_indices[:real_batch_size] if topk_indices is not None else None,
+        num_padding_rows,
+    )
+
+
+def _restore_trtllm_decode_dp_padding(
+    output: torch.Tensor, num_padding_rows: int
+) -> torch.Tensor:
+    if num_padding_rows == 0:
+        return output
+    return torch.cat(
+        [output, output.new_zeros((num_padding_rows, *output.shape[1:]))], dim=0
+    )
+
+
 def _validate_flashmla_kv_decode_shapes(
     *,
     q: torch.Tensor,
@@ -385,6 +421,16 @@ class DeepseekSparseAttnBackend(
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
+        self.supports_mha_one_shot: bool = not (
+            not _is_hip
+            and self.token_to_kv_pool.dtype == torch.float8_e4m3fn
+            and not self.dsa_kv_cache_store_fp8
+            and "tilelang"
+            in (
+                model_runner.server_args.dsa_prefill_backend,
+                model_runner.server_args.dsa_decode_backend,
+            )
+        )
         self.dsa_prefill_impl: _DSA_IMPL_T = (
             model_runner.server_args.dsa_prefill_backend
         )
@@ -2865,12 +2911,22 @@ class DeepseekSparseAttnBackend(
     ) -> torch.Tensor:
         from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
-        live_num_tokens = q_all.shape[0]
-        cache_seqlens = metadata.dsa_cache_seqlens_int32[:live_num_tokens]
+        cache_seqlens = metadata.dsa_cache_seqlens_int32
         assert metadata.flashmla_metadata is not None
         num_splits = metadata.flashmla_metadata.num_splits
 
-        # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
+        # Eager DP attention can pad q/page-table rows to the largest token count
+        # in the group after FlashMLA metadata has been planned for the real
+        # request rows. Sparse attention has no DP collective, so run only that
+        # real prefix and restore the physical shape before the following MLP/EP
+        # collectives. Each DSA decode metadata row still describes one query
+        # token; combining padded rows into seq_len_q > 1 would merge requests.
+        q_all, page_table_1, num_padding_rows = _trim_trtllm_decode_dp_padding(
+            q_all,
+            page_table_1,
+            cache_seqlens.shape[0],
+        )
+
         q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
         num_q_heads = q_all.shape[2]
         target_q_heads = self.flashmla_kv_num_q_heads
@@ -2924,7 +2980,7 @@ class DeepseekSparseAttnBackend(
         if target_q_heads != num_q_heads:
             o = o[:, :, :num_q_heads, :]
 
-        return o
+        return _restore_trtllm_decode_dp_padding(o, num_padding_rows)
 
     def _forward_standard_mha(
         self,
@@ -3397,7 +3453,8 @@ class DeepseekSparseAttnBackend(
 
             # Requirements: H200/B200, short sequences, supported dtype, fits in chunk
             self.use_mha = (
-                (
+                self.supports_mha_one_shot
+                and (
                     device_sm == 90 or (device_sm >= 100 and device_sm < 110)
                 )  # SM90/SM100 only
                 and max_kv_len

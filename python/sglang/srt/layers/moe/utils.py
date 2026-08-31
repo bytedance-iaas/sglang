@@ -365,6 +365,16 @@ def get_deepep_mode() -> DeepEPMode:
     return moe.deepep_mode
 
 
+def moe_a2a_requires_symmetric_spec_padding(is_extend_in_batch: bool) -> bool:
+    """Whether sparse speculative ranks need one rank-invariant MoE geometry.
+
+    MegaMoE uses a symmetric fused collective and must keep mixed active/idle
+    speculative ranks in the same padded forward.
+    """
+    del is_extend_in_batch
+    return get_moe_a2a_backend().is_megamoe()
+
+
 def get_deepep_config() -> str:
     moe = get_flags().moe
     if moe.deepep_config is None:
