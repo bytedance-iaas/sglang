@@ -278,11 +278,19 @@ def _validate_megamoe_single_node_topology(*, node_rank: int) -> None:
     }
     group_topology = moe_ep_group.all_gather_object(local_topology)
     node_ranks = {entry["node_rank"] for entry in group_topology}
+    hostnames = {entry["hostname"] for entry in group_topology}
 
-    if len(node_ranks) != 1:
+    # In the supported launcher layout, all ranks in one MegaMoE EP group are
+    # processes in the same worker container.  Checking the kernel hostname in
+    # addition to the launcher-provided node rank makes this deliberately more
+    # restrictive than the physical-node requirement: a group split across
+    # containers is rejected even when a misconfigured launcher reuses the
+    # same node_rank on both sides.
+    if len(node_ranks) != 1 or len(hostnames) != 1:
         raise RuntimeError(
-            "MegaMoE only supports a single-node MoE expert-parallel group, "
-            f"but ranks span multiple hosts: {group_topology}. "
+            "MegaMoE only supports a single-container, single-node MoE "
+            f"expert-parallel group, but ranks span multiple launcher nodes "
+            f"or hostnames: {group_topology}. "
             "Pipeline-parallel stages may span hosts only when each MoE EP "
             "group remains on one host."
         )
@@ -290,8 +298,9 @@ def _validate_megamoe_single_node_topology(*, node_rank: int) -> None:
     if moe_ep_group.rank_in_group == 0:
         logger.info(
             "Validated single-node MegaMoE topology: node_rank=%s, "
-            "group_size=%s, global_ranks=%s",
+            "hostname=%s, group_size=%s, global_ranks=%s",
             node_rank,
+            next(iter(hostnames)),
             moe_ep_group.world_size,
             moe_ep_group.ranks,
         )

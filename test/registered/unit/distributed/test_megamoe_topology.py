@@ -36,7 +36,7 @@ class _GlooMoEEPGroup:
         return topology
 
 
-def _run_gloo_guard(rank, world_size, port, node_ranks, result_queue):
+def _run_gloo_guard(rank, world_size, port, node_ranks, hostnames, result_queue):
     os.environ.update(
         MASTER_ADDR="127.0.0.1",
         MASTER_PORT=str(port),
@@ -53,7 +53,9 @@ def _run_gloo_guard(rank, world_size, port, node_ranks, result_queue):
         group = _GlooMoEEPGroup(rank, world_size)
         with (
             patch.object(bootstrap, "get_moe_ep_group", return_value=group),
-            patch.object(bootstrap.socket, "gethostname", return_value=f"pod-{rank}"),
+            patch.object(
+                bootstrap.socket, "gethostname", return_value=hostnames[rank]
+            ),
         ):
             try:
                 bootstrap._validate_megamoe_single_node_topology(
@@ -77,14 +79,14 @@ def _free_tcp_port():
 
 
 class TestMegaMoETopology(unittest.TestCase):
-    def _run_two_rank_guard(self, node_ranks):
+    def _run_two_rank_guard(self, node_ranks, hostnames):
         context = multiprocessing.get_context("spawn")
         result_queue = context.Queue()
         port = _free_tcp_port()
         processes = [
             context.Process(
                 target=_run_gloo_guard,
-                args=(rank, 2, port, node_ranks, result_queue),
+                args=(rank, 2, port, node_ranks, hostnames, result_queue),
             )
             for rank in range(2)
         ]
@@ -157,14 +159,21 @@ class TestMegaMoETopology(unittest.TestCase):
             bootstrap._validate_megamoe_single_node_topology(node_rank=0)
 
     def test_two_rank_gloo_accepts_single_node_group(self):
-        results = self._run_two_rank_guard((0, 0))
+        results = self._run_two_rank_guard((0, 0), ("pod-a", "pod-a"))
         self.assertEqual([status for _, status, _ in results], ["ok", "ok"])
 
     def test_two_rank_gloo_rejects_cross_node_group_without_hanging(self):
-        results = self._run_two_rank_guard((0, 1))
+        results = self._run_two_rank_guard((0, 1), ("pod-a", "pod-b"))
         self.assertEqual([status for _, status, _ in results], ["error", "error"])
         self.assertTrue(
             all("single-node" in message for _, _, message in results), results
+        )
+
+    def test_two_rank_gloo_rejects_reused_node_rank_across_containers(self):
+        results = self._run_two_rank_guard((0, 0), ("pod-a", "pod-b"))
+        self.assertEqual([status for _, status, _ in results], ["error", "error"])
+        self.assertTrue(
+            all("single-container" in message for _, _, message in results), results
         )
 
     def test_parallel_group_init_only_checks_megamoe_topology(self):
