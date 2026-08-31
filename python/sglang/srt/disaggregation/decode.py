@@ -111,6 +111,18 @@ def _bootstrap_addr(req: Req) -> str:
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
 
 
+def _owns_external_output(scheduler: Scheduler) -> bool:
+    ps = getattr(scheduler, "ps", None)
+    if ps is None:
+        # Unit-test/minimal scheduler doubles predate parallel-state wiring.
+        return True
+    return (
+        getattr(ps, "pp_rank", 0) == 0
+        and getattr(ps, "attn_tp_rank", 0) == 0
+        and getattr(ps, "attn_cp_rank", 0) == 0
+    )
+
+
 class DecodeReqToTokenPool:
     """
     The difference of DecodeReqToTokenPool and ReqToTokenPool is that
@@ -271,7 +283,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
 @dataclass
 class DecodeRequest:
     req: Req
-    kv_receiver: CommonKVReceiver
+    kv_receiver: Optional[CommonKVReceiver]
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
     is_rebootstrap: bool = False
@@ -281,6 +293,23 @@ class DecodeRequest:
     # caller's SSE open forever.
     rebootstrap_started_at: Optional[float] = None
     admission_bypass_count: int = 0
+    abort_output_emitted: bool = False
+    abort_resources_released: bool = False
+    abort_hisparse_finished: bool = False
+    abort_hicache_cleaned: bool = False
+    abort_staging_released: bool = False
+    abort_metadata_released: bool = False
+    abort_tracker_cleared: bool = False
+    abort_receiver_cleared: bool = False
+    abort_tracker_armed: bool = False
+    metadata_publication_started: bool = False
+    metadata_sent: bool = False
+    # Admission-side ownership journal. _match_prefix_and_lock acquires
+    # this lock before _pre_alloc; abort/rollback must release it exactly once.
+    prefix_lock_held: bool = False
+    # Terminal marker for a failed deferred-release admission contract.
+    # Prevents a later scheduler tick from retrying publication.
+    deferred_preflight_failed: bool = False
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -296,6 +325,20 @@ class DecodeRequest:
     @property
     def priority(self) -> Optional[int]:
         return self.req.priority
+
+
+@dataclass
+class DeferredDecodeAbortHold:
+    """Immutable transfer ownership needed while remote writers drain."""
+
+    decode_req: DecodeRequest
+    receiver: CommonKVReceiver
+    manager: CommonKVManager
+    bootstrap_room: int
+    generation: int
+    expected_prefill_ranks: set[int]
+    metadata_buffer_index: int
+    abort_drain_deadline: float
 
 
 class DecodePreallocQueue(DecodeHiCachePreallocMixin):
@@ -367,6 +410,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 "(e.g. GQA, MHA). MLA models should not set this flag."
             )
         self.kv_manager = self._init_kv_manager()
+        self.transfer_queue.bind_kv_manager_capabilities(self.kv_manager)
         if self.enable_staging:
             self.transfer_queue._init_staging_handler(self.kv_manager)
 
@@ -387,6 +431,27 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and self.token_to_kv_pool_allocator.page_size > 1
             and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
         )
+
+    def _deferred_admission_preflight(self, decode_req: DecodeRequest) -> bool:
+        """Validate deferred ownership before any admission-side mutation."""
+        if not getattr(self.transfer_queue, "enable_deferred_kv_release", False):
+            return True
+        receiver = decode_req.kv_receiver
+        manager = getattr(receiver, "kv_mgr", None) if receiver is not None else None
+        generation = (
+            getattr(receiver, "generation", None) if receiver is not None else None
+        )
+        expected_ranks = getattr(receiver, "expected_prefill_ranks", None)
+        if receiver is None or generation is None or not expected_ranks:
+            return False
+        if not (
+            getattr(manager, "supports_request_generation", False)
+            and getattr(manager, "supports_deferred_decode_kv_release", False)
+            and getattr(manager, "enable_deferred_decode_kv_release", False)
+        ):
+            return False
+        capability = getattr(self.transfer_queue, "_supports_deferred_abort", None)
+        return callable(capability) and bool(capability(decode_req))
 
     def _draft_pd_transfer_pool(self):
         """Select the PD destination for draft KV under HiSparse.
@@ -737,6 +802,140 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.add(req, is_rebootstrap=True)
 
     @staticmethod
+    def _rid_matches(rid: str, target: str, abort_all: bool) -> bool:
+        return abort_all or rid.startswith(target)
+
+    def _emit_abort_output_once(self, entry: DecodeRequest) -> None:
+        if getattr(entry, "abort_output_emitted", False):
+            return
+        # Only the global PP/attention leader owns the detokenizer socket.
+        if _owns_external_output(self.scheduler):
+            self.scheduler.output_streamer.stream_output(
+                [entry.req], entry.req.return_logprob
+            )
+        entry.abort_output_emitted = True
+        entry.req.finished_output = True
+
+    def remove_aborted(self, rid: str, abort_all: bool = False) -> List[DecodeRequest]:
+        removed: List[DecodeRequest] = []
+        removed_ids: set[int] = set()
+        for entry in self.queue + self.pending_reqs:
+            if (
+                self._rid_matches(entry.req.rid, rid, abort_all)
+                and id(entry) not in removed_ids
+            ):
+                removed.append(entry)
+                removed_ids.add(id(entry))
+        self.queue = [e for e in self.queue if id(e) not in removed_ids]
+        self.pending_reqs = [e for e in self.pending_reqs if id(e) not in removed_ids]
+
+        for reqs in (self.retracted_queue, self.held_rebootstrap_reqs):
+            kept = []
+            for req in reqs:
+                if self._rid_matches(req.rid, rid, abort_all):
+                    removed.append(DecodeRequest(req=req, kv_receiver=None))
+                else:
+                    kept.append(req)
+            reqs[:] = kept
+
+        for entry in removed:
+            self._abort_and_release(entry)
+        return removed
+
+    def _abort_and_release(self, entry: DecodeRequest) -> None:
+        """Abort one preallocation owner and release each resource once."""
+        req = entry.req
+        if not isinstance(getattr(req, "finished_reason", None), FINISH_ABORT):
+            prepare_abort(req, "Aborted by AbortReq.")
+
+        receiver = entry.kv_receiver
+        if receiver is not None and not getattr(receiver, "abort_notified", False):
+            # Notify the remote producer before deleting generation state.
+            receiver.abort()
+
+        # Tracker state is local ownership too. Clear it before clearing the
+        # receiver so a failed pre-publication admission cannot poison a reused
+        # room/generation. Published requests use the deferred hold path
+        # instead and never come through this helper.
+        if getattr(entry, "abort_tracker_armed", False) and receiver is not None:
+            manager = getattr(receiver, "kv_mgr", None)
+            clear_tracker = getattr(manager, "clear_deferred_abort_state", None)
+            generation = getattr(receiver, "generation", None)
+            if callable(clear_tracker) and generation is not None:
+                clear_tracker(req.bootstrap_room, generation)
+            entry.abort_tracker_armed = False
+
+        if getattr(self.transfer_queue, "enable_staging", False):
+            room = req.bootstrap_room
+            staging_handler = getattr(self.transfer_queue, "staging_handler", None)
+            if staging_handler is not None and staging_handler.is_staging_room(room):
+                staging_handler.unregister_decode_req(room)
+                entry.abort_staging_released = True
+
+        if not getattr(entry, "abort_hicache_cleaned", False):
+            cleanup_hicache = getattr(
+                self.transfer_queue, "_clean_hicache_prefetch_resources", None
+            )
+            prefix_match = getattr(entry, "prefix_match", None)
+            owns_hicache_resource = bool(
+                (
+                    prefix_match is not None
+                    and getattr(prefix_match, "prefetch_registered", False)
+                )
+                or getattr(entry, "hicache_restored_node", None) is not None
+            )
+            if cleanup_hicache is not None:
+                cleanup_hicache(entry)
+            elif owns_hicache_resource:
+                raise RuntimeError(
+                    "Cannot release decode preallocation owner with live "
+                    "HiCache resources: transfer queue has no cleanup hook"
+                )
+            entry.abort_hicache_cleaned = True
+        if (
+            getattr(entry, "prefix_lock_held", False)
+            and getattr(entry, "prefix_match", None) is not None
+        ):
+            self.tree_cache.dec_lock_ref(entry.prefix_match.last_device_node)
+            entry.prefix_lock_held = False
+        if self.scheduler.enable_hisparse and not getattr(
+            entry, "abort_hisparse_finished", False
+        ):
+            self.scheduler.finish_hisparse_request(req)
+            entry.abort_hisparse_finished = True
+
+        idx = getattr(entry, "metadata_buffer_index", -1)
+        if idx >= 0 and not getattr(entry, "abort_metadata_released", False):
+            self.metadata_buffers.bootstrap_room[idx] = 0
+            self.req_to_metadata_buffer_idx_allocator.free(idx)
+            entry.metadata_buffer_index = -1
+            entry.abort_metadata_released = True
+
+        owns_kv_resource = bool(
+            getattr(req, "kv", None) is not None
+            or getattr(req, "mamba_pool_idx", None) is not None
+            or (hasattr(req, "kv") and getattr(req, "req_pool_idx", None) is not None)
+        )
+        if not getattr(entry, "abort_resources_released", False) and owns_kv_resource:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+            entry.abort_resources_released = True
+
+        if receiver is not None:
+            receiver.clear()
+            entry.kv_receiver = None
+        if not getattr(entry, "abort_output_emitted", False):
+            if _owns_external_output(self.scheduler):
+                self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+            entry.abort_output_emitted = True
+            req.finished_output = True
+
+    def _rollback_admission_owner(self, entry: DecodeRequest) -> None:
+        """Rollback a pre-publication admission transaction exactly once."""
+        # This intentionally shares the idempotent release journal with normal
+        # abort cleanup. It is only called before metadata publication.
+        self._abort_and_release(entry)
+
+    @staticmethod
     def _rebootstrap_prefill_len(req: Req) -> int:
         if getattr(req, "pd_rebootstrap_in_progress", False):
             return len(req.origin_input_ids) + len(req.output_ids)
@@ -791,8 +990,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.add(req, is_retracted=is_retracted)
 
     def release_memory_occupation(self):
-        self.queue.clear()
-        self.retracted_queue.clear()
+        self.remove_aborted("", abort_all=True)
         if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
             self.kv_manager.deregister_buffer_to_engine()
 
@@ -1136,13 +1334,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
-                if not getattr(decode_req.req, "finished_output", False):
-                    self.scheduler.output_streamer.stream_output(
-                        [decode_req.req],
-                        decode_req.req.return_logprob,
-                    )
-                decode_req.kv_receiver.clear()
-                decode_req.kv_receiver = None
+                self._abort_and_release(decode_req)
                 failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
 
@@ -1210,6 +1402,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             if not decode_req.waiting_for_input:
                 continue
+            if getattr(decode_req, "deferred_preflight_failed", False):
+                continue
+            # Must precede prefix lock, _pre_alloc, HiCache/HiSparse work,
+            # metadata allocation, staging registration, and publication.
+            if not self._deferred_admission_preflight(decode_req):
+                decode_req.deferred_preflight_failed = True
+                prepare_abort(
+                    decode_req.req,
+                    "Deferred decode admission preflight failed; request was not published",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                failed_reqs.append(decode_req)
+                indices_to_remove.add(i)
+                continue
 
             if transfer_window_budget <= 0:
                 break
@@ -1246,6 +1452,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if use_decode_radix_cache:
                 # Match prefix against decode's radix cache.
                 prefix_match = self._match_prefix_and_lock(decode_req.req)
+                decode_req.prefix_match = prefix_match
                 prefix_indices = prefix_match.prefix_indices
                 # prefix_len: tokens already on device (L1 hit).
                 # total_prefix_len: full prefix promised to prefill
@@ -1291,8 +1498,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
                 > full_allocatable_tokens
             ):
-                if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                if prefix_match is not None:
+                    self.tree_cache.dec_lock_ref(prefix_match.last_device_node)
+                    decode_req.prefix_lock_held = False
                 if (
                     fit_first
                     and decode_req.admission_bypass_count < admission_max_bypasses
@@ -1301,8 +1509,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     continue
                 break
             if required_tokens_for_request > full_allocatable_tokens:
-                if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                if prefix_match is not None:
+                    self.tree_cache.dec_lock_ref(prefix_match.last_device_node)
+                    decode_req.prefix_lock_held = False
                 if (
                     fit_first
                     and decode_req.admission_bypass_count < admission_max_bypasses
@@ -1325,8 +1534,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
                     > swa_allocatable_tokens
                 ):
-                    if prefix_len > 0:
-                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    if prefix_match is not None:
+                        self.tree_cache.dec_lock_ref(prefix_match.last_device_node)
+                        decode_req.prefix_lock_held = False
                     if (
                         fit_first
                         and decode_req.admission_bypass_count < admission_max_bypasses
@@ -1338,20 +1548,35 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if total_prefix_len != 0 and hasattr(
                 self.token_to_kv_pool_allocator, "c4_attn_allocator"
             ):
-                if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                if prefix_match is not None:
+                    self.tree_cache.dec_lock_ref(prefix_match.last_device_node)
+                    decode_req.prefix_lock_held = False
                 raise RuntimeError(
                     "DSV4 NPU PD disaggregation does not support decode-side "
                     "prefix cache yet; disable disaggregation decode radix/HiCache "
                     "for PD + chunked prefill."
                 )
 
-            dst_kv_indices = self._pre_alloc(
-                decode_req.req,
-                prefix_indices,
-                prefix_len,
-                total_prefix_len,
-            )
+            # The lock was acquired by _match_prefix_and_lock; from here on it
+            # belongs to this admission transaction even if _pre_alloc raises.
+            decode_req.prefix_lock_held = prefix_match is not None
+            try:
+                dst_kv_indices = self._pre_alloc(
+                    decode_req.req,
+                    prefix_indices,
+                    prefix_len,
+                    total_prefix_len,
+                )
+            except Exception as admission_error:
+                prepare_abort(
+                    decode_req.req,
+                    f"Decode preallocation failed: {admission_error}",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                self._abort_and_release(decode_req)
+                failed_reqs.append(decode_req)
+                indices_to_remove.add(i)
+                continue
             decode_req.prefix_match = prefix_match
             if self.scheduler.enable_decode_hicache:
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
@@ -1522,30 +1747,86 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             metadata_kwargs = {"decode_prefix_len": total_prefix_len}
             if device_page_indices is not None:
                 metadata_kwargs["device_kv_indices"] = device_page_indices
-            if (
-                self.transfer_queue.enable_staging
-                and hasattr(decode_req.kv_receiver, "require_staging")
-                and decode_req.kv_receiver.require_staging
-            ):
-                # Register before send_metadata, which triggers the STAGING_REQ
-                # prefetch (dropped for an unregistered room); tiny race, correct order.
-                self.transfer_queue.staging_handler.register_decode_req(
-                    decode_req.req.bootstrap_room, decode_req
+            # The remainder is one admission transaction.  Every operation up
+            # to the marker is pre-publication and must be rollback-safe.
+            # send_metadata can publish to a strict subset of Prefill ranks, so
+            # once the marker is set the owner must enter the deferred hold path.
+            publication_started = False
+            try:
+                supports_deferred_abort = getattr(
+                    self.transfer_queue, "_supports_deferred_abort", None
                 )
-            decode_req.kv_receiver.send_metadata(
-                page_indices,
-                decode_req.metadata_buffer_index,
-                state_indices,
-                **metadata_kwargs,
-            )
-            if decode_req.is_rebootstrap:
-                payload = decode_req.req.build_rebootstrap_payload(
-                    bootstrap_generation=decode_req.kv_receiver.generation
+                deferred_enabled = getattr(
+                    self.transfer_queue, "enable_deferred_kv_release", False
                 )
-                self.kv_manager.submit_prefill_recompute(
-                    decode_req.kv_receiver,
-                    payload,
+                if supports_deferred_abort is None and deferred_enabled:
+                    raise RuntimeError(
+                        "Deferred decode KV release is enabled, but the transfer "
+                        "queue does not expose its generation-scoped capability gate"
+                    )
+                if supports_deferred_abort is not None and supports_deferred_abort(
+                    decode_req
+                ):
+                    receiver = decode_req.kv_receiver
+                    manager = receiver.kv_mgr
+                    generation = receiver.generation
+                    expected_ranks = set(receiver.expected_prefill_ranks)
+                    if not manager.register_deferred_abort_room(
+                        decode_req.req.bootstrap_room, generation, expected_ranks
+                    ):
+                        raise RuntimeError(
+                            "Failed to arm generation-scoped deferred decode abort "
+                            f"tracking for rid={decode_req.req.rid}"
+                        )
+                    decode_req.abort_tracker_armed = True
+                    if not receiver.arm_decode_owner_lease():
+                        raise RuntimeError(
+                            "Failed to arm generation-scoped decode owner lease "
+                            f"for rid={decode_req.req.rid}"
+                        )
+                if (
+                    self.transfer_queue.enable_staging
+                    and hasattr(decode_req.kv_receiver, "require_staging")
+                    and decode_req.kv_receiver.require_staging
+                ):
+                    # Registration is itself local ownership; it is deliberately
+                    # after tracker/lease validation and before publication.
+                    self.transfer_queue.staging_handler.register_decode_req(
+                        decode_req.req.bootstrap_room, decode_req
+                    )
+                decode_req.metadata_publication_started = True
+                publication_started = True
+                decode_req.kv_receiver.send_metadata(
+                    page_indices,
+                    decode_req.metadata_buffer_index,
+                    state_indices,
+                    **metadata_kwargs,
                 )
+                decode_req.metadata_sent = True
+                if decode_req.is_rebootstrap:
+                    payload = decode_req.req.build_rebootstrap_payload(
+                        bootstrap_generation=decode_req.kv_receiver.generation
+                    )
+                    self.kv_manager.submit_prefill_recompute(
+                        decode_req.kv_receiver,
+                        payload,
+                    )
+            except Exception as admission_error:
+                prepare_abort(
+                    decode_req.req,
+                    f"Decode admission failed: {admission_error}",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                if publication_started:
+                    # Keep the receiver and every destination owner until the
+                    # generation-scoped all-rank drain ACK arrives.
+                    self.transfer_queue._arm_deferred_abort(decode_req)
+                    self.transfer_queue._emit_abort_output_once(decode_req)
+                else:
+                    self._abort_and_release(decode_req)
+                failed_reqs.append(decode_req)
+                indices_to_remove.add(i)
+                continue
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             transfer_window_budget -= 1
@@ -1556,6 +1837,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
+        if failed_reqs:
+            failed_ids = {id(entry) for entry in failed_reqs}
+            self.pending_reqs = [
+                entry for entry in self.pending_reqs if id(entry) not in failed_ids
+            ]
 
         return preallocated_reqs, failed_reqs
 
@@ -2031,6 +2317,302 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.spec_algorithm = scheduler.spec_algorithm
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.staging_handler = None
+        # The concrete manager is created by DecodePreallocQueue immediately
+        # after this queue. Until then, keep the user request only; the manager
+        # capability gate is applied before metadata publication.
+        self.enable_deferred_kv_release = (
+            envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
+        )
+        self.deferred_kv_release_timeout = (
+            envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT.get()
+        )
+        self.deferred_abort_holds: List[DeferredDecodeAbortHold] = []
+
+    @staticmethod
+    def _rid_matches(rid: str, target: str, abort_all: bool) -> bool:
+        return abort_all or rid.startswith(target)
+
+    def _emit_abort_output_once(self, entry: DecodeRequest) -> None:
+        if getattr(entry, "abort_output_emitted", False):
+            return
+        if _owns_external_output(self.scheduler):
+            self.scheduler.output_streamer.stream_output(
+                [entry.req], entry.req.return_logprob
+            )
+        entry.abort_output_emitted = True
+        entry.req.finished_output = True
+
+    def _supports_deferred_abort(self, entry: DecodeRequest) -> bool:
+        receiver = entry.kv_receiver
+        if receiver is None or receiver.generation is None:
+            return False
+        manager = receiver.kv_mgr
+        return bool(
+            self.enable_deferred_kv_release
+            and getattr(manager, "supports_request_generation", False)
+            and getattr(manager, "supports_deferred_decode_kv_release", False)
+            and getattr(manager, "enable_deferred_decode_kv_release", False)
+        )
+
+    def _require_deferred_abort_capability(self, entry: DecodeRequest) -> None:
+        if self._supports_deferred_abort(entry):
+            return
+        receiver = entry.kv_receiver
+        manager = None if receiver is None else receiver.kv_mgr
+        raise RuntimeError(
+            "Cannot safely release decode transfer destinations after metadata "
+            f"publication for rid={entry.req.rid}: backend manager "
+            f"{type(manager).__name__} does not support generation-scoped "
+            "deferred decode KV release"
+        )
+
+    def _arm_deferred_abort(self, entry: DecodeRequest) -> None:
+        receiver = entry.kv_receiver
+        if not (entry.metadata_sent or entry.metadata_publication_started):
+            self._do_immediate_abort_release(entry)
+            return
+        if receiver is None or receiver.generation is None:
+            self._do_immediate_abort_release(entry)
+            return
+        self._require_deferred_abort_capability(entry)
+        self._defer_aborted_owner(entry, register_tracker=True)
+        # The tracker is armed before abort(), even if abort() suppresses a
+        # transport-level duplicate notification.
+        if not getattr(receiver, "abort_notified", False):
+            receiver.abort()
+
+    def _defer_aborted_owner(
+        self, entry: DecodeRequest, *, register_tracker: bool
+    ) -> None:
+        """Detach an aborted owner without sending another wire ABORT."""
+        receiver = entry.kv_receiver
+        assert receiver is not None
+        self._require_deferred_abort_capability(entry)
+        manager = receiver.kv_mgr
+        generation = receiver.generation
+        assert generation is not None
+        expected_prefill_ranks = set(receiver.expected_prefill_ranks)
+        if any(hold.decode_req is entry for hold in self.deferred_abort_holds):
+            return
+        if register_tracker and not entry.abort_tracker_armed:
+            tracker_armed = manager.register_deferred_abort_room(
+                entry.req.bootstrap_room, generation, expected_prefill_ranks
+            )
+            if not tracker_armed:
+                raise RuntimeError(
+                    "Failed to arm generation-scoped deferred decode abort "
+                    f"tracking for rid={entry.req.rid} "
+                    f"room={entry.req.bootstrap_room} generation={generation}"
+                )
+            entry.abort_tracker_armed = True
+        hold = DeferredDecodeAbortHold(
+            decode_req=entry,
+            receiver=receiver,
+            manager=manager,
+            bootstrap_room=entry.req.bootstrap_room,
+            generation=generation,
+            expected_prefill_ranks=expected_prefill_ranks,
+            metadata_buffer_index=entry.metadata_buffer_index,
+            abort_drain_deadline=time.monotonic() + self.deferred_kv_release_timeout,
+        )
+        self.deferred_abort_holds.append(hold)
+
+    def _do_immediate_abort_release(self, entry: DecodeRequest) -> None:
+        receiver = entry.kv_receiver
+        if receiver is not None and not getattr(receiver, "abort_notified", False):
+            receiver.abort()
+        if receiver is None:
+            # There is no remote writer to drain. Release local ownership in the
+            # same order as _do_release, without fabricating a manager/hold.
+            if (
+                self.enable_staging
+                and self.staging_handler is not None
+                and self.staging_handler.is_staging_room(entry.req.bootstrap_room)
+            ):
+                self.staging_handler.unregister_decode_req(entry.req.bootstrap_room)
+            if self.scheduler.enable_hisparse and not getattr(
+                entry, "abort_hisparse_finished", False
+            ):
+                self.scheduler.finish_hisparse_request(entry.req)
+                entry.abort_hisparse_finished = True
+            if not getattr(entry, "abort_hicache_cleaned", False):
+                self._clean_hicache_prefetch_resources(entry)
+                entry.abort_hicache_cleaned = True
+            idx = entry.metadata_buffer_index
+            if idx >= 0 and not getattr(entry, "abort_metadata_released", False):
+                self.metadata_buffers.bootstrap_room[idx] = 0
+                self.req_to_metadata_buffer_idx_allocator.free(idx)
+                entry.metadata_buffer_index = -1
+                entry.abort_metadata_released = True
+            req = entry.req
+            if not getattr(entry, "abort_resources_released", False) and (
+                getattr(req, "req_pool_idx", None) is not None
+                or getattr(req, "kv", None) is not None
+                or getattr(req, "mamba_pool_idx", None) is not None
+            ):
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+                entry.abort_resources_released = True
+            return
+        hold = DeferredDecodeAbortHold(
+            entry,
+            receiver,
+            receiver.kv_mgr,
+            entry.req.bootstrap_room,
+            receiver.generation or 0,
+            set(getattr(receiver, "expected_prefill_ranks", ())),
+            entry.metadata_buffer_index,
+            time.monotonic(),
+        )
+        self._do_release(hold, clear_tracker=receiver.generation is not None)
+
+    def has_pending_deferred_abort_holds(self) -> bool:
+        """Whether an aborted transfer still owns writable destinations."""
+        return bool(self.deferred_abort_holds)
+
+    def resolve_deferred_abort_holds(self) -> None:
+        if not self.deferred_abort_holds:
+            return
+        now = time.monotonic()
+        kept: List[DeferredDecodeAbortHold] = []
+        ready: List[DeferredDecodeAbortHold] = []
+        for hold in self.deferred_abort_holds:
+            if not getattr(hold.receiver, "abort_notified", False):
+                try:
+                    hold.receiver.abort()
+                except Exception:
+                    logger.exception(
+                        "Deferred decode abort notification retry failed for room=%s generation=%s",
+                        hold.bootstrap_room,
+                        hold.generation,
+                    )
+            drained = hold.manager.is_abort_release_safe(
+                hold.bootstrap_room, hold.generation
+            )
+            if not drained:
+                if now >= hold.abort_drain_deadline:
+                    raise RuntimeError(
+                        "Fatal deferred decode abort drain timeout: refusing "
+                        "to release writable pages for "
+                        f"rid={hold.decode_req.req.rid} "
+                        f"room={hold.bootstrap_room} generation={hold.generation} "
+                        f"expected_prefill_ranks={sorted(hold.expected_prefill_ranks)}"
+                    )
+                kept.append(hold)
+                continue
+            ready.append(hold)
+        for hold in ready:
+            try:
+                self._do_release(hold)
+            except Exception:
+                logger.exception(
+                    "Deferred decode abort release failed for room=%s "
+                    "generation=%s; retaining owner for retry",
+                    hold.bootstrap_room,
+                    hold.generation,
+                )
+                kept.append(hold)
+        self.deferred_abort_holds = kept
+
+    def _do_release(
+        self, hold: DeferredDecodeAbortHold, *, clear_tracker: bool = True
+    ) -> None:
+        """Release a held transfer owner once, in writer-safe order."""
+        entry = hold.decode_req
+        req = entry.req
+        if (
+            not getattr(entry, "abort_staging_released", False)
+            and self.enable_staging
+            and self.staging_handler is not None
+            and self.staging_handler.is_staging_room(hold.bootstrap_room)
+        ):
+            # Synchronizes outstanding scatter work before destination pages can
+            # be returned to the allocator.
+            self.staging_handler.unregister_decode_req(hold.bootstrap_room)
+        entry.abort_staging_released = True
+
+        if self.scheduler.enable_hisparse and not getattr(
+            entry, "abort_hisparse_finished", False
+        ):
+            self.scheduler.finish_hisparse_request(req)
+            entry.abort_hisparse_finished = True
+        if not getattr(entry, "abort_hicache_cleaned", False):
+            self._clean_hicache_prefetch_resources(entry)
+            entry.abort_hicache_cleaned = True
+
+        idx = hold.metadata_buffer_index
+        if idx >= 0 and not getattr(entry, "abort_metadata_released", False):
+            self.metadata_buffers.bootstrap_room[idx] = 0
+            self.req_to_metadata_buffer_idx_allocator.free(idx)
+            entry.metadata_buffer_index = -1
+            entry.abort_metadata_released = True
+
+        if not getattr(entry, "abort_resources_released", False) and (
+            getattr(req, "req_pool_idx", None) is not None
+            or getattr(req, "kv", None) is not None
+            or getattr(req, "mamba_pool_idx", None) is not None
+        ):
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+        entry.abort_resources_released = True
+
+        if clear_tracker and not getattr(entry, "abort_tracker_cleared", False):
+            hold.manager.clear_deferred_abort_state(
+                hold.bootstrap_room, hold.generation
+            )
+            entry.abort_tracker_cleared = True
+        if not getattr(entry, "abort_receiver_cleared", False):
+            hold.receiver.clear()
+            entry.abort_receiver_cleared = True
+            if entry.kv_receiver is hold.receiver:
+                entry.kv_receiver = None
+
+    def remove_aborted(self, rid: str, abort_all: bool = False) -> List[DecodeRequest]:
+        removed = [
+            e for e in self.queue if self._rid_matches(e.req.rid, rid, abort_all)
+        ]
+        # Validate before mutating queue ownership.  A published generation on
+        # an unsupported backend must fail closed without orphaning the local
+        # destination owner or releasing any writable resource.
+        for entry in removed:
+            receiver = entry.kv_receiver
+            if (
+                (entry.metadata_sent or entry.metadata_publication_started)
+                and receiver is not None
+                and receiver.generation is not None
+            ):
+                self._require_deferred_abort_capability(entry)
+        self.queue = [e for e in self.queue if id(e) not in {id(x) for x in removed}]
+        for entry in removed:
+            if not isinstance(
+                getattr(entry.req, "finished_reason", None), FINISH_ABORT
+            ):
+                prepare_abort(entry.req, "Aborted by AbortReq.")
+            receiver = entry.kv_receiver
+            if (
+                (entry.metadata_sent or entry.metadata_publication_started)
+                and receiver is not None
+                and receiver.generation is not None
+            ):
+                self._arm_deferred_abort(entry)
+            else:
+                self._do_immediate_abort_release(entry)
+            self._emit_abort_output_once(entry)
+        return removed
+
+    def bind_kv_manager_capabilities(self, manager: CommonKVManager) -> None:
+        """Fail closed before metadata can expose a writable destination."""
+        requested = self.enable_deferred_kv_release
+        self.enable_deferred_kv_release = bool(
+            requested
+            and getattr(manager, "supports_request_generation", False)
+            and getattr(manager, "supports_deferred_decode_kv_release", False)
+            and getattr(manager, "enable_deferred_decode_kv_release", False)
+        )
+        if requested and not self.enable_deferred_kv_release:
+            raise RuntimeError(
+                "Deferred decode KV release was requested, but backend manager "
+                f"{type(manager).__name__} lacks the generation-scoped abort/ACK "
+                "protocol"
+            )
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -2307,7 +2889,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         instead of committing more requests than its device buffers can hold.
         """
         if not self.queue:
+            self.resolve_deferred_abort_holds()
             return []
+
+        self.resolve_deferred_abort_holds()
 
         if max_successes is not None:
             assert max_successes >= 0
@@ -2352,6 +2937,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 poll == KVPoll.Failed
                 or hicache_restore_status == HiCacheRestoreResult.FAILED
             ):
+                receiver = decode_req.kv_receiver
+                metadata_published = (
+                    (
+                        getattr(decode_req, "metadata_sent", False)
+                        or getattr(decode_req, "metadata_publication_started", False)
+                    )
+                    and receiver is not None
+                    and receiver.generation is not None
+                )
+                if metadata_published:
+                    self._require_deferred_abort_capability(decode_req)
                 error_message = (
                     f"Decode transfer failed for request rank={self.tp_rank} "
                     f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
@@ -2363,7 +2959,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     except Exception as e:
                         error_message += f" with exception {e}"
                         is_propagated = getattr(e, "is_from_another_rank", False)
-                self._clean_hicache_prefetch_resources(decode_req)
                 # Mute error message for propagated exceptions to avoid duplicate logging
                 if is_propagated:
                     logger.debug(error_message)
@@ -2374,17 +2969,28 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     error_message,
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
-                self.scheduler.output_streamer.stream_output(
-                    [decode_req.req],
-                    decode_req.req.return_logprob,
-                )
-                if self.scheduler.enable_hisparse:
-                    self.scheduler.finish_hisparse_request(decode_req.req)
-                # release pre-allocated kv cache, but don't insert into the tree since it's failed
-                release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
-                decode_req.kv_receiver.clear()
-                decode_req.kv_receiver = None
                 indices_to_remove.add(i)
+                if metadata_published:
+                    self._arm_deferred_abort(decode_req)
+                else:
+                    self._clean_hicache_prefetch_resources(decode_req)
+                    decode_req.abort_hicache_cleaned = True
+                    if self.scheduler.enable_hisparse:
+                        self.scheduler.finish_hisparse_request(decode_req.req)
+                        decode_req.abort_hisparse_finished = True
+                    if (
+                        getattr(decode_req.req, "req_pool_idx", None) is not None
+                        or getattr(decode_req.req, "kv", None) is not None
+                        or getattr(decode_req.req, "mamba_pool_idx", None) is not None
+                    ):
+                        release_kv_cache(
+                            decode_req.req, self.tree_cache, is_insert=False
+                        )
+                    decode_req.abort_resources_released = True
+                    if receiver is not None:
+                        receiver.clear()
+                        decode_req.kv_receiver = None
+                self._emit_abort_output_once(decode_req)
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
@@ -2400,10 +3006,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption
                 if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
-                    self.scheduler.output_streamer.stream_output(
-                        [decode_req.req],
-                        decode_req.req.return_logprob,
-                    )
+                    self._emit_abort_output_once(decode_req)
                     if self.scheduler.enable_hisparse:
                         self.scheduler.finish_hisparse_request(decode_req.req)
                     self._clean_hicache_prefetch_resources(decode_req)
@@ -2422,6 +3025,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 raise ValueError(f"Unexpected poll case: {poll}")
 
         for i in indices_to_remove:
+            if getattr(self.queue[i], "abort_metadata_released", False) or any(
+                hold.decode_req is self.queue[i] for hold in self.deferred_abort_holds
+            ):
+                continue
             if self.enable_staging and self.staging_handler.is_staging_room(
                 self.queue[i].req.bootstrap_room
             ):
@@ -2442,8 +3049,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         return transferred_reqs
 
     def release_memory_occupation(self):
-        """Clean up in-flight transfers before releasing GPU memory."""
-        self.queue.clear()
+        """Refuse teardown while a remote writer may own destinations."""
+        self.remove_aborted("", abort_all=True)
+        self.resolve_deferred_abort_holds()
+        if self.has_pending_deferred_abort_holds():
+            raise RuntimeError(
+                "Cannot release decode memory occupation with pending deferred "
+                f"abort holds: count={len(self.deferred_abort_holds)}"
+            )
 
     def resume_memory_occupation(self):
         """Queues are already cleared on release; new transfers can be accepted."""
@@ -2459,6 +3072,7 @@ class SchedulerDisaggregationDecodeMixin:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            self.disagg_decode_transfer_queue.resolve_deferred_abort_holds()
             if self._engine_paused:
                 continue
             self.process_decode_queue()
@@ -2498,6 +3112,7 @@ class SchedulerDisaggregationDecodeMixin:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            self.disagg_decode_transfer_queue.resolve_deferred_abort_holds()
             if self._engine_paused:
                 continue
             self.process_decode_queue()

@@ -77,6 +77,7 @@ from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
     maybe_release_metadata_buffer,
+    process_pending_prefill_external_aborts,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -4258,6 +4259,10 @@ class Scheduler(
             # results instantly, but they still indicate the server is not idle.
             idle &= len(self.grammar_manager.grammar_queue) == 0
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                process_pending_prefill_external_aborts(self)
+                idle &= (
+                    not self.disagg_prefill_bootstrap_queue.has_pending_abort_release()
+                )
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
 
@@ -4267,6 +4272,9 @@ class Scheduler(
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
                 if self.decode_offload_manager is not None:
                     idle &= len(self.decode_offload_manager.ongoing_offload) == 0
+                idle &= (
+                    not self.disagg_decode_transfer_queue.has_pending_deferred_abort_holds()
+                )
 
             # HiSparse: staging requests transitioning prefill -> decode
             if self.enable_hisparse:
@@ -4603,6 +4611,10 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                self.disagg_prefill_bootstrap_queue.defer_external_abort(req)
+                logger.debug(f"Abort queued prefill request. {req.rid=}")
+                continue
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
@@ -4610,20 +4622,6 @@ class Scheduler(
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 release_kv_cache(req, self.tree_cache)
-            # For disaggregation prefill mode, free the metadata buffer index
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                bootstrap_pending = req.pending_bootstrap
-                maybe_release_metadata_buffer(
-                    req, self.req_to_metadata_buffer_idx_allocator
-                )
-                if (
-                    bootstrap_pending
-                    and hasattr(req, "disagg_kv_sender")
-                    and req.disagg_kv_sender is not None
-                ):
-                    if hasattr(req.disagg_kv_sender, "abort"):
-                        req.disagg_kv_sender.abort()
-
             # For mamba radix cache
             if (
                 req.mamba_pool_idx is not None
@@ -4657,52 +4655,48 @@ class Scheduler(
         # Delete requests not in the waiting queue when PD disaggregation is enabled
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # Abort requests that have not yet been bootstrapped
-            for req in self.disagg_prefill_bootstrap_queue.queue:
-                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort bootstrap queue request. {req.rid=}")
-                    if self.enable_hicache_storage:
-                        self.tree_cache.release_aborted_request(req.rid)
-
-                    if hasattr(req.disagg_kv_sender, "abort"):
-                        req.disagg_kv_sender.abort()
-                    if self.ps.pp_size > 1:
-                        prepare_abort(req, "Aborted by AbortReq.")
+            bootstrap_reqs = self.disagg_prefill_bootstrap_queue.remove_aborted(
+                recv_req.rid, recv_req.abort_all
+            )
+            for req in bootstrap_reqs:
+                logger.debug(f"Abort bootstrap queue request. {req.rid=}")
 
             # Abort in-flight requests
-            for req in self.disagg_prefill_inflight_queue:
-                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort inflight queue request. {req.rid=}")
-                    if hasattr(req.disagg_kv_sender, "abort"):
-                        req.disagg_kv_sender.abort()
+            aborted_inflight = [
+                req
+                for req in self.disagg_prefill_inflight_queue
+                if recv_req.abort_all or req.rid.startswith(recv_req.rid)
+            ]
+            aborted_inflight_ids = {id(req) for req in aborted_inflight}
+            remaining_inflight = [
+                req
+                for req in self.disagg_prefill_inflight_queue
+                if id(req) not in aborted_inflight_ids
+            ]
+            self.disagg_prefill_inflight_queue = remaining_inflight
+            for req in aborted_inflight:
+                logger.debug(f"Abort inflight queue request. {req.rid=}")
+                self.disagg_prefill_bootstrap_queue.defer_external_abort(req)
 
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             # Abort requests that have not yet finished preallocation
-            for decode_req in self.disagg_decode_prealloc_queue.queue:
-                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
-                    decode_req.kv_receiver.abort()
-                    if self.ps.pp_size > 1:
-                        prepare_abort(decode_req.req, "Aborted by AbortReq.")
+            removed_prealloc = self.disagg_decode_prealloc_queue.remove_aborted(
+                recv_req.rid, recv_req.abort_all
+            )
+            # Active DecodeRequest owners are finalized by the queue. Retracted
+            # and held rebootstrap Req owners are also finalized there, but the
+            # scheduler still owns their optional CPU-offload copy.
+            for owner in removed_prealloc:
+                req = owner.req
+                if hasattr(req, "kv_cache_cpu"):
+                    del req.kv_cache_cpu
 
             # Abort requests waiting for kvcache to release tree cache
-            for decode_req in self.disagg_decode_transfer_queue.queue:
-                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
-                    decode_req.kv_receiver.abort()
+            self.disagg_decode_transfer_queue.remove_aborted(
+                recv_req.rid, recv_req.abort_all
+            )
 
             # Abort requests already retracted to CPU cache
-            if self.disagg_decode_prealloc_queue.retracted_queue:
-                remaining_retracted = []
-                for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
-                    if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
-                        assert hasattr(decode_req, "kv_cache_cpu")
-                        del decode_req.kv_cache_cpu
-                        self.ipc_channels.send_to_tokenizer.send_output(
-                            AbortReq(rid=decode_req.rid), decode_req
-                        )
-                    else:
-                        remaining_retracted.append(decode_req)
-                self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
 
         # Delete requests in the running batch
         if self.ps.pp_size == 1:

@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, call, patch
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
+    DecodeRequest,
     DecodeTransferQueue,
     HiCacheRestoreResult,
 )
@@ -21,9 +22,14 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 class FakeReceiver:
     def __init__(self):
         self.clear_called = False
+        self.generation = None
+        self.kv_mgr = MagicMock()
 
     def clear(self):
         self.clear_called = True
+
+    def abort(self):
+        self.abort_called = True
 
     def failure_exception(self):
         return None
@@ -34,31 +40,97 @@ class FakeReceiver:
 
 
 class TestDecodeQueueCleanup(CustomTestCase):
+    @patch("sglang.srt.disaggregation.decode.prepare_abort")
+    def test_remove_aborted_returns_wrappers_for_retracted_and_held(self, prepare):
+        retracted = SimpleNamespace(
+            rid="abort-retracted",
+            bootstrap_room=1,
+            finished_reason=None,
+            return_logprob=False,
+            finished_output=False,
+            req_pool_idx=None,
+            kv=None,
+            mamba_pool_idx=None,
+        )
+        held = SimpleNamespace(
+            rid="abort-held",
+            bootstrap_room=2,
+            finished_reason=None,
+            return_logprob=False,
+            finished_output=False,
+            req_pool_idx=None,
+            kv=None,
+            mamba_pool_idx=None,
+        )
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.queue = []
+        queue.pending_reqs = []
+        queue.retracted_queue = [retracted]
+        queue.held_rebootstrap_reqs = [held]
+        queue.metadata_buffers = SimpleNamespace(bootstrap_room={})
+        queue.req_to_metadata_buffer_idx_allocator = MagicMock()
+        queue.tree_cache = MagicMock()
+        queue.transfer_queue = SimpleNamespace(
+            enable_staging=False,
+            staging_handler=None,
+            _clean_hicache_prefetch_resources=MagicMock(),
+        )
+        queue.scheduler = SimpleNamespace(
+            enable_hisparse=False,
+            output_streamer=MagicMock(),
+            ps=SimpleNamespace(pp_rank=0, attn_tp_rank=0, attn_cp_rank=0),
+        )
+
+        removed = queue.remove_aborted("abort-")
+
+        self.assertEqual([owner.req for owner in removed], [retracted, held])
+        self.assertEqual(queue.retracted_queue, [])
+        self.assertEqual(queue.held_rebootstrap_reqs, [])
+        self.assertEqual(queue.scheduler.output_streamer.stream_output.call_count, 2)
+        self.assertEqual(prepare.call_count, 2)
+
     def test_prealloc_abort_clears_receiver_before_removing_request(self):
         receiver = FakeReceiver()
         req = SimpleNamespace(
             rid="abort-prealloc",
+            bootstrap_room=7,
             finished_reason=FINISH_ABORT("aborted"),
             return_logprob=False,
+            finished_output=False,
+            req_pool_idx=None,
+            kv=None,
+            mamba_pool_idx=None,
         )
-        decode_req = SimpleNamespace(req=req, kv_receiver=receiver)
+        decode_req = DecodeRequest(req=req, kv_receiver=receiver)
 
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.pp_size = 1
         queue.queue = [decode_req]
         queue.pending_reqs = []
         queue.retracted_queue = []
+        queue.held_rebootstrap_reqs = []
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
         queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
         queue._allocatable_token_budgets = MagicMock(return_value=0)
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
+        queue.metadata_buffers = SimpleNamespace(bootstrap_room={})
+        queue.req_to_metadata_buffer_idx_allocator = MagicMock()
+        queue.tree_cache = MagicMock()
+        queue.transfer_queue = SimpleNamespace(
+            enable_staging=False,
+            staging_handler=None,
+            _clean_hicache_prefetch_resources=MagicMock(),
+        )
 
         scheduler = MagicMock()
         scheduler.running_batch.reqs = []
         scheduler.enable_priority_scheduling = False
         scheduler.enable_hisparse = False
         scheduler.output_streamer = MagicMock()
+        scheduler.ps.pp_rank = 0
+        scheduler.ps.attn_tp_rank = 0
+        scheduler.ps.attn_cp_rank = 0
         queue.scheduler = scheduler
 
         preallocated, failed = queue.pop_preallocated()
@@ -114,27 +186,44 @@ class TestDecodeQueueCleanup(CustomTestCase):
         receiver = BadEqReceiver()
         req = SimpleNamespace(
             rid="abort-shared",
+            bootstrap_room=8,
             finished_reason=FINISH_ABORT("aborted"),
             return_logprob=False,
+            finished_output=False,
+            req_pool_idx=None,
+            kv=None,
+            mamba_pool_idx=None,
         )
-        decode_req = SimpleNamespace(req=req, kv_receiver=receiver)
+        decode_req = DecodeRequest(req=req, kv_receiver=receiver)
 
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.pp_size = 1
         queue.queue = [decode_req]
         queue.pending_reqs = [decode_req]  # same object, dual ownership
         queue.retracted_queue = []
+        queue.held_rebootstrap_reqs = []
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
         queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
         queue._allocatable_token_budgets = MagicMock(return_value=0)
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
+        queue.metadata_buffers = SimpleNamespace(bootstrap_room={})
+        queue.req_to_metadata_buffer_idx_allocator = MagicMock()
+        queue.tree_cache = MagicMock()
+        queue.transfer_queue = SimpleNamespace(
+            enable_staging=False,
+            staging_handler=None,
+            _clean_hicache_prefetch_resources=MagicMock(),
+        )
 
         scheduler = MagicMock()
         scheduler.running_batch.reqs = []
         scheduler.enable_priority_scheduling = False
         scheduler.enable_hisparse = False
         scheduler.output_streamer = MagicMock()
+        scheduler.ps.pp_rank = 0
+        scheduler.ps.attn_tp_rank = 0
+        scheduler.ps.attn_cp_rank = 0
         queue.scheduler = scheduler
 
         # Must not raise on the receiver __eq__ above.
@@ -177,17 +266,24 @@ class TestDecodeQueueCleanup(CustomTestCase):
             rid="failed-transfer",
             bootstrap_room=7,
             return_logprob=False,
+            finished_output=False,
+            req_pool_idx=2,
+            kv=object(),
+            mamba_pool_idx=None,
         )
         decode_req = SimpleNamespace(
             req=req,
             kv_receiver=receiver,
             metadata_buffer_index=3,
+            metadata_sent=False,
             hicache_restore_status=HiCacheRestoreResult.READY,
         )
 
         queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
         queue.queue = [decode_req]
         queue.enable_staging = False
+        queue.enable_deferred_kv_release = False
+        queue.deferred_abort_holds = []
         queue.gloo_group = MagicMock()
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
         queue.tp_rank = 0
@@ -202,6 +298,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.enable_hisparse = False
         scheduler.output_streamer = MagicMock()
         scheduler.metrics_reporter.enable_metrics = False
+        scheduler.ps.pp_rank = 0
+        scheduler.ps.attn_tp_rank = 0
+        scheduler.ps.attn_cp_rank = 0
         queue.scheduler = scheduler
 
         mock_poll.return_value = [KVPoll.Failed]
@@ -237,6 +336,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
         queue.queue = decode_reqs
         queue.enable_staging = False
+        queue.deferred_abort_holds = []
         queue.gloo_group = MagicMock()
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
         queue.tp_rank = 0
@@ -349,12 +449,52 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
             queue=[], retracted_queue=[object()]
         )
-        scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(
+            queue=[], has_pending_deferred_abort_holds=lambda: False
+        )
         scheduler.decode_offload_manager = None
         scheduler.enable_hisparse = False
         scheduler.enable_hierarchical_cache = False
 
         self.assertFalse(scheduler.is_fully_idle())
+
+    def test_deferred_decode_abort_hold_keeps_scheduler_non_idle(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.running_batch = MagicMock()
+        scheduler.running_batch.is_empty.return_value = True
+        scheduler.chunked_req = None
+        scheduler.dllm_manager = MagicMock()
+        scheduler.dllm_manager.any_staging_reqs.return_value = False
+        scheduler.last_batch = None
+        scheduler.cur_batch_for_debug = None
+        scheduler.enable_overlap = False
+        scheduler.ps = ParallelState.trivial()
+        scheduler.running_mbs = []
+        scheduler.waiting_queue = []
+        scheduler.grammar_manager = SimpleNamespace(grammar_queue=[])
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
+            queue=[], retracted_queue=[]
+        )
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(
+            queue=[], has_pending_deferred_abort_holds=lambda: True
+        )
+        scheduler.decode_offload_manager = None
+        scheduler.enable_hisparse = False
+        scheduler.enable_hierarchical_cache = False
+
+        self.assertFalse(scheduler.is_fully_idle())
+
+    def test_pp_decode_tick_resolves_holds_without_release_status(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(
+            resolve_deferred_abort_holds=MagicMock()
+        )
+
+        result = scheduler.process_decode_transfer_queue(None)
+
+        self.assertIsNone(result)
+        scheduler.disagg_decode_transfer_queue.resolve_deferred_abort_holds.assert_called_once_with()
 
 
 if __name__ == "__main__":

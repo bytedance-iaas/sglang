@@ -759,6 +759,11 @@ class SchedulerPPMixin:
                 if get_disagg().disaggregation_decode_enable_offload_kvcache:
                     self.decode_offload_manager.check_offload_progress()
 
+                # Deferred abort ownership is rank-local and does not require a
+                # PP consensus payload. Poll it every scheduler tick, including
+                # idle ticks and ticks with no transfer release status.
+                self.disagg_decode_transfer_queue.resolve_deferred_abort_holds()
+
                 if next_release_rids is not None:
                     pending_release_status = _pp_merge_pending_release_status(
                         pending_release_status,
@@ -2066,6 +2071,7 @@ class SchedulerPPMixin:
     def process_decode_transfer_queue(
         self: Scheduler, release_status: Optional[PPTransferStatus]
     ):
+        self.disagg_decode_transfer_queue.resolve_deferred_abort_holds()
         if release_status is not None:
             good_rids, bad_rids = release_status
             released_reqs = self.disagg_decode_transfer_queue.pop_transferred(

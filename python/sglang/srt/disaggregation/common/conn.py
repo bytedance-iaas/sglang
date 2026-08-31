@@ -141,6 +141,8 @@ class PrefillRankInfo:
 
 class CommonKVManager(BaseKVManager):
     supports_request_generation = False
+    supports_deferred_decode_kv_release = False
+    supports_decode_owner_lease = False
 
     def __init__(
         self,
@@ -162,6 +164,14 @@ class CommonKVManager(BaseKVManager):
         self.is_hybrid_mla_backend = getattr(args, "is_hybrid_mla_backend", False)
         self.disaggregation_mode = disaggregation_mode
         self.server_args = server_args
+        self.enable_deferred_decode_kv_release = (
+            self.supports_deferred_decode_kv_release
+            and envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
+        )
+        self.enable_decode_owner_lease = (
+            self.supports_decode_owner_lease
+            and envs.SGLANG_DISAGGREGATION_DECODE_OWNER_LEASE.get()
+        )
         # for p/d multi node infer
         self.bootstrap_host = server_args.host
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
@@ -218,6 +228,11 @@ class CommonKVManager(BaseKVManager):
         # generation-scoped liveness lease so that healthy admission backpressure
         # is not mistaken for a lost decode peer by the prefill sender.
         self.request_bootstrap_activity: Dict[Tuple[int, int], float] = {}
+        self.request_owner_lease_expected: Dict[Tuple[int, int], Set[int]] = {}
+        self.request_owner_lease_activity: Dict[Tuple[int, int], Dict[int, float]] = {}
+        self.request_owner_lease_started: Dict[Tuple[int, int], float] = {}
+        self._deferred_abort_ack_tracker: Dict[Tuple[int, int], Set[int]] = {}
+        self._deferred_abort_expected_ranks: Dict[Tuple[int, int], Set[int]] = {}
         self.request_status_lock = threading.RLock()
         self._socket_cache: Dict[str, zmq.Socket] = {}
         self._monitor_cache: Dict[str, zmq.Socket] = {}
@@ -334,8 +349,36 @@ class CommonKVManager(BaseKVManager):
             self.request_failure_history = {}
         if not hasattr(self, "request_bootstrap_activity"):
             self.request_bootstrap_activity = {}
+        if not hasattr(self, "request_owner_lease_expected"):
+            self.request_owner_lease_expected = {}
+        if not hasattr(self, "request_owner_lease_activity"):
+            self.request_owner_lease_activity = {}
+        if not hasattr(self, "request_owner_lease_started"):
+            self.request_owner_lease_started = {}
         if not hasattr(self, "request_status_lock"):
             self.request_status_lock = threading.RLock()
+        if not hasattr(self, "_deferred_abort_ack_tracker"):
+            self._deferred_abort_ack_tracker = {}
+        if not hasattr(self, "_deferred_abort_expected_ranks"):
+            self._deferred_abort_expected_ranks = {}
+
+    def _clear_generation_protocol_state(
+        self, bootstrap_room: int, generation: Optional[int] = None
+    ) -> None:
+        for table_name in (
+            "request_owner_lease_expected",
+            "request_owner_lease_activity",
+            "request_owner_lease_started",
+            "_owner_lease_last_sent",
+        ):
+            table = getattr(self, table_name, None)
+            if table is None:
+                continue
+            for key in list(table):
+                if key[0] == bootstrap_room and (
+                    generation is None or key[1] == generation
+                ):
+                    table.pop(key, None)
 
     def _clear_request_payload_for_new_generation(self, bootstrap_room: int) -> None:
         for attr in (
@@ -354,6 +397,7 @@ class CommonKVManager(BaseKVManager):
             for key, timestamp in self.request_bootstrap_activity.items()
             if key[0] != bootstrap_room
         }
+        self._clear_generation_protocol_state(bootstrap_room)
 
     def _clear_request_payload(self, bootstrap_room: int) -> None:
         for attr in (
@@ -370,6 +414,155 @@ class CommonKVManager(BaseKVManager):
             stale_keys = [key for key in activity if key[0] == bootstrap_room]
             for key in stale_keys:
                 activity.pop(key, None)
+
+    def arm_decode_owner_lease(
+        self,
+        bootstrap_room: int,
+        generation: int,
+        expected_ranks: Set[int],
+        timestamp: Optional[float] = None,
+    ) -> bool:
+        """Start an immutable, generation-scoped post-metadata lease window."""
+        self._ensure_request_lifecycle_state()
+        with self.request_status_lock:
+            if not self.is_current_generation(bootstrap_room, generation):
+                return False
+            status = self.request_status.get(bootstrap_room)
+            if status in (None, KVPoll.Success, KVPoll.Failed):
+                return False
+            key = (bootstrap_room, generation)
+            expected = set(expected_ranks)
+            if not expected:
+                return False
+            existing_expected = self.request_owner_lease_expected.get(key)
+            if existing_expected is not None:
+                # send_metadata() and its caller may both defensively arm the
+                # lease. Re-arming must not extend the immutable lifetime cap.
+                return existing_expected == expected
+            now = time.monotonic() if timestamp is None else timestamp
+            self.request_owner_lease_expected[key] = expected
+            self.request_owner_lease_activity[key] = {rank: now for rank in expected}
+            self.request_owner_lease_started[key] = now
+            return True
+
+    def note_decode_owner_lease(
+        self,
+        bootstrap_room: int,
+        prefill_rank: int,
+        generation: int,
+        timestamp: Optional[float] = None,
+    ) -> bool:
+        """Record a wire lease without changing request protocol status."""
+        self._ensure_request_lifecycle_state()
+        with self.request_status_lock:
+            key = (bootstrap_room, generation)
+            if not self.is_current_generation(bootstrap_room, generation):
+                return False
+            if self.request_status.get(bootstrap_room) in (
+                None,
+                KVPoll.Success,
+                KVPoll.Failed,
+            ):
+                return False
+            if prefill_rank not in self.request_owner_lease_expected.get(key, set()):
+                return False
+            self.request_owner_lease_activity[key][prefill_rank] = (
+                time.monotonic() if timestamp is None else timestamp
+            )
+            return True
+
+    def decode_owner_lease_expired(
+        self, bootstrap_room: int, generation: int, timestamp: Optional[float] = None
+    ) -> bool:
+        self._ensure_request_lifecycle_state()
+        with self.request_status_lock:
+            key = (bootstrap_room, generation)
+            if not self.is_current_generation(bootstrap_room, generation):
+                return False
+            expected = self.request_owner_lease_expected.get(key)
+            started = self.request_owner_lease_started.get(key)
+            activity = self.request_owner_lease_activity.get(key)
+            if expected is None or started is None or activity is None:
+                return False
+            now = time.monotonic() if timestamp is None else timestamp
+            if (
+                now - started
+                >= envs.SGLANG_DISAGGREGATION_OWNER_LEASE_MAX_LIFETIME.get()
+            ):
+                return True
+            timeout = envs.SGLANG_DISAGGREGATION_OWNER_LEASE_TIMEOUT.get()
+            return any(
+                now - activity.get(rank, started) >= timeout for rank in expected
+            )
+
+    def has_decode_owner_lease(self, bootstrap_room: int, generation: int) -> bool:
+        self._ensure_request_lifecycle_state()
+        with self.request_status_lock:
+            return (bootstrap_room, generation) in self.request_owner_lease_started
+
+    def register_deferred_abort_room(
+        self, bootstrap_room: int, generation: int, expected_ranks: Set[int]
+    ) -> bool:
+        self._ensure_request_lifecycle_state()
+        with self.request_status_lock:
+            key = (bootstrap_room, generation)
+            expected_ranks = set(expected_ranks)
+            # An empty expectation would make ``issubset`` below vacuously
+            # true and release writable destinations without any Prefill rank
+            # proving that its generation-scoped transfer work drained.
+            if not expected_ranks:
+                return False
+            existing_expected = self._deferred_abort_expected_ranks.get(key)
+            existing_acks = self._deferred_abort_ack_tracker.get(key)
+            if existing_expected is not None or existing_acks is not None:
+                # Re-arming the same generation is idempotent.  In particular,
+                # do not erase ACKs which raced ahead of the duplicate arm.
+                if existing_expected != expected_ranks:
+                    return False
+                return True
+            if not self.is_current_generation(bootstrap_room, generation):
+                return False
+            if self.request_status.get(bootstrap_room) in (
+                None,
+                KVPoll.Success,
+                KVPoll.Failed,
+            ):
+                # The tracker must be armed before publication can make this
+                # generation terminal. Once a tracker is cleared, do not let a
+                # delayed same-generation retry create a new abort epoch whose
+                # ACK set could be satisfied by packets from the retired epoch.
+                return False
+            self._deferred_abort_ack_tracker[key] = set()
+            self._deferred_abort_expected_ranks[key] = expected_ranks
+            return True
+
+    def note_abort_ack(
+        self, bootstrap_room: int, prefill_rank: int, generation: int
+    ) -> bool:
+        self._ensure_request_lifecycle_state()
+        with self.request_status_lock:
+            key = (bootstrap_room, generation)
+            expected = self._deferred_abort_expected_ranks.get(key)
+            acks = self._deferred_abort_ack_tracker.get(key)
+            if expected is not None and acks is not None and prefill_rank in expected:
+                acks.add(prefill_rank)
+                return True
+            return False
+
+    def is_abort_release_safe(self, bootstrap_room: int, generation: int) -> bool:
+        self._ensure_request_lifecycle_state()
+        with self.request_status_lock:
+            key = (bootstrap_room, generation)
+            expected = self._deferred_abort_expected_ranks.get(key)
+            acks = self._deferred_abort_ack_tracker.get(key)
+            return expected is not None and acks is not None and expected.issubset(acks)
+
+    def clear_deferred_abort_state(self, bootstrap_room: int, generation: int) -> None:
+        self._ensure_request_lifecycle_state()
+        with self.request_status_lock:
+            key = (bootstrap_room, generation)
+            self._deferred_abort_ack_tracker.pop(key, None)
+            self._deferred_abort_expected_ranks.pop(key, None)
 
     def begin_request(
         self,
@@ -513,12 +706,14 @@ class CommonKVManager(BaseKVManager):
                 self.request_status_history.pop((bootstrap_room, generation), None)
                 self.request_failure_history.pop((bootstrap_room, generation), None)
                 self.request_bootstrap_activity.pop((bootstrap_room, generation), None)
+                self._clear_generation_protocol_state(bootstrap_room, generation)
                 return False
             self.request_status.pop(bootstrap_room, None)
             self.request_generation.pop(bootstrap_room, None)
             self.request_status_history.pop((bootstrap_room, generation), None)
             self.request_failure_history.pop((bootstrap_room, generation), None)
             self.request_bootstrap_activity.pop((bootstrap_room, generation), None)
+            self._clear_generation_protocol_state(bootstrap_room, generation)
             self._clear_request_payload(bootstrap_room)
             return True
 
@@ -1402,6 +1597,10 @@ class CommonKVSender(BaseKVSender):
                     )
                     return
 
+    def renew_decode_owner_lease(self, phase: str = "active") -> bool:
+        """Transport backends override this when owner leases are supported."""
+        return False
+
     def _register_prefill_dp_rank(self):
         """Register this request's prefill dp_rank to the bootstrap server."""
         url = f"http://{self.bootstrap_server_url}/register_dp_rank"
@@ -1596,6 +1795,20 @@ class CommonKVReceiver(BaseKVReceiver):
         self.target_tp_ranks = self.prefill_info.target_tp_ranks
         self.target_cp_ranks = self.prefill_info.target_cp_ranks
         self.target_pp_ranks = self.prefill_info.target_pp_ranks
+        self.expected_prefill_ranks: Set[int] = {
+            target_tp_rank
+            * (self.prefill_info.pp_size * self.prefill_info.attn_cp_size)
+            + target_pp_rank * self.prefill_info.attn_cp_size
+            + target_cp_rank
+            for target_cp_rank in self.target_cp_ranks
+            for target_tp_rank in self.target_tp_ranks
+            for target_pp_rank in self.target_pp_ranks
+            if not (
+                self.kv_mgr.is_mla_backend
+                and self.target_tp_rank is not None
+                and target_tp_rank != self.target_tp_rank
+            )
+        }
         self.required_dst_info_num = self.prefill_info.required_dst_info_num
         self.required_prefill_response_num = (
             self.prefill_info.required_prefill_response_num
@@ -1775,18 +1988,31 @@ class CommonKVReceiver(BaseKVReceiver):
     def _check_waiting_timeout(self) -> Optional[KVPoll]:
         if self.init_time is None:
             return None
+        generation = getattr(self, "generation", None)
+        owner_lease_expired = False
+        if (
+            getattr(self.kv_mgr, "enable_decode_owner_lease", False)
+            and generation is not None
+            and self.kv_mgr.has_decode_owner_lease(self.bootstrap_room, generation)
+        ):
+            owner_lease_expired = self.kv_mgr.decode_owner_lease_expired(
+                self.bootstrap_room, generation
+            )
+            if not owner_lease_expired:
+                return None
         elapsed = time.time() - self.init_time
-        if elapsed < self.kv_mgr.waiting_timeout:
+        if not owner_lease_expired and elapsed < self.kv_mgr.waiting_timeout:
             return None
         logger.warning_once(
             "Some requests fail to receive KV Cache transfer done signal after bootstrapping. "
             "If a greater mean TTFT is acceptable, you can 'export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
         )
         failure_reason = (
-            f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
+            f"Request {self.bootstrap_room} decode owner lease expired"
+            if owner_lease_expired
+            else f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
             f"in KVPoll.WaitingForInput"
         )
-        generation = getattr(self, "generation", None)
         if generation is None:
             self.kv_mgr.record_failure(self.bootstrap_room, failure_reason)
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
@@ -1798,9 +2024,21 @@ class CommonKVReceiver(BaseKVReceiver):
             and hasattr(self, "bootstrap_infos")
             and self.bootstrap_infos is not None
         ):
-            self._send_abort_notification()
-            self.abort_notified = True
+            self.abort_notified = self._send_abort_notification()
         return KVPoll.Failed
+
+    def arm_decode_owner_lease(self) -> bool:
+        generation = getattr(self, "generation", None)
+        if (
+            not getattr(self.kv_mgr, "enable_decode_owner_lease", False)
+            or generation is None
+        ):
+            return False
+        return self.kv_mgr.arm_decode_owner_lease(
+            self.bootstrap_room,
+            generation,
+            getattr(self, "expected_prefill_ranks", set()),
+        )
 
     def failure_exception(self):
         raise Exception("Fake KVReceiver Exception")
@@ -1827,11 +2065,16 @@ class CommonKVReceiver(BaseKVReceiver):
             and hasattr(self, "bootstrap_infos")
             and self.bootstrap_infos is not None
         ):
-            self._send_abort_notification()
-            self.abort_notified = True
+            self.abort_notified = self._send_abort_notification()
 
-    def _send_abort_notification(self):
-        for bootstrap_info in self.bootstrap_infos:
+    def _send_abort_notification(self) -> bool:
+        pending = getattr(self, "_abort_notification_pending", None)
+        if pending is None:
+            pending = self._abort_notification_pending = set(
+                range(len(self.bootstrap_infos))
+            )
+        for index in list(pending):
+            bootstrap_info = self.bootstrap_infos[index]
             # Best-effort notification to prefill side that this request was aborted.
             try:
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
@@ -1849,10 +2092,12 @@ class CommonKVReceiver(BaseKVReceiver):
                     f"Sent abort notification for room {self.bootstrap_room} "
                     f"to {bootstrap_info.get('rank_ip', 'unknown')}:{bootstrap_info.get('rank_port', 'unknown')}"
                 )
+                pending.discard(index)
             except Exception as e:
                 logger.debug(
                     f"Failed to send abort notification for room {self.bootstrap_room}: {e}"
                 )
+        return not pending
 
 
 class CommonKVBootstrapServer(BaseKVBootstrapServer):

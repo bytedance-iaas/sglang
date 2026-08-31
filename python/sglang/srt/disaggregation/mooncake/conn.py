@@ -66,6 +66,11 @@ from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
 
+
+class DeferredAbortAckDeliveryError(RuntimeError):
+    """Fail-stop signal when an abort ACK cannot be delivered safely."""
+
+
 FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
     "Number of mooncake_session_ids un-blacklisted via probe.",
@@ -196,6 +201,8 @@ class KVArgsRegisterInfo:
 
 class MooncakeKVManager(CommonKVManager):
     supports_request_generation = True
+    supports_deferred_decode_kv_release = True
+    supports_decode_owner_lease = True
 
     AUX_DATA_HEADER = b"AUX_DATA"
 
@@ -212,6 +219,11 @@ class MooncakeKVManager(CommonKVManager):
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.enable_trace = server_args.enable_trace
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self._deferred_ack_targets = {}
+            self._transfer_attempts = defaultdict(int)
+            self._source_cleanup_complete = set()
+            self._deferred_ack_retry = {}
+            self._owner_lease_last_sent = {}
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
@@ -773,13 +785,7 @@ class MooncakeKVManager(CommonKVManager):
                 )
                 for (src_ptr, dst_ptr, item_len) in layers_params
             ]
-            for future in concurrent.futures.as_completed(futures):
-                status = future.result()
-                if status != 0:
-                    for f in futures:
-                        f.cancel()
-                    return status
-            return 0
+            return self._await_transfer_futures(futures)
         else:
             # Combining all layers' params in one batch transfer is more efficient
             # compared to using multiple threads
@@ -905,13 +911,7 @@ class MooncakeKVManager(CommonKVManager):
                 executor.submit(process_layer, src_ptr, dst_ptr, token_item_len)
                 for src_ptr, dst_ptr, token_item_len in layers_params
             ]
-            for future in concurrent.futures.as_completed(futures):
-                status = future.result()
-                if status != 0:
-                    for pending in futures:
-                        pending.cancel()
-                    return status
-            return 0
+            return self._await_transfer_futures(futures)
 
         transfer_blocks = []
         for src_ptr, dst_ptr, token_item_len in layers_params:
@@ -1061,14 +1061,7 @@ class MooncakeKVManager(CommonKVManager):
             for src_layer_ptr, dst_layer_ptr in layer_ptr_pairs
         ]
 
-        for future in concurrent.futures.as_completed(futures):
-            status = future.result()
-            if status != 0:
-                for f in futures:
-                    f.cancel()
-                return status
-
-        return 0
+        return self._await_transfer_futures(futures)
 
     def send_aux(
         self,
@@ -1585,6 +1578,142 @@ class MooncakeKVManager(CommonKVManager):
             is_ipv6=na.is_ipv6,
         )
 
+    def _prefill_unique_rank(self) -> int:
+        return (
+            self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
+            + self.pp_rank * self.attn_cp_size
+            + self.attn_cp_rank
+        )
+
+    def _send_abort_ack(
+        self, decode_ip: str, decode_port: int, room: int, generation: int
+    ) -> bool:
+        try:
+            na = NetworkAddress(decode_ip, decode_port)
+            self._send_multipart_locked(
+                na.to_tcp(),
+                [
+                    b"ABORT_ACK",
+                    str(room).encode("ascii"),
+                    str(self._prefill_unique_rank()).encode("ascii"),
+                    str(generation).encode("ascii"),
+                ],
+                is_ipv6=na.is_ipv6,
+            )
+            return True
+        except Exception as e:
+            logger.debug("Failed to send drained ABORT_ACK for room %s: %s", room, e)
+            return False
+
+    def register_deferred_ack_target(
+        self,
+        room: int,
+        generation: int,
+        decode_ip: str,
+        decode_port: int,
+    ) -> None:
+        with self.request_status_lock:
+            key = (room, generation)
+            self._deferred_ack_targets.setdefault(key, set()).add(
+                (decode_ip, decode_port)
+            )
+            self._deferred_ack_retry.setdefault(key, (time.monotonic(), 0))
+
+    def mark_source_cleanup_complete(self, room: int, generation: int) -> None:
+        """Record scheduler-owned source cleanup, distinct from attempt count."""
+        with self.request_status_lock:
+            self._source_cleanup_complete.add((room, generation))
+        self._maybe_ack_drained_abort(room, generation)
+
+    def _maybe_ack_drained_abort(self, room: int, generation: int) -> None:
+        with self.request_status_lock:
+            key = (room, generation)
+            if (
+                self._transfer_attempts.get(key, 0) != 0
+                or key not in self._source_cleanup_complete
+            ):
+                return
+            targets = set(self._deferred_ack_targets.get(key, set()))
+        succeeded = set()
+        for decode_ip, decode_port in targets:
+            if self._send_abort_ack(decode_ip, decode_port, room, generation):
+                succeeded.add((decode_ip, decode_port))
+        with self.request_status_lock:
+            key = (room, generation)
+            # Do not overwrite a target which raced with the network sends.
+            # Remove only endpoints proven acknowledged in this pass.
+            current = self._deferred_ack_targets.get(key)
+            if current is None:
+                return
+            current.difference_update(succeeded)
+            if not current:
+                self._deferred_ack_targets.pop(key, None)
+                self._deferred_ack_retry.pop(key, None)
+
+    def retry_deferred_abort_acks(self) -> None:
+        """Bounded retry hook called by the existing scheduler tick."""
+        now = time.monotonic()
+        with self.request_status_lock:
+            keys = list(self._deferred_ack_targets)
+        for room, generation in keys:
+            with self.request_status_lock:
+                deadline, retries = self._deferred_ack_retry.get(
+                    (room, generation), (now, 0)
+                )
+                if now < deadline:
+                    continue
+                if retries >= 6:
+                    # Keep target and ownership state intact: callers must stop
+                    # the scheduler rather than silently leaking a generation.
+                    raise DeferredAbortAckDeliveryError(
+                        f"ABORT_ACK delivery exhausted retries for room={room} generation={generation}"
+                    )
+                self._deferred_ack_retry[(room, generation)] = (
+                    now + min(2**retries, 8),
+                    retries + 1,
+                )
+            self._maybe_ack_drained_abort(room, generation)
+
+    def _finish_transfer_attempt(self, room: int, generation: int) -> None:
+        should_check_ack = False
+        with self.request_status_lock:
+            key = (room, generation)
+            outstanding = self._transfer_attempts.get(key, 0)
+            if outstanding == 1:
+                self._transfer_attempts.pop(key, None)
+                should_check_ack = True
+            elif outstanding > 1:
+                self._transfer_attempts[key] = outstanding - 1
+        if should_check_ack:
+            self._maybe_ack_drained_abort(room, generation)
+
+    def _await_transfer_futures(self, futures) -> int:
+        """Drain every submitted write before reporting the transfer complete."""
+        first_failure = None
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                status = future.result()
+            except concurrent.futures.CancelledError:
+                continue
+            except Exception as exc:
+                # Preserve completion order: a non-zero status observed before
+                # a later exception is the first transfer failure.  We still
+                # cancel pending work, but continue iterating so every
+                # submitted future is drained before returning.
+                if first_failure is None:
+                    first_failure = exc
+                for pending in futures:
+                    pending.cancel()
+                continue
+            if status != 0:
+                if first_failure is None:
+                    first_failure = status
+                for pending in futures:
+                    pending.cancel()
+        if isinstance(first_failure, BaseException):
+            raise first_failure
+        return 0 if first_failure is None else first_failure
+
     def transfer_worker(
         self,
         queue: FastQueue,
@@ -1601,6 +1730,8 @@ class MooncakeKVManager(CommonKVManager):
             )
 
         while True:
+            kv_chunk = None
+            keep_transfer_attempt = False
             try:
                 kv_chunk: TransferKVChunk = queue.get()
                 if kv_chunk.generation is not None and not self.is_current_generation(
@@ -1672,24 +1803,28 @@ class MooncakeKVManager(CommonKVManager):
                     if not req.is_dummy:
                         # Early exit if the request has failed
                         with self.session_lock:
-                            if req.mooncake_session_id in self.failed_sessions:
-                                self.record_failure(
-                                    kv_chunk.room,
-                                    f"Decode instance could be dead, remote mooncake session {req.mooncake_session_id} is not alive",
-                                    kv_chunk.generation,
-                                )
-                                self.update_status(
-                                    kv_chunk.room, KVPoll.Failed, kv_chunk.generation
-                                )
+                            session_failed = (
+                                req.mooncake_session_id in self.failed_sessions
+                            )
+                        if session_failed:
+                            self.record_failure(
+                                kv_chunk.room,
+                                f"Decode instance could be dead, remote mooncake session {req.mooncake_session_id} is not alive",
+                                kv_chunk.generation,
+                            )
+                            failed_current_generation = self.update_status(
+                                kv_chunk.room, KVPoll.Failed, kv_chunk.generation
+                            )
+                            if failed_current_generation:
                                 self.sync_status_to_decode_endpoint(
                                     req.endpoint,
                                     req.dst_port,
                                     req.room,
                                     KVPoll.Failed,
                                     prefill_unique_rank,
-                                    req.generation,
+                                    kv_chunk.generation,
                                 )
-                                break
+                            break
 
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
@@ -1925,6 +2060,7 @@ class MooncakeKVManager(CommonKVManager):
                     )
 
                 if staging_deferred:
+                    keep_transfer_attempt = True
                     continue
 
                 with self.request_status_lock:
@@ -1946,10 +2082,48 @@ class MooncakeKVManager(CommonKVManager):
                         self._staging_ctx.prefetched_rooms.discard(kv_chunk.room)
 
             except Exception as e:
-                # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
-                raise RuntimeError(
-                    f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
-                )
+                room = kv_chunk.room if kv_chunk is not None else None
+                generation = kv_chunk.generation if kv_chunk is not None else None
+                if room is not None:
+                    self.record_failure(
+                        room, f"Mooncake transfer worker failed: {e}", generation
+                    )
+                    failed_current_generation = self.update_status(
+                        room, KVPoll.Failed, generation
+                    )
+                    # Bootstrap may replace transfer_infos while this worker is
+                    # reporting a failure. Snapshot only this chunk's generation
+                    # under the lifecycle lock, then perform network I/O outside
+                    # the lock so a secondary race cannot kill the worker.
+                    with self.request_status_lock:
+                        failure_targets = (
+                            tuple(
+                                info
+                                for info in self.transfer_infos.get(room, {}).values()
+                                if info.generation == generation
+                                or (info.generation is None and generation == 1)
+                            )
+                            if failed_current_generation
+                            else ()
+                        )
+                    for info in failure_targets:
+                        try:
+                            self.sync_status_to_decode_endpoint(
+                                info.endpoint,
+                                info.dst_port,
+                                room,
+                                KVPoll.Failed,
+                                self._prefill_unique_rank(),
+                                info.generation,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to propagate worker failure for room %s", room
+                            )
+                logger.exception("Mooncake transfer worker survived generation failure")
+            finally:
+                if kv_chunk is not None and not keep_transfer_attempt:
+                    self._finish_transfer_attempt(kv_chunk.room, kv_chunk.generation)
 
     def start_prefill_thread(self):
         def bootstrap_thread():
@@ -1984,43 +2158,51 @@ class MooncakeKVManager(CommonKVManager):
                         if len(waiting_req_bytes) > 4 and waiting_req_bytes[4] != b""
                         else None
                     )
-                    # No need to abort the room if it has already succeeded
-                    if (
-                        self.is_current_generation(room_to_be_aborted, generation)
-                        and self.check_status(room_to_be_aborted, generation)
-                        != KVPoll.Success
-                    ):
-                        self.update_status(
-                            room_to_be_aborted, KVPoll.Failed, generation
-                        )
-                        logger.debug(
-                            f"Received abort notification for room {room_to_be_aborted}, "
-                            f"marked as Failed"
-                        )
-                    else:
-                        logger.debug(
-                            f"Received abort notification for room {room_to_be_aborted}, "
-                            f"ignoring (already completed or unknown)"
-                        )
-                    # Send ACK back to decode endpoint
-                    try:
+                    if not self.enable_deferred_decode_kv_release or generation is None:
+                        if (
+                            room_to_be_aborted in self.request_status
+                            and self.check_status(room_to_be_aborted, generation)
+                            != KVPoll.Success
+                        ):
+                            self.update_status(
+                                room_to_be_aborted, KVPoll.Failed, generation
+                            )
                         na = NetworkAddress(decode_ip, decode_port)
+                        message = [
+                            b"ABORT_ACK",
+                            str(room_to_be_aborted).encode("ascii"),
+                        ]
+                        if generation is not None:
+                            message.extend(
+                                [
+                                    str(self._prefill_unique_rank()).encode("ascii"),
+                                    str(generation).encode("ascii"),
+                                ]
+                            )
                         self._send_multipart_locked(
-                            na.to_tcp(),
-                            [
-                                b"ABORT_ACK",
-                                str(room_to_be_aborted).encode("ascii"),
-                            ],
-                            is_ipv6=na.is_ipv6,
+                            na.to_tcp(), message, is_ipv6=na.is_ipv6
                         )
-                        logger.debug(
-                            f"Sent ABORT_ACK for room {room_to_be_aborted} to "
-                            f"{decode_ip}:{decode_port}"
+                        continue
+                    key = (room_to_be_aborted, generation)
+                    with self.request_status_lock:
+                        current = self.is_current_generation(
+                            room_to_be_aborted, generation
                         )
-                    except Exception as e:
-                        logger.debug(
-                            f"Failed to send ABORT_ACK for room {room_to_be_aborted}: {e}"
+                        status = (
+                            self.request_status.get(room_to_be_aborted)
+                            if current
+                            else None
                         )
+                        if current and status not in (KVPoll.Success, KVPoll.Failed):
+                            # Fence producers and register the target atomically.
+                            self.request_status[room_to_be_aborted] = KVPoll.Failed
+                        self._deferred_ack_targets.setdefault(key, set()).add(
+                            (decode_ip, decode_port)
+                        )
+                        self._deferred_ack_retry.setdefault(key, (time.monotonic(), 0))
+                    # Active rooms ACK only once every queued/running attempt drains.
+                    # Unknown or terminal rooms use the same outstanding==0 rule.
+                    self._maybe_ack_drained_abort(room_to_be_aborted, generation)
                     continue
                 if room == "BOOTSTRAP_KEEPALIVE":
                     room_to_renew = int(waiting_req_bytes[1].decode("ascii"))
@@ -2154,9 +2336,30 @@ class MooncakeKVManager(CommonKVManager):
 
                 # Prefill acknowledges abort notification
                 if msg[0] == b"ABORT_ACK":
-                    # TODO(shangming): use this info to implement the deferred release mechanism if needed
                     ack_aborted_room = int(msg[1].decode("ascii"))
-                    logger.debug(f"Received ABORT_ACK for room {ack_aborted_room}")
+                    ack_generation = (
+                        int(msg[3].decode("ascii")) if len(msg) >= 4 else None
+                    )
+                    if len(msg) >= 4:
+                        self.note_abort_ack(
+                            ack_aborted_room,
+                            int(msg[2].decode("ascii")),
+                            ack_generation,
+                        )
+                    logger.debug(
+                        "Received ABORT_ACK for room %s generation %s",
+                        ack_aborted_room,
+                        ack_generation,
+                    )
+                    continue
+
+                if msg[0] == b"PREFILL_OWNER_LEASE":
+                    if len(msg) == 4:
+                        self.note_decode_owner_lease(
+                            int(msg[1].decode("ascii")),
+                            int(msg[2].decode("ascii")),
+                            int(msg[3].decode("ascii")),
+                        )
                     continue
 
                 bootstrap_room, status, prefill_rank = msg[:3]
@@ -2231,6 +2434,13 @@ class MooncakeKVManager(CommonKVManager):
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
 
         with self.request_status_lock:
+            active_generation = (
+                generation
+                if generation is not None
+                else self.request_generation.get(bootstrap_room, 1)
+            )
+            attempt_key = (bootstrap_room, active_generation)
+            self._transfer_attempts[attempt_key] += 1
             if (
                 bootstrap_room not in self.request_status
                 or (
@@ -2242,27 +2452,34 @@ class MooncakeKVManager(CommonKVManager):
                 logger.debug(
                     "Request with bootstrap_room=%s already failed", bootstrap_room
                 )
-                return
+                self._transfer_attempts[attempt_key] -= 1
+                if self._transfer_attempts[attempt_key] == 0:
+                    self._transfer_attempts.pop(attempt_key, None)
+                should_ack = True
+            else:
+                should_ack = False
+            if should_ack:
+                pass
+            elif bootstrap_room not in self.transfer_infos:
+                self._transfer_attempts[attempt_key] -= 1
+                if self._transfer_attempts[attempt_key] == 0:
+                    self._transfer_attempts.pop(attempt_key, None)
+                should_ack = True
+            if should_ack:
+                shard_idx = None
+            else:
+                # NOTE(shangming): sharding according to the dst_infos to make sure
+                # requests with the same dst_sessions will be added into the same
+                # queue, which enables early abort with failed sessions.
+                dst_infos = tuple(self.transfer_infos[bootstrap_room])
+                session_port_sum = sum(
+                    int(session.rsplit(":", 1)[1]) for session in dst_infos
+                )
+                shard_idx = session_port_sum % len(self.transfer_queues)
 
-            if bootstrap_room not in self.transfer_infos:
-                # This means that the current rank is a dummy rank for this request,
-                # and it has already been marked as success, so there is no need to
-                # add further chunks into the transfer queue.
-                return
-
-            # NOTE(shangming): sharding according to the dst_infos to make sure
-            # requests with the same dst_sessions will be added into the same
-            # queue, which enables early abort with failed sessions.
-            dst_infos = tuple(self.transfer_infos[bootstrap_room])
-            session_port_sum = sum(
-                int(session.rsplit(":", 1)[1]) for session in dst_infos
-            )
-            shard_idx = session_port_sum % len(self.transfer_queues)
-            active_generation = (
-                generation
-                if generation is not None
-                else self.request_generation[bootstrap_room]
-            )
+        if should_ack:
+            self._maybe_ack_drained_abort(bootstrap_room, active_generation)
+            return
 
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
@@ -2352,6 +2569,69 @@ class MooncakeKVSender(CommonKVSender):
         )
         self.init_time = time.time()
         self._init_trace_ctx()
+
+    def renew_decode_owner_lease(self, phase: str = "active") -> bool:
+        if (
+            not self.kv_mgr.enable_decode_owner_lease
+            or self.generation is None
+            or self.conclude_state in (KVPoll.Success, KVPoll.Failed)
+        ):
+            return False
+        now = time.monotonic()
+        key = (self.bootstrap_room, self.generation)
+        interval = min(30.0, envs.SGLANG_DISAGGREGATION_OWNER_LEASE_INTERVAL.get())
+        with self.kv_mgr.request_status_lock:
+            if not self.kv_mgr.is_current_generation(
+                self.bootstrap_room, self.generation
+            ):
+                return False
+            if self.kv_mgr.request_status.get(self.bootstrap_room) in (
+                KVPoll.Success,
+                KVPoll.Failed,
+            ):
+                return False
+            last_sent = self.kv_mgr._owner_lease_last_sent.get(key)
+            if last_sent is not None and now - last_sent < interval:
+                return False
+            infos = tuple(
+                req
+                for req in self.kv_mgr.transfer_infos.get(
+                    self.bootstrap_room, {}
+                ).values()
+                if not req.is_dummy and req.generation == self.generation
+            )
+            if not infos:
+                return False
+
+        sent = False
+        rank = self.kv_mgr._prefill_unique_rank()
+        message = [
+            b"PREFILL_OWNER_LEASE",
+            str(self.bootstrap_room).encode("ascii"),
+            str(rank).encode("ascii"),
+            str(self.generation).encode("ascii"),
+        ]
+        for req in infos:
+            try:
+                na = NetworkAddress(req.endpoint, req.dst_port)
+                self.kv_mgr._send_multipart_locked(
+                    na.to_tcp(), message, is_ipv6=na.is_ipv6
+                )
+                sent = True
+            except Exception as exc:
+                logger.debug(
+                    "Failed to renew decode owner lease for room %s generation %s: %s",
+                    self.bootstrap_room,
+                    self.generation,
+                    exc,
+                )
+        if sent:
+            with self.kv_mgr.request_status_lock:
+                if self.kv_mgr.is_current_generation(
+                    self.bootstrap_room, self.generation
+                ):
+                    self.kv_mgr._owner_lease_last_sent[key] = now
+        return sent
 
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
     def send(
@@ -2601,6 +2881,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
             )
             return
 
+        self.arm_decode_owner_lease()
         self.chunk_staging_infos = []
         if (
             self.kv_mgr.enable_staging
@@ -2639,16 +2920,20 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         ]
                     )
             except zmq.ZMQError:
+                reason = (
+                    f"send_metadata to prefill {bootstrap_info.get('rank_ip')}:"
+                    f"{bootstrap_info.get('rank_port')} failed"
+                )
                 self.kv_mgr.record_failure(
                     self.bootstrap_room,
-                    f"send_metadata to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
+                    reason,
                     self.generation,
                 )
                 self.conclude_state = KVPoll.Failed
                 self.kv_mgr.update_status(
                     self.bootstrap_room, KVPoll.Failed, self.generation
                 )
-                return
+                raise KVTransferError(self.bootstrap_room, reason)
         self.init_time = time.time()
 
     def poll(self) -> KVPoll:

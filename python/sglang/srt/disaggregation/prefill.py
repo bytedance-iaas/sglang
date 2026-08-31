@@ -21,8 +21,11 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from array import array
 from collections import deque
+from collections.abc import MutableMapping
+from contextlib import nullcontext
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -82,6 +85,10 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 
+class PrefillAbortDrainTimeout(RuntimeError):
+    """Source transfer quiescence could not be proven before the deadline."""
+
+
 def should_force_retry(req: Req) -> bool:
     """Test hook to force a request into optimistic prefill retry."""
     retry_prob = envs.SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.get()
@@ -91,6 +98,44 @@ def should_force_retry(req: Req) -> bool:
 
     digest = hashlib.sha256(str(req.rid).encode()).digest()
     return int.from_bytes(digest[:8], "big") < retry_prob * 2**64
+
+
+def renew_disagg_prefill_owner_leases(self: Scheduler) -> None:
+    """Renew decode-side liveness for every live prefill request owner."""
+    bootstrap_queue = getattr(self, "disagg_prefill_bootstrap_queue", None)
+    candidates = [
+        *((req, "bootstrap") for req in getattr(bootstrap_queue, "queue", [])),
+        *((req, "waiting") for req in getattr(self, "waiting_queue", [])),
+        *(
+            (req, "inflight")
+            for req in (getattr(self, "disagg_prefill_inflight_queue", None) or [])
+        ),
+    ]
+    for phase, batch in (
+        ("running", getattr(self, "running_batch", None)),
+        ("last", getattr(self, "last_batch", None)),
+    ):
+        if batch is not None:
+            candidates.extend((req, phase) for req in getattr(batch, "reqs", []))
+    chunked_req = getattr(self, "chunked_req", None)
+    if chunked_req is not None:
+        candidates.append((chunked_req, "chunked"))
+
+    seen = set()
+    for req, phase in candidates:
+        if (
+            id(req) in seen
+            or getattr(req, "bootstrap_host", None) == FAKE_BOOTSTRAP_HOST
+            or is_aborted(req)
+            or getattr(req, "finished_reason", None) is not None
+            or getattr(req, "finished_output", False)
+        ):
+            continue
+        seen.add(id(req))
+        sender = getattr(req, "disagg_kv_sender", None)
+        if sender is None:
+            continue
+        sender.renew_decode_owner_lease(phase=phase)
 
 
 def _transfer_start_layer(*, pool, hf_text_config) -> int:
@@ -126,6 +171,202 @@ def maybe_release_metadata_buffer(
     if req.metadata_buffer_index >= 0:
         allocator.free(req.metadata_buffer_index)
         req.metadata_buffer_index = -1
+
+
+def finalize_prefill_external_abort(
+    req: Req, scheduler: Scheduler, allocator: ReqToMetadataIdxAllocator
+) -> bool:
+    """Try to finalize a detached prefill owner after transfer quiescence."""
+    if getattr(req, "_disagg_external_abort_finalized", False):
+        return False
+
+    sender = getattr(req, "disagg_kv_sender", None)
+    if sender is not None and not getattr(req, "_disagg_external_abort_fenced", False):
+        _hold_prefill_abort_ack(req, sender)
+        sender.abort()
+        req._disagg_external_abort_fenced = True
+    if not getattr(req, "_disagg_external_abort_prepared", False):
+        if getattr(req, "finished_reason", None) is None:
+            prepare_abort(req, "Aborted by AbortReq.")
+        req.pending_bootstrap = False
+        req._disagg_external_abort_prepared = True
+    if sender is not None and not _prefill_abort_drained(req, sender):
+        req._disagg_external_abort_pending = True
+        deadline = getattr(req, "_disagg_external_abort_drain_deadline", None)
+        if deadline is not None and time.monotonic() >= deadline:
+            raise PrefillAbortDrainTimeout(
+                "Timed out waiting for source transfer drain before prefill abort "
+                f"cleanup: rid={req.rid} room="
+                f"{getattr(sender, 'bootstrap_room', 'unknown')} generation="
+                f"{getattr(sender, 'generation', 'unknown')}"
+            )
+        return False
+
+    if not getattr(req, "_disagg_external_abort_metadata_released", False):
+        maybe_release_metadata_buffer(req, allocator)
+        req._disagg_external_abort_metadata_released = True
+    if scheduler.enable_hicache_storage and not getattr(
+        req, "_disagg_external_abort_hicache_released", False
+    ):
+        scheduler.tree_cache.release_aborted_request(req.rid)
+        req._disagg_external_abort_hicache_released = True
+
+    owns_kv = (
+        getattr(req, "req_pool_idx", None) is not None
+        or getattr(req, "kv", None) is not None
+        or getattr(req, "mamba_pool_idx", None) is not None
+    )
+    if (
+        owns_kv
+        and getattr(scheduler, "enable_hisparse", False)
+        and not getattr(req, "_disagg_external_abort_hisparse_released", False)
+    ):
+        scheduler.finish_hisparse_request(req)
+        req._disagg_external_abort_hisparse_released = True
+    if owns_kv and not getattr(req, "_disagg_external_abort_kv_released", False):
+        release_kv_cache(req, scheduler.tree_cache, is_insert=False)
+        req._disagg_external_abort_kv_released = True
+
+    ps = scheduler.ps
+    owns_output = (
+        getattr(ps, "pp_rank", 0) == 0
+        and getattr(ps, "attn_tp_rank", 0) == 0
+        and getattr(ps, "attn_cp_rank", 0) == 0
+    )
+    if (
+        owns_output
+        and not getattr(req, "finished_output", False)
+        and not getattr(req, "_disagg_external_abort_output_emitted", False)
+    ):
+        scheduler.output_streamer.stream_output([req], req.return_logprob)
+        req.finished_output = True
+        req._disagg_external_abort_output_emitted = True
+
+    # Release the attempt hold only after every source-owned resource has been
+    # released successfully.  Set the manager latch immediately before ACK.
+    manager = getattr(sender, "kv_mgr", None) if sender is not None else None
+    generation = getattr(sender, "generation", None) if sender is not None else None
+    _release_prefill_abort_ack_hold(req, sender)
+    mark_cleanup = getattr(manager, "mark_source_cleanup_complete", None)
+    if callable(mark_cleanup) and sender is not None and generation is not None:
+        mark_cleanup(sender.bootstrap_room, generation)
+    if sender is not None and not getattr(
+        req, "_disagg_external_abort_ack_emitted", False
+    ):
+        emit_ack = getattr(manager, "_maybe_ack_drained_abort", None)
+        if callable(emit_ack) and generation is not None:
+            emit_ack(sender.bootstrap_room, generation)
+        req._disagg_external_abort_ack_emitted = True
+    # The marker is last so retries can recover from any cleanup exception.
+    req._disagg_external_abort_finalized = True
+    req._disagg_external_abort_pending = False
+    return True
+
+
+def _mooncake_attempt_ledger(sender):
+    manager = getattr(sender, "kv_mgr", None)
+    room = getattr(sender, "bootstrap_room", None)
+    generation = getattr(sender, "generation", None)
+    attempts = getattr(manager, "_transfer_attempts", None)
+    if not isinstance(attempts, MutableMapping) or room is None or generation is None:
+        return None
+    return manager, attempts, (room, generation)
+
+
+def _hold_prefill_abort_ack(req: Req, sender) -> None:
+    """Keep Mooncake's drain ACK pending until source cleanup succeeds."""
+    ledger = _mooncake_attempt_ledger(sender)
+    if ledger is None:
+        return
+    manager, attempts, key = ledger
+    if getattr(req, "_disagg_external_abort_ack_hold_key", None) == key and not getattr(
+        req, "_disagg_external_abort_ack_hold_released", False
+    ):
+        return
+    lock = getattr(manager, "request_status_lock", None)
+    with lock if lock is not None else nullcontext():
+        attempts[key] = attempts.get(key, 0) + 1
+    req._disagg_external_abort_ack_hold_key = key
+
+
+def _release_prefill_abort_ack_hold(req: Req, sender) -> None:
+    key = getattr(req, "_disagg_external_abort_ack_hold_key", None)
+    if key is None or getattr(req, "_disagg_external_abort_ack_hold_released", False):
+        return
+    ledger = _mooncake_attempt_ledger(sender)
+    if ledger is None:
+        return
+    manager, attempts, current_key = ledger
+    if current_key != key:
+        return
+    lock = getattr(manager, "request_status_lock", None)
+    with lock if lock is not None else nullcontext():
+        outstanding = attempts.get(key, 0)
+        if outstanding <= 1:
+            attempts.pop(key, None)
+        else:
+            # This path should be unreachable because cleanup starts only after
+            # all real attempts drain. Preserve their count if a backend races.
+            attempts[key] = outstanding - 1
+    req._disagg_external_abort_ack_hold_released = True
+
+
+def _prefill_abort_drained(req: Req, sender) -> bool:
+    """Use a backend-provided nonblocking abort-drain predicate.
+
+    Without this interface the scheduler cannot prove that source KV is safe
+    to release, so the owner remains pending rather than risking UAF.
+    """
+    # Mooncake currently exposes the attempt ledger on its manager, but not a
+    # sender-level public predicate. This compatibility bridge is nonblocking;
+    # transports should eventually provide is_abort_drained.
+    ledger = _mooncake_attempt_ledger(sender)
+    if ledger is not None:
+        manager, attempts, key = ledger
+        lock = getattr(manager, "request_status_lock", None)
+        with lock if lock is not None else nullcontext():
+            cleanup_hold = getattr(
+                req, "_disagg_external_abort_ack_hold_key", None
+            ) == key and not getattr(
+                req, "_disagg_external_abort_ack_hold_released", False
+            )
+            return attempts.get(key, 0) <= int(cleanup_hold)
+    predicate = getattr(sender, "is_abort_drained", None)
+    if callable(predicate):
+        try:
+            return bool(predicate())
+        except Exception:
+            logger.debug("Abort drain predicate failed", exc_info=True)
+            return False
+    generation = getattr(sender, "generation", None)
+    if generation is None:
+        return True
+    logger.warning(
+        "Prefill sender %s has no nonblocking abort-drain predicate; %s remains pending",
+        type(sender).__name__,
+        getattr(sender, "bootstrap_room", "unknown"),
+    )
+    return False
+
+
+def process_pending_prefill_external_aborts(self: Scheduler) -> None:
+    pending = getattr(self, "_pending_prefill_external_aborts", None)
+    if not pending:
+        return
+    remaining = []
+    for req in pending:
+        try:
+            if not finalize_prefill_external_abort(
+                req, self, self.req_to_metadata_buffer_idx_allocator
+            ):
+                if not getattr(req, "_disagg_external_abort_finalized", False):
+                    remaining.append(req)
+        except PrefillAbortDrainTimeout:
+            raise
+        except Exception:
+            logger.exception("Deferred prefill abort cleanup failed for %s", req.rid)
+            remaining.append(req)
+    self._pending_prefill_external_aborts = remaining
 
 
 class PrefillBootstrapQueue:
@@ -383,6 +624,30 @@ class PrefillBootstrapQueue:
         for req in reqs:
             self.add(req, num_kv_heads)
 
+    def remove_aborted(self, rid: str, abort_all: bool = False) -> List[Req]:
+        """Detach and finalize matching bootstrap owners exactly once."""
+        removed = [req for req in self.queue if abort_all or req.rid.startswith(rid)]
+        removed_ids = {id(req) for req in removed}
+        self.queue = [req for req in self.queue if id(req) not in removed_ids]
+        for req in removed:
+            self.defer_external_abort(req)
+        return removed
+
+    def defer_external_abort(self, req: Req) -> None:
+        if not hasattr(req, "_disagg_external_abort_drain_deadline"):
+            timeout = (
+                envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT.get()
+            )
+            req._disagg_external_abort_drain_deadline = time.monotonic() + timeout
+        pending = getattr(self.scheduler, "_pending_prefill_external_aborts", [])
+        if all(existing is not req for existing in pending):
+            pending.append(req)
+        self.scheduler._pending_prefill_external_aborts = pending
+        process_pending_prefill_external_aborts(self.scheduler)
+
+    def has_pending_abort_release(self) -> bool:
+        return bool(getattr(self.scheduler, "_pending_prefill_external_aborts", []))
+
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
         if len(req.origin_input_ids) > self.max_total_num_tokens:
             message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_total_num_tokens}"
@@ -483,6 +748,8 @@ class PrefillBootstrapQueue:
 
     def get_ready_bootstrapped_rids_for_pp(self) -> Tuple[List[str], List[str]]:
         """Return ordered PP candidates without reserving local resources."""
+        renew_disagg_prefill_owner_leases(self.scheduler)
+        process_pending_prefill_external_aborts(self.scheduler)
         good_rids: List[str] = []
         failed_rids: List[str] = []
         poll_groups = self.scheduler.pp_disagg_prefill_poll_groups["bootstrap"]
@@ -514,7 +781,12 @@ class PrefillBootstrapQueue:
         return good_rids, failed_rids
 
     def release_memory_occupation(self):
-        self.queue.clear()
+        self.remove_aborted("", abort_all=True)
+        process_pending_prefill_external_aborts(self.scheduler)
+        if self.has_pending_abort_release():
+            raise RuntimeError(
+                "Cannot release prefill memory while source transfers are draining"
+            )
         if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
             self.kv_manager.deregister_buffer_to_engine()
 
@@ -587,7 +859,12 @@ class SchedulerDisaggregationPrefillMixin:
         running_batch: ScheduleBatch,
         last_batch: Optional[ScheduleBatch],
     ) -> NextBatchPlan:
+        renew_disagg_prefill_owner_leases(self)
+        process_pending_prefill_external_aborts(self)
         self.process_pending_chunked_abort()
+        kv_mgr = getattr(self.disagg_prefill_bootstrap_queue, "kv_manager", None)
+        if kv_mgr is not None and hasattr(kv_mgr, "retry_deferred_abort_acks"):
+            kv_mgr.retry_deferred_abort_acks()
 
         # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
         # Otherwise, it hangs under high concurrency
@@ -911,7 +1188,10 @@ class SchedulerDisaggregationPrefillMixin:
             if transfer_status is not None:
                 if req.rid in failed_rids:
                     self.handle_inflight_transfer_failure(req)
-                    done_reqs.append(req)
+                    if not getattr(
+                        req, "_disagg_external_abort_pending", False
+                    ) and not getattr(req, "_disagg_external_abort_finalized", False):
+                        done_reqs.append(req)
                     continue
 
                 if req.rid not in success_rids:
@@ -931,16 +1211,30 @@ class SchedulerDisaggregationPrefillMixin:
                 # todo: set Transferring correctly in backend
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
+                kv_mgr = getattr(req.disagg_kv_sender, "kv_mgr", None)
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finished_reason = FINISH_LENGTH(length=0)
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
                 # FIXME: clean up req's data in transfer engine
                 req.disagg_kv_sender.clear()
+                if kv_mgr is not None and req.bootstrap_room is not None:
+                    kv_mgr.mark_source_cleanup_complete(
+                        req.bootstrap_room, req.disagg_kv_sender.generation
+                    )
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
             elif poll == KVPoll.Failed:
                 self.handle_inflight_transfer_failure(req)
-                done_reqs.append(req)
+                kv_mgr = getattr(req.disagg_kv_sender, "kv_mgr", None)
+                if kv_mgr is not None and req.bootstrap_room is not None:
+                    req.disagg_kv_sender.clear()
+                    kv_mgr.mark_source_cleanup_complete(
+                        req.bootstrap_room, req.disagg_kv_sender.generation
+                    )
+                if not getattr(
+                    req, "_disagg_external_abort_pending", False
+                ) and not getattr(req, "_disagg_external_abort_finalized", False):
+                    done_reqs.append(req)
             else:
                 raise RuntimeError(
                     f"Unexpected poll state {poll} for req {req.rid} in inflight queue"
@@ -1004,13 +1298,41 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-        release_kv_cache(req, self.tree_cache)  # unlock the tree
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
             )
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
+        # A failed poll only reports the transfer state; Mooncake may still be
+        # executing a generation-scoped attempt/future against the source KV.
+        # Detach the owner and use the existing nonblocking drain path before
+        # releasing source resources or acknowledging the abort.
+        ledger = _mooncake_attempt_ledger(req.disagg_kv_sender)
+        if ledger is not None:
+            _, attempts, key = ledger
+            lock = getattr(ledger[0], "request_status_lock", None)
+            with lock if lock is not None else nullcontext():
+                has_active_attempt = attempts.get(key, 0) > 0
+            if has_active_attempt:
+                queue = getattr(self, "disagg_prefill_bootstrap_queue", None)
+                if queue is not None:
+                    queue.defer_external_abort(req)
+                else:
+                    timeout = (
+                        envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT.get()
+                    )
+                    if not hasattr(req, "_disagg_external_abort_drain_deadline"):
+                        req._disagg_external_abort_drain_deadline = (
+                            time.monotonic() + timeout
+                        )
+                    pending = getattr(self, "_pending_prefill_external_aborts", [])
+                    if all(existing is not req for existing in pending):
+                        pending.append(req)
+                    self._pending_prefill_external_aborts = pending
+                    process_pending_prefill_external_aborts(self)
+                return exc
+        release_kv_cache(req, self.tree_cache)  # unlock the tree
         return exc
 
     def get_transferred_rids(
