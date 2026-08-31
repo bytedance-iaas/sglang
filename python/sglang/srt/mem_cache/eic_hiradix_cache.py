@@ -514,17 +514,32 @@ class EICHiRadixCache(RadixCache):
             result.append(result_list[i] == 0)
         return result
 
-    def writing_check(self, write_back=False, finish_count: Optional[int] = None):
+    def writing_check(
+        self,
+        write_back=None,
+        finish_count: Optional[int] = None,
+        blocking: bool = False,
+    ):
         # finish_count is the base class's PP lockstep hint; EIC reconciles the
         # ack count itself via the tp_group MIN below, so it is ignored here.
+        if write_back is None:
+            write_back = self.cache_controller.write_policy == "write_back"
         if len(self.ongoing_write_through) == 0:
             return
         write_check_start_time = time.perf_counter()
-        if write_back:
+        if write_back and blocking:
             while (
                 len(self.ongoing_write_through)
                 != self.cache_controller.ack_write_queue.qsize()
             ):
+                if time.perf_counter() - write_check_start_time > 30.0:
+                    logger.error(
+                        "writing_check barrier timed out after 30s: "
+                        f"ongoing={len(self.ongoing_write_through)} "
+                        f"acked={self.cache_controller.ack_write_queue.qsize()}; "
+                        "EIC write thread likely stalled, proceeding with partial acks"
+                    )
+                    break
                 time.sleep(0.01)
         queue_size = torch.tensor(
             self.cache_controller.ack_write_queue.qsize(), dtype=torch.int
@@ -1052,8 +1067,7 @@ class EICHiRadixCache(RadixCache):
                     heapq.heappush(eviction_heap, (new_priority, x.parent))
 
             if self.cache_controller.write_policy == "write_back":
-                # blocking till all write back complete
-                self.writing_check(write_back=True)
+                self.writing_check(write_back=True, blocking=True)
                 for node in write_back_nodes:
                     if node.backuped:
                         self._evict_backuped(node)
