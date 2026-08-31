@@ -810,11 +810,31 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return
         # Only the global PP/attention leader owns the detokenizer socket.
         if _owns_external_output(self.scheduler):
-            self.scheduler.output_streamer.stream_output(
-                [entry.req], entry.req.return_logprob
-            )
+            try:
+                self.scheduler.output_streamer.stream_output(
+                    [entry.req], entry.req.return_logprob
+                )
+            finally:
+                # OutputStreamer marks a terminal request before handing its
+                # payload to the IPC transport. Mirror that durable request
+                # journal even if the transport raises after accepting it, so
+                # a cleanup retry cannot enqueue the terminal output twice.
+                if getattr(entry.req, "finished_output", False):
+                    entry.abort_output_emitted = True
         entry.abort_output_emitted = True
         entry.req.finished_output = True
+
+    @staticmethod
+    def _validate_abort_owner(entry: DecodeRequest) -> None:
+        req = entry.req
+        if (
+            getattr(req, "kv", None) is not None
+            and getattr(req, "req_pool_idx", None) is None
+        ):
+            raise RuntimeError(
+                "Cannot release decode preallocation with KV metadata but "
+                "no request-pool owner"
+            )
 
     def remove_aborted(self, rid: str, abort_all: bool = False) -> List[DecodeRequest]:
         removed: List[DecodeRequest] = []
@@ -826,17 +846,24 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ):
                 removed.append(entry)
                 removed_ids.add(id(entry))
+        detached_req_ids: set[int] = set()
+        for reqs in (self.retracted_queue, self.held_rebootstrap_reqs):
+            for req in reqs:
+                if (
+                    self._rid_matches(req.rid, rid, abort_all)
+                    and id(req) not in detached_req_ids
+                ):
+                    removed.append(DecodeRequest(req=req, kv_receiver=None))
+                    detached_req_ids.add(id(req))
+        # Validate the ownership relation before detaching any entry. A corrupt
+        # owner must remain reachable for diagnosis instead of being orphaned by
+        # a fail-closed cleanup exception.
+        for entry in removed:
+            self._validate_abort_owner(entry)
         self.queue = [e for e in self.queue if id(e) not in removed_ids]
         self.pending_reqs = [e for e in self.pending_reqs if id(e) not in removed_ids]
-
         for reqs in (self.retracted_queue, self.held_rebootstrap_reqs):
-            kept = []
-            for req in reqs:
-                if self._rid_matches(req.rid, rid, abort_all):
-                    removed.append(DecodeRequest(req=req, kv_receiver=None))
-                else:
-                    kept.append(req)
-            reqs[:] = kept
+            reqs[:] = [req for req in reqs if id(req) not in detached_req_ids]
 
         for entry in removed:
             self._abort_and_release(entry)
@@ -851,7 +878,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         receiver = entry.kv_receiver
         if receiver is not None and not getattr(receiver, "abort_notified", False):
             # Notify the remote producer before deleting generation state.
-            receiver.abort()
+            try:
+                receiver.abort()
+            except Exception:
+                # Preallocation has not published destination metadata, so a
+                # failed best-effort notification cannot leave a remote writer
+                # targeting these pages. Do not let it strand local ownership
+                # after remove_aborted() has detached the request.
+                logger.exception(
+                    "Decode preallocation abort notification failed for "
+                    "rid=%s room=%s; continuing local rollback",
+                    req.rid,
+                    req.bootstrap_room,
+                )
 
         # Tracker state is local ownership too. Clear it before clearing the
         # receiver so a failed pre-publication admission cannot poison a reused
@@ -898,8 +937,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ):
             self.tree_cache.dec_lock_ref(entry.prefix_match.last_device_node)
             entry.prefix_lock_held = False
-        if self.scheduler.enable_hisparse and not getattr(
-            entry, "abort_hisparse_finished", False
+        # A request can be aborted while it is still waiting in the decode
+        # preallocation window. In that state HiSparse is enabled globally, but
+        # this request has no req-pool slot or KV descriptor and therefore owns
+        # no coordinator state for request_finished() to release.
+        owns_hisparse_resource = (
+            getattr(req, "req_pool_idx", None) is not None
+            and getattr(req, "kv", None) is not None
+        )
+        if (
+            self.scheduler.enable_hisparse
+            and owns_hisparse_resource
+            and not getattr(entry, "abort_hisparse_finished", False)
         ):
             self.scheduler.finish_hisparse_request(req)
             entry.abort_hisparse_finished = True
@@ -911,23 +960,41 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             entry.metadata_buffer_index = -1
             entry.abort_metadata_released = True
 
-        owns_kv_resource = bool(
-            getattr(req, "kv", None) is not None
-            or getattr(req, "mamba_pool_idx", None) is not None
-            or (hasattr(req, "kv") and getattr(req, "req_pool_idx", None) is not None)
-        )
-        if not getattr(entry, "abort_resources_released", False) and owns_kv_resource:
-            release_kv_cache(req, self.tree_cache, is_insert=False)
-            entry.abort_resources_released = True
+        req_pool_allocated = getattr(req, "req_pool_idx", None) is not None
+        kv_allocated = getattr(req, "kv", None) is not None
+        mamba_allocated = getattr(req, "mamba_pool_idx", None) is not None
+        if not getattr(entry, "abort_resources_released", False):
+            if req_pool_allocated and not kv_allocated:
+                # req_to_token_pool.alloc() runs before ReqKvInfo and logical KV
+                # allocation. If a later preallocation step raises, unwind this
+                # partial owner directly: release_kv_cache intentionally rejects
+                # asymmetric req-pool/KV state. Mamba state, when present, must
+                # be released while req_pool_idx still identifies its mapping.
+                if mamba_allocated:
+                    free_mamba_cache = getattr(
+                        self.req_to_token_pool, "free_mamba_cache", None
+                    )
+                    if not callable(free_mamba_cache):
+                        raise RuntimeError(
+                            "Cannot roll back partial decode preallocation with "
+                            "live Mamba state: req-to-token pool has no Mamba "
+                            "cleanup hook"
+                        )
+                    free_mamba_cache(req)
+                self.req_to_token_pool.free(req)
+                entry.abort_resources_released = True
+            elif kv_allocated and not req_pool_allocated:
+                # Direct callers still get the same fail-closed invariant; the
+                # normal remove_aborted path validates before queue detachment.
+                self._validate_abort_owner(entry)
+            elif req_pool_allocated or mamba_allocated:
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+                entry.abort_resources_released = True
 
         if receiver is not None:
             receiver.clear()
             entry.kv_receiver = None
-        if not getattr(entry, "abort_output_emitted", False):
-            if _owns_external_output(self.scheduler):
-                self.scheduler.output_streamer.stream_output([req], req.return_logprob)
-            entry.abort_output_emitted = True
-            req.finished_output = True
+        self._emit_abort_output_once(entry)
 
     def _rollback_admission_owner(self, entry: DecodeRequest) -> None:
         """Rollback a pre-publication admission transaction exactly once."""

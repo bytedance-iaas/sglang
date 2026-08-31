@@ -40,6 +40,46 @@ class FakeReceiver:
 
 
 class TestDecodeQueueCleanup(CustomTestCase):
+    def _make_hisparse_prealloc_abort_owner(
+        self, *, rid, req_pool_idx, kv, mamba_pool_idx=None
+    ):
+        receiver = MagicMock()
+        receiver.abort_notified = False
+        req = SimpleNamespace(
+            rid=rid,
+            bootstrap_room=9,
+            finished_reason=None,
+            return_logprob=False,
+            finished_output=False,
+            req_pool_idx=req_pool_idx,
+            kv=kv,
+            mamba_pool_idx=mamba_pool_idx,
+        )
+        decode_req = DecodeRequest(req=req, kv_receiver=receiver)
+
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.queue = [decode_req]
+        # The add() slow path aliases the same owner in both collections.
+        queue.pending_reqs = [decode_req]
+        queue.retracted_queue = []
+        queue.held_rebootstrap_reqs = []
+        queue.metadata_buffers = SimpleNamespace(bootstrap_room={})
+        queue.req_to_metadata_buffer_idx_allocator = MagicMock()
+        queue.req_to_token_pool = MagicMock()
+        queue.tree_cache = MagicMock()
+        queue.transfer_queue = SimpleNamespace(
+            enable_staging=False,
+            staging_handler=None,
+            _clean_hicache_prefetch_resources=MagicMock(),
+        )
+        queue.scheduler = SimpleNamespace(
+            enable_hisparse=True,
+            finish_hisparse_request=MagicMock(),
+            output_streamer=MagicMock(),
+            ps=SimpleNamespace(pp_rank=0, attn_tp_rank=0, attn_cp_rank=0),
+        )
+        return queue, decode_req, receiver
+
     @patch("sglang.srt.disaggregation.decode.prepare_abort")
     def test_remove_aborted_returns_wrappers_for_retracted_and_held(self, prepare):
         retracted = SimpleNamespace(
@@ -234,6 +274,215 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertEqual(queue.queue, [])
         self.assertTrue(all(r is not decode_req for r in queue.pending_reqs))
         self.assertIsNone(decode_req.kv_receiver)
+
+    @patch("sglang.srt.disaggregation.decode.release_kv_cache")
+    def test_hisparse_external_abort_before_allocation_is_idempotent(
+        self, mock_release_kv_cache
+    ):
+        queue, decode_req, receiver = self._make_hisparse_prealloc_abort_owner(
+            rid="hisparse-unallocated", req_pool_idx=None, kv=None
+        )
+
+        removed = queue.remove_aborted("hisparse-unallocated")
+        removed_again = queue.remove_aborted("hisparse-unallocated")
+        queue._abort_and_release(decode_req)
+
+        self.assertEqual(len(removed), 1)
+        self.assertIs(removed[0], decode_req)
+        self.assertEqual(removed_again, [])
+        self.assertEqual(queue.queue, [])
+        self.assertEqual(queue.pending_reqs, [])
+        receiver.abort.assert_called_once_with()
+        receiver.clear.assert_called_once_with()
+        self.assertIsNone(decode_req.kv_receiver)
+        queue.scheduler.finish_hisparse_request.assert_not_called()
+        mock_release_kv_cache.assert_not_called()
+        queue.req_to_token_pool.free.assert_not_called()
+        queue.scheduler.output_streamer.stream_output.assert_called_once_with(
+            [decode_req.req], decode_req.req.return_logprob
+        )
+
+    @patch("sglang.srt.disaggregation.decode.release_kv_cache")
+    def test_hisparse_external_abort_releases_allocated_owner_once(
+        self, mock_release_kv_cache
+    ):
+        cleanup_order = []
+        queue, decode_req, receiver = self._make_hisparse_prealloc_abort_owner(
+            rid="hisparse-allocated", req_pool_idx=3, kv=object()
+        )
+        receiver.abort.side_effect = lambda: cleanup_order.append("receiver.abort")
+        receiver.clear.side_effect = lambda: cleanup_order.append("receiver.clear")
+        queue.scheduler.finish_hisparse_request.side_effect = (
+            lambda _req: cleanup_order.append("hisparse.finish")
+        )
+        mock_release_kv_cache.side_effect = (
+            lambda *_args, **_kwargs: cleanup_order.append("kv.release")
+        )
+        queue.scheduler.output_streamer.stream_output.side_effect = (
+            lambda *_args, **_kwargs: cleanup_order.append("output")
+        )
+
+        removed = queue.remove_aborted("hisparse-allocated")
+        queue.remove_aborted("hisparse-allocated")
+        queue._abort_and_release(decode_req)
+
+        self.assertEqual(len(removed), 1)
+        self.assertIs(removed[0], decode_req)
+        self.assertEqual(queue.queue, [])
+        self.assertEqual(queue.pending_reqs, [])
+        receiver.abort.assert_called_once_with()
+        receiver.clear.assert_called_once_with()
+        queue.scheduler.finish_hisparse_request.assert_called_once_with(decode_req.req)
+        mock_release_kv_cache.assert_called_once_with(
+            decode_req.req, queue.tree_cache, is_insert=False
+        )
+        queue.scheduler.output_streamer.stream_output.assert_called_once_with(
+            [decode_req.req], decode_req.req.return_logprob
+        )
+        self.assertEqual(
+            cleanup_order,
+            [
+                "receiver.abort",
+                "hisparse.finish",
+                "kv.release",
+                "receiver.clear",
+                "output",
+            ],
+        )
+
+    @patch("sglang.srt.disaggregation.decode.release_kv_cache")
+    def test_hisparse_external_abort_rolls_back_req_pool_only_allocation(
+        self, mock_release_kv_cache
+    ):
+        queue, decode_req, receiver = self._make_hisparse_prealloc_abort_owner(
+            rid="hisparse-req-pool-only", req_pool_idx=4, kv=None
+        )
+
+        removed = queue.remove_aborted("hisparse-req-pool-only")
+        queue._abort_and_release(decode_req)
+
+        self.assertEqual(removed, [decode_req])
+        receiver.abort.assert_called_once_with()
+        receiver.clear.assert_called_once_with()
+        queue.scheduler.finish_hisparse_request.assert_not_called()
+        mock_release_kv_cache.assert_not_called()
+        queue.req_to_token_pool.free_mamba_cache.assert_not_called()
+        queue.req_to_token_pool.free.assert_called_once_with(decode_req.req)
+        queue.scheduler.output_streamer.stream_output.assert_called_once_with(
+            [decode_req.req], decode_req.req.return_logprob
+        )
+
+    @patch("sglang.srt.disaggregation.decode.release_kv_cache")
+    def test_hisparse_external_abort_rolls_back_partial_allocation(
+        self, mock_release_kv_cache
+    ):
+        mamba_pool_idx = object()
+        queue, decode_req, receiver = self._make_hisparse_prealloc_abort_owner(
+            rid="hisparse-partial",
+            req_pool_idx=4,
+            kv=None,
+            mamba_pool_idx=mamba_pool_idx,
+        )
+
+        removed = queue.remove_aborted("hisparse-partial")
+        queue.remove_aborted("hisparse-partial")
+        queue._abort_and_release(decode_req)
+
+        self.assertEqual(len(removed), 1)
+        self.assertIs(removed[0], decode_req)
+        self.assertEqual(queue.queue, [])
+        self.assertEqual(queue.pending_reqs, [])
+        receiver.abort.assert_called_once_with()
+        receiver.clear.assert_called_once_with()
+        queue.scheduler.finish_hisparse_request.assert_not_called()
+        mock_release_kv_cache.assert_not_called()
+        self.assertEqual(
+            queue.req_to_token_pool.method_calls,
+            [call.free_mamba_cache(decode_req.req), call.free(decode_req.req)],
+        )
+        queue.scheduler.output_streamer.stream_output.assert_called_once_with(
+            [decode_req.req], decode_req.req.return_logprob
+        )
+
+    @patch("sglang.srt.disaggregation.decode.logger.exception")
+    @patch("sglang.srt.disaggregation.decode.release_kv_cache")
+    def test_hisparse_external_abort_notification_failure_still_rolls_back(
+        self, mock_release_kv_cache, mock_log_exception
+    ):
+        queue, decode_req, receiver = self._make_hisparse_prealloc_abort_owner(
+            rid="hisparse-abort-notify-failure", req_pool_idx=5, kv=None
+        )
+        receiver.abort.side_effect = RuntimeError("transport unavailable")
+
+        removed = queue.remove_aborted("hisparse-abort-notify-failure")
+        queue._abort_and_release(decode_req)
+
+        self.assertEqual(removed, [decode_req])
+        self.assertEqual(queue.queue, [])
+        self.assertEqual(queue.pending_reqs, [])
+        receiver.abort.assert_called_once_with()
+        receiver.clear.assert_called_once_with()
+        mock_log_exception.assert_called_once()
+        queue.req_to_token_pool.free.assert_called_once_with(decode_req.req)
+        queue.scheduler.finish_hisparse_request.assert_not_called()
+        mock_release_kv_cache.assert_not_called()
+        queue.scheduler.output_streamer.stream_output.assert_called_once_with(
+            [decode_req.req], decode_req.req.return_logprob
+        )
+
+    @patch("sglang.srt.disaggregation.decode.release_kv_cache")
+    def test_hisparse_external_abort_output_side_effect_is_not_retried(
+        self, mock_release_kv_cache
+    ):
+        queue, decode_req, receiver = self._make_hisparse_prealloc_abort_owner(
+            rid="hisparse-output-side-effect", req_pool_idx=None, kv=None
+        )
+
+        def output_then_fail(reqs, _return_logprob):
+            reqs[0].finished_output = True
+            raise RuntimeError("detokenizer transport failed after accept")
+
+        queue.scheduler.output_streamer.stream_output.side_effect = output_then_fail
+
+        with self.assertRaisesRegex(RuntimeError, "after accept"):
+            queue.remove_aborted("hisparse-output-side-effect")
+        queue._abort_and_release(decode_req)
+
+        queue.scheduler.output_streamer.stream_output.assert_called_once_with(
+            [decode_req.req], decode_req.req.return_logprob
+        )
+        self.assertTrue(decode_req.abort_output_emitted)
+        self.assertTrue(decode_req.req.finished_output)
+        receiver.abort.assert_called_once_with()
+        receiver.clear.assert_called_once_with()
+        mock_release_kv_cache.assert_not_called()
+
+    @patch("sglang.srt.disaggregation.decode.release_kv_cache")
+    def test_hisparse_external_abort_rejects_kv_only_owner_before_detach(
+        self, mock_release_kv_cache
+    ):
+        queue, decode_req, receiver = self._make_hisparse_prealloc_abort_owner(
+            rid="hisparse-kv-only", req_pool_idx=None, kv=object()
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "no request-pool owner"):
+            queue.remove_aborted("hisparse-kv-only")
+
+        self.assertEqual(queue.queue, [decode_req])
+        self.assertEqual(queue.pending_reqs, [decode_req])
+        receiver.abort.assert_not_called()
+        receiver.clear.assert_not_called()
+        queue.scheduler.finish_hisparse_request.assert_not_called()
+        mock_release_kv_cache.assert_not_called()
+        queue.req_to_token_pool.free.assert_not_called()
+        queue.scheduler.output_streamer.stream_output.assert_not_called()
+
+        queue.queue = []
+        queue.pending_reqs = []
+        queue.held_rebootstrap_reqs = [decode_req.req]
+        with self.assertRaisesRegex(RuntimeError, "no request-pool owner"):
+            queue.remove_aborted("hisparse-kv-only")
+        self.assertEqual(queue.held_rebootstrap_reqs, [decode_req.req])
 
     def test_ensure_prefill_info_tolerates_cleared_receiver(self):
         # A req whose kv_receiver was already cleared must not crash on .abort().
