@@ -14,9 +14,9 @@ on:
         default: ""
       source_image_ref:
         description: |
-          可选：当 auto_rename=true 时，以此为源镜像（而非 image_refs）进行重命名。
-          留空则使用 image_refs 中的镜像作为源。
-          格式: iaas-gpu-cn-beijing.cr.volces.com/serving/<framework>:<old-tag>
+          可选源镜像。auto_rename=true 时从该镜像生成标准 tag；
+          auto_rename=false 时将它复制到 image_refs 指定的唯一目标，再补全格式。
+          可用于把旧 repo 中的历史镜像规范化到 serving/<framework>:<tag>。
         required: false
         type: string
         default: ""
@@ -68,6 +68,9 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Set up crane
+        uses: imjasonh/setup-crane@v0.4
+
       - name: Login to Volcengine CR
         run: |
           set -euo pipefail
@@ -96,6 +99,18 @@ jobs:
           if [ "${{ inputs.auto_rename }}" = "false" ] && [ -z "${{ inputs.image_refs }}" ]; then
             echo "ERROR: image_refs is required when auto_rename is disabled"
             exit 1
+          fi
+          if [ "${{ inputs.auto_rename }}" = "false" ] && [ -n "${{ inputs.source_image_ref }}" ]; then
+            target_count=0
+            while IFS= read -r line; do
+              line="${line//[$'\r\n']/}"
+              [[ -z "$line" || "$line" == \#* ]] && continue
+              target_count=$((target_count + 1))
+            done <<< "${{ inputs.image_refs }}"
+            if [ "${target_count}" -ne 1 ]; then
+              echo "ERROR: exact-copy mode requires exactly one image_refs target"
+              exit 1
+            fi
           fi
           echo "Input validation passed."
 
@@ -261,6 +276,27 @@ jobs:
             fi
           }
 
+          copy_and_backfill() {
+            local source_ref="$1"
+            local target_ref="$2"
+            local allowed_prefix="${VOLCENGINE_CR_REGISTRY}/${VOLCENGINE_CR_NAMESPACE}/"
+
+            if [[ "${target_ref}" != "${allowed_prefix}"* ]]; then
+              echo "ERROR: exact-copy target must start with ${allowed_prefix}"
+              return 1
+            fi
+
+            echo ""
+            echo "=== $(date '+%H:%M:%S') Normalize: ${source_ref} -> ${target_ref} ==="
+            if docker manifest inspect "${target_ref}" >/dev/null 2>&1; then
+              echo "  Target already exists, using existing: ${target_ref}"
+            else
+              retry crane copy "${source_ref}" "${target_ref}"
+              echo "  Copied: ${target_ref}"
+            fi
+            backfill_one "${target_ref}"
+          }
+
           backfill_one() {
             local image_ref="$1"
 
@@ -319,6 +355,15 @@ jobs:
               [[ -z "$line" || "$line" == \#* ]] && continue
               rename_and_backfill "$line"
             done <<< "${IMAGE_REFS}"
+          elif [ -n "${SOURCE_IMAGE_REF}" ]; then
+            echo "  Exact copy to image_refs target, then direct backfill"
+            target_ref=""
+            while IFS= read -r line; do
+              line="${line//[$'\r\n']/}"
+              [[ -z "$line" || "$line" == \#* ]] && continue
+              target_ref="$line"
+            done <<< "${IMAGE_REFS}"
+            copy_and_backfill "${SOURCE_IMAGE_REF}" "${target_ref}"
           else
             echo "  Direct backfill (no rename)"
             while IFS= read -r line; do
