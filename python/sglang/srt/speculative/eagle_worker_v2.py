@@ -1486,23 +1486,35 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # build_tree_kernel_efficient expects draft_tokens without bonus.
         draft_tokens_no_bonus = draft_tokens[:, 1:]
 
-        # Directly write to cuda graph buffers for verify attn.
-        tree_mask_buf, position_buf = (
-            self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
-        )
-
-        seq_lens_sum = batch.seq_lens_sum
-        if seq_lens_sum is None:
-            if batch.seq_lens_cpu is not None:
-                seq_lens_sum = int(batch.seq_lens_cpu.sum())
-            else:
-                seq_lens_sum = int(batch.seq_lens.sum())
-
         bs = batch.seq_lens.shape[0]
         assert parent_list.shape == (
             bs,
             num_draft - 1,
         ), f"topology shape mismatch: {parent_list.shape} vs ({bs}, {num_draft - 1})"
+
+        # Match the backend-neutral verify-mask contract used by the non-PP
+        # EAGLE path.  The legacy getter also returned a position buffer, but
+        # positions are now owned and allocated by build_tree_kernel_efficient.
+        attn_backend = self.target_worker.model_runner.attn_backend
+        verify_mask = attn_backend.verify_mask
+        if verify_mask is None:
+            tree_mask_buf, mask_mode, fill_mask = (
+                None,
+                self.tree_mask_mode,
+                True,
+            )
+        else:
+            mask_mode, fill_mask = verify_mask.mode, verify_mask.is_read
+            tree_mask_buf = verify_mask.buffer if verify_mask.fits(bs) else None
+
+        seq_lens_sum = batch.seq_lens_sum
+        if seq_lens_sum is None:
+            if tree_mask_buf is not None or mask_mode == TreeMaskMode.QLEN_ONLY:
+                seq_lens_sum = 0
+            else:
+                # The tree builder only uses this value to size an eager
+                # FULL_MASK allocation.  An upper bound avoids a D2H sync.
+                seq_lens_sum = bs * attn_backend.max_context_len
 
         (
             tree_mask,
@@ -1521,9 +1533,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             topk,
             spec_steps,
             num_draft,
-            self.tree_mask_mode,
+            mask_mode,
             tree_mask_buf,
-            position_buf,
+            fill_prefix_mask=fill_mask,
         )
 
         draft_tokens_arranged = draft_tokens_arranged.to(torch.int64)

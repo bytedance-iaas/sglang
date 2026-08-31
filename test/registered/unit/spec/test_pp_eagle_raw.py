@@ -9,7 +9,9 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+from sglang.srt.layers.attention.verify_mask import VerifyMask
 from sglang.srt.speculative.eagle_info import EaglePPVerifyInputRaw
+from sglang.srt.speculative.eagle_utils import TreeMaskMode
 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 
 
@@ -73,19 +75,17 @@ class TestEaglePPVerifyInputRaw(unittest.TestCase):
 
 class TestEaglePPVerifyRebuild(unittest.TestCase):
     @staticmethod
-    def _worker():
+    def _worker(verify_mask=None):
         return SimpleNamespace(
             topk=1,
             speculative_num_steps=3,
             speculative_num_draft_tokens=4,
-            tree_mask_mode=object(),
+            tree_mask_mode=TreeMaskMode.FULL_MASK,
             target_worker=SimpleNamespace(
                 model_runner=SimpleNamespace(
                     attn_backend=SimpleNamespace(
-                        get_verify_buffers_to_fill_after_draft=lambda: (
-                            torch.empty(1),
-                            torch.empty(1),
-                        )
+                        verify_mask=verify_mask,
+                        max_context_len=4096,
                     )
                 )
             ),
@@ -129,6 +129,42 @@ class TestEaglePPVerifyRebuild(unittest.TestCase):
         self.assertEqual(verify.topk, 1)
         self.assertEqual(verify.spec_steps, 3)
         self.assertEqual(verify.draft_token_num, 4)
+        self.assertEqual(build_tree.call_args.args[9], TreeMaskMode.FULL_MASK)
+        self.assertIsNone(build_tree.call_args.args[10])
+        self.assertTrue(build_tree.call_args.kwargs["fill_prefix_mask"])
+
+    def test_rebuild_uses_current_verify_mask_contract(self):
+        raw = TestEaglePPVerifyInputRaw._raw()
+        batch = self._batch(raw)
+        mask_buffer = torch.empty(128, dtype=torch.bool)
+        verify_mask = VerifyMask(
+            buffer=mask_buffer,
+            mode=TreeMaskMode.QLEN_ONLY,
+            max_bs=2,
+            is_read=False,
+        )
+        arranged = torch.tensor([10, 11, 12, 13, 20, 21, 22, 23])
+        kernel_result = (
+            mask_buffer,
+            torch.tensor([2]),
+            torch.tensor([3]),
+            torch.tensor([4]),
+            torch.tensor([5]),
+            arranged,
+        )
+
+        with patch(
+            "sglang.srt.speculative.eagle_worker_v2.build_tree_kernel_efficient",
+            return_value=kernel_result,
+        ) as build_tree:
+            EAGLEWorkerV2._build_verify_input_from_pp_raw(
+                self._worker(verify_mask), batch
+            )
+
+        self.assertEqual(build_tree.call_args.args[5], 22)
+        self.assertEqual(build_tree.call_args.args[9], TreeMaskMode.QLEN_ONLY)
+        self.assertIs(build_tree.call_args.args[10], mask_buffer)
+        self.assertFalse(build_tree.call_args.kwargs["fill_prefix_mask"])
 
     def test_rebuild_rejects_parent_shape_mismatch(self):
         raw = TestEaglePPVerifyInputRaw._raw()
