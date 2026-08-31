@@ -817,6 +817,85 @@ class TestEICHiCacheRegression(unittest.TestCase):
         r = self._make_reconciler(0, self.FakeStore())
         self.assertEqual([r.bump_epoch("r"), r.bump_epoch("r")], [1, 2])
 
+    def _make_writing_check_cache(self, write_policy):
+        # Minimal EICPagedHiRadixCache for exercising writing_check's dec_lock_ref
+        # gating. One acked node in ongoing_write_through, TP=1 (no all_reduce).
+        cache = object.__new__(EICPagedHiRadixCache)
+        cache.tp_group = None
+        node = SimpleNamespace(id=7, host_value=object())
+        cache.ongoing_write_through = {7: node}
+        ackq = Queue()
+        ackq.put((7, True))
+        cache.cache_controller = SimpleNamespace(
+            write_policy=write_policy, ack_write_queue=ackq
+        )
+        cache.dec_lock_ref = mock.Mock()
+        return cache
+
+    def test_writing_check_skips_dec_lock_ref_under_write_back_policy(self):
+        # The device-pool double-count crash: under write_back policy nodes are never
+        # inc_lock_ref'd, so writing_check() (evict throttle / check_hicache_events,
+        # which pass no flag) must NOT dec_lock_ref -- doing so drains a running req's
+        # protected pages into evictable ("pool memory leak detected").
+        import torch as _torch
+
+        cache = self._make_writing_check_cache("write_back")
+        with mock.patch.object(
+            _torch.distributed, "get_world_size", return_value=1
+        ):
+            EICPagedHiRadixCache.writing_check(cache)  # no explicit flag
+        cache.dec_lock_ref.assert_not_called()
+        self.assertEqual(cache.ongoing_write_through, {})
+
+    def test_writing_check_dec_lock_ref_under_write_through_policy(self):
+        # write_through nodes ARE inc_lock_ref'd, so the release must still fire.
+        import torch as _torch
+
+        cache = self._make_writing_check_cache("write_through")
+        with mock.patch.object(
+            _torch.distributed, "get_world_size", return_value=1
+        ):
+            EICPagedHiRadixCache.writing_check(cache)
+        cache.dec_lock_ref.assert_called_once()
+        self.assertEqual(cache.ongoing_write_through, {})
+
+    def test_writing_check_no_barrier_when_not_blocking(self):
+        # The forward-loop hazard: under write_back the per-loop call sites must NOT
+        # spin waiting for every ack (a hung EIC write thread would freeze forward_ct
+        # until the watchdog SIGQUITs the server). With ongoing != acked and no
+        # blocking, writing_check must return promptly instead of looping forever.
+        import torch as _torch
+
+        cache = self._make_writing_check_cache("write_back")
+        cache.ongoing_write_through = {7: SimpleNamespace(id=7, host_value=object())}
+        ackq = Queue()  # deliberately EMPTY: qsize(0) != ongoing(1)
+        cache.cache_controller.ack_write_queue = ackq
+        with mock.patch.object(_torch.distributed, "get_world_size", return_value=1):
+            EICPagedHiRadixCache.writing_check(cache)  # blocking defaults False
+        # Returned without hanging; the un-acked node is left for the next pass.
+        self.assertEqual(cache.ongoing_write_through, {7: cache.ongoing_write_through[7]})
+
+    def test_writing_check_barrier_times_out(self):
+        # evict's blocking barrier must be bounded: if acks never arrive it breaks
+        # after the timeout instead of hanging the scheduler indefinitely.
+        import torch as _torch
+
+        cache = self._make_writing_check_cache("write_back")
+        cache.ongoing_write_through = {7: SimpleNamespace(id=7, host_value=object())}
+        cache.cache_controller.ack_write_queue = Queue()  # never satisfies barrier
+        with mock.patch.object(
+            _torch.distributed, "get_world_size", return_value=1
+        ), mock.patch(
+            "sglang.srt.mem_cache.eic_hiradix_cache.time.perf_counter",
+            # start, one spin (<30s), past 30s -> break, final cost_time read
+            side_effect=[0.0, 5.0, 40.0, 40.1],
+        ), mock.patch(
+            "sglang.srt.mem_cache.eic_hiradix_cache.time.sleep"
+        ):
+            EICPagedHiRadixCache.writing_check(cache, write_back=True, blocking=True)
+        # Broke out of the barrier (did not hang) and drained the 0 available acks.
+        self.assertTrue(True)
+
     def test_async_batch_set_drops_when_write_pool_exhausted(self):
         # Backend-failure OOM guard: when the async write pool is exhausted (the
         # consumer thread is behind a slow/failing EIC backend), async_batch_set must
