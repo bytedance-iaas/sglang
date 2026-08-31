@@ -230,6 +230,104 @@ class TestSidpServerArgs(CustomTestCase):
         self.assertTrue(parsed.sidp_enable_peak_shifting)
         self.assertEqual(parsed.sidp_peak_sync_strategy, "none")
 
+    def test_sidp_default_policy_and_backend_resolution(self):
+        args = self._make_sidp_args()
+        with patch.dict(
+            os.environ,
+            {"PYTORCH_CUDA_ALLOC_CONF": "", "PYTORCH_ALLOC_CONF": ""},
+        ):
+            args._handle_sidp()
+        self.assertEqual(args.sidp_prefetch_policy, "compute")
+        self.assertEqual(args.sidp_copy_backend, "dma")
+        self.assertFalse(args.sidp_enable_peak_shifting)
+
+    def test_sidp_legacy_peak_maps_to_static_peak_dma(self):
+        args = self._make_sidp_args(sidp_enable_peak_shifting=True)
+        with patch.dict(
+            os.environ,
+            {"PYTORCH_CUDA_ALLOC_CONF": "", "PYTORCH_ALLOC_CONF": ""},
+        ):
+            args._handle_sidp()
+        self.assertEqual(args.sidp_prefetch_policy, "static_peak")
+        self.assertEqual(args.sidp_copy_backend, "dma")
+        self.assertTrue(args.sidp_enable_peak_shifting)
+
+    def test_sidp_dynamic_auto_selects_sm(self):
+        args = self._make_sidp_args(sidp_prefetch_policy="dynamic_owner")
+        with (
+            patch.dict(
+                os.environ,
+                {"PYTORCH_CUDA_ALLOC_CONF": "", "PYTORCH_ALLOC_CONF": ""},
+            ),
+            self.assertLogs(server_args_module.logger, level="WARNING") as logs,
+        ):
+            args._handle_sidp()
+        self.assertEqual(args.sidp_prefetch_policy, "dynamic_owner")
+        self.assertEqual(args.sidp_copy_backend, "sm")
+        self.assertIn("experimental", "\n".join(logs.output))
+
+    def test_sidp_compute_sm_control_mode(self):
+        args = self._make_sidp_args(
+            sidp_prefetch_policy="compute", sidp_copy_backend="sm"
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"PYTORCH_CUDA_ALLOC_CONF": "", "PYTORCH_ALLOC_CONF": ""},
+            ),
+            self.assertLogs(server_args_module.logger, level="WARNING"),
+        ):
+            args._handle_sidp()
+        self.assertEqual(args.sidp_prefetch_policy, "compute")
+        self.assertEqual(args.sidp_copy_backend, "sm")
+
+    def test_sidp_invalid_policy_backend_combinations(self):
+        cases = [
+            (
+                {
+                    "sidp_prefetch_policy": "dynamic_owner",
+                    "sidp_copy_backend": "dma",
+                },
+                "dynamic_owner requires",
+            ),
+            (
+                {
+                    "sidp_prefetch_policy": "dynamic_owner",
+                    "sidp_peak_sync_strategy": "force_sync",
+                },
+                "only valid for static_peak",
+            ),
+            (
+                {
+                    "sidp_prefetch_policy": "dynamic_owner",
+                    "sidp_k": 8,
+                },
+                "requires remote weights",
+            ),
+            (
+                {"sidp_copy_backend": "sm", "enable_torch_compile": True},
+                "does not support --enable-torch-compile",
+            ),
+            (
+                {
+                    "sidp_enable_peak_shifting": True,
+                    "sidp_prefetch_policy": "compute",
+                },
+                "conflicts",
+            ),
+        ]
+        for overrides, message in cases:
+            with self.subTest(overrides=overrides):
+                args = self._make_sidp_args(**overrides)
+                with (
+                    patch.dict(
+                        os.environ,
+                        {"PYTORCH_CUDA_ALLOC_CONF": "", "PYTORCH_ALLOC_CONF": ""},
+                    ),
+                    self.assertRaisesRegex(AssertionError, message),
+                ):
+                    args._handle_sidp()
+
     def test_graph_profiling_parameters(self):
         args = self._make_sidp_args(
             sidp_enable_graph_profiling=True,

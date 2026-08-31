@@ -3,6 +3,30 @@
 from typing import List, Tuple
 
 
+def cycle_fill_generation(cycle: int, cache_depth: int = 2) -> int:
+    """Generation published after ``cycle`` has filled its fixed cache slot."""
+    if cycle < 0 or cache_depth < 1:
+        raise ValueError("cycle must be non-negative and cache_depth must be positive")
+    return cycle // cache_depth + 1
+
+
+def cycle_reuse_requirement(cycle: int, cache_depth: int = 2) -> int:
+    """COMPUTED generation required before ``cycle`` may overwrite its slot."""
+    if cycle < 0 or cache_depth < 1:
+        raise ValueError("cycle must be non-negative and cache_depth must be positive")
+    return cycle // cache_depth
+
+
+def next_forward_cycle_zero_generations(
+    num_cycles: int, cache_depth: int = 2
+) -> Tuple[int, int]:
+    """Return ``(required_comp, target_fill)`` for next-forward cycle zero."""
+    if num_cycles < 1 or cache_depth < 1 or num_cycles % cache_depth:
+        raise ValueError("num_cycles must be positive and divisible by cache_depth")
+    required = num_cycles // cache_depth
+    return required, required + 1
+
+
 def owner_of(layer_idx: int, dp_size: int) -> int:
     return layer_idx % dp_size
 

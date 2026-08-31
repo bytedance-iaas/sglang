@@ -1099,10 +1099,31 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = 2
+    sidp_prefetch_policy: A[
+        str,
+        Arg(
+            help="SiDP remote-weight scheduling policy. 'compute' and "
+            "'static_peak' use a graph-static order; 'dynamic_owner' chooses "
+            "a currently free owner on device at runtime. 'auto' preserves "
+            "the legacy --sidp-enable-peak-shifting mapping.",
+            choices=["auto", "compute", "static_peak", "dynamic_owner"],
+        ),
+        NS("parallel"),
+    ] = "auto"
+    sidp_copy_backend: A[
+        str,
+        Arg(
+            help="SiDP encoded-weight copy backend. 'dma' uses the CUDA copy "
+            "engine; 'sm' uses a CUDA kernel and is required by "
+            "dynamic_owner. 'auto' selects SM only for dynamic_owner.",
+            choices=["auto", "dma", "sm"],
+        ),
+        NS("parallel"),
+    ] = "auto"
     sidp_enable_peak_shifting: A[
         bool,
-        "Enable SiDP peak-shifting: reorder each cycle's remote prefetches into "
-        "permutation waves. Disabled by default for compute-order A/B comparison.",
+        "Deprecated compatibility alias for "
+        "--sidp-prefetch-policy static_peak.",
         NS("parallel"),
     ] = False
     sidp_enable_debug_logging: A[
@@ -6550,6 +6571,43 @@ class ServerArgs:
         if self.sidp_size <= 0:
             return
 
+        assert self.sidp_prefetch_policy in (
+            "auto",
+            "compute",
+            "static_peak",
+            "dynamic_owner",
+        ), "sidp_prefetch_policy must be one of: auto, compute, static_peak, dynamic_owner"
+        assert self.sidp_copy_backend in (
+            "auto",
+            "dma",
+            "sm",
+        ), "sidp_copy_backend must be one of: auto, dma, sm"
+
+        if self.sidp_prefetch_policy == "auto":
+            self.sidp_prefetch_policy = (
+                "static_peak" if self.sidp_enable_peak_shifting else "compute"
+            )
+        elif self.sidp_enable_peak_shifting:
+            assert self.sidp_prefetch_policy == "static_peak", (
+                "--sidp-enable-peak-shifting conflicts with "
+                f"--sidp-prefetch-policy {self.sidp_prefetch_policy}"
+            )
+
+        if self.sidp_copy_backend == "auto":
+            self.sidp_copy_backend = (
+                "sm" if self.sidp_prefetch_policy == "dynamic_owner" else "dma"
+            )
+        assert not (
+            self.sidp_prefetch_policy == "dynamic_owner"
+            and self.sidp_copy_backend != "sm"
+        ), "SiDP dynamic_owner requires --sidp-copy-backend sm"
+
+        # Keep the legacy field coherent for launch-sync and older diagnostic
+        # callers. Dynamic owner scheduling intentionally does not use it.
+        self.sidp_enable_peak_shifting = (
+            self.sidp_prefetch_policy == "static_peak"
+        )
+
         assert self.sidp_size >= 2, "SiDP requires sidp_size >= 2"
         assert (
             self.sidp_size == self.dp_size
@@ -6611,6 +6669,33 @@ class ServerArgs:
         assert self.sidp_peak_sync_timeout_s > 0, (
             "sidp_peak_sync_timeout_s must be positive"
         )
+        if self.sidp_peak_sync_strategy != "none":
+            assert (
+                self.sidp_prefetch_policy == "static_peak"
+                and self.sidp_copy_backend == "dma"
+            ), (
+                "SiDP peak synchronization is only valid for "
+                "static_peak + dma"
+            )
+        if self.sidp_prefetch_policy == "dynamic_owner":
+            assert self.sidp_k < self.sidp_size, (
+                "SiDP dynamic_owner requires remote weights (sidp_k < sidp_size)"
+            )
+        if self.sidp_copy_backend == "sm":
+            assert not self.enable_torch_compile, (
+                "SiDP SM copy uses graph-stable indirect pointer descriptors "
+                "and does not support --enable-torch-compile yet"
+            )
+            logger.warning(
+                "SiDP SM copy is an experimental backend. It is CUDA Graph "
+                "compatible, but may contend with model GEMMs for SM resources."
+            )
+        if self.sidp_prefetch_policy == "dynamic_owner":
+            logger.warning(
+                "SiDP dynamic_owner is experimental. It uses system-scope "
+                "peer atomics and runtime owner arbitration; hardware support "
+                "will be checked during SiDP setup."
+            )
         if (
             self.sidp_enable_peak_shifting
             and self.sidp_peak_sync_strategy == "force_sync"
@@ -6654,7 +6739,8 @@ class ServerArgs:
             logger.info(
                 f"SiDP enabled: sidp_size={self.sidp_size}, k={self.sidp_k}, "
                 f"cache_cycles={self.sidp_cache_cycles}, "
-                f"peak_shifting={self.sidp_enable_peak_shifting}, "
+                f"prefetch_policy={self.sidp_prefetch_policy}, "
+                f"copy_backend={self.sidp_copy_backend}, "
                 f"peak_sync_strategy={self.sidp_peak_sync_strategy}, "
                 f"graph_profiling={self.sidp_enable_graph_profiling}, "
                 f"rdzv_port={self.sidp_rdzv_port}"

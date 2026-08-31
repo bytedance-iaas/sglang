@@ -12,15 +12,21 @@ from typing import Any, Dict, List, Tuple
 import torch
 import torch.distributed
 
-from sglang.srt.layers.sidp.config import SidpConfig
+from sglang.srt.layers.sidp.config import (
+    SidpConfig,
+    SidpCopyBackend,
+    SidpPrefetchPolicy,
+)
 from sglang.srt.layers.sidp.cuda_memcpy import SidpCudaMemcpy
 from sglang.srt.layers.sidp.graph_profiler import SidpGraphProfiler
 from sglang.srt.layers.sidp.scheduler import (
     is_local_layer,
+    next_forward_cycle_zero_generations,
     owner_of,
     prefetch_order,
     remote_positions,
 )
+from sglang.srt.layers.sidp.sm_backend import SidpSmBackend
 from sglang.srt.layers.sidp.sync_strategy import (
     NoSyncStrategy,
     build_peak_sync_strategy,
@@ -59,7 +65,18 @@ class SidpManager:
         self.cache_cycles = config.cache_cycles
         self.num_layers = config.num_layers
         self.enable_cycle_overlap = config.enable_cycle_overlap
-        self.enable_peak_shifting = config.enable_peak_shifting
+        self.prefetch_policy = config.prefetch_policy
+        if (
+            config.enable_peak_shifting
+            and self.prefetch_policy == SidpPrefetchPolicy.COMPUTE.value
+        ):
+            self.prefetch_policy = SidpPrefetchPolicy.STATIC_PEAK.value
+        self.copy_backend = config.copy_backend
+        self.enable_peak_shifting = (
+            self.prefetch_policy == SidpPrefetchPolicy.STATIC_PEAK.value
+        )
+        if self.copy_backend == SidpCopyBackend.SM.value and not self.enable_cycle_overlap:
+            raise ValueError("SiDP SM copy requires the cycle-overlap pipeline")
         self.enable_debug_logging = config.enable_debug_logging
         self.enable_graph_profiling = config.enable_graph_profiling
         self.profile_dummy_compute = config.profile_dummy_compute
@@ -89,6 +106,7 @@ class SidpManager:
 
         # Populated by setup()
         self.peer_views: Dict[int, Dict[str, EncodedWeight]] = {}
+        self._peer_sm_ipc: Dict[int, Dict[str, Dict[str, dict]]] = {}
         self.buffers: Dict[int, Dict[str, torch.Tensor]] = {}
         self._transfer_buffers: Dict[int, Dict[str, EncodedWeight]] = {}
         self._materialization_buffers: Dict[str, torch.Tensor] = {}
@@ -108,6 +126,7 @@ class SidpManager:
         self._local_encoded_weights: Dict[int, Dict[str, EncodedWeight]] = {}
         self._local_encoded_refs: List[torch.Tensor] = []
         self._graph_profiler: SidpGraphProfiler | None = None
+        self._sm_backend: SidpSmBackend | None = None
         self._launch_sync_strategy = NoSyncStrategy()
 
     def setup(self, model, model_runner=None):
@@ -194,6 +213,8 @@ class SidpManager:
                 warmup_replays=self.config.profile_warmup_replays,
                 output_dir=self.config.profile_output_dir,
                 peak_shifting=self.enable_peak_shifting,
+                prefetch_policy=self.prefetch_policy,
+                copy_backend=self.copy_backend,
                 dummy_compute=self.profile_dummy_compute,
                 sync_strategy=self._launch_sync_strategy.name,
                 weight_codec=self.weight_codec.name,
@@ -209,11 +230,11 @@ class SidpManager:
                 if self.enable_cycle_overlap
                 else "serial-graph-safe"
             )
-            order = "peak-shifting" if self.enable_peak_shifting else "compute"
             logger.info(
                 f"[SiDP rank{self.dp_rank}] local={len(local_layers)}, "
                 f"non_local={len(non_local_layers)}, "
-                f"mode={mode}, order={order}"
+                f"mode={mode}, policy={self.prefetch_policy}, "
+                f"copy_backend={self.copy_backend}"
             )
 
         # D3/D10: Materialize every locally retained weight representation;
@@ -257,16 +278,37 @@ class SidpManager:
             if owner_of(lid, self.dp_size) != self.dp_rank:
                 continue
             for pname, encoded in encoded_params.items():
+                tensor_reduction = _reduce_tensor(encoded.tensor)
+                extra_reductions = {
+                    name: _reduce_tensor(tensor)
+                    for name, tensor in encoded.extra_tensors.items()
+                }
                 handle = pickle.dumps(
                     {
-                        "version": 2,
+                        "version": (
+                            3
+                            if self.copy_backend == SidpCopyBackend.SM.value
+                            else 2
+                        ),
                         "codec": self.weight_codec.name,
-                        "tensor": _reduce_tensor(encoded.tensor),
-                        "extra_tensors": {
-                            name: _reduce_tensor(tensor)
-                            for name, tensor in encoded.extra_tensors.items()
-                        },
+                        "tensor": tensor_reduction,
+                        "extra_tensors": extra_reductions,
                         "metadata": encoded.metadata,
+                        "sm_ipc": (
+                            {
+                                "<main>": self.memcpy.export_ipc_pointer(
+                                    encoded.tensor.data_ptr(), encoded.tensor.nbytes
+                                ),
+                                **{
+                                    name: self.memcpy.export_ipc_pointer(
+                                        tensor.data_ptr(), tensor.nbytes
+                                    )
+                                    for name, tensor in encoded.extra_tensors.items()
+                                },
+                            }
+                            if self.copy_backend == SidpCopyBackend.SM.value
+                            else None
+                        ),
                     }
                 )
                 self.store.set(f"sidp/{self.dp_rank}/{lid}/{pname}", handle)
@@ -287,6 +329,7 @@ class SidpManager:
         for lid in non_local_layers:
             src = owner_of(lid, self.dp_size)
             self.peer_views[lid] = {}
+            self._peer_sm_ipc[lid] = {}
             for pname, _ in self._get_ffn_params(layers[lid]):
                 key = f"sidp/{src}/{lid}/{pname}"
                 payload = self.store.get(key)
@@ -295,7 +338,7 @@ class SidpManager:
                 # upgrades, while all new ranks publish the versioned format.
                 if isinstance(wire_payload, dict):
                     version = wire_payload.get("version")
-                    if version not in (1, 2):
+                    if version not in (1, 2, 3):
                         raise RuntimeError(
                             "Unsupported SiDP weight payload version: "
                             f"{version}"
@@ -309,10 +352,11 @@ class SidpManager:
                     reduced_tensor = wire_payload["tensor"]
                     reduced_extras = (
                         wire_payload.get("extra_tensors", {})
-                        if version == 2
+                        if version in (2, 3)
                         else {}
                     )
                     metadata = wire_payload.get("metadata")
+                    sm_ipc = wire_payload.get("sm_ipc")
                 else:
                     if self.weight_codec.name != "identity":
                         raise RuntimeError(
@@ -321,6 +365,22 @@ class SidpManager:
                     reduced_tensor = wire_payload
                     reduced_extras = {}
                     metadata = None
+                    sm_ipc = None
+                if self.copy_backend == SidpCopyBackend.SM.value:
+                    if not isinstance(sm_ipc, dict):
+                        raise RuntimeError(
+                            "SiDP SM copy requires raw requester-context IPC "
+                            f"descriptors: layer={lid}, param={pname}"
+                        )
+                    expected_components = {"<main>", *reduced_extras}
+                    if set(sm_ipc) != expected_components:
+                        raise RuntimeError(
+                            "SiDP SM IPC component schema mismatch: "
+                            f"layer={lid}, param={pname}, "
+                            f"expected={sorted(expected_components)}, "
+                            f"actual={sorted(sm_ipc)}"
+                        )
+                    self._peer_sm_ipc[lid][pname] = sm_ipc
                 peer_view = _rebuild_tensor(reduced_tensor, src_device=src)
                 extra_views = {
                     name: _rebuild_tensor(reduced, src_device=src)
@@ -413,9 +473,13 @@ class SidpManager:
                 self.memcpy.enable_peer_access(dev)
         self._prime_routes(non_local_layers)
 
+        if self.copy_backend == SidpCopyBackend.SM.value:
+            self._sm_backend = SidpSmBackend(self)
+
         # Initial WAR state: every slot is safe to write before its first use.
-        for evt in self._consume_events:
-            evt.record(torch.cuda.current_stream())
+        if self.copy_backend == SidpCopyBackend.DMA.value:
+            for evt in self._consume_events:
+                evt.record(torch.cuda.current_stream())
 
         if self.enable_cycle_overlap and self._cycle_layers.get(0):
             self._initialize_cycle_zero()
@@ -458,7 +522,10 @@ class SidpManager:
             # in flight on comm_stream while earlier layers compute.
             if self._graph_profiler is not None:
                 self._graph_profiler.record_wait_start(layer_id, compute_stream)
-            compute_stream.wait_event(self._prefetch_events[slot])
+            if self._sm_backend is not None:
+                self._sm_backend.wait_layer(layer_id)
+            else:
+                compute_stream.wait_event(self._prefetch_events[slot])
             if self._graph_profiler is not None:
                 self._graph_profiler.record_wait_end(layer_id, compute_stream)
             self._decode_weight_before_compute(layer_id, slot, compute_stream)
@@ -482,7 +549,10 @@ class SidpManager:
             return
 
         slot = self._layer_to_slot[layer_id]
-        self._consume_events[slot].record(torch.cuda.current_stream())
+        if self._sm_backend is not None:
+            self._sm_backend.record_consumed(layer_id)
+        else:
+            self._consume_events[slot].record(torch.cuda.current_stream())
 
         cycle = layer_id // self.dp_size
         if self._last_non_local_in_cycle.get(cycle) == layer_id:
@@ -527,6 +597,10 @@ class SidpManager:
         self._queued_cycles.clear()
         self._queued_cycles.add(0)  # resident from setup or previous forward
         self._next_forward_cycle_zero_queued = False
+        if self._sm_backend is not None:
+            # The previous final join makes it safe to rebase bookkeeping while
+            # preserving the already resident next-forward cycle 0 data.
+            self._sm_backend.reset_forward(cycle_zero_resident=True)
         self.comm_stream.wait_stream(compute_stream)
         for cycle in range(1, min(self._cycle_cache_depth, self._num_cycles)):
             self._enqueue_cycle(cycle, wait_for_consume=False)
@@ -574,6 +648,11 @@ class SidpManager:
                 raw_batch_size=raw_batch_size,
                 graph_batch_size=graph_batch_size,
                 launch_profile=launch_profile,
+                trace_provider=(
+                    self._sm_backend.trace_snapshot
+                    if self._sm_backend is not None
+                    else None
+                ),
             )
 
     @property
@@ -785,8 +864,11 @@ class SidpManager:
         self._queued_cycles.add(cycle)
         if self._graph_profiler is not None:
             self._graph_profiler.record_cycle_comm_start(cycle, self.comm_stream)
-        for layer_id in layers:
-            self._do_prefetch(layer_id, wait_for_consume=wait_for_consume)
+        if self._sm_backend is not None:
+            self._sm_backend.enqueue_cycle(cycle)
+        else:
+            for layer_id in layers:
+                self._do_prefetch(layer_id, wait_for_consume=wait_for_consume)
         if self._graph_profiler is not None:
             self._graph_profiler.record_cycle_comm_end(cycle, self.comm_stream)
 
@@ -797,23 +879,42 @@ class SidpManager:
         self._next_forward_cycle_zero_queued = True
         if self._graph_profiler is not None:
             self._graph_profiler.record_cycle_comm_start(0, self.comm_stream)
-        for layer_id in self._cycle_layers[0]:
-            self._do_prefetch(layer_id)
+        if self._sm_backend is not None:
+            required_comp_gen, target_fill_gen = next_forward_cycle_zero_generations(
+                self._num_cycles, self._cycle_cache_depth
+            )
+            self._sm_backend.enqueue_cycle(
+                0,
+                target_fill_gen=target_fill_gen,
+                required_comp_gen=required_comp_gen,
+            )
+        else:
+            for layer_id in self._cycle_layers[0]:
+                self._do_prefetch(layer_id)
         if self._graph_profiler is not None:
             self._graph_profiler.record_cycle_comm_end(0, self.comm_stream)
 
     def _initialize_cycle_zero(self):
         """Materialize the first forward's cycle 0 during model initialization."""
         compute_stream = torch.cuda.current_stream()
+        if self._sm_backend is not None:
+            self._sm_backend.reset_forward(cycle_zero_resident=False)
         self.comm_stream.wait_stream(compute_stream)
         if self._graph_profiler is not None:
             self._graph_profiler.record_cycle_comm_start(0, self.comm_stream)
-        for layer_id in self._cycle_layers[0]:
-            self._do_prefetch(layer_id, wait_for_consume=False)
+        if self._sm_backend is not None:
+            self._sm_backend.enqueue_cycle(
+                0, target_fill_gen=1, required_comp_gen=0
+            )
+        else:
+            for layer_id in self._cycle_layers[0]:
+                self._do_prefetch(layer_id, wait_for_consume=False)
         if self._graph_profiler is not None:
             self._graph_profiler.record_cycle_comm_end(0, self.comm_stream)
         compute_stream.wait_stream(self.comm_stream)
         torch.cuda.synchronize()
+        if self._sm_backend is not None and self.enable_debug_logging:
+            self._sm_backend.debug_validate_cycle(0)
 
     def _build_cycle_schedule(self):
         """Build compute-order cycle membership and stable slot identities."""
@@ -849,7 +950,9 @@ class SidpManager:
             self.dp_size,
             self.k,
             self.num_layers,
-            peak_shifting=self.enable_peak_shifting,
+            peak_shifting=(
+                self.prefetch_policy == SidpPrefetchPolicy.STATIC_PEAK.value
+            ),
         )
         self._cycle_layers = {}
         for layer_id in self._fetch_schedule:
@@ -875,8 +978,9 @@ class SidpManager:
         if num_slots == 0:
             return
 
-        self._prefetch_events = [torch.cuda.Event() for _ in range(num_slots)]
-        self._consume_events = [torch.cuda.Event() for _ in range(num_slots)]
+        if self.copy_backend == SidpCopyBackend.DMA.value:
+            self._prefetch_events = [torch.cuda.Event() for _ in range(num_slots)]
+            self._consume_events = [torch.cuda.Event() for _ in range(num_slots)]
 
         if self.enable_cycle_overlap:
             remote_count = len(self._remote_positions)

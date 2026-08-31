@@ -1,6 +1,12 @@
 import pytest
 
-from sglang.srt.layers.sidp.scheduler import owner_of, prefetch_order
+from sglang.srt.layers.sidp.scheduler import (
+    cycle_fill_generation,
+    cycle_reuse_requirement,
+    next_forward_cycle_zero_generations,
+    owner_of,
+    prefetch_order,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -58,6 +64,30 @@ def test_peak_shifting_changes_only_order_not_coverage():
 
     assert prefetch_order(1, 8, 1, 8) == [0, 2, 3, 4, 5, 6, 7]
     assert prefetch_order(1, 8, 1, 8, peak_shifting=True) == [2, 3, 4, 5, 6, 7, 0]
+
+
+@pytest.mark.parametrize("k", [1, 2, 4])
+def test_cycle_candidates_cover_each_non_local_owner_once(k):
+    for rank in range(8):
+        order = prefetch_order(rank, 8, k, 48)
+        for cycle in range(6):
+            layers = order[cycle * (8 - k) : (cycle + 1) * (8 - k)]
+            owners = [owner_of(layer, 8) for layer in layers]
+            expected = [
+                owner
+                for owner in range(8)
+                if owner not in {(rank + offset) % 8 for offset in range(k)}
+            ]
+            assert owners == expected
+            assert len(owners) == len(set(owners))
+
+
+def test_two_cycle_generation_protocol():
+    assert [cycle_fill_generation(c) for c in range(6)] == [1, 1, 2, 2, 3, 3]
+    assert [cycle_reuse_requirement(c) for c in range(6)] == [0, 0, 1, 1, 2, 2]
+    assert next_forward_cycle_zero_generations(6) == (3, 4)
+    with pytest.raises(ValueError):
+        next_forward_cycle_zero_generations(5)
 
 
 if __name__ == "__main__":

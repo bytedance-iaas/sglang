@@ -1,4 +1,20 @@
 from dataclasses import dataclass
+from enum import Enum
+
+
+class SidpPrefetchPolicy(str, Enum):
+    """How one SiDP cycle orders its remote layer fills."""
+
+    COMPUTE = "compute"
+    STATIC_PEAK = "static_peak"
+    DYNAMIC_OWNER = "dynamic_owner"
+
+
+class SidpCopyBackend(str, Enum):
+    """Data-movement implementation used by the cycle pipeline."""
+
+    DMA = "dma"
+    SM = "sm"
 
 
 @dataclass
@@ -12,6 +28,10 @@ class SidpConfig:
     num_layers: int = 0
     transfer_dtype: str = "same"
     enable_cycle_overlap: bool = False
+    prefetch_policy: str = SidpPrefetchPolicy.COMPUTE.value
+    copy_backend: str = SidpCopyBackend.DMA.value
+    # Compatibility input for out-of-tree callers. Runtime code uses the
+    # resolved ``prefetch_policy`` above.
     enable_peak_shifting: bool = False
     enable_debug_logging: bool = False
     enable_graph_profiling: bool = False

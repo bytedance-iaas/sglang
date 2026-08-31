@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 import torch
@@ -43,6 +43,8 @@ class SidpGraphProfiler:
         warmup_replays: int,
         output_dir: str,
         peak_shifting: bool,
+        prefetch_policy: str = "compute",
+        copy_backend: str = "dma",
         dummy_compute: bool = False,
         sync_strategy: str = "none",
         weight_codec: str = "identity",
@@ -59,10 +61,12 @@ class SidpGraphProfiler:
         self.dummy_compute = dummy_compute
         self.sync_strategy = sync_strategy
         self.weight_codec = weight_codec
+        self.prefetch_policy = prefetch_policy
+        self.copy_backend = copy_backend
         self.order = (
             "resident"
             if not self.has_communication
-            else ("peak-shifting" if peak_shifting else "compute")
+            else f"{prefetch_policy}-{copy_backend}"
         )
         self.replay_index = 0
 
@@ -113,6 +117,8 @@ class SidpGraphProfiler:
                 "dummy_compute": self.dummy_compute,
                 "sync_strategy": self.sync_strategy,
                 "weight_codec": self.weight_codec,
+                "prefetch_policy": self.prefetch_policy,
+                "copy_backend": self.copy_backend,
             }
         )
 
@@ -192,6 +198,7 @@ class SidpGraphProfiler:
         raw_batch_size: int,
         graph_batch_size: int,
         launch_profile: dict | None = None,
+        trace_provider: Callable[[], dict | None] | None = None,
     ) -> None:
         """Synchronize and emit one sampled replay.
 
@@ -212,6 +219,7 @@ class SidpGraphProfiler:
         anchor_host_ns = time.monotonic_ns()
 
         anchor_offset_ms = self._offset_ms(self.anchor)
+        sm_trace = trace_provider() if trace_provider is not None else None
         cycles = []
         copies = []
         waits = []
@@ -297,5 +305,6 @@ class SidpGraphProfiler:
             "cycles": cycles,
             "copies": copies,
             "waits": waits,
+            "sm_trace": sm_trace,
         }
         self._write(record)

@@ -1,6 +1,10 @@
 """SiDP (Shared-weight Intra-node Data Parallelism): Dense-FFN weight sharing across DP ranks via CUDA IPC + NVLink prefetch."""
 
-from sglang.srt.layers.sidp.config import SidpConfig
+from sglang.srt.layers.sidp.config import (
+    SidpConfig,
+    SidpCopyBackend,
+    SidpPrefetchPolicy,
+)
 from sglang.srt.layers.sidp.sidp_manager import SidpManager
 from sglang.srt.layers.sidp.weight_codec import (
     EncodedWeight,
@@ -24,6 +28,8 @@ def set_global_sidp_manager(manager):
 __all__ = [
     "SidpManager",
     "SidpConfig",
+    "SidpCopyBackend",
+    "SidpPrefetchPolicy",
     "SidpWeightCodec",
     "EncodedWeight",
     "MaterializationSpec",

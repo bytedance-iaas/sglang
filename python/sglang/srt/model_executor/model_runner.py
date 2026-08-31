@@ -1182,6 +1182,8 @@ class ModelRunner:
             rdzv_host="127.0.0.1",
             num_layers=num_layers,
             enable_cycle_overlap=True,
+            prefetch_policy=self.server_args.sidp_prefetch_policy,
+            copy_backend=self.server_args.sidp_copy_backend,
             enable_peak_shifting=self.server_args.sidp_enable_peak_shifting,
             enable_debug_logging=self.server_args.sidp_enable_debug_logging,
             enable_graph_profiling=self.server_args.sidp_enable_graph_profiling,
