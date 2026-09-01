@@ -944,6 +944,40 @@ class TestEICHiCacheRegression(unittest.TestCase):
         self.assertEqual(c.write_queue.qsize(), 1)
         self.assertEqual(len(copied), 1)  # copy_func invoked once
 
+    def _make_evict_throttle_cache(self, backlog):
+        # Minimal cache for exercising evict()'s write-through throttle loop only.
+        # The loop runs before any tree work; evictable_leaves is the first thing
+        # the body touches, so a sentinel there proves the throttle was escaped.
+        cache = object.__new__(EICPagedHiRadixCache)
+        cache.ongoing_write_through = {i: object() for i in range(backlog)}
+        cache.writing_check = mock.Mock()
+        return cache
+
+    def test_evict_throttle_is_bounded_when_write_thread_stalls(self):
+        # The watchdog SIGQUIT crash: a hung EIC mset stops ongoing_write_through
+        # from draining, and evict()'s throttle spun forever on all PP0 ranks. PP1
+        # then blocked in broadcast, forward_ct froze, and the 300s scheduler
+        # watchdog killed all 8 ranks. The throttle must break out on a deadline.
+        cache = self._make_evict_throttle_cache(backlog=51)  # > 50, never drains
+        params = SimpleNamespace(num_tokens=1, swa_num_tokens=0)
+        escaped = RuntimeError("throttle escaped")
+
+        class Sentinel:
+            def __iter__(self):
+                raise escaped
+
+        cache.evictable_leaves = Sentinel()
+        with mock.patch(
+            "sglang.srt.mem_cache.eic_hiradix_cache.time.perf_counter",
+            # start, two spins under the deadline, then past 30s -> break
+            side_effect=[0.0, 1.0, 2.0, 40.0],
+        ), mock.patch("sglang.srt.mem_cache.eic_hiradix_cache.time.sleep"):
+            with self.assertRaises(RuntimeError) as ctx:
+                EICPagedHiRadixCache.evict(cache, params)
+        self.assertIs(ctx.exception, escaped)  # reached the body, i.e. broke out
+        self.assertEqual(cache.writing_check.call_count, 2)  # bounded spins
+        self.assertEqual(len(cache.ongoing_write_through), 51)  # never drained
+
 
 if __name__ == "__main__":
     unittest.main()
