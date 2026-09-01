@@ -1352,6 +1352,9 @@ class Envs:
     # Quantize the SWA fp8 KV cache from bf16-rounded values (matches
     # trainer-side QAT and the DSA-CP path) instead of fp32 registers.
     SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE = EnvBool(False)
+    # Enable the built-in target-only DSV4 BU4 SWA cache. The runtime fails
+    # fast until direct packed write and decode capabilities are available.
+    SGLANG_ENABLE_KVBIT = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

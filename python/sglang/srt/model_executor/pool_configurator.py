@@ -37,6 +37,13 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_compress_state_ring_size,
     get_compress_state_write_pad,
 )
+from sglang.srt.mem_cache.kvbit_dsv4 import (
+    DSV4_KVBIT_ROW_BYTES,
+    DSV4_NATIVE_SWA_ROW_BYTES,
+    dsv4_kvbit_enabled_for_worker,
+    dsv4_kvbit_target_swa_savings,
+    validate_dsv4_bu4_geometry,
+)
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -831,6 +838,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             target_layers = self.num_layers_total
             self.bytes_per_full_token *= (target_layers + draft_layers) / target_layers
 
+        self._apply_kvbit_target_swa_budget(kvc)
+
         # Online c128 keeps a single in-progress (max, sum, kv) state per index
         # and assumes a strict forward-only schedule. Speculative decode (MTP)
         # would need rollback / replay across draft and verify, which the
@@ -860,6 +869,30 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 logger.info(
                     "DSV4 compressed attention: online c128 enabled (ring_size=1)"
                 )
+
+    def _apply_kvbit_target_swa_budget(self, kvc: KVCacheConfigurator) -> None:
+        self.kvbit_packed_swa = dsv4_kvbit_enabled_for_worker(
+            enabled=envs.SGLANG_ENABLE_KVBIT.get(),
+            is_draft_worker=kvc.is_draft_worker,
+        )
+        if self.kvbit_packed_swa:
+            validate_dsv4_bu4_geometry(
+                self.qk_nope_head_dim,
+                self.qk_rope_head_dim,
+            )
+            target_swa_savings = dsv4_kvbit_target_swa_savings(
+                swa_ratio=self.swa_ratio,
+                num_target_layers=self.num_layers_total,
+            )
+            self.bytes_per_full_token -= target_swa_savings
+            logger.info(
+                "DSV4 KVBit target SWA budget: native_row=%d, packed_row=%d, "
+                "target_layers=%d, savings_per_full_token=%.2f, scratch=disabled",
+                DSV4_NATIVE_SWA_ROW_BYTES,
+                DSV4_KVBIT_ROW_BYTES,
+                self.num_layers_total,
+                target_swa_savings,
+            )
 
     def _assert_ring_serves_draft_tokens(self, num_draft_tokens: int) -> None:
         """A verify batch writes its whole optimistic tail into the ring, so ring

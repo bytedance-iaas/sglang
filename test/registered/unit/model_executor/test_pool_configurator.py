@@ -1006,5 +1006,60 @@ class TestDflashDraftKvBudget(CustomTestCase):
         self.assertLess(_tokens(10240), _tokens(None))
 
 
+class TestDSV4KVBitBudget(CustomTestCase):
+    """Only target SWA rows receive the 584-to-380-byte budget reduction."""
+
+    def _configurator(self):
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        configurator = object.__new__(DSV4PoolConfigurator)
+        configurator.bytes_per_full_token = 100_000.0
+        configurator.qk_nope_head_dim = 448
+        configurator.qk_rope_head_dim = 64
+        configurator.swa_ratio = 0.5
+        configurator.num_layers_total = 60
+        return configurator
+
+    def test_target_budget_uses_packed_rows_without_scratch_charge(self):
+        from sglang.srt.environ import envs
+
+        configurator = self._configurator()
+        with envs.SGLANG_ENABLE_KVBIT.override(True):
+            configurator._apply_kvbit_target_swa_budget(
+                SimpleNamespace(is_draft_worker=False)
+            )
+
+        expected = 100_000.0 - 0.5 * (584 - 380) * 60
+        self.assertEqual(configurator.bytes_per_full_token, expected)
+        self.assertTrue(configurator.kvbit_packed_swa)
+
+    def test_draft_and_disabled_budgets_remain_native(self):
+        from sglang.srt.environ import envs
+
+        for enabled, is_draft_worker in ((False, False), (True, True)):
+            with self.subTest(enabled=enabled, is_draft_worker=is_draft_worker):
+                configurator = self._configurator()
+                with envs.SGLANG_ENABLE_KVBIT.override(enabled):
+                    configurator._apply_kvbit_target_swa_budget(
+                        SimpleNamespace(is_draft_worker=is_draft_worker)
+                    )
+
+                self.assertEqual(configurator.bytes_per_full_token, 100_000.0)
+                self.assertFalse(configurator.kvbit_packed_swa)
+
+    def test_target_budget_rejects_non_dsv4_geometry(self):
+        from sglang.srt.environ import envs
+
+        configurator = self._configurator()
+        configurator.qk_nope_head_dim = 512
+        with (
+            envs.SGLANG_ENABLE_KVBIT.override(True),
+            self.assertRaisesRegex(ValueError, "448-nope/64-rope"),
+        ):
+            configurator._apply_kvbit_target_swa_budget(
+                SimpleNamespace(is_draft_worker=False)
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

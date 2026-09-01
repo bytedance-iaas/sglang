@@ -68,6 +68,11 @@ from sglang.srt.layers.attention.verify_mask import (
 )
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.kvbit_dsv4 import (
+    DSV4_NATIVE_SWA_ROW_BYTES,
+    dsv4_kvbit_sparse_decode,
+    merge_attention_states_natural_log,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     get_parallel,
@@ -1664,6 +1669,90 @@ class DeepseekV4AttnBackend(
             cache_k=swa_k,
         )
 
+    def _forward_kvbit(
+        self,
+        *,
+        q: torch.Tensor,
+        layer_id: int,
+        compress_ratio: Literal[0, 4, 128],
+        packed_swa_cache: torch.Tensor,
+        core_attn_metadata: DSV4AttnMetadata,
+        attn_sink: torch.Tensor,
+    ) -> torch.Tensor:
+        """Attend packed SWA directly and merge native compressed KV by ln-LSE."""
+
+        def match_num_queries(x: Optional[torch.Tensor], value: int):
+            if x is None or x.shape[0] == q.shape[0]:
+                return x
+            if x.shape[0] > q.shape[0]:
+                return x[: q.shape[0]]
+            return _pad_tensor_to_size(x, q.shape[0], value=value)
+
+        if q.ndim == 3:
+            q = q.unsqueeze(1)
+        swa_indices = match_num_queries(core_attn_metadata.swa_page_indices, value=0)
+        swa_lengths = match_num_queries(core_attn_metadata.swa_topk_lengths, value=1)
+        if swa_indices.ndim == 2:
+            swa_indices = swa_indices.unsqueeze(1)
+
+        swa_output, swa_lse = dsv4_kvbit_sparse_decode(
+            q=q,
+            packed=packed_swa_cache,
+            indices=swa_indices,
+            lengths=swa_lengths,
+            attn_sink=attn_sink,
+            page_size=self.page_size,
+            softmax_scale=self.softmax_scale,
+        )
+        if compress_ratio == 0:
+            return swa_output.squeeze(1)
+
+        if compress_ratio == 4:
+            extra_indices = core_attn_metadata.c4_sparse_page_indices
+            extra_lengths = core_attn_metadata.c4_sparse_topk_lengths
+        else:
+            extra_indices = core_attn_metadata.c128_page_indices
+            extra_lengths = core_attn_metadata.c128_topk_lengths_clamp1
+        extra_indices = match_num_queries(extra_indices, value=-1)
+        extra_lengths = match_num_queries(extra_lengths, value=1)
+        if extra_indices.ndim == 2:
+            extra_indices = extra_indices.unsqueeze(1)
+
+        extra_k_cache = self.token_to_kv_pool.get_extra_key_buffer(layer_id)
+        extra_page_size = self.token_to_kv_pool.get_extra_key_page_size(layer_id)
+        extra_k_cache = extra_k_cache[
+            :, : extra_page_size * DSV4_NATIVE_SWA_ROW_BYTES
+        ].view(
+            extra_k_cache.shape[0],
+            extra_page_size,
+            1,
+            DSV4_NATIVE_SWA_ROW_BYTES,
+        )
+        from sgl_kernel.flash_mla import flash_mla_with_kvcache
+
+        extra_output, extra_lse = flash_mla_with_kvcache(
+            q=q,
+            k_cache=extra_k_cache,
+            head_dim_v=self.head_dim_v,
+            block_table=None,
+            cache_seqlens=None,
+            tile_scheduler_metadata=core_attn_metadata.get_flashmla_metadata(
+                compress_ratio
+            ),
+            softmax_scale=self.softmax_scale,
+            is_fp8_kvcache=True,
+            indices=extra_indices,
+            topk_length=extra_lengths,
+            attn_sink=None,
+        )
+        output, _ = merge_attention_states_natural_log(
+            swa_output,
+            swa_lse,
+            extra_output,
+            extra_lse,
+        )
+        return output.squeeze(1)
+
     def forward(
         self,
         q: torch.Tensor,
@@ -1692,6 +1781,16 @@ class DeepseekV4AttnBackend(
             if save_kv_cache:
                 self.store_cache(layer_id, swa_k, forward_batch)
             swa_k_cache = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
+            if token_to_kv_pool.swa_kv_pool.is_dsv4_kvbit_packed_swa:
+                assert attn_sink is not None
+                return self._forward_kvbit(
+                    q=q,
+                    layer_id=layer_id,
+                    compress_ratio=compress_ratio,
+                    packed_swa_cache=swa_k_cache,
+                    core_attn_metadata=core_attn_metadata,
+                    attn_sink=attn_sink,
+                )
 
             extra_k_cache, extra_indices, extra_topk_lengths = None, None, None
             if compress_ratio == 4:
