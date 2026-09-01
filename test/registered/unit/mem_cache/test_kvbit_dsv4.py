@@ -518,7 +518,7 @@ class TestDSV4KVBitPackedCompressor(CustomTestCase):
             ),
         ):
             backend._forward_compress_packed(
-                kv_score_buffer=torch.empty(1, 4, 1024),
+                kv_score_buffer=torch.empty(1, 4, 2048),
                 kv_score_input=torch.empty(2, 512),
                 ape=compressor.ape,
                 compressor=compressor,
@@ -570,7 +570,7 @@ class TestDSV4KVBitPackedCompressor(CustomTestCase):
             ),
         ):
             backend._forward_compress_packed(
-                kv_score_buffer=torch.empty(1, 4, 1024),
+                kv_score_buffer=torch.empty(1, 4, 2048),
                 kv_score_input=torch.empty(1, 512),
                 ape=compressor.ape,
                 compressor=compressor,
