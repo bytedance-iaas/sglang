@@ -91,6 +91,15 @@ jobs:
           docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
             sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
 
+      # Kernel builds run in Docker and self-hosted runners retain BuildKit
+      # state between jobs. Reclaim stale state before checkout so a previous
+      # image build cannot exhaust the root filesystem during yum install.
+      - name: Prune stale Docker data
+        run: |
+          docker buildx prune -af
+          docker system prune -af
+          docker volume prune -af
+
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.checkout_ref || github.ref }}
