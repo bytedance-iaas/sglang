@@ -1,0 +1,166 @@
+name: Build GLM 5.3 W4A8 Community Image
+
+on:
+  workflow_call:
+    inputs:
+      image_tag:
+        description: Immutable task image tag
+        required: true
+        type: string
+
+concurrency:
+  group: glm53-w4a8-community-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'bytedance-iaas/sglang'
+    environment: prod
+    runs-on: x64-docker-build-node
+    env:
+      IMAGE_REPO: iaas-gpu-cn-beijing.cr.volces.com/serving/sglang
+      REGISTRY_HOST: iaas-gpu-cn-beijing.cr.volces.com
+      BASE_IMAGE: iaas-gpu-cn-beijing.cr.volces.com/serving/sglang:glm52-w4a8-integrated-1e105705-pp-eagle-v1@sha256:692d9f218caa76270736a0ed3529c7ad467bfb816c8677b17615d52a0d5df74b
+      SGL_DEEP_GEMM_COMMIT: aee79a715951a3d47dbbbdbd5387d8be8a131d53
+      VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
+      VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
+    steps:
+      - name: Delete huge unnecessary tools folder
+        run: rm -rf /opt/hostedtoolcache
+
+      - name: Cleanup workspace
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+
+      - name: Prune stale Docker data
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx prune --filter "until=72h" -f
+          docker system prune -af --filter "until=72h"
+          df -h /
+
+      - name: Checkout exact task branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Compute source provenance
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain --untracked-files=no)"
+          source_commit="$(git rev-parse HEAD)"
+          source_tree="$(git write-tree)"
+          expected_tag_prefix="glm53-w4a8-community-${source_commit:0:10}-"
+          case "${{ inputs.image_tag }}" in
+            "${expected_tag_prefix}"*) ;;
+            *)
+              echo "image_tag must start with ${expected_tag_prefix}" >&2
+              exit 1
+              ;;
+          esac
+          echo "source_commit=${source_commit}" >> "$GITHUB_OUTPUT"
+          echo "source_tree=${source_tree}" >> "$GITHUB_OUTPUT"
+          printf 'SOURCE_COMMIT=%s\nSOURCE_TREE=%s\n' "$source_commit" "$source_tree"
+
+      - name: Stage exact shallow source tree
+        id: archive
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
+          SOURCE_TREE: ${{ steps.source.outputs.source_tree }}
+        run: |
+          set -euo pipefail
+          rm -rf .glm53-build
+          mkdir -p .glm53-build
+          git clone --depth 1 --no-local \
+            "file://${GITHUB_WORKSPACE}" .glm53-build/source
+          test "$(git -C .glm53-build/source rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test "$(git -C .glm53-build/source write-tree)" = "$SOURCE_TREE"
+          test -z "$(git -C .glm53-build/source status --porcelain=v1 --untracked-files=all)"
+          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
+            -cf .glm53-build/source.tar -C .glm53-build/source .
+          source_archive_sha256="$(sha256sum .glm53-build/source.tar | awk '{print $1}')"
+          echo "source_archive_sha256=${source_archive_sha256}" >> "$GITHUB_OUTPUT"
+          printf 'SOURCE_ARCHIVE_SHA256=%s\n' "$source_archive_sha256"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            network=host
+            env.NO_PROXY=iaas-gpu-cn-beijing.cr.volces.com
+            env.no_proxy=iaas-gpu-cn-beijing.cr.volces.com
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["127.0.0.1:5000"]
+
+      - name: Login to Volcengine CR
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$VOLCENGINE_CR_USERNAME"
+          test -n "$VOLCENGINE_CR_PASSWORD"
+          echo "$VOLCENGINE_CR_PASSWORD" | docker login "$REGISTRY_HOST" \
+            --username "$VOLCENGINE_CR_USERNAME" --password-stdin
+
+      - name: Build and publish immutable community image
+        id: image
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
+          SOURCE_TREE: ${{ steps.source.outputs.source_tree }}
+          SOURCE_ARCHIVE_SHA256: ${{ steps.archive.outputs.source_archive_sha256 }}
+        run: |
+          set -euo pipefail
+          image_ref="${IMAGE_REPO}:${{ inputs.image_tag }}"
+          build_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          docker buildx build \
+            --platform linux/amd64 \
+            --file docker/glm53-w4a8-community-source-overlay.Dockerfile \
+            --build-arg BASE_IMAGE="$BASE_IMAGE" \
+            --build-arg SGL_DEEP_GEMM_COMMIT="$SGL_DEEP_GEMM_COMMIT" \
+            --build-arg SGLANG_BUILD_COMMIT="$SOURCE_COMMIT" \
+            --build-arg SGLANG_SOURCE_TREE="$SOURCE_TREE" \
+            --build-arg SGLANG_SOURCE_ARCHIVE_SHA256="$SOURCE_ARCHIVE_SHA256" \
+            --build-arg SGLANG_BUILD_URL="$build_url" \
+            --build-arg SGLANG_IMAGE_TAG="$image_ref" \
+            --metadata-file /tmp/glm53-w4a8-image-metadata.json \
+            --push \
+            --tag "$image_ref" \
+            .
+          digest="$(python3 -c 'import json; print(json.load(open("/tmp/glm53-w4a8-image-metadata.json"))["containerimage.digest"])')"
+          test -n "$digest"
+          echo "image_ref=${image_ref}" >> "$GITHUB_OUTPUT"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          printf 'IMAGE_REF=%s\nIMAGE_DIGEST=%s\n' "$image_ref" "$digest"
+
+      - name: Verify published digest and provenance
+        shell: bash
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.image_ref }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
+          SOURCE_TREE: ${{ steps.source.outputs.source_tree }}
+          SOURCE_ARCHIVE_SHA256: ${{ steps.archive.outputs.source_archive_sha256 }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect "${IMAGE_REF}@${IMAGE_DIGEST}"
+          docker pull "${IMAGE_REF}@${IMAGE_DIGEST}"
+          test "$(docker image inspect "${IMAGE_REF}@${IMAGE_DIGEST}" \
+            --format '{{ index .Config.Labels "ai.sglang.build.source-archive-sha256" }}')" \
+            = "$SOURCE_ARCHIVE_SHA256"
+          docker run --rm "${IMAGE_REF}@${IMAGE_DIGEST}" bash -ceu '
+            test "$(git -C /glm53-community/sglang rev-parse HEAD)" = "$1"
+            test "$(git -C /glm53-community/sglang write-tree)" = "$2"
+            git -C /glm53-community/sglang diff --quiet -- .
+            git -C /glm53-community/sglang diff --cached --quiet -- .
+            test -z "$(git -C /glm53-community/sglang status --porcelain=v1 --untracked-files=all)"
+            test "$(readlink -f /sgl-workspace/sglang)" = /glm53-community/sglang
+            test "$(cat /opt/sgl-deep-gemm/source-commit)" = "$3"
+            test "$(cat /opt/sglang-source-archive-sha256)" = "$4"
+            PYTHONPATH=/glm53-community/sglang/python python3 -c '"'"'import importlib.machinery, pathlib; expected = pathlib.Path("/glm53-community/sglang/python/sglang/__init__.py"); actual = pathlib.Path(importlib.machinery.PathFinder.find_spec("sglang").origin).resolve(); assert actual == expected'"'"'
+            python3 -c '"'"'import deep_gemm; assert callable(getattr(deep_gemm, "fp8_fp4_mega_moe", None)); assert callable(getattr(deep_gemm, "mega_moe_pre_dispatch_sm90", None)); assert callable(getattr(deep_gemm._C, "fp8_fp4_mega_moe_sm90", None))'"'"'
+            PYTHONPATH=/glm53-community/sglang/python python3 -m pytest -q /glm53-community/sglang/test/registered/unit/model_loader/test_mxfp4_packed_expert_names.py
+          ' -- "$SOURCE_COMMIT" "$SOURCE_TREE" "$SGL_DEEP_GEMM_COMMIT" "$SOURCE_ARCHIVE_SHA256"

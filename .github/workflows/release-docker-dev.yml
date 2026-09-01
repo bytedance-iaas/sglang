@@ -40,6 +40,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  glm53-w4a8-community:
+    if: ${{ github.repository == 'bytedance-iaas/sglang' && startsWith(inputs.tag, 'glm53-w4a8-community-') }}
+    uses: ./.github/workflows/release-docker-glm53-w4a8-community.yml
+    with:
+      image_tag: ${{ inputs.tag }}
+    secrets: inherit
+
   prepare:
     if: github.repository == 'sgl-project/sglang'
     runs-on: ubuntu-latest
