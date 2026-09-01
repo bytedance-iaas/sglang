@@ -352,9 +352,22 @@ if _HAS_TRITON:
         values = tl.load(kv_ptr + row * stride_kv_row + offs).to(tl.float32)
 
         prefix = values
-        for step in (1, 2, 4, 8, 16, 32, 64, 128):
-            partner = tl.gather(prefix, offs ^ step, axis=0)
-            prefix = tl.where((offs & step) == 0, prefix + partner, partner - prefix)
+        partner = tl.gather(prefix, offs ^ 1, axis=0)
+        prefix = tl.where((offs & 1) == 0, prefix + partner, partner - prefix)
+        partner = tl.gather(prefix, offs ^ 2, axis=0)
+        prefix = tl.where((offs & 2) == 0, prefix + partner, partner - prefix)
+        partner = tl.gather(prefix, offs ^ 4, axis=0)
+        prefix = tl.where((offs & 4) == 0, prefix + partner, partner - prefix)
+        partner = tl.gather(prefix, offs ^ 8, axis=0)
+        prefix = tl.where((offs & 8) == 0, prefix + partner, partner - prefix)
+        partner = tl.gather(prefix, offs ^ 16, axis=0)
+        prefix = tl.where((offs & 16) == 0, prefix + partner, partner - prefix)
+        partner = tl.gather(prefix, offs ^ 32, axis=0)
+        prefix = tl.where((offs & 32) == 0, prefix + partner, partner - prefix)
+        partner = tl.gather(prefix, offs ^ 64, axis=0)
+        prefix = tl.where((offs & 64) == 0, prefix + partner, partner - prefix)
+        partner = tl.gather(prefix, offs ^ 128, axis=0)
+        prefix = tl.where((offs & 128) == 0, prefix + partner, partner - prefix)
         values = tl.where(offs < 256, prefix * 0.0625, values)
 
         grouped = tl.reshape(values, [8, 64])
