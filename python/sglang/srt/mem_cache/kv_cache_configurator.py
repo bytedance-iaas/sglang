@@ -78,6 +78,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_mm,
     get_parallel,
+    get_platform,
     get_schedule,
     get_spec,
     mamba_extra_buffer_enabled,
@@ -1268,7 +1269,7 @@ class KVCacheConfigurator:
         if enable_kvbit_swa:
             if not current_platform.is_cuda():
                 raise RuntimeError("DSV4 KVBit packed SWA is CUDA-only.")
-            if current_platform.is_sm120():
+            if get_platform().is_sm120:
                 raise RuntimeError(
                     "DSV4 KVBit packed SWA does not support SM120 because its "
                     "native C4/C128 extra-cache path requires FlashMLA."
