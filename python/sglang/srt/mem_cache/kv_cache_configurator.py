@@ -1268,21 +1268,23 @@ class KVCacheConfigurator:
         )
         if enable_kvbit_swa:
             if not current_platform.is_cuda():
-                raise RuntimeError("DSV4 KVBit packed SWA is CUDA-only.")
+                raise RuntimeError("DSV4 KVBit packed persistent KV is CUDA-only.")
             if get_platform().is_sm120:
                 raise RuntimeError(
-                    "DSV4 KVBit packed SWA does not support SM120 because its "
-                    "native C4/C128 extra-cache path requires FlashMLA."
+                    "DSV4 KVBit packed persistent KV does not support SM120."
                 )
             if get_memory().enable_hisparse:
-                raise RuntimeError("DSV4 KVBit packed SWA does not support HiSparse.")
+                raise RuntimeError(
+                    "DSV4 KVBit packed persistent KV does not support HiSparse."
+                )
             if get_memory().enable_hierarchical_cache:
                 raise RuntimeError(
-                    "DSV4 KVBit packed SWA does not support hierarchical cache."
+                    "DSV4 KVBit packed persistent KV does not support "
+                    "hierarchical cache."
                 )
             if get_disagg().disaggregation_mode != "null":
                 raise RuntimeError(
-                    "DSV4 KVBit packed SWA does not support disaggregation."
+                    "DSV4 KVBit packed persistent KV does not support disaggregation."
                 )
             validate_dsv4_bu4_geometry(
                 self.model_config.qk_nope_head_dim,

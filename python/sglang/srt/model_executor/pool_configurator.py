@@ -41,7 +41,7 @@ from sglang.srt.mem_cache.kvbit_dsv4 import (
     DSV4_KVBIT_ROW_BYTES,
     DSV4_NATIVE_SWA_ROW_BYTES,
     dsv4_kvbit_enabled_for_worker,
-    dsv4_kvbit_target_swa_savings,
+    dsv4_kvbit_target_persistent_savings,
     validate_dsv4_bu4_geometry,
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -880,18 +880,24 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 self.qk_nope_head_dim,
                 self.qk_rope_head_dim,
             )
-            target_swa_savings = dsv4_kvbit_target_swa_savings(
+            target_persistent_savings = dsv4_kvbit_target_persistent_savings(
                 swa_ratio=self.swa_ratio,
                 num_target_layers=self.num_layers_total,
+                num_c4_layers=self.num_layers_ca4,
+                num_c128_layers=self.num_layers_ca128,
+                c4_shrink_factor=self.c4_shrink_factor,
             )
-            self.bytes_per_full_token -= target_swa_savings
+            self.bytes_per_full_token -= target_persistent_savings
             logger.info(
-                "DSV4 KVBit target SWA budget: native_row=%d, packed_row=%d, "
-                "target_layers=%d, savings_per_full_token=%.2f, scratch=disabled",
+                "DSV4 KVBit target persistent budget: native_row=%d, "
+                "packed_row=%d, target_layers=%d, c4_layers=%d, "
+                "c128_layers=%d, savings_per_full_token=%.2f, scratch=disabled",
                 DSV4_NATIVE_SWA_ROW_BYTES,
                 DSV4_KVBIT_ROW_BYTES,
                 self.num_layers_total,
-                target_swa_savings,
+                self.num_layers_ca4,
+                self.num_layers_ca128,
+                target_persistent_savings,
             )
 
     def _assert_ring_serves_draft_tokens(self, num_draft_tokens: int) -> None:

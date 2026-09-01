@@ -1,7 +1,7 @@
 import math
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -120,7 +120,7 @@ class TestDSV4KVBitCapability(CustomTestCase):
 
 
 class TestDSV4KVBitPackedSWAPool(CustomTestCase):
-    """The target SWA factory is packed; native C4/C128 construction is untouched."""
+    """Target persistent SWA/C4/C128 pools use the packed row ABI."""
 
     def _owner(self, *, enabled):
         owner = object.__new__(DeepSeekV4TokenToKVPool)
@@ -155,9 +155,21 @@ class TestDSV4KVBitPackedSWAPool(CustomTestCase):
                 torch.zeros(1, 512, dtype=torch.bfloat16),
             )
 
-    def test_disabled_swa_factory_and_compressed_factory_stay_native(self):
+    def test_target_compressed_factories_use_packed_rows(self):
+        owner = self._owner(enabled=True)
+        packed_c4 = owner._make_compressed_kv_pool(**self._pool_kwargs(page_size=64))
+        packed_c128 = owner._make_compressed_kv_pool(**self._pool_kwargs(page_size=2))
+
+        self.assertIsInstance(packed_c4, DSV4KVBitPackedSWAPool)
+        self.assertEqual(packed_c4.page_size, 64)
+        self.assertEqual(packed_c4.bytes_per_page_padded, 64 * 380)
+        self.assertIsInstance(packed_c128, DSV4KVBitPackedSWAPool)
+        self.assertEqual(packed_c128.page_size, 2)
+        self.assertEqual(packed_c128.bytes_per_page_padded, 2 * 380)
+
+    def test_disabled_swa_and_compressed_factories_stay_native(self):
         native_swa = self._owner(enabled=False)._make_swa_kv_pool(**self._pool_kwargs())
-        native_c4 = self._owner(enabled=True)._make_kv_pool(
+        native_c4 = self._owner(enabled=False)._make_compressed_kv_pool(
             **self._pool_kwargs(page_size=2)
         )
 
@@ -244,7 +256,7 @@ class TestDSV4KVBitAttentionMath(CustomTestCase):
             atol=2e-5,
             rtol=2e-5,
         )
-        with self.assertRaisesRegex(ValueError, "page_size=256"):
+        with self.assertRaisesRegex(ValueError, r"page_size in \(2, 64, 256\)"):
             dsv4_kvbit_sparse_decode(
                 q=q,
                 packed=packed,
@@ -254,6 +266,69 @@ class TestDSV4KVBitAttentionMath(CustomTestCase):
                 page_size=128,
                 softmax_scale=512**-0.5,
             )
+
+    def test_sparse_extra_decode_supports_compressed_pages_and_empty_state(self):
+        q = torch.zeros(1, 1, 2, 512, dtype=torch.bfloat16)
+        indices = torch.full((1, 1, 4), -1, dtype=torch.int32)
+        lengths = torch.ones(1, dtype=torch.int32)
+
+        for page_size in (64, 2):
+            with self.subTest(page_size=page_size):
+                packed = torch.zeros(2, page_size * 380, dtype=torch.uint8)
+                output, lse = dsv4_kvbit_sparse_decode(
+                    q=q,
+                    packed=packed,
+                    indices=indices,
+                    lengths=lengths,
+                    attn_sink=None,
+                    page_size=page_size,
+                    softmax_scale=512**-0.5,
+                )
+                self.assertTrue(torch.equal(output, torch.zeros_like(output)))
+                self.assertTrue(torch.isneginf(lse).all())
+
+    def test_sparse_extra_decode_supports_nonempty_compressed_pages(self):
+        torch.manual_seed(9)
+        keys = torch.randn(3, 512, dtype=torch.bfloat16) * 0.1
+        encoded = encode_dsv4_bu4_reference(keys)
+        q = torch.randn(1, 1, 2, 512, dtype=torch.bfloat16) * 0.1
+
+        for page_size, physical_locs in (
+            (64, torch.tensor([1, 63, 64], dtype=torch.int64)),
+            (2, torch.tensor([0, 1, 2], dtype=torch.int64)),
+        ):
+            with self.subTest(page_size=page_size):
+                packed = torch.zeros(2, page_size * 380, dtype=torch.uint8)
+                packed.view(-1, 380)[physical_locs] = encoded
+                indices = physical_locs.to(torch.int32).view(1, 1, -1)
+                lengths = torch.tensor([3], dtype=torch.int32)
+
+                output, lse = dsv4_kvbit_sparse_decode(
+                    q=q,
+                    packed=packed,
+                    indices=indices,
+                    lengths=lengths,
+                    attn_sink=None,
+                    page_size=page_size,
+                    softmax_scale=512**-0.5,
+                )
+
+                decoded = decode_dsv4_bu4_reference(encoded).float()
+                scores = torch.einsum("qhd,kd->qhk", q[0].float(), decoded) * (
+                    512**-0.5
+                )
+                expected = torch.einsum(
+                    "qhk,kd->qhd", torch.softmax(scores, dim=-1), decoded
+                )
+                torch.testing.assert_close(
+                    output[0].float(), expected, atol=0.02, rtol=0.02
+                )
+                torch.testing.assert_close(
+                    lse[0],
+                    torch.logsumexp(scores, dim=-1).transpose(0, 1),
+                    atol=2e-5,
+                    rtol=2e-5,
+                )
 
     def test_natural_log_lse_merge_matches_concatenated_attention(self):
         left_scores = torch.tensor([1.0, -2.0])
@@ -290,7 +365,7 @@ class TestDSV4KVBitAttentionMath(CustomTestCase):
         torch.testing.assert_close(output, valid_output)
         torch.testing.assert_close(lse, valid_lse)
 
-    def test_ratio_four_and_128_split_packed_swa_from_native_extra(self):
+    def test_ratio_four_and_128_use_packed_swa_and_packed_extra(self):
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             DeepseekV4AttnBackend,
         )
@@ -302,7 +377,7 @@ class TestDSV4KVBitAttentionMath(CustomTestCase):
                 backend.softmax_scale = 512**-0.5
                 backend.head_dim_v = 512
                 extra_page_size = 64 if ratio == 4 else 2
-                extra_cache = torch.zeros(1, extra_page_size * 584, dtype=torch.uint8)
+                extra_cache = torch.zeros(1, extra_page_size * 380, dtype=torch.uint8)
                 backend.token_to_kv_pool = SimpleNamespace(
                     get_extra_key_buffer=lambda _layer_id, value=extra_cache: value,
                     get_extra_key_page_size=lambda _layer_id, value=extra_page_size: (
@@ -325,21 +400,12 @@ class TestDSV4KVBitAttentionMath(CustomTestCase):
                 extra_output = torch.full_like(swa_output, 3)
                 swa_lse = torch.full((1, 2, 1), math.log(2.0))
                 extra_lse = torch.zeros(1, 2, 1)
-                flash_mla = SimpleNamespace(
-                    flash_mla_with_kvcache=lambda output=extra_output, lse=extra_lse, **_: (
-                        output,
-                        lse,
-                    )
-                )
 
-                with (
-                    patch(
-                        "sglang.srt.layers.attention.deepseek_v4_backend."
-                        "dsv4_kvbit_sparse_decode",
-                        return_value=(swa_output, swa_lse),
-                    ),
-                    patch.dict("sys.modules", {"sgl_kernel.flash_mla": flash_mla}),
-                ):
+                with patch(
+                    "sglang.srt.layers.attention.deepseek_v4_backend."
+                    "dsv4_kvbit_sparse_decode",
+                    side_effect=((swa_output, swa_lse), (extra_output, extra_lse)),
+                ) as sparse_decode:
                     output = backend._forward_kvbit(
                         q=q,
                         layer_id=0,
@@ -352,6 +418,171 @@ class TestDSV4KVBitAttentionMath(CustomTestCase):
                 torch.testing.assert_close(
                     output.float(), torch.full_like(output, 5.0 / 3.0).float()
                 )
+                self.assertEqual(sparse_decode.call_count, 2)
+                swa_call, extra_call = sparse_decode.call_args_list
+                self.assertIsNotNone(swa_call.kwargs["attn_sink"])
+                self.assertEqual(swa_call.kwargs["page_size"], 256)
+                self.assertIs(extra_call.kwargs["packed"], extra_cache)
+                self.assertIsNone(extra_call.kwargs["attn_sink"])
+                self.assertEqual(extra_call.kwargs["page_size"], extra_page_size)
+
+
+class TestDSV4KVBitPackedCompressor(CustomTestCase):
+    def test_packed_online_c128_keeps_mtp_prefix_state_write(self):
+        from sglang.srt.layers.attention.dsv4.compressor_v2 import (
+            CompressorBackendMixin,
+        )
+
+        backend = object.__new__(CompressorBackendMixin)
+        packed_pool = SimpleNamespace(is_dsv4_kvbit_packed=True)
+        backend.token_to_kv_pool = SimpleNamespace(
+            layer_mapping={7: (None, None, packed_pool)}
+        )
+        backend.enable_deepseek_v4_fp4_indexer = False
+        backend.forward_metadata = SimpleNamespace(
+            core_metadata=SimpleNamespace(
+                c128_out_loc=torch.tensor([3], dtype=torch.int32)
+            )
+        )
+        backend._forward_compress_packed = MagicMock()
+        backend._forward_compress_all_in_one = MagicMock()
+        backend.online_c128_mtp = MagicMock()
+        state_pool = SimpleNamespace(
+            kv_score_buffer=SimpleNamespace(kv_score=torch.empty(1, 512))
+        )
+        compressor = SimpleNamespace(
+            ratio=128,
+            is_in_indexer=False,
+            ape=torch.empty(128, 512),
+            compute_kv_score=MagicMock(return_value=torch.empty(1, 512)),
+            get_state_pool=MagicMock(return_value=state_pool),
+        )
+        forward_mode = SimpleNamespace(is_idle=lambda: False)
+        forward_batch = SimpleNamespace(forward_mode=forward_mode)
+
+        with patch(
+            "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate."
+            "is_unified_kv_triton",
+            return_value=False,
+        ):
+            backend.forward_unified(
+                x=torch.empty(1, 512),
+                forward_batch=forward_batch,
+                layer_id=7,
+                compressor=compressor,
+            )
+
+        backend._forward_compress_packed.assert_called_once()
+        backend._forward_compress_all_in_one.assert_not_called()
+        backend.online_c128_mtp.write_prefix_states.assert_called_once_with(
+            layer_id=7,
+            compressor=compressor,
+            kv_score_input=compressor.compute_kv_score.return_value,
+            logical_forward_mode=forward_mode,
+        )
+
+    def test_decode_non_boundary_does_not_write_location_zero(self):
+        from sglang.kernels.ops.attention.dsv4 import CompressorDecodePlan
+        from sglang.srt.layers.attention.dsv4.compressor_v2 import (
+            CompressorBackendMixin,
+        )
+
+        backend = object.__new__(CompressorBackendMixin)
+        plan_d = torch.zeros((2, 16), dtype=torch.uint8)
+        plan_d_i32 = plan_d.view(torch.int32)
+        plan_d_i32[:, 0] = torch.tensor([4, 5], dtype=torch.int32)
+        backend.forward_metadata = SimpleNamespace(
+            c4_compress_metadata=CompressorDecodePlan(4, plan_d)
+        )
+        captured = {}
+        backend.token_to_kv_pool = SimpleNamespace(
+            set_extra_key_buffer_fused=lambda **kwargs: captured.update(kwargs)
+        )
+        compressor = SimpleNamespace(
+            ratio=4,
+            head_dim=512,
+            ape=torch.empty(4, 512),
+            norm=SimpleNamespace(weight=torch.ones(512), variance_epsilon=1e-6),
+            freqs_cis=torch.empty(8, 32, dtype=torch.complex64),
+        )
+        compressed = torch.zeros(2, 512, dtype=torch.bfloat16)
+
+        with (
+            patch(
+                "sglang.srt.layers.attention.dsv4.compressor_v2.compress_forward",
+                return_value=compressed,
+            ),
+            patch(
+                "sglang.kernels.ops.attention.deepseek_v4_rope."
+                "fused_norm_rope_inplace_triton"
+            ),
+        ):
+            backend._forward_compress_packed(
+                kv_score_buffer=torch.empty(1, 4, 1024),
+                kv_score_input=torch.empty(2, 512),
+                ape=compressor.ape,
+                compressor=compressor,
+                layer_id=7,
+                out_loc=torch.tensor([10, 11], dtype=torch.int32),
+            )
+
+        torch.testing.assert_close(
+            captured["loc"], torch.tensor([10, -1], dtype=torch.int32)
+        )
+
+    def test_prefill_padded_plan_does_not_write_location_zero(self):
+        from sglang.kernels.ops.attention.dsv4 import CompressorPrefillPlan
+        from sglang.srt.layers.attention.dsv4.compressor_v2 import (
+            CompressorBackendMixin,
+        )
+
+        backend = object.__new__(CompressorBackendMixin)
+        plan_c = torch.zeros((2, 16), dtype=torch.uint8)
+        plan_c_i32 = plan_c.view(torch.int32)
+        plan_c_i32[0, 0] = 4
+        plan_c_i32[0, 1] = 1
+        plan_c_i32[1, 0] = -1
+        plan_w = torch.empty((0, 8), dtype=torch.uint8)
+        backend.forward_metadata = SimpleNamespace(
+            c4_compress_metadata=CompressorPrefillPlan(4, plan_c, plan_w)
+        )
+        captured = {}
+        backend.token_to_kv_pool = SimpleNamespace(
+            set_extra_key_buffer_fused=lambda **kwargs: captured.update(kwargs)
+        )
+        compressor = SimpleNamespace(
+            ratio=4,
+            head_dim=512,
+            ape=torch.empty(4, 512),
+            norm=SimpleNamespace(weight=torch.ones(512), variance_epsilon=1e-6),
+            freqs_cis=torch.empty(8, 32, dtype=torch.complex64),
+        )
+        compressed = torch.zeros(2, 512, dtype=torch.bfloat16)
+
+        with (
+            patch(
+                "sglang.srt.layers.attention.dsv4.compressor_v2.compress_forward",
+                return_value=compressed,
+            ),
+            patch(
+                "sglang.kernels.ops.attention.deepseek_v4_rope."
+                "fused_norm_rope_inplace_triton"
+            ),
+        ):
+            backend._forward_compress_packed(
+                kv_score_buffer=torch.empty(1, 4, 1024),
+                kv_score_input=torch.empty(1, 512),
+                ape=compressor.ape,
+                compressor=compressor,
+                layer_id=7,
+                out_loc=torch.tensor([10, 11, 12], dtype=torch.int32),
+            )
+
+        self.assertEqual(captured["layer_id"], 7)
+        torch.testing.assert_close(
+            captured["loc"], torch.tensor([11, -1], dtype=torch.int32)
+        )
+        self.assertIs(captured["cache_k"], compressed)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_cuda_fused_write_and_direct_decode_match_cpu_reference(self):
@@ -412,6 +643,64 @@ class TestDSV4KVBitAttentionMath(CustomTestCase):
             output.cpu().float(), expected_output.float(), atol=0.03, rtol=0.03
         )
         torch.testing.assert_close(lse.cpu(), expected_lse, atol=0.03, rtol=0.03)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_cuda_compressed_page_write_and_decode_match_cpu_reference(self):
+        torch.manual_seed(13)
+        keys_cpu = torch.randn(3, 512, dtype=torch.bfloat16) * 0.1
+        q_cpu = torch.randn(1, 1, 2, 512, dtype=torch.bfloat16) * 0.1
+
+        for page_size, loc_cpu in (
+            (64, torch.tensor([1, 63, 64], dtype=torch.int32)),
+            (2, torch.tensor([0, 1, 2], dtype=torch.int32)),
+        ):
+            with self.subTest(page_size=page_size):
+                indices_cpu = loc_cpu.view(1, 1, -1)
+                lengths_cpu = torch.tensor([3], dtype=torch.int32)
+                expected_packed = torch.zeros(2, page_size * 380, dtype=torch.uint8)
+                expected_packed.view(-1, 380)[loc_cpu.long()] = (
+                    encode_dsv4_bu4_reference(keys_cpu)
+                )
+                expected_output, expected_lse = dsv4_kvbit_sparse_decode(
+                    q=q_cpu,
+                    packed=expected_packed,
+                    indices=indices_cpu,
+                    lengths=lengths_cpu,
+                    attn_sink=None,
+                    page_size=page_size,
+                    softmax_scale=512**-0.5,
+                )
+
+                pool = DSV4KVBitPackedSWAPool(
+                    size=page_size,
+                    page_size=page_size,
+                    dtype=torch.bfloat16,
+                    qk_nope_head_dim=448,
+                    qk_rope_head_dim=64,
+                    layer_num=1,
+                    device="cuda",
+                    enable_memory_saver=False,
+                )
+                pool.set_key_buffer_fused(0, loc_cpu.cuda(), keys_cpu.cuda())
+                output, lse = dsv4_kvbit_sparse_decode(
+                    q=q_cpu.cuda(),
+                    packed=pool.kv_buffer[0],
+                    indices=indices_cpu.cuda(),
+                    lengths=lengths_cpu.cuda(),
+                    attn_sink=None,
+                    page_size=page_size,
+                    softmax_scale=512**-0.5,
+                )
+
+                torch.testing.assert_close(
+                    output.cpu().float(),
+                    expected_output.float(),
+                    atol=0.03,
+                    rtol=0.03,
+                )
+                torch.testing.assert_close(
+                    lse.cpu(), expected_lse, atol=0.03, rtol=0.03
+                )
 
 
 if __name__ == "__main__":

@@ -69,7 +69,6 @@ from sglang.srt.layers.attention.verify_mask import (
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.kvbit_dsv4 import (
-    DSV4_NATIVE_SWA_ROW_BYTES,
     dsv4_kvbit_sparse_decode,
     merge_attention_states_natural_log,
 )
@@ -1720,30 +1719,14 @@ class DeepseekV4AttnBackend(
 
         extra_k_cache = self.token_to_kv_pool.get_extra_key_buffer(layer_id)
         extra_page_size = self.token_to_kv_pool.get_extra_key_page_size(layer_id)
-        extra_k_cache = extra_k_cache[
-            :, : extra_page_size * DSV4_NATIVE_SWA_ROW_BYTES
-        ].view(
-            extra_k_cache.shape[0],
-            extra_page_size,
-            1,
-            DSV4_NATIVE_SWA_ROW_BYTES,
-        )
-        from sgl_kernel.flash_mla import flash_mla_with_kvcache
-
-        extra_output, extra_lse = flash_mla_with_kvcache(
+        extra_output, extra_lse = dsv4_kvbit_sparse_decode(
             q=q,
-            k_cache=extra_k_cache,
-            head_dim_v=self.head_dim_v,
-            block_table=None,
-            cache_seqlens=None,
-            tile_scheduler_metadata=core_attn_metadata.get_flashmla_metadata(
-                compress_ratio
-            ),
-            softmax_scale=self.softmax_scale,
-            is_fp8_kvcache=True,
+            packed=extra_k_cache,
             indices=extra_indices,
-            topk_length=extra_lengths,
+            lengths=extra_lengths,
             attn_sink=None,
+            page_size=extra_page_size,
+            softmax_scale=self.softmax_scale,
         )
         output, _ = merge_attention_states_natural_log(
             swa_output,

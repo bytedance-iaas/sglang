@@ -117,11 +117,19 @@ def dsv4_kvbit_enabled_for_worker(*, enabled: bool, is_draft_worker: bool) -> bo
     return enabled and not is_draft_worker
 
 
-def dsv4_kvbit_target_swa_savings(*, swa_ratio: float, num_target_layers: int) -> float:
-    return (
-        swa_ratio
-        * (DSV4_NATIVE_SWA_ROW_BYTES - DSV4_KVBIT_ROW_BYTES)
-        * num_target_layers
+def dsv4_kvbit_target_persistent_savings(
+    *,
+    swa_ratio: float,
+    num_target_layers: int,
+    num_c4_layers: int,
+    num_c128_layers: int,
+    c4_shrink_factor: float = 1.0,
+) -> float:
+    row_saving = DSV4_NATIVE_SWA_ROW_BYTES - DSV4_KVBIT_ROW_BYTES
+    return row_saving * (
+        swa_ratio * num_target_layers
+        + num_c4_layers / (4 * c4_shrink_factor)
+        + num_c128_layers / 128
     )
 
 
@@ -434,6 +442,7 @@ if _HAS_TRITON:
         PAGE_SIZE: tl.constexpr,
         ROW_BYTES: tl.constexpr,
         BLOCK_N: tl.constexpr,
+        HAS_SINK: tl.constexpr,
     ):
         query_row = tl.program_id(0)
         head = tl.program_id(1)
@@ -443,8 +452,10 @@ if _HAS_TRITON:
         q = tl.load(
             q_ptr + query_row * stride_q_row + head * stride_q_head + q_offsets
         ).to(tl.float32)
-        max_score = tl.load(sink_ptr + head).to(tl.float32)
-        normalizer = 1.0
+        max_score = (
+            tl.load(sink_ptr + head).to(tl.float32) if HAS_SINK else -float("inf")
+        )
+        normalizer = 1.0 if HAS_SINK else 0.0
         accumulator = tl.zeros([512], dtype=tl.float32)
 
         start = 0
@@ -510,8 +521,13 @@ if _HAS_TRITON:
             score += tl.sum(q_rope[None, :] * rope, axis=1)
             score = tl.where(valid_token, score * softmax_scale, -float("inf"))
 
-            next_max = tl.maximum(max_score, tl.max(score, axis=0))
-            rescale = tl.exp(max_score - next_max)
+            has_valid_token = tl.sum(valid_token.to(tl.int32), axis=0) > 0
+            next_max = tl.where(
+                has_valid_token,
+                tl.maximum(max_score, tl.max(score, axis=0)),
+                max_score,
+            )
+            rescale = tl.where(has_valid_token, tl.exp(max_score - next_max), 1.0)
             probabilities = tl.exp(score - next_max)
             probabilities = tl.where(valid_token, probabilities, 0.0)
             accumulator *= rescale
@@ -565,16 +581,17 @@ if _HAS_TRITON:
             start += BLOCK_N
 
         output_offsets = tl.arange(0, 512)
+        has_mass = normalizer > 0
         tl.store(
             output_ptr
             + query_row * stride_output_row
             + head * stride_output_head
             + output_offsets,
-            accumulator / normalizer,
+            tl.where(has_mass, accumulator / normalizer, 0.0),
         )
         tl.store(
             lse_ptr + query_row * stride_lse_row + head,
-            max_score + tl.log(normalizer),
+            tl.where(has_mass, max_score + tl.log(normalizer), -float("inf")),
         )
 
 
@@ -625,7 +642,7 @@ def _dsv4_sparse_decode_reference(
     packed: torch.Tensor,
     indices: torch.Tensor,
     lengths: torch.Tensor,
-    attn_sink: torch.Tensor,
+    attn_sink: torch.Tensor | None,
     *,
     page_size: int,
     softmax_scale: float,
@@ -645,13 +662,21 @@ def _dsv4_sparse_decode_reference(
         stored = _decode_dsv4_bu4_stored_domain(rows[selected].cpu()).to(q.device)
         scores = torch.einsum("qhd,kd->qhk", q_folded[row].float(), stored.float())
         scores.mul_(softmax_scale)
-        sink = attn_sink.float().view(1, -1, 1)
-        scores = torch.cat((scores, sink), dim=-1)
-        probabilities = torch.softmax(scores, dim=-1)[..., :-1]
-        output[row] = torch.einsum("qhk,kd->qhd", probabilities, stored.float()).to(
-            q.dtype
-        )
-        lse[row] = torch.logsumexp(scores, dim=-1).transpose(0, 1)
+        if attn_sink is not None:
+            sink = attn_sink.float().view(1, -1, 1)
+            scores = torch.cat((scores, sink), dim=-1)
+        if scores.shape[-1] == 0:
+            output[row].zero_()
+            lse[row].fill_(-torch.inf)
+        else:
+            probabilities = torch.softmax(scores, dim=-1)
+            value_probabilities = (
+                probabilities[..., :-1] if attn_sink is not None else probabilities
+            )
+            output[row] = torch.einsum(
+                "qhk,kd->qhd", value_probabilities, stored.float()
+            ).to(q.dtype)
+            lse[row] = torch.logsumexp(scores, dim=-1).transpose(0, 1)
     return restore_dsv4_h256(output), lse
 
 
@@ -660,14 +685,16 @@ def dsv4_kvbit_sparse_decode(
     packed: torch.Tensor,
     indices: torch.Tensor,
     lengths: torch.Tensor,
-    attn_sink: torch.Tensor,
+    attn_sink: torch.Tensor | None,
     *,
     page_size: int,
     softmax_scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Direct sparse attention over page_size=256 packed DSV4 Q/K/V=512 rows."""
-    if page_size != 256:
-        raise ValueError(f"DSV4 KVBit requires page_size=256, got {page_size}")
+    """Direct sparse attention over packed DSV4 Q/K/V=512 rows."""
+    if page_size not in (2, 64, 256):
+        raise ValueError(
+            f"DSV4 KVBit requires page_size in (2, 64, 256), got {page_size}"
+        )
     if q.ndim != 4 or q.shape[1] != 1 or q.shape[-1] != 512:
         raise ValueError(f"q must have shape (tokens, 1, heads, 512), got {q.shape}")
     if indices.ndim != 3 or indices.shape[:2] != q.shape[:2]:
@@ -698,7 +725,7 @@ def dsv4_kvbit_sparse_decode(
         packed,
         indices,
         lengths,
-        attn_sink,
+        attn_sink if attn_sink is not None else q,
         output_folded,
         lse,
         q_folded.stride(0),
@@ -715,6 +742,7 @@ def dsv4_kvbit_sparse_decode(
         PAGE_SIZE=page_size,
         ROW_BYTES=DSV4_BU4_LAYOUT.row_bytes,
         BLOCK_N=16,
+        HAS_SINK=attn_sink is not None,
         num_warps=4,
         num_stages=1,
     )
@@ -722,9 +750,10 @@ def dsv4_kvbit_sparse_decode(
 
 
 class DSV4KVBitPackedSWAPool(KVCache):
-    """Persistent 380-byte target SWA rows with no native shadow or scratch."""
+    """Persistent 380-byte target DSV4 rows with no native shadow or scratch."""
 
     is_dsv4_kvbit_packed_swa = True
+    is_dsv4_kvbit_packed = True
 
     def __init__(
         self,
@@ -740,8 +769,10 @@ class DSV4KVBitPackedSWAPool(KVCache):
         end_layer: int | None = None,
     ):
         validate_dsv4_bu4_geometry(qk_nope_head_dim, qk_rope_head_dim)
-        if page_size != 256:
-            raise ValueError(f"DSV4 KVBit requires page_size=256, got {page_size}")
+        if page_size not in (2, 64, 256):
+            raise ValueError(
+                f"DSV4 KVBit requires page_size in (2, 64, 256), got {page_size}"
+            )
         super().__init__(
             size,
             page_size,

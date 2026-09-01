@@ -1007,7 +1007,7 @@ class TestDflashDraftKvBudget(CustomTestCase):
 
 
 class TestDSV4KVBitBudget(CustomTestCase):
-    """Only target SWA rows receive the 584-to-380-byte budget reduction."""
+    """Target SWA/C4/C128 rows receive the 584-to-380-byte reduction."""
 
     def _configurator(self):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
@@ -1018,6 +1018,9 @@ class TestDSV4KVBitBudget(CustomTestCase):
         configurator.qk_rope_head_dim = 64
         configurator.swa_ratio = 0.5
         configurator.num_layers_total = 60
+        configurator.num_layers_ca4 = 15
+        configurator.num_layers_ca128 = 45
+        configurator.c4_shrink_factor = 1
         return configurator
 
     def test_target_budget_uses_packed_rows_without_scratch_charge(self):
@@ -1029,9 +1032,22 @@ class TestDSV4KVBitBudget(CustomTestCase):
                 SimpleNamespace(is_draft_worker=False)
             )
 
-        expected = 100_000.0 - 0.5 * (584 - 380) * 60
+        expected = 100_000.0 - (584 - 380) * (0.5 * 60 + 15 / 4 + 45 / 128)
         self.assertEqual(configurator.bytes_per_full_token, expected)
         self.assertTrue(configurator.kvbit_packed_swa)
+
+    def test_hisparse_c4_shrink_factor_reduces_only_c4_savings(self):
+        from sglang.srt.environ import envs
+
+        configurator = self._configurator()
+        configurator.c4_shrink_factor = 2
+        with envs.SGLANG_ENABLE_KVBIT.override(True):
+            configurator._apply_kvbit_target_swa_budget(
+                SimpleNamespace(is_draft_worker=False)
+            )
+
+        expected = 100_000.0 - (584 - 380) * (0.5 * 60 + 15 / (4 * 2) + 45 / 128)
+        self.assertEqual(configurator.bytes_per_full_token, expected)
 
     def test_draft_and_disabled_budgets_remain_native(self):
         from sglang.srt.environ import envs

@@ -60,6 +60,7 @@ def get_compress_state_write_pad(compress_ratio: int, ring_size: int) -> int:
 
 class DeepSeekV4SingleKVPool(KVCache):
     is_dsv4_kvbit_packed_swa = False
+    is_dsv4_kvbit_packed = False
 
     def __init__(
         self,
@@ -630,7 +631,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             c4_kv_pool_type = DeepSeekV4SingleKVPool
             if enable_hisparse:
                 c4_kv_pool_type = HiSparseC4DevicePool
-            self.c4_kv_pool = self._make_kv_pool(
+            self.c4_kv_pool = self._make_compressed_kv_pool(
                 size=c4_size,
                 page_size=c4_page_size,
                 dtype=dtype,
@@ -641,7 +642,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 cls=c4_kv_pool_type,
             )
 
-            self.c128_kv_pool = self._make_kv_pool(
+            self.c128_kv_pool = self._make_compressed_kv_pool(
                 size=c128_size,
                 page_size=c128_page_size,
                 dtype=dtype,
@@ -891,6 +892,41 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return DSV4KVBitPackedSWAPool(
             size=size,
             page_size=global_page_size,
+            dtype=dtype,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+        )
+
+    def _make_compressed_kv_pool(
+        self,
+        *,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        global_page_size: int,
+        cls: type = DeepSeekV4SingleKVPool,
+    ) -> KVCache:
+        if not self.enable_kvbit_swa:
+            return self._make_kv_pool(
+                size=size,
+                page_size=page_size,
+                dtype=dtype,
+                layer_num=layer_num,
+                device=device,
+                enable_memory_saver=enable_memory_saver,
+                global_page_size=global_page_size,
+                cls=cls,
+            )
+        assert cls is DeepSeekV4SingleKVPool
+        return DSV4KVBitPackedSWAPool(
+            size=size,
+            page_size=page_size,
             dtype=dtype,
             qk_nope_head_dim=self.qk_nope_head_dim,
             qk_rope_head_dim=self.qk_rope_head_dim,
