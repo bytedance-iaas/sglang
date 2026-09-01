@@ -177,9 +177,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # resolution (the declarative registry materializes too late to affect
     # it). Inkling opts into full-graph prefill capture here.
     from sglang.srt.arg_groups.cuda_graph_hook import (
+        apply_deepep_adjustments,
         apply_inkling_prefill_cuda_graph_default,
         apply_muse_glimmer_prefill_cuda_graph_max_bs_default,
         disable_prefill_cuda_graph_for_deepseek_trtllm_mla,
+        enforce_deepep_prefill_cuda_graph_capacity,
         handle_cuda_graph_config,
     )
 
@@ -362,6 +364,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Model-capability adjustments that legacy code applied at model-load
     # time; last declarations of the resolution, mirroring that order.
     handle_model_capability_adjustments(server_args)
+
+    # DP and model-capability handlers may regenerate prefill buckets after
+    # the initial CUDA-graph pass. Re-apply DeepEP's alignment to the final
+    # buckets before enforcing the resolved low-latency capacity.
+    apply_deepep_adjustments(server_args)
+    enforce_deepep_prefill_cuda_graph_capacity(server_args)
 
     # Validate after all batch-size declarations are visible.
     validate_deepep_v2_speculative_draft(server_args)

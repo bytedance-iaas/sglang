@@ -16,7 +16,9 @@ from sglang.srt.arg_groups.attention_hook import (
 )
 from sglang.srt.arg_groups.cuda_graph_hook import (
     apply_cuda_graph_compatibility,
+    apply_deepep_adjustments,
     disable_tc_piecewise_cudagraph_if_incompatible,
+    enforce_deepep_prefill_cuda_graph_capacity,
     handle_cuda_graph_config,
 )
 from sglang.srt.arg_groups.hicache_hook import (
@@ -41,6 +43,7 @@ from sglang.srt.arg_groups.moe_hook import (
 )
 from sglang.srt.arg_groups.overrides import (
     cutedsl_moe_max_num_tokens,
+    declare_resolution,
     max_speculative_num_draft_tokens,
     resolution_result,
 )
@@ -78,6 +81,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     Phase,
     PhaseConfig,
+    with_phase,
 )
 from sglang.srt.runtime_context import (
     describe_kv_events_publisher,
@@ -1998,6 +2002,174 @@ class TestCudaGraphDisaggregationRoles(CustomTestCase):
             resolution_result(args, "cuda_graph_config").decode.backend, Backend.FULL
         )
         self.assertIn((Phase.DECODE, "backend"), args._cuda_graph_config_locked)
+
+
+class TestDeepEPPrefillCudaGraphAdjustments(CustomTestCase):
+    def _args(
+        self,
+        *,
+        deepep_mode="low_latency",
+        prefill_bs=None,
+        prefill_max_bs=None,
+        prefill_backend=Backend.BREAKABLE,
+        moe_a2a_backend="deepep",
+        moe_runner_backend="auto",
+    ):
+        args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend=moe_a2a_backend,
+            deepep_mode=deepep_mode,
+            moe_runner_backend=moe_runner_backend,
+        )
+        args.cuda_graph_config = CudaGraphConfig(
+            decode=PhaseConfig(
+                backend=Backend.FULL,
+                max_bs=16,
+                bs=[1, 4, 10, 16],
+            ),
+            prefill=PhaseConfig(
+                backend=prefill_backend,
+                bs=prefill_bs,
+                max_bs=prefill_max_bs,
+            ),
+        )
+        return args
+
+    def test_low_latency_drops_prefill_buckets_above_dispatch_capacity(self):
+        args = self._args(
+            prefill_bs=[4, 8, 144, 160],
+            prefill_max_bs=160,
+        )
+        decode_config = args.cuda_graph_config.decode
+
+        with envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(144):
+            apply_deepep_adjustments(args)
+            enforce_deepep_prefill_cuda_graph_capacity(args)
+
+        config = resolution_result(args, "cuda_graph_config")
+        self.assertEqual(config.prefill.bs, [8, 144])
+        self.assertEqual(config.prefill.max_bs, 144)
+        self.assertEqual(config.decode, decode_config)
+
+    def test_auto_mode_does_not_apply_low_latency_capacity(self):
+        args = self._args(
+            deepep_mode="auto",
+            prefill_bs=[8, 160],
+            prefill_max_bs=160,
+        )
+
+        with envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(144):
+            apply_deepep_adjustments(args)
+            enforce_deepep_prefill_cuda_graph_capacity(args)
+
+        config = resolution_result(args, "cuda_graph_config")
+        self.assertEqual(config.prefill.bs, [8, 160])
+        self.assertEqual(config.prefill.max_bs, 160)
+
+    def test_resolved_auto_to_low_latency_applies_capacity(self):
+        args = self._args(
+            deepep_mode="auto",
+            moe_runner_backend="flashinfer_cutedsl",
+            prefill_bs=[8, 160],
+            prefill_max_bs=160,
+        )
+
+        apply_deepep_adjustments(args)
+        handle_a2a_moe(args)
+        self.assertEqual(resolution_result(args, "deepep_mode"), "low_latency")
+        with envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(144):
+            enforce_deepep_prefill_cuda_graph_capacity(args)
+
+        prefill = resolution_result(args, "cuda_graph_config").prefill
+        self.assertEqual(prefill.bs, [8])
+        self.assertEqual(prefill.max_bs, 8)
+
+    def test_low_latency_rejects_when_no_prefill_bucket_fits(self):
+        args = self._args(prefill_bs=[8, 16], prefill_max_bs=16)
+        apply_deepep_adjustments(args)
+
+        with (
+            envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(4),
+            self.assertRaisesRegex(ValueError, "has no capture bucket"),
+        ):
+            enforce_deepep_prefill_cuda_graph_capacity(args)
+
+    def test_empty_prefill_bucket_list_keeps_eager_fallback(self):
+        args = self._args(prefill_bs=[], prefill_max_bs=160)
+
+        with envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(4):
+            apply_deepep_adjustments(args)
+            enforce_deepep_prefill_cuda_graph_capacity(args)
+
+        prefill = resolution_result(args, "cuda_graph_config").prefill
+        self.assertEqual(prefill.bs, [])
+        self.assertEqual(prefill.max_bs, 160)
+
+    def test_non_deepep_and_non_breakable_configs_are_unchanged(self):
+        for overrides in (
+            {"moe_a2a_backend": "none"},
+            {"prefill_backend": Backend.TC_PIECEWISE},
+        ):
+            with self.subTest(**overrides):
+                args = self._args(
+                    prefill_bs=[8, 160],
+                    prefill_max_bs=160,
+                    **overrides,
+                )
+                original = args.cuda_graph_config
+
+                with envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(8):
+                    apply_deepep_adjustments(args)
+                    enforce_deepep_prefill_cuda_graph_capacity(args)
+
+                self.assertEqual(resolution_result(args, "cuda_graph_config"), original)
+
+    def test_default_generated_buckets_are_capacity_bounded(self):
+        args = self._args(prefill_bs=None, prefill_max_bs=None)
+
+        with envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(144):
+            apply_deepep_adjustments(args)
+            enforce_deepep_prefill_cuda_graph_capacity(args)
+
+        prefill = resolution_result(args, "cuda_graph_config").prefill
+        self.assertEqual(prefill.bs[0], 8)
+        self.assertEqual(prefill.bs[-1], 144)
+        self.assertTrue(all(bucket <= 144 for bucket in prefill.bs))
+        self.assertEqual(prefill.max_bs, 144)
+
+    def test_capacity_is_applied_after_bucket_alignment(self):
+        args = self._args(prefill_bs=[136, 144], prefill_max_bs=144)
+
+        with envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(143):
+            apply_deepep_adjustments(args)
+            enforce_deepep_prefill_cuda_graph_capacity(args)
+
+        prefill = resolution_result(args, "cuda_graph_config").prefill
+        self.assertEqual(prefill.bs, [136])
+        self.assertEqual(prefill.max_bs, 136)
+
+    def test_final_pass_realigns_regenerated_buckets_before_capacity(self):
+        args = self._args(prefill_bs=[4, 12, 160], prefill_max_bs=160)
+
+        with envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(144):
+            apply_deepep_adjustments(args)
+            config = resolution_result(args, "cuda_graph_config")
+            declare_resolution(
+                args,
+                "_simulate_late_bucket_regeneration",
+                cuda_graph_config=with_phase(
+                    config,
+                    Phase.PREFILL,
+                    bs=[4, 12, 160],
+                    max_bs=160,
+                ),
+            )
+            apply_deepep_adjustments(args)
+            enforce_deepep_prefill_cuda_graph_capacity(args)
+
+        prefill = resolution_result(args, "cuda_graph_config").prefill
+        self.assertEqual(prefill.bs, [8, 16])
+        self.assertEqual(prefill.max_bs, 16)
 
 
 class TestPrefillCudaGraphLoRACompatibility(CustomTestCase):

@@ -14,6 +14,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
 from sglang.srt.connector import ConnectorType
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import (
     ALLOWED_BACKENDS_PER_PHASE,
     Backend,
@@ -474,6 +475,65 @@ def handle_cuda_graph_config(server_args: Any):
             "cuda_graph_config[prefill].backend='full' is experimental. "
             "Use breakable or tc_piecewise for production workloads."
         )
+
+
+def enforce_deepep_prefill_cuda_graph_capacity(server_args: Any) -> None:
+    """Keep low-latency DeepEP prefill graph buckets within its buffer.
+
+    This must run after MoE resolution: ``flashinfer_cutedsl`` resolves
+    ``deepep_mode=auto`` to ``low_latency`` in ``handle_a2a_moe``. The prefill
+    CUDA graph buckets are aggregate token counts, while DeepEP allocates a
+    fixed dispatch capacity per rank. Without a runtime-enforced balanced
+    split, one rank may receive the whole bucket, so dividing the bucket by DP
+    or EP size would not be safe.
+    """
+    cfg = resolved_view(server_args)
+    prefill_config = cfg.cuda_graph_config.prefill
+    if (
+        cfg.moe_a2a_backend != "deepep"
+        or cfg.deepep_mode != "low_latency"
+        or prefill_config.backend != Backend.BREAKABLE
+    ):
+        return
+
+    capacity = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+    capture_buckets = prefill_config.bs or []
+    # An explicit empty list is the existing opt-out from prefill graph
+    # capture; cuda_graph_setup keeps the eager runner in that case.
+    if not capture_buckets:
+        return
+    supported = [bucket for bucket in capture_buckets if bucket <= capacity]
+    if not supported:
+        raise ValueError(
+            "DeepEP low-latency breakable prefill CUDA graph has no capture "
+            "bucket within "
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
+            f"{capacity}; increase the DeepEP capacity or configure a "
+            "smaller prefill CUDA graph bucket."
+        )
+
+    dropped = [bucket for bucket in capture_buckets if bucket > capacity]
+    if not dropped:
+        return
+
+    logger.warning(
+        "DeepEP low-latency prefill CUDA graph cannot capture buckets above "
+        "the per-rank dispatch capacity %d; keeping %s and routing larger "
+        "prefills to eager execution (dropped %s).",
+        capacity,
+        supported,
+        dropped,
+    )
+    declare_resolution(
+        server_args,
+        "_enforce_deepep_prefill_cuda_graph_capacity",
+        cuda_graph_config=with_phase(
+            cfg.cuda_graph_config,
+            Phase.PREFILL,
+            bs=supported,
+            max_bs=max(supported),
+        ),
+    )
 
 
 def validate_cuda_graph_config(server_args: Any):
