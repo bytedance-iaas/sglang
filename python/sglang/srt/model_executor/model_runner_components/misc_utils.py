@@ -43,33 +43,29 @@ def _resolve_pp_transformer(model):
     return None
 
 
-def _pp_boundary_is_scattered(model, *, incoming: bool) -> bool:
+def _pp_output_boundary_is_scattered(model) -> bool:
     transformer = _resolve_pp_transformer(model)
     if transformer is None or transformer.start_layer >= transformer.end_layer:
         return False
-    layer_id = transformer.start_layer if incoming else transformer.end_layer - 1
+    layer_id = transformer.end_layer - 1
     modes = getattr(transformer.layers[layer_id], "layer_scatter_modes", None)
-    mode = getattr(modes, "layer_input_mode" if incoming else "layer_output_mode", None)
+    mode = getattr(modes, "layer_output_mode", None)
     return getattr(mode, "name", None) == "SCATTERED"
 
 
 def get_pp_proxy_tensor_ownership(model) -> frozenset[str]:
     """Return keys owned by this PP lane at its outgoing boundary.
 
-    LayerScatterModes is the model's authoritative boundary contract.  A
-    scattered final local layer leaves hidden states and residual rank-local;
-    top-k indices intentionally remain full-width under the graph contract.
+    A model can explicitly declare auxiliary lane-local proxy tensors via
+    ``pp_proxy_tensors_all_gather_exclude``. LayerScatterModes additionally
+    determines whether the standard hidden states and residual are lane-local.
     """
-    if _pp_boundary_is_scattered(model, incoming=False):
-        return frozenset(("hidden_states", "residual"))
-    return frozenset()
-
-
-def get_pp_proxy_token_scatter_factor(
-    model, attn_tp_size: int, *, incoming: bool
-) -> int:
-    """Return the token scatter factor at one side of this PP stage."""
-    return attn_tp_size if _pp_boundary_is_scattered(model, incoming=incoming) else 1
+    send_whole_keys = set(
+        getattr(model, "pp_proxy_tensors_all_gather_exclude", None) or ()
+    )
+    if _pp_output_boundary_is_scattered(model):
+        send_whole_keys.update(("hidden_states", "residual"))
+    return frozenset(send_whole_keys)
 
 
 def maybe_disable_chunked_prefix_cache(

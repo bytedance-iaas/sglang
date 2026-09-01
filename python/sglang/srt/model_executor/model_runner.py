@@ -796,16 +796,6 @@ class ModelRunner:
     def get_pp_proxy_tensor_ownership(self) -> frozenset[str]:
         return misc_utils.get_pp_proxy_tensor_ownership(self.model)
 
-    def get_pp_proxy_input_token_scatter_factor(self) -> int:
-        return misc_utils.get_pp_proxy_token_scatter_factor(
-            self.model, self.ps.attn_tp_size, incoming=True
-        )
-
-    def get_pp_proxy_output_token_scatter_factor(self) -> int:
-        return misc_utils.get_pp_proxy_token_scatter_factor(
-            self.model, self.ps.attn_tp_size, incoming=False
-        )
-
     def decode_num_tokens_per_req(
         self, *, num_draft_tokens: Optional[int] = None
     ) -> int:

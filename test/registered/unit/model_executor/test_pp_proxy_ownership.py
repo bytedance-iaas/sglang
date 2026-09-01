@@ -2,7 +2,6 @@ import types
 
 from sglang.srt.model_executor.model_runner_components.misc_utils import (
     get_pp_proxy_tensor_ownership,
-    get_pp_proxy_token_scatter_factor,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -31,19 +30,15 @@ def test_scattered_boundary_owns_hidden_and_residual():
     mode = types.SimpleNamespace(name="SCATTERED")
     model = _wrapped_partition(mode, mode)
     assert get_pp_proxy_tensor_ownership(model) == {"hidden_states", "residual"}
-    assert get_pp_proxy_token_scatter_factor(model, 4, incoming=True) == 4
-    assert get_pp_proxy_token_scatter_factor(model, 4, incoming=False) == 4
 
 
 def test_full_boundary_keeps_all_proxy_keys_replicated():
     full = types.SimpleNamespace(name="TP_ATTN_FULL")
     model = _wrapped_partition(full, full)
     assert not get_pp_proxy_tensor_ownership(model)
-    assert get_pp_proxy_token_scatter_factor(model, 4, incoming=True) == 1
-    assert get_pp_proxy_token_scatter_factor(model, 4, incoming=False) == 1
 
 
-def test_incoming_and_outgoing_boundaries_are_independent():
+def test_only_outgoing_boundary_controls_transport_ownership():
     scattered = types.SimpleNamespace(name="SCATTERED")
     full = types.SimpleNamespace(name="TP_ATTN_FULL")
     model = types.SimpleNamespace(
@@ -53,5 +48,23 @@ def test_incoming_and_outgoing_boundaries_are_independent():
     )
 
     assert not get_pp_proxy_tensor_ownership(model)
-    assert get_pp_proxy_token_scatter_factor(model, 8, incoming=True) == 8
-    assert get_pp_proxy_token_scatter_factor(model, 8, incoming=False) == 1
+
+
+def test_explicit_model_ownership_is_preserved():
+    full = types.SimpleNamespace(name="TP_ATTN_FULL")
+    model = _wrapped_partition(full, full)
+    model.pp_proxy_tensors_all_gather_exclude = {"v_first", "topk_indices"}
+
+    assert get_pp_proxy_tensor_ownership(model) == {"v_first", "topk_indices"}
+
+
+def test_explicit_and_boundary_ownership_are_combined():
+    scattered = types.SimpleNamespace(name="SCATTERED")
+    model = _wrapped_partition(scattered, scattered)
+    model.pp_proxy_tensors_all_gather_exclude = {"topk_indices"}
+
+    assert get_pp_proxy_tensor_ownership(model) == {
+        "hidden_states",
+        "residual",
+        "topk_indices",
+    }

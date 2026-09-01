@@ -54,24 +54,35 @@ def _worker(rank, port):
             tp.rank_in_group + 1
         )
         replicated = torch.arange(8, dtype=torch.float32).reshape(2, 4)
-        if pp.rank_in_group == 0:
-            pp.send_tensor_dict(
-                {"sharded": sharded, "replicated": replicated, "tag": "proxy"},
-                all_gather_group=tp,
-                all_gather_exclude={"sharded"},
-            )
-        else:
-            got = pp.recv_tensor_dict(all_gather_group=tp)
-            torch.testing.assert_close(got["sharded"], sharded, rtol=0, atol=0)
-            torch.testing.assert_close(got["replicated"], replicated, rtol=0, atol=0)
-            assert got["tag"] == "proxy"
-        pp.barrier()
+        for async_send in (False, True):
+            if pp.rank_in_group == 0:
+                works = pp.send_tensor_dict(
+                    {
+                        "sharded": sharded,
+                        "replicated": replicated,
+                        "tag": "proxy",
+                    },
+                    all_gather_group=tp,
+                    all_gather_exclude={"sharded"},
+                    async_send=async_send,
+                )
+                for item in works or ():
+                    assert item.work is not None
+                    item.work.wait()
+            else:
+                got = pp.recv_tensor_dict(all_gather_group=tp)
+                torch.testing.assert_close(got["sharded"], sharded, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    got["replicated"], replicated, rtol=0, atol=0
+                )
+                assert got["tag"] == "proxy"
+            torch.distributed.barrier()
     finally:
         torch.distributed.destroy_process_group()
 
 
 class TestPPTensorOwnership(CustomTestCase):
-    def test_sender_metadata_controls_mixed_dict(self):
+    def test_sender_metadata_controls_sync_and_async_mixed_dict(self):
         mp.spawn(_worker, args=(find_available_port(24000),), nprocs=WORLD, join=True)
 
 

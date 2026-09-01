@@ -3000,6 +3000,15 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts()
         self.use_dsa = is_deepseek_dsa(config)
+        # DSA indexer top-k is computed independently on every attention-TP
+        # lane unless the optional broadcast is enabled. Its token axis can be
+        # full-width while its values are still lane-local, so PP transport
+        # must send it whole instead of splicing slices from different lanes.
+        self.pp_proxy_tensors_all_gather_exclude = (
+            frozenset()
+            if not self.use_dsa or envs.SGLANG_DSA_TOPK_BROADCAST.get()
+            else frozenset(("topk_indices",))
+        )
         self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
