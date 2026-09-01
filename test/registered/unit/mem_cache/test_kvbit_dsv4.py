@@ -350,7 +350,7 @@ class TestDSV4KVBitAttentionMath(CustomTestCase):
                     )
 
                 torch.testing.assert_close(
-                    output.float(), torch.full_like(output.float(), 5.0 / 3.0)
+                    output.float(), torch.full_like(output, 5.0 / 3.0).float()
                 )
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
