@@ -22,6 +22,56 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _resolve_pp_transformer(model):
+    """Find the PP-partitioned transformer behind common model wrappers."""
+    pending = [model]
+    visited = set()
+    while pending:
+        candidate = pending.pop(0)
+        if candidate is None or id(candidate) in visited:
+            continue
+        visited.add(id(candidate))
+        if (
+            getattr(candidate, "layers", None) is not None
+            and getattr(candidate, "start_layer", None) is not None
+            and getattr(candidate, "end_layer", None) is not None
+        ):
+            return candidate
+        pending.extend(
+            getattr(candidate, attr, None) for attr in ("model", "language_model")
+        )
+    return None
+
+
+def _pp_boundary_is_scattered(model, *, incoming: bool) -> bool:
+    transformer = _resolve_pp_transformer(model)
+    if transformer is None or transformer.start_layer >= transformer.end_layer:
+        return False
+    layer_id = transformer.start_layer if incoming else transformer.end_layer - 1
+    modes = getattr(transformer.layers[layer_id], "layer_scatter_modes", None)
+    mode = getattr(modes, "layer_input_mode" if incoming else "layer_output_mode", None)
+    return getattr(mode, "name", None) == "SCATTERED"
+
+
+def get_pp_proxy_tensor_ownership(model) -> frozenset[str]:
+    """Return keys owned by this PP lane at its outgoing boundary.
+
+    LayerScatterModes is the model's authoritative boundary contract.  A
+    scattered final local layer leaves hidden states and residual rank-local;
+    top-k indices intentionally remain full-width under the graph contract.
+    """
+    if _pp_boundary_is_scattered(model, incoming=False):
+        return frozenset(("hidden_states", "residual"))
+    return frozenset()
+
+
+def get_pp_proxy_token_scatter_factor(
+    model, attn_tp_size: int, *, incoming: bool
+) -> int:
+    """Return the token scatter factor at one side of this PP stage."""
+    return attn_tp_size if _pp_boundary_is_scattered(model, incoming=incoming) else 1
+
+
 def maybe_disable_chunked_prefix_cache(
     *, use_mla_backend: bool, is_draft_worker: bool
 ) -> None:

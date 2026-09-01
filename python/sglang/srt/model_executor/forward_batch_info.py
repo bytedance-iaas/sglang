@@ -1770,6 +1770,11 @@ def build_inner_fb_view(
 
 class PPProxyTensors:
     # adapted from https://github.com/vllm-project/vllm/blob/d14e98d924724b284dc5eaf8070d935e214e50c0/vllm/sequence.py#L1103
+    #
+    # Each field has its own attention-TP ownership. Replicated fields may use
+    # PP send-slice/receive-all-gather; lane-local fields must be sent whole.
+    # The sender records that decision in TensorMetadata so the receiver cannot
+    # reconstruct a field with a mismatched ownership assumption.
     tensors: Dict[str, torch.Tensor]
 
     def __init__(self, tensors):

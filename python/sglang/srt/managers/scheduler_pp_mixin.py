@@ -566,7 +566,16 @@ class SchedulerPPMixin:
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.ps.pp_size + get_parallel().pp_async_batch_depth
-        # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
+        # The all-gather group is fixed by topology. Per-tensor ownership is
+        # carried by TensorMetadata.send_whole (upstream #30095), so a sharded
+        # proxy key cannot disable transport for replicated keys in the same
+        # dict. Models may declare the actual non-replicated proxy keys.
+        self.pp_proxy_all_gather_exclude = (
+            self.tp_worker.model_runner.get_pp_proxy_tensor_ownership()
+        )
+        # DSA prefill CP has a rank-local transport contract for the whole
+        # message. Preserve that existing topology-wide fallback; outside CP,
+        # sender metadata selects lane-preserving transport per proxy key.
         self.require_attn_tp_allgather = (
             not get_parallel().enable_dsa_prefill_context_parallel
         )
@@ -1062,6 +1071,9 @@ class SchedulerPPMixin:
                     self.attn_tp_group if self.require_attn_tp_allgather else None
                 ),
                 async_send=async_send,
+                all_gather_exclude=(
+                    self.pp_proxy_all_gather_exclude if msg_type == "proxy" else None
+                ),
             )
         )
         return p2p_work
