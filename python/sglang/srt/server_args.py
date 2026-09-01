@@ -304,7 +304,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "marlin",
 ]
 
-BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl", "torch"]
+BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl", "gemv", "torch"]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
 RETRACTION_POLICY_CHOICES = ["length", "priority"]
@@ -1729,7 +1729,7 @@ class ServerArgs:
     bf16_gemm_backend: A[
         str,
         Arg(
-            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM100/SM103 (Blackwell), otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10X; dispatches between the CuTe DSL kernel and cuBLAS), 'torch' (always uses cuBLAS via torch.nn.functional.linear, even on SM100/SM103).",
+            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM100/SM103 (Blackwell), otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10X; dispatches between the CuTe DSL kernel and cuBLAS), 'gemv' (Hopper single-token bf16 GEMV JIT kernel on SM90; dispatches to cuBLAS for m > 1), 'torch' (always uses cuBLAS via torch.nn.functional.linear, even on SM100/SM103).",
             cli_name="--bf16-gemm-backend",
             choices=BF16_GEMM_BACKEND_CHOICES,
         ),
