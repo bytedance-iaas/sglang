@@ -37,6 +37,10 @@ on:
         required: false
         type: boolean
         default: true
+      image_formats:
+        description: "Volcengine fork only: CSV of image formats to build (oci, zstd, nydus)."
+        required: false
+        default: "oci,zstd,nydus"
       private_debug_base_only:
         description: "Volcengine fork only: build and publish exactly one AMD64 CUDA 13 base image, without compiling a kernel wheel or building SBO/W4A8 variants."
         required: false
@@ -340,6 +344,7 @@ jobs:
       tag_value: ${{ inputs.tag }}
       use_environment: prod
       artifact_name: ${{ (github.event_name == 'schedule' || inputs.compile_kernel) && matrix.artifact_name || '' }}
+      image_formats: ${{ github.event_name == 'schedule' && 'oci,zstd,nydus' || inputs.image_formats }}
       extra_build_args: >-
         --build-arg BRANCH_TYPE=local
         --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)

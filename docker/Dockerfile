@@ -51,7 +51,18 @@ fi
 # Ubuntu 24.04 ships Python 3.12 in main, so we no longer need the deadsnakes
 # PPA. Dropping it avoids transient Launchpad 504s in `add-apt-repository`.
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
-    apt update && apt install -y --no-install-recommends wget curl software-properties-common \
+    retry_apt_update() { \
+        for i in 1 2 3 4 5; do \
+            rm -rf /var/lib/apt/lists/*; \
+            apt-get clean; \
+            apt-get update && return 0; \
+            echo "apt update attempt $i failed; sleeping 15s"; \
+            sleep 15; \
+        done; \
+        return 1; \
+    }; \
+    retry_apt_update \
+    && apt-get install -y --no-install-recommends wget curl software-properties-common \
     && apt install -y --no-install-recommends python3.12-full python3.12-dev \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
