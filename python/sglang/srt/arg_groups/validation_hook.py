@@ -17,6 +17,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
@@ -34,11 +35,21 @@ def check_pipeline_parallelism(server_args: Any) -> None:
         and cfg.speculative_algorithm in ("EAGLE", "EAGLE3")
         and not cfg.enable_multi_layer_eagle
     )
-    assert cfg.speculative_algorithm is None or pp_prefill_eagle, (
-        "Pipeline parallelism with speculative decoding is only supported "
-        "for disaggregation prefill with EAGLE/EAGLE3; speculative decode "
-        "requires a draft worker on ranks where PP does not create one"
+    pp_decode_eagle = (
+        envs.SGLANG_ENABLE_PP_SPEC.get()
+        and cfg.disaggregation_mode in ("decode", "null")
+        and cfg.speculative_algorithm == "EAGLE"
+        and not cfg.enable_multi_layer_eagle
     )
+    assert cfg.speculative_algorithm is None or pp_prefill_eagle or pp_decode_eagle, (
+        "Pipeline parallelism with speculative decoding is only supported "
+        "for disaggregation prefill with EAGLE/EAGLE3, or for explicitly "
+        "enabled Decode PP with single-layer EAGLE"
+    )
+    if pp_decode_eagle:
+        assert not cfg.speculative_adaptive, (
+            "Decode PP with EAGLE requires static speculative parameters"
+        )
     assert cfg.disable_overlap_schedule, (
         "Pipeline parallelism is not compatible with overlap schedule"
     )
