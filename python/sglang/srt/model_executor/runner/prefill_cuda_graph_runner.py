@@ -92,6 +92,7 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
 )
+from sglang.srt.model_executor.runner.base_runner import resolve_pp_proxy_num_tokens
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
@@ -676,7 +677,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if buffers is None or self.model_runner.pp_group.is_first_rank:
             return None
         return PPProxyTensors(
-            {name: buffer[:num_tokens] for name, buffer in buffers.items()}
+            {
+                name: buffer[
+                    : resolve_pp_proxy_num_tokens(
+                        tensor_name=name,
+                        num_tokens=num_tokens,
+                        forward_mode=self.capture_forward_mode,
+                        attn_cp_size=self.model_runner.ps.attn_cp_size,
+                        input_token_scatter_factor=self.model_runner.get_pp_proxy_input_token_scatter_factor(),
+                    )
+                ]
+                for name, buffer in buffers.items()
+            }
         )
 
     @contextmanager
@@ -1138,6 +1150,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         replace_embeds,
         prefix_lens,
         is_target_verify: bool,
+        is_draft_extend_v2: bool = False,
         capture_hidden_mode,
         return_logprob: bool,
         lora_ineligible: bool = False,
@@ -1149,6 +1162,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ``capture_hidden_mode=None`` when unknown at the call site (it is
         rank-uniform; forward-time-only checking cannot split the group).
         """
+        # Prefill graphs are captured with EXTEND geometry. DRAFT_EXTEND_V2
+        # deliberately does not inherit context-parallel token slicing, so a
+        # CP-sized capture would expose the wrong PP proxy rows. Keep this
+        # decision in the shared local predicate so every DP rank agrees.
+        if is_draft_extend_v2 and self.model_runner.ps.attn_cp_size > 1:
+            return False
         if self._is_full_backend and batch_size > self._capture_req_slots:
             return False
         # LoRA replays need prepare_lora_batch's static metadata. lora_manager
@@ -1216,6 +1235,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             replace_embeds=forward_batch.replace_embeds,
             prefix_lens=forward_batch.extend_prefix_lens_cpu,
             is_target_verify=forward_batch.forward_mode.is_target_verify(),
+            is_draft_extend_v2=forward_batch.forward_mode.is_draft_extend_v2(),
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             return_logprob=forward_batch.return_logprob,
             lora_ineligible=self.enable_lora
@@ -1859,14 +1879,27 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     def _finalize_execute_output(
-        self, output
+        self, output, *, forward_mode: ForwardMode
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         if isinstance(output, LogitsProcessorOutput):
             return self._trim_logits_output(output)
         if isinstance(output, EmbeddingPoolerOutput):
             return output
         assert isinstance(output, PPProxyTensors)
-        return _slice_output_rows(output, self.raw_num_tokens)
+        return PPProxyTensors(
+            {
+                name: tensor[
+                    : resolve_pp_proxy_num_tokens(
+                        tensor_name=name,
+                        num_tokens=self.raw_num_tokens,
+                        forward_mode=forward_mode,
+                        attn_cp_size=self.model_runner.ps.attn_cp_size,
+                        input_token_scatter_factor=self.model_runner.get_pp_proxy_output_token_scatter_factor(),
+                    )
+                ]
+                for name, tensor in output.tensors.items()
+            }
+        )
 
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
         if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
@@ -1918,4 +1951,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     raw_num_tokens,
                     **kwargs,
                 )
-            return self._finalize_execute_output(output)
+            return self._finalize_execute_output(
+                output, forward_mode=forward_batch.forward_mode
+            )

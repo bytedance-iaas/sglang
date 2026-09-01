@@ -2,6 +2,7 @@ import types
 
 from sglang.srt.model_executor.model_runner_components.misc_utils import (
     get_pp_proxy_tensor_ownership,
+    get_pp_proxy_token_scatter_factor,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -30,12 +31,16 @@ def test_scattered_boundary_owns_hidden_and_residual():
     mode = types.SimpleNamespace(name="SCATTERED")
     model = _wrapped_partition(mode, mode)
     assert get_pp_proxy_tensor_ownership(model) == {"hidden_states", "residual"}
+    assert get_pp_proxy_token_scatter_factor(model, 4, incoming=True) == 4
+    assert get_pp_proxy_token_scatter_factor(model, 4, incoming=False) == 4
 
 
 def test_full_boundary_keeps_all_proxy_keys_replicated():
     full = types.SimpleNamespace(name="TP_ATTN_FULL")
     model = _wrapped_partition(full, full)
     assert not get_pp_proxy_tensor_ownership(model)
+    assert get_pp_proxy_token_scatter_factor(model, 4, incoming=True) == 1
+    assert get_pp_proxy_token_scatter_factor(model, 4, incoming=False) == 1
 
 
 def test_only_outgoing_boundary_controls_transport_ownership():
@@ -48,6 +53,8 @@ def test_only_outgoing_boundary_controls_transport_ownership():
     )
 
     assert not get_pp_proxy_tensor_ownership(model)
+    assert get_pp_proxy_token_scatter_factor(model, 8, incoming=True) == 8
+    assert get_pp_proxy_token_scatter_factor(model, 8, incoming=False) == 1
 
 
 def test_explicit_model_ownership_is_preserved():

@@ -68,6 +68,19 @@ def get_pp_proxy_tensor_ownership(model) -> frozenset[str]:
     return frozenset(send_whole_keys)
 
 
+def get_pp_proxy_token_scatter_factor(
+    model, attn_tp_size: int, *, incoming: bool
+) -> int:
+    """Return the token-row scatter factor at one side of this PP stage."""
+    transformer = _resolve_pp_transformer(model)
+    if transformer is None or transformer.start_layer >= transformer.end_layer:
+        return 1
+    layer_id = transformer.start_layer if incoming else transformer.end_layer - 1
+    modes = getattr(transformer.layers[layer_id], "layer_scatter_modes", None)
+    mode = getattr(modes, "layer_input_mode" if incoming else "layer_output_mode", None)
+    return attn_tp_size if getattr(mode, "name", None) == "SCATTERED" else 1
+
+
 def maybe_disable_chunked_prefix_cache(
     *, use_mla_backend: bool, is_draft_worker: bool
 ) -> None:

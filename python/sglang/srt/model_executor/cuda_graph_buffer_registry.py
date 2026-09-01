@@ -68,6 +68,49 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
         _foreach_copy(group_dsts, group_srcs)
 
 
+def zero_pp_proxy_buffer_tail(buffer: torch.Tensor, source: torch.Tensor) -> None:
+    """Clear graph-resident PP rows that are not overwritten by ``source``."""
+    source_len = source.shape[0]
+    if source_len > buffer.shape[0]:
+        raise ValueError(
+            f"PP proxy source length {source_len} exceeds graph buffer "
+            f"length {buffer.shape[0]}"
+        )
+    if source_len < buffer.shape[0]:
+        buffer[source_len:].zero_()
+
+
+def copy_pp_proxy_tensors_to_graph_buffers(
+    destination: Dict[str, torch.Tensor], source: Any
+) -> None:
+    """Copy live PP proxy rows and clear every graph-buffer tail.
+
+    Graph buffers are a stable-address superset of the fields used by every
+    model.  A live proxy may therefore omit a destination key; clear that
+    whole buffer so a previous replay cannot leak through.  The converse is
+    invalid because an unknown source key would be silently dropped.
+    """
+    destination_keys = set(destination)
+    source_keys = set(source.tensors)
+    if extra := sorted(source_keys - destination_keys):
+        raise ValueError(
+            "PP proxy tensors have no matching graph buffers: " f"extra={extra}"
+        )
+
+    for key, buffer in destination.items():
+        src = source.tensors.get(key)
+        if src is None:
+            buffer.zero_()
+            continue
+        if src.shape[0] > buffer.shape[0]:
+            raise ValueError(
+                f"PP proxy tensor {key!r} has {src.shape[0]} rows, but its "
+                f"graph buffer has only {buffer.shape[0]}"
+            )
+        buffer[: src.shape[0]].copy_(src)
+        zero_pp_proxy_buffer_tail(buffer, src)
+
+
 class PaddingPolicy(Enum):
     """How to handle ``raw_n < padded_n`` for a slot.
 
@@ -115,6 +158,17 @@ class FillContext:
     # slot's source_fn — e.g. the pipeline-parallel proxy tensors, which the
     # replay path receives as a separate argument rather than off the FB.
     pp_proxy_tensors: Optional[Any] = None
+
+
+def _validate_pp_proxy_buffer_keys(
+    destination_keys: Any, pp_proxy_tensors: Optional[Any]
+) -> None:
+    if pp_proxy_tensors is None:
+        return
+    if extra := sorted(set(pp_proxy_tensors.tensors) - set(destination_keys)):
+        raise ValueError(
+            "PP proxy tensors have no matching graph buffers: " f"extra={extra}"
+        )
 
 
 @dataclass
@@ -411,6 +465,14 @@ class CudaGraphBufferRegistry:
             raw_num_tokens=raw_num_tokens,
             padded_num_tokens=padded_num_tokens,
             pp_proxy_tensors=pp_proxy_tensors,
+        )
+        _validate_pp_proxy_buffer_keys(
+            (
+                name.removeprefix("pp_proxy_tensors.")
+                for name in self._slots
+                if name.startswith("pp_proxy_tensors.")
+            ),
+            pp_proxy_tensors,
         )
 
         # Phase 1: reset padded regions where it matters.
@@ -745,7 +807,20 @@ def build_decode_registry(
             def _pp_source(key):
                 def _fn(_fb, ctx):
                     ppx = ctx.pp_proxy_tensors
-                    return None if ppx is None else ppx.tensors[key]
+                    return None if ppx is None else ppx.tensors.get(key)
+
+                return _fn
+
+            def _pp_zero_tail(key):
+                def _fn(buf, _fb, ctx):
+                    ppx = ctx.pp_proxy_tensors
+                    if ppx is None:
+                        return
+                    src = ppx.tensors.get(key)
+                    if src is None:
+                        buf.zero_()
+                    else:
+                        zero_pp_proxy_buffer_tail(buf, src)
 
                 return _fn
 
@@ -758,6 +833,7 @@ def build_decode_registry(
                         axis="none",
                         padding_policy=PaddingPolicy.KEEP_PAD,
                         source_fn=_pp_source(_key),
+                        post_fill=_pp_zero_tail(_key),
                     ),
                     bind=_backing,
                 )
@@ -960,6 +1036,19 @@ def build_prefill_registry(
 
                 return _fn
 
+            def _pp_zero_tail(key):
+                def _fn(buf, _fb, ctx):
+                    ppx = ctx.pp_proxy_tensors
+                    if ppx is None:
+                        return
+                    src = ppx.tensors.get(key)
+                    if src is None:
+                        buf.zero_()
+                    else:
+                        zero_pp_proxy_buffer_tail(buf, src)
+
+                return _fn
+
             for _key, _backing in pp.items():
                 reg.register_slot(
                     GraphSlot(
@@ -972,6 +1061,7 @@ def build_prefill_registry(
                         axis="tokens",
                         padding_policy=PaddingPolicy.ZERO,
                         source_fn=_pp_source(_key),
+                        post_fill=_pp_zero_tail(_key),
                     ),
                     bind=_backing,
                 )

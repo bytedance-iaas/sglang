@@ -10,7 +10,7 @@ import torch
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_prefill_registry,
 )
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
     _build_layer_model_forward_kwargs,
@@ -73,11 +73,22 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
 
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.buffers = buffers
+        runner.capture_forward_mode = ForwardMode.TARGET_VERIFY
+        runner.require_attn_tp_gather = True
         runner.model_runner = SimpleNamespace(
-            pp_group=SimpleNamespace(is_first_rank=False)
+            pp_group=SimpleNamespace(is_first_rank=False),
+            ps=SimpleNamespace(pp_rank=1, attn_tp_size=2, attn_cp_size=1),
+            get_pp_proxy_input_token_scatter_factor=lambda: 2,
         )
         capture_proxy = runner._capture_pp_proxy_tensors(3)
-        torch.testing.assert_close(capture_proxy.tensors, full_proxy.tensors)
+        self.assertEqual(tuple(capture_proxy["hidden_states"].shape), (2, 2))
+        self.assertEqual(tuple(capture_proxy["residual"].shape), (2, 2))
+        torch.testing.assert_close(
+            capture_proxy["hidden_states"], full_proxy["hidden_states"][:2]
+        )
+        torch.testing.assert_close(
+            capture_proxy["residual"], full_proxy["residual"][:2]
+        )
         self.assertEqual(
             capture_proxy["hidden_states"].data_ptr(),
             buffers.pp_proxy_tensors["hidden_states"].data_ptr(),
@@ -113,12 +124,20 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
     def test_finalize_pp_proxy_trims_padded_token_rows(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.raw_num_tokens = 3
+        runner.capture_forward_mode = ForwardMode.EXTEND
+        runner.require_attn_tp_gather = True
+        runner.model_runner = SimpleNamespace(
+            ps=SimpleNamespace(pp_rank=0, attn_tp_size=2, attn_cp_size=1),
+            get_pp_proxy_output_token_scatter_factor=lambda: 2,
+        )
         output = PPProxyTensors({"hidden_states": torch.arange(10).reshape(5, 2)})
-        trimmed = runner._finalize_execute_output(output)
+        trimmed = runner._finalize_execute_output(
+            output, forward_mode=runner.capture_forward_mode
+        )
         self.assertIsInstance(trimmed, PPProxyTensors)
-        self.assertEqual(tuple(trimmed["hidden_states"].shape), (3, 2))
+        self.assertEqual(tuple(trimmed["hidden_states"].shape), (2, 2))
         torch.testing.assert_close(
-            trimmed["hidden_states"][-1], output["hidden_states"][2]
+            trimmed["hidden_states"][-1], output["hidden_states"][1]
         )
 
     def test_resolve_layer_model_from_language_model_wrapper(self):
@@ -183,10 +202,107 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
     def test_pipeline_proxy_output_is_supported(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.raw_num_tokens = 3
+        runner.capture_forward_mode = ForwardMode.EXTEND
+        runner.require_attn_tp_gather = True
+        runner.model_runner = SimpleNamespace(
+            ps=SimpleNamespace(pp_rank=0, attn_tp_size=2, attn_cp_size=1),
+            get_pp_proxy_output_token_scatter_factor=lambda: 2,
+        )
         output = PPProxyTensors({"hidden_states": torch.zeros((8, 8))})
 
-        finalized = runner._finalize_execute_output(output)
-        self.assertEqual(finalized["hidden_states"].shape, (3, 8))
+        finalized = runner._finalize_execute_output(
+            output, forward_mode=runner.capture_forward_mode
+        )
+        self.assertEqual(finalized["hidden_states"].shape, (2, 8))
+
+    def test_pp_proxy_widths_follow_tp_and_topk_contracts(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.raw_num_tokens = 5
+        runner.capture_forward_mode = ForwardMode.TARGET_VERIFY
+        runner.require_attn_tp_gather = True
+        runner.model_runner = SimpleNamespace(
+            ps=SimpleNamespace(pp_rank=1, attn_tp_size=2, attn_cp_size=1),
+            get_pp_proxy_output_token_scatter_factor=lambda: 2,
+        )
+        output = PPProxyTensors(
+            {
+                "hidden_states": torch.zeros((8, 4)),
+                "residual": torch.zeros((8, 4)),
+                "topk_indices": torch.zeros((8,), dtype=torch.int64),
+            }
+        )
+
+        finalized = runner._finalize_execute_output(
+            output, forward_mode=runner.capture_forward_mode
+        )
+
+        self.assertEqual(tuple(finalized["hidden_states"].shape), (3, 4))
+        self.assertEqual(tuple(finalized["residual"].shape), (3, 4))
+        self.assertEqual(tuple(finalized["topk_indices"].shape), (5,))
+
+    def test_pp_proxy_widths_follow_boundary_not_global_gather_gate(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.raw_num_tokens = 5
+        runner.capture_forward_mode = ForwardMode.TARGET_VERIFY
+        # This intentionally disagrees with the boundary capability.  CUDA
+        # graph geometry must follow the model's actual PP input ownership.
+        runner.require_attn_tp_gather = True
+        runner.model_runner = SimpleNamespace(
+            ps=SimpleNamespace(pp_rank=1, attn_tp_size=2, attn_cp_size=1),
+            get_pp_proxy_output_token_scatter_factor=lambda: 1,
+        )
+        output = PPProxyTensors({"hidden_states": torch.zeros((8, 4))})
+
+        finalized = runner._finalize_execute_output(
+            output, forward_mode=runner.capture_forward_mode
+        )
+
+        self.assertEqual(tuple(finalized["hidden_states"].shape), (5, 4))
+
+    def test_pp_proxy_widths_use_context_parallel_for_extend_and_mixed(self):
+        for forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
+            with self.subTest(forward_mode=forward_mode):
+                runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+                runner.raw_num_tokens = 5
+                runner.capture_forward_mode = forward_mode
+                runner.require_attn_tp_gather = True
+                runner.model_runner = SimpleNamespace(
+                    ps=SimpleNamespace(pp_rank=1, attn_tp_size=2, attn_cp_size=4),
+                    get_pp_proxy_output_token_scatter_factor=lambda: 2,
+                )
+                output = PPProxyTensors(
+                    {
+                        "hidden_states": torch.zeros((8, 4)),
+                        "residual": torch.zeros((8, 4)),
+                        "topk_indices": torch.zeros((8,), dtype=torch.int64),
+                    }
+                )
+
+                finalized = runner._finalize_execute_output(
+                    output, forward_mode=forward_mode
+                )
+
+                self.assertEqual(tuple(finalized["hidden_states"].shape), (2, 4))
+                self.assertEqual(tuple(finalized["residual"].shape), (2, 4))
+                self.assertEqual(tuple(finalized["topk_indices"].shape), (2,))
+
+    def test_draft_extend_with_cp_falls_back_from_prefill_graph(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.model_runner = SimpleNamespace(ps=SimpleNamespace(attn_cp_size=4))
+
+        self.assertFalse(
+            runner.can_replay_locally(
+                batch_size=1,
+                num_tokens=4,
+                input_embeds=None,
+                replace_embeds=None,
+                prefix_lens=None,
+                is_target_verify=False,
+                is_draft_extend_v2=True,
+                capture_hidden_mode=None,
+                return_logprob=False,
+            )
+        )
 
     def test_bcg_eager_tail_uses_live_multimodal_embeddings(self):
         live_embeds = object()

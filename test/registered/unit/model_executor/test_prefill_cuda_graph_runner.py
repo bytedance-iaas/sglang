@@ -179,6 +179,10 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
     def test_pp_proxy_output_is_trimmed_to_raw_prefill_tokens(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.raw_num_tokens = 3
+        runner.model_runner = SimpleNamespace(
+            ps=SimpleNamespace(attn_cp_size=1),
+            get_pp_proxy_output_token_scatter_factor=lambda: 1,
+        )
         output = PPProxyTensors(
             {
                 "hidden_states": torch.arange(32).view(8, 4),
@@ -186,7 +190,9 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             }
         )
 
-        trimmed = runner._finalize_execute_output(output)
+        trimmed = runner._finalize_execute_output(
+            output, forward_mode=ForwardMode.EXTEND
+        )
 
         self.assertIsInstance(trimmed, PPProxyTensors)
         self.assertEqual(tuple(trimmed["hidden_states"].shape), (3, 4))
@@ -438,7 +444,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             input_ids=torch.zeros(4, dtype=torch.int64),
             input_embeds=None,
             replace_embeds=None,
-            forward_mode=SimpleNamespace(is_target_verify=lambda: False),
+            forward_mode=ForwardMode.EXTEND,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             global_num_tokens_cpu=None,
             return_logprob=False,

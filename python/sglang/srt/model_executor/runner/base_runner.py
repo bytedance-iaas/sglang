@@ -67,6 +67,30 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def resolve_pp_proxy_num_tokens(
+    *,
+    tensor_name: str,
+    num_tokens: int,
+    forward_mode: ForwardMode,
+    attn_cp_size: int,
+    input_token_scatter_factor: int,
+) -> int:
+    """Return the number of token rows owned by one PP proxy field.
+
+    Context-parallel extend owns a CP shard for every proxy field. Otherwise,
+    only the standard hidden-state fields follow layer-boundary ownership.
+    Auxiliary fields keep their full token axis unless they define a separate
+    geometry contract.
+    """
+    if forward_mode.is_context_parallel_extend() and attn_cp_size > 1:
+        return (num_tokens + attn_cp_size - 1) // attn_cp_size
+    if tensor_name in ("hidden_states", "residual") and input_token_scatter_factor > 1:
+        return (
+            num_tokens + input_token_scatter_factor - 1
+        ) // input_token_scatter_factor
+    return num_tokens
+
+
 def _allocate_decode_buffers(
     *,
     device: torch.device,
@@ -530,16 +554,20 @@ class BaseRunner(ABC):
             extend_start_loc = None
 
         if get_parallel().pp_size > 1:
-            # PP0 already cp-split hidden_states before send.
-            pp_hidden_tokens = num_tokens
-            if (
-                capture_forward_mode == ForwardMode.EXTEND
-                and mr.ps.pp_rank != 0
-                and mr.ps.attn_cp_size > 1
-            ):
-                pp_hidden_tokens = num_tokens // mr.ps.attn_cp_size
+            input_token_scatter_factor = mr.get_pp_proxy_input_token_scatter_factor()
             pp_proxy_tensors = PPProxyTensors(
-                {k: v[:pp_hidden_tokens] for k, v in buffers.pp_proxy_tensors.items()}
+                {
+                    k: v[
+                        : resolve_pp_proxy_num_tokens(
+                            tensor_name=k,
+                            num_tokens=num_tokens,
+                            forward_mode=capture_forward_mode,
+                            attn_cp_size=mr.ps.attn_cp_size,
+                            input_token_scatter_factor=input_token_scatter_factor,
+                        )
+                    ]
+                    for k, v in buffers.pp_proxy_tensors.items()
+                }
             )
 
         # TP-gather requirements for global token metadata.

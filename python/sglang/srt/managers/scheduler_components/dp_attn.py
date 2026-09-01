@@ -336,6 +336,7 @@ def _local_prefill_cuda_graph_vote(
         replace_embeds=replace_embeds,
         prefix_lens=prefix_lens,
         is_target_verify=mode.is_target_verify(),
+        is_draft_extend_v2=mode.is_draft_extend_v2(),
         capture_hidden_mode=None,
         return_logprob=return_logprob,
         lora_ineligible=prefill_graph_runner.enable_lora,

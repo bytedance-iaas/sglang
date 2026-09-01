@@ -59,6 +59,7 @@ from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     build_decode_registry,
+    copy_pp_proxy_tensors_to_graph_buffers,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -75,6 +76,7 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     freeze_gc,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_executor.runner.base_runner import resolve_pp_proxy_num_tokens
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     maybe_flashinfer_autotune_speculative_draft,
 )
@@ -931,7 +933,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # pipeline parallelism
         if self.pp_size > 1:
             pp_proxy_tensors = PPProxyTensors(
-                {k: v[:num_tokens] for k, v in buffers.pp_proxy_tensors.items()}
+                {
+                    k: v[
+                        : resolve_pp_proxy_num_tokens(
+                            tensor_name=k,
+                            num_tokens=num_tokens,
+                            forward_mode=self.capture_forward_mode,
+                            attn_cp_size=self.model_runner.ps.attn_cp_size,
+                            input_token_scatter_factor=self.model_runner.get_pp_proxy_input_token_scatter_factor(),
+                        )
+                    ]
+                    for k, v in buffers.pp_proxy_tensors.items()
+                }
             )
 
         if self.require_mlp_tp_gather:
@@ -1305,6 +1318,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            if pp_proxy_tensors is not None and hasattr(
+                self.buffers, "pp_proxy_tensors"
+            ):
+                copy_pp_proxy_tensors_to_graph_buffers(
+                    self.buffers.pp_proxy_tensors, pp_proxy_tensors
+                )
             if (
                 not is_ragged
                 and self.model_runner.spec_algorithm.is_dflash_family()
@@ -1512,7 +1531,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         else:
             assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            return PPProxyTensors(
+                {
+                    k: v[
+                        : resolve_pp_proxy_num_tokens(
+                            tensor_name=k,
+                            num_tokens=self.raw_num_token,
+                            forward_mode=forward_batch.forward_mode,
+                            attn_cp_size=self.model_runner.ps.attn_cp_size,
+                            input_token_scatter_factor=self.model_runner.get_pp_proxy_output_token_scatter_factor(),
+                        )
+                    ]
+                    for k, v in output.tensors.items()
+                }
+            )
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None
