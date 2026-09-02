@@ -2,8 +2,8 @@
 # Fixed-BU4 sparse decode support for DSV4 packed persistent KV.
 FetchContent_Declare(
     repo-flashmla
-    URL      https://${GITHUB_ARTIFACTORY}/yuyu5333/FlashMLA/archive/f45de930aa8124749ac6f2777ee9e6a7f398da8f.tar.gz
-    URL_HASH SHA256=c0d8f1bfcf67810f279bbefd2fb343ee33227e249cd0d047d796c09d5c3a3bb9
+    URL      https://${GITHUB_ARTIFACTORY}/yuyu5333/FlashMLA/archive/98751d47134c8f2f1a4df5b07875144c3d8075d1.tar.gz
+    URL_HASH SHA256=45e28146eec2017479a087840247ceff7049762e1091ec9aa0cd95978a912086
 )
 FetchContent_Populate(repo-flashmla)
 
