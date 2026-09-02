@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 
 from sglang.srt.configs.model_config import ModelImpl
-from sglang.srt.distributed import get_world_group
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     prealloc_symmetric_memory_pool,
 )
@@ -56,6 +56,26 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.base_runner import BaseRunner
 
 logger = logging.getLogger(__name__)
+
+
+def get_deep_gemm_memory_budget_gb(model_runner: ModelRunner) -> float:
+    """Return the minimum free memory among ranks running this model.
+
+    Speculative draft models can be present on only the last pipeline stage.
+    Their graph capture therefore must not enter a world-group collective:
+    earlier pipeline stages have already left initialization and will never
+    post the matching operation. ``draft_tp_context`` patches the TP group to
+    the draft model's actual participants, so the current TP group is the
+    common synchronization scope for both target and draft runners.
+    """
+
+    model_group = get_tp_group()
+    return get_available_gpu_memory(
+        model_runner.device,
+        model_runner.gpu_id,
+        distributed=model_group.world_size > 1,
+        cpu_group=model_group.cpu_group,
+    )
 
 
 def _align_pipeline_layers(layers: list, layer_model) -> list:
@@ -214,13 +234,7 @@ def capture_cuda_graphs(
             set_masked_standard_layout_memory_budget,
         )
 
-        world_group = get_world_group()
-        available_memory_gb = get_available_gpu_memory(
-            model_runner.device,
-            model_runner.gpu_id,
-            distributed=world_group.world_size > 1,
-            cpu_group=world_group.cpu_group,
-        )
+        available_memory_gb = get_deep_gemm_memory_budget_gb(model_runner)
         budget_bytes = set_masked_standard_layout_memory_budget(
             int(available_memory_gb * (1 << 30))
         )

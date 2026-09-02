@@ -7,12 +7,36 @@ from sglang.srt.model_executor.model_runner_components import cuda_graph_setup
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     _align_pipeline_layers,
     capture_decode_graph,
+    get_deep_gemm_memory_budget_gb,
     has_standard_gqa_for_all_local_layers,
     index_attention_layers_by_global_id,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+def test_deep_gemm_memory_budget_uses_current_model_tp_group(monkeypatch):
+    """A PP-last-only EAGLE draft must not synchronize with world ranks."""
+
+    draft_cpu_group = object()
+    draft_group = SimpleNamespace(world_size=8, cpu_group=draft_cpu_group)
+    calls = []
+    monkeypatch.setattr(cuda_graph_setup, "get_tp_group", lambda: draft_group)
+    monkeypatch.setattr(
+        cuda_graph_setup,
+        "get_available_gpu_memory",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or 17.5,
+    )
+
+    model_runner = SimpleNamespace(device="cuda", gpu_id=3)
+    assert get_deep_gemm_memory_budget_gb(model_runner) == 17.5
+    assert calls == [
+        (
+            ("cuda", 3),
+            {"distributed": True, "cpu_group": draft_cpu_group},
+        )
+    ]
 
 
 def test_standard_gqa_gate_uses_pipeline_local_layer_range():
