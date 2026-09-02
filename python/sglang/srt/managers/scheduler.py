@@ -4152,14 +4152,22 @@ class Scheduler(
                 self._relay_forward_payload(batch, batch.req_pool_indices, batch_result)
                 batch.input_ids = None
                 self._copy_auxiliary_output_to_cpu(batch, batch_result)
-            elif not batch.spec_algorithm.is_none():
-                # Non-overlap: drive the V2 worker synchronously (no
-                # future_map relay / on_publish).
+            elif not batch.spec_algorithm.is_none() and self.ps.pp_size > 1:
+                # PP + spec advances request-visible state after the last-stage
+                # result returns around the output ring.  Do not overwrite the
+                # relayed raw verify tree here with a rank-local draft input.
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
                     batch_result = self.model_worker.forward_batch_generation(
                         batch, pp_proxy_tensors=pp_proxy_tensors
                     )
+                self.update_cache_from_scheduler(batch, batch_result)
+            elif not batch.spec_algorithm.is_none():
+                # Non-overlap: drive the V2 worker synchronously (no
+                # future_map relay / on_publish).
+                resolve_forward_inputs(batch, self.future_map)
+                with self._forward_isolation(batch, overlap=False):
+                    batch_result = self.model_worker.forward_batch_generation(batch)
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input

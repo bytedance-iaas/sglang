@@ -283,11 +283,23 @@ class DeepseekV2WeightLoaderMixin:
                         nextn_layer_prefix=layer_prefix,
                         nextn_spec_weight_names=spec_weight_names,
                     ):
-                        if not name.startswith(layer_prefix):
+                        # lm_head is always shared from the target model.
+                        if "shared_head.head" in name:
                             continue
 
-                        # Use shared head and embed weights from target model
-                        if "shared_head.head" in name or "embed_tokens" in name:
+                        # A PP draft is constructed as a standalone model on the
+                        # last target stage.  That target stage has no embedding
+                        # to share, so retain the checkpoint embedding for the
+                        # draft.  In the non-PP case the target embedding remains
+                        # the single source of truth.
+                        is_embed = "embed_tokens" in name
+                        if is_embed and (
+                            self.pp_group.world_size == 1
+                            or not self.pp_group.is_last_rank
+                        ):
+                            continue
+
+                        if not name.startswith(layer_prefix) and not is_embed:
                             continue
 
                         # Transform name: NextN-specific → "model.*", decoder → "model.decoder.*"
@@ -390,8 +402,13 @@ class DeepseekV2WeightLoaderMixin:
                         # Skip loading extra bias for GPTQ models.
                         if name.endswith(".bias") and name not in params_dict:
                             continue
-                        # Skip loading embed_tokens if not first rank in pipeline parallelism
-                        if ".embed_tokens." in name and not self.pp_group.is_first_rank:
+                        # The standalone NextN draft on the target's last PP
+                        # stage must keep the embedding admitted above.
+                        if (
+                            ".embed_tokens." in name
+                            and not is_nextn
+                            and not self.pp_group.is_first_rank
+                        ):
                             continue
                         # Skip loading norm if not last rank in pipeline parallelism
                         if ".norm." in name and not self.pp_group.is_last_rank:
@@ -528,6 +545,7 @@ class DeepseekV2WeightLoaderMixin:
                 "eh_proj",
                 "enorm",
                 "hnorm",
+                "embed_tokens",
             ],
         )
 

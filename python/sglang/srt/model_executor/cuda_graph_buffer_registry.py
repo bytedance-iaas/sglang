@@ -68,6 +68,18 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
         _foreach_copy(group_dsts, group_srcs)
 
 
+def zero_pp_proxy_buffer_tail(buffer: torch.Tensor, source: torch.Tensor) -> None:
+    """Clear graph-resident PP rows not overwritten by the live source."""
+    source_len = source.shape[0]
+    if source_len > buffer.shape[0]:
+        raise ValueError(
+            f"PP proxy source length {source_len} exceeds graph buffer "
+            f"length {buffer.shape[0]}"
+        )
+    if source_len < buffer.shape[0]:
+        buffer[source_len:].zero_()
+
+
 class PaddingPolicy(Enum):
     """How to handle ``raw_n < padded_n`` for a slot.
 
@@ -749,6 +761,17 @@ def build_decode_registry(
 
                 return _fn
 
+            def _pp_zero_tail(key):
+                def _fn(buf, _fb, ctx):
+                    ppx = ctx.pp_proxy_tensors
+                    if ppx is None:
+                        return
+                    src = ppx.tensors.get(key)
+                    if src is not None:
+                        zero_pp_proxy_buffer_tail(buf, src)
+
+                return _fn
+
             for _key, _backing in pp.items():
                 reg.register_slot(
                     GraphSlot(
@@ -758,6 +781,7 @@ def build_decode_registry(
                         axis="none",
                         padding_policy=PaddingPolicy.KEEP_PAD,
                         source_fn=_pp_source(_key),
+                        post_fill=_pp_zero_tail(_key),
                     ),
                     bind=_backing,
                 )

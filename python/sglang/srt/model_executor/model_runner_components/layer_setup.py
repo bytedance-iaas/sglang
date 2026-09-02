@@ -196,14 +196,18 @@ def _assert_pp_mtp_compat(
     num_effective_layers: int,
     model_num_layers: int,
 ) -> None:
+    # PP partitions the target model, so each rank sees fewer effective layers.
+    # EAGLE and DSpark intentionally host their MTP draft on the last PP stage
+    # and implement the cross-stage verify protocol.
     assert (
         (not model_has_mtp_layers)
         or (spec_algorithm.is_none())
-        or (
-            (not spec_algorithm.is_none())
-            and (num_effective_layers == model_num_layers)
-        )
-    ), "PP is not compatible with MTP models."
+        or (num_effective_layers == model_num_layers)
+        or (spec_algorithm.is_eagle() or spec_algorithm.is_dspark())
+    ), (
+        "PP is not compatible with MTP models except when using EAGLE or "
+        "DSpark speculative decoding."
+    )
 
 
 def adjust_hybrid_swa_layer_ids(

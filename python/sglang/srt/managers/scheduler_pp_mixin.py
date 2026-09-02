@@ -38,19 +38,33 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.observability.req_time_stats import set_time_batch
-from sglang.srt.runtime_context import get_disagg, get_parallel
+from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
 from sglang.srt.sampling.sampling_observer_pp import (
     add_auxiliary_output_to_pp_tensors,
     pop_auxiliary_output_from_pp_tensors,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
+from sglang.srt.utils import (
+    DynamicGradMode,
+    broadcast_pyobj,
+    point_to_point_pyobj,
+    require_attn_tp_gather,
+)
 from sglang.srt.utils.common import get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
+
+
+def should_pp_allgather_tensors(
+    *,
+    enable_dsa_prefill_context_parallel: bool,
+    require_attn_tp_gather_: bool,
+) -> bool:
+    """Whether PP tensors are replicated across attention-TP ranks."""
+    return not enable_dsa_prefill_context_parallel and not require_attn_tp_gather_
 
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
@@ -63,6 +77,27 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
         and not batch.contains_last_prefill_chunk
         and not batch.return_logprob
     )
+
+
+def _pp_snapshot_graph_output_tensors(
+    tensor_dict: Dict[str, torch.Tensor], can_run_cuda_graph: bool
+) -> Dict[str, torch.Tensor]:
+    """Detach asynchronous PP sends from CUDA-graph-owned output buffers."""
+    if not can_run_cuda_graph:
+        return tensor_dict
+
+    def clone_tensors(value):
+        if torch.is_tensor(value):
+            return value.clone()
+        if isinstance(value, list):
+            return [clone_tensors(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(clone_tensors(item) for item in value)
+        if isinstance(value, dict):
+            return {key: clone_tensors(item) for key, item in value.items()}
+        return value
+
+    return {key: clone_tensors(value) for key, value in tensor_dict.items()}
 
 
 @dataclass
@@ -566,9 +601,16 @@ class SchedulerPPMixin:
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.ps.pp_size + get_parallel().pp_async_batch_depth
-        # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
-        self.require_attn_tp_allgather = (
-            not get_parallel().enable_dsa_prefill_context_parallel
+        # The send-slice/receive-all-gather optimization is valid only when
+        # every attention-TP rank owns an identical PP tensor. A2A MoE and
+        # fully-DP dense layers leave model outputs token-scattered, so each PP
+        # lane must send its local tensor intact. DSA prefill CP is likewise
+        # rank-local and already bypasses the optimization.
+        self.require_attn_tp_allgather = should_pp_allgather_tensors(
+            enable_dsa_prefill_context_parallel=(
+                get_parallel().enable_dsa_prefill_context_parallel
+            ),
+            require_attn_tp_gather_=require_attn_tp_gather(),
         )
         self.mbs = [None] * self.pp_loop_size
         self.last_mbs = [None] * self.pp_loop_size
@@ -1039,6 +1081,8 @@ class SchedulerPPMixin:
             else None
         )
         add_auxiliary_output_to_pp_tensors(tensor_dict, auxiliary_output)
+        if result.pp_verify_input_raw is not None:
+            tensor_dict.update(result.pp_verify_input_raw.to_tensor_dict())
         return tensor_dict
 
     def _pp_send_dict_to_next_stage(
@@ -1152,6 +1196,7 @@ class SchedulerPPMixin:
         pp_outputs: PPProxyTensors,
     ):
         from sglang.srt.managers.scheduler import GenerationBatchResult
+        from sglang.srt.speculative.eagle_info import EaglePPVerifyInputRaw
 
         logits_output = None
         extend_input_len_per_req = None
@@ -1174,11 +1219,23 @@ class SchedulerPPMixin:
                     logits_output = LogitsProcessorOutput(next_token_logits=None)
                 logits_output.auxiliary_device_output = auxiliary_output
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
+        batch.input_ids = next_token_ids
 
-        # Rebind the last stage's ring proposal as batch.spec_info so the PD result
-        # processor sees the same object on every rank.
+        # Rebind the last-stage proposal.  PP + EAGLE uses a CPU raw tree so
+        # every rank rebuilds its own verify buffers; other speculative paths
+        # keep the existing tensor relay through future_map.
         next_draft_input = None
-        if "draft_topk_p" in pp_outputs.tensors:
+        if self.spec_algorithm.is_eagle() and "pp_spec_output" in pp_outputs.tensors:
+            batch.spec_info = EaglePPVerifyInputRaw.from_pp_outputs(pp_outputs)
+        elif (
+            self.spec_algorithm.is_eagle()
+            and batch.forward_mode.is_extend()
+            and batch.contains_last_prefill_chunk
+        ):
+            batch.spec_info = EaglePPVerifyInputRaw.build_dummy_for_decode(
+                batch, get_spec().speculative_num_draft_tokens
+            )
+        elif "draft_topk_p" in pp_outputs.tensors:
             from sglang.srt.speculative.eagle_info import EagleDraftInput
 
             next_draft_input = EagleDraftInput(
@@ -1194,20 +1251,27 @@ class SchedulerPPMixin:
         # PP rank 0 also relays into output_tokens_buf so the next iter's
         # resolve_forward_inputs finds these tokens for the decode portion
         # of mixed-chunk batches (which gather via mix_running_indices).
-        self.future_map.stash(
-            batch.req_pool_indices,
-            RelayPayload(
-                bonus_tokens=next_token_ids,
-                topk_p=None if next_draft_input is None else next_draft_input.topk_p,
-                topk_index=(
-                    None if next_draft_input is None else next_draft_input.topk_index
+        if not isinstance(batch.spec_info, EaglePPVerifyInputRaw):
+            self.future_map.stash(
+                batch.req_pool_indices,
+                RelayPayload(
+                    bonus_tokens=next_token_ids,
+                    topk_p=(
+                        None if next_draft_input is None else next_draft_input.topk_p
+                    ),
+                    topk_index=(
+                        None
+                        if next_draft_input is None
+                        else next_draft_input.topk_index
+                    ),
+                    hidden_states=(
+                        None
+                        if next_draft_input is None
+                        else next_draft_input.hidden_states
+                    ),
                 ),
-                hidden_states=(
-                    None if next_draft_input is None else next_draft_input.hidden_states
-                ),
-            ),
-        )
-        batch.input_ids = None
+            )
+            batch.input_ids = None
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
@@ -1217,7 +1281,24 @@ class SchedulerPPMixin:
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
         )
-        output_result.copy_auxiliary_output_to_cpu()
+        if isinstance(batch.spec_info, EaglePPVerifyInputRaw):
+            output_result.accept_lens = torch.tensor(
+                batch.spec_info.accept_lens, dtype=torch.int64
+            )
+            output_result.speculative_num_draft_tokens = (
+                get_spec().speculative_num_draft_tokens
+            )
+        # The PP result processor consumes next_token_ids (and, for spec-v2,
+        # accept_lens) on CPU.  Schedule the full result copy on copy_stream;
+        # the caller records d2h_event on that same stream and waits before
+        # process_batch_result.  Copying only auxiliary output leaves the
+        # speculative token tensor on CUDA and violates
+        # _resolve_spec_v2_tokens' CPU contract.
+        output_result.copy_done = self.device_module.Event()
+        output_result.copy_to_cpu(
+            return_logprob=batch.return_logprob,
+            return_hidden_states=batch.return_hidden_states,
+        )
         return output_result
 
     def _pp_process_batch_result(
@@ -1355,6 +1436,12 @@ class SchedulerPPMixin:
                 mb_metadata[mb_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
                 )
+                output_tensors = None
+                if self.pp_group.is_last_rank:
+                    output_tensors = _pp_snapshot_graph_output_tensors(
+                        self._pp_prepare_tensor_dict(result, cur_batch),
+                        result.can_run_cuda_graph,
+                    )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())
                 if self.pp_group.is_last_rank:
@@ -1362,9 +1449,7 @@ class SchedulerPPMixin:
                     last_rank_comm_queue.append(
                         (
                             event,
-                            PPProxyTensors(
-                                self._pp_prepare_tensor_dict(result, cur_batch)
-                            ),
+                            PPProxyTensors(output_tensors),
                         )
                     )
         return result, event

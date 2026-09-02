@@ -9,6 +9,7 @@ import torch
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 logger = logging.getLogger(__name__)
@@ -148,6 +149,21 @@ class ScheduleBatchDisaggregationDecodeMixin:
             future_map,
         )
         if spec_info is not None:
+            if get_parallel().pp_size > 1:
+                # A running PP decode batch already carries a raw draft tree.
+                # Normalize each newly transferred PD request before merge so
+                # both sides use the same speculative input representation.
+                from sglang.srt.speculative.eagle_info import (
+                    EagleDraftInput,
+                    EaglePPVerifyInputRaw,
+                )
+
+                if isinstance(spec_info, EagleDraftInput):
+                    self.input_ids = spec_info.bonus_tokens
+                    spec_info = EaglePPVerifyInputRaw.build_dummy_from_bonus_tokens(
+                        bonus_tokens=spec_info.bonus_tokens,
+                        num_draft=get_spec().speculative_num_draft_tokens,
+                    )
             self.spec_info = spec_info
         else:
             # Non-spec: stash last token into the relay so the first DECODE's

@@ -22,7 +22,10 @@ from sglang.srt.state_capturer.base import TopkCaptureOutput
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
     from sglang.srt.sampling.sampling_observer import HostAuxiliaryOutput
-    from sglang.srt.speculative.eagle_info import EagleDraftInput
+    from sglang.srt.speculative.eagle_info import (
+        EagleDraftInput,
+        EaglePPVerifyInputRaw,
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -82,6 +85,7 @@ class GenerationBatchResult:
     # FIXME(lsyin): maybe move to a better place?
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None
+    accept_index: Optional[torch.Tensor] = None
 
     block_accept_lens: Optional[torch.Tensor] = None
 
@@ -108,6 +112,10 @@ class GenerationBatchResult:
     # Forward pass metrics (FPM) — GPU-accurate timing via CUDA events
     fpm_start_event: Optional[torch.cuda.Event] = None
     fpm_end_event: Optional[torch.cuda.Event] = None
+
+    # PP + EAGLE: the last stage produces the next raw verify tree and the PP
+    # output ring relays it to every stage for the following iteration.
+    pp_verify_input_raw: Optional[EaglePPVerifyInputRaw] = None
 
     auxiliary_host_output: Optional[HostAuxiliaryOutput] = None
 

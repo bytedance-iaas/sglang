@@ -40,7 +40,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
@@ -71,10 +75,13 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
+    EaglePPVerifyInputRaw,
     EagleVerifyInput,
 )
 from sglang.srt.speculative.eagle_utils import (
+    TreeMaskMode,
     _eagle_prefill_tail_tokens,
+    build_tree_kernel_efficient,
     default_tree_mask_mode,
     get_draft_recurrent_hidden_state_spec,
     organize_draft_results,
@@ -284,7 +291,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def init_lm_head(self):
         from sglang.srt.lora.layers import unwrap_lora_layer
 
-        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+        pp_size = self.target_worker.pp_group.world_size
+        if pp_size > 1:
+            # The draft worker is a standalone PP-size-1 model on the last
+            # target stage, so it loads its own embedding from the checkpoint.
+            # The target last stage owns only lm_head (its embedding is a
+            # PPMissingLayer), therefore share just the target head.
+            head = self.target_worker.model_runner.model.get_head()
+        else:
+            embed, head = self.target_worker.model_runner.model.get_embed_and_head()
         target_lm_head = unwrap_lora_layer(
             getattr(self.target_worker.model_runner.model, "lm_head", None)
         )
@@ -305,16 +320,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 hasattr(self.draft_runner.model, "load_lm_head_from_target")
                 and self.draft_runner.model.load_lm_head_from_target
             ):
-                self.draft_runner.model.set_embed_and_head(embed, head)
+                if pp_size > 1:
+                    self.draft_runner.model.set_head(head)
+                else:
+                    self.draft_runner.model.set_embed_and_head(embed, head)
                 maybe_share_target_lm_head()
             else:
-                self.draft_runner.model.set_embed(embed)
+                if pp_size == 1:
+                    self.draft_runner.model.set_embed(embed)
 
             # grab hot token ids
             if self.draft_runner.model.hot_token_id is not None:
-                self.hot_token_id = self.draft_runner.model.hot_token_id.to(
-                    embed.device
-                )
+                self.hot_token_id = self.draft_runner.model.hot_token_id.to(head.device)
 
         else:
             if self.hot_token_id is not None and head is not None:
@@ -322,8 +339,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.hot_token_id = self.hot_token_id.to(head.device)
                 head.data = head.data[self.hot_token_id]
 
-            # Share the embedding and lm_head
-            self.draft_runner.model.set_embed_and_head(embed, head)
+            if pp_size > 1:
+                self.draft_runner.model.set_head(head)
+            else:
+                self.draft_runner.model.set_embed_and_head(embed, head)
             maybe_share_target_lm_head()
 
     def init_attention_backend(self):
@@ -554,6 +573,31 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.draft_forward(forward_batch)
                 )
+
+        if self.server_args.pp_size > 1:
+            # The PP last rank owns the draft model.  Relay the raw tree rather
+            # than a rank-local verify input so every target stage can rebuild
+            # masks and positions against its own attention buffers.
+            if batch.forward_mode.is_idle():
+                num_draft = self.speculative_num_draft_tokens
+                parent_width = max(num_draft - 1, 0)
+                return (
+                    torch.empty((0, num_draft), dtype=torch.long, device="cpu"),
+                    torch.empty((0, parent_width), dtype=torch.long, device="cpu"),
+                    torch.empty((0, parent_width), dtype=torch.long, device="cpu"),
+                )
+
+            # CUDA graph outputs are replay buffers.  Clone before the next
+            # graph launch can overwrite data still queued for the PP ring.
+            if can_run_decode_cuda_graph:
+                parent_list = parent_list.clone()
+                top_scores_index = top_scores_index.clone()
+                draft_tokens = draft_tokens.clone()
+
+            draft_tokens = torch.cat(
+                (draft_input.bonus_tokens.unsqueeze(1), draft_tokens), dim=1
+            ).flatten()
+            return draft_tokens, parent_list, top_scores_index
 
         return build_eagle_verify_input(
             batch,
@@ -1080,10 +1124,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
         )
+        self._pp_enabled = get_parallel().pp_size > 1
+        self._pp_is_last_rank = get_pp_group().is_last_rank
+        # Non-last PP ranks have no draft worker but still need the same tree
+        # mask policy when rebuilding relayed verify trees.
+        self.tree_mask_mode = default_tree_mask_mode()
 
         # Only the last PP stage runs the draft; other EAGLEWorkerV2 instances
         # return proxies so scheduler dispatch remains rank-uniform.
-        self._hosts_draft = get_pp_group().is_last_rank
+        self._hosts_draft = self._pp_is_last_rank
         self._draft_worker = (
             EagleDraftWorker(
                 server_args,
@@ -1174,18 +1223,31 @@ class EAGLEWorkerV2(BaseSpecWorker):
         grammar_barrier=None,
         pp_proxy_tensors=None,
     ):
-        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+        # Idle DP ranks must follow the global prefill phase under PP so the
+        # MegaMoE collective sequence remains aligned with active peers.
+        run_as_prefill = batch.forward_mode.is_extend() or (
+            self._pp_enabled
+            and batch.forward_mode.is_idle()
+            and batch.is_extend_in_batch
+        )
+        if run_as_prefill:
             # Target prefill
-            target_capture_mode = (
-                CaptureHiddenMode.NULL
-                if self.speculative_algorithm.is_standalone()
-                else CaptureHiddenMode.FULL
-            )
+            if not self._pp_enabled or self._pp_is_last_rank:
+                target_capture_mode = (
+                    CaptureHiddenMode.NULL
+                    if self.speculative_algorithm.is_standalone()
+                    else CaptureHiddenMode.FULL
+                )
+            else:
+                target_capture_mode = CaptureHiddenMode.NULL
             batch_output = self.target_worker.forward_batch_generation(
                 batch,
                 pp_proxy_tensors=pp_proxy_tensors,
                 capture_hidden_mode=target_capture_mode,
             )
+
+            if self._pp_enabled and not self._pp_is_last_rank:
+                return batch_output
 
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
             # Extend processed L prompt tokens; next verify iter expects same L.
@@ -1193,11 +1255,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # Publish before draft_extend so the fence is at target-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
-
-            # A rank that does not host the draft (prefill-side PP builds it only on
-            # the last stage) forwards the target's proxy tensors and stops here.
-            if self._draft_worker is None:
-                return batch_output
 
             # Draft prefill
             with (
@@ -1216,49 +1273,67 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         batch_output.logits_output.mm_input_embeds,
                     )
                 )
-                return batch_output
+            return batch_output
         else:
-            self.activate_step_by_batch(batch.seq_lens.shape[0])
-
-            if batch.spec_info is None:
-                capture_mode = (
-                    CaptureHiddenMode.NULL
-                    if self.speculative_algorithm.is_standalone()
-                    else CaptureHiddenMode.LAST
-                )
-                hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
-                    self.draft_worker.draft_runner
-                )
-                batch.spec_info = EagleDraftInput.create_idle_input(
-                    device=self.device,
-                    hidden_size=hidden_size,
-                    dtype=hidden_dtype,
-                    topk=self.topk,
-                    capture_hidden_mode=capture_mode,
-                    vocab_size=self.target_worker.model_config.vocab_size,
-                )
-            if self.speculative_num_steps == 0:
-                # Drafting disabled (high batch size). _draft_extend below still
-                # runs, keeping draft KV warm for when the batch shrinks.
-                verify_input = self._build_trivial_verify_input(batch)
+            # Every PP stage verifies the same raw tree.  Only the last stage
+            # drafts, samples, and creates the next tree.
+            if batch.forward_mode.is_idle():
+                verify_input = self._build_idle_verify_input(batch)
+            elif self._pp_enabled:
+                if isinstance(batch.spec_info, EagleDraftInput):
+                    batch.input_ids = batch.spec_info.bonus_tokens
+                    batch.spec_info = EaglePPVerifyInputRaw.build_dummy_for_decode(
+                        batch, self.speculative_num_draft_tokens
+                    )
+                verify_input = self._build_verify_input_from_pp_raw(batch)
             else:
-                with (
-                    self.draft_worker.draft_tp_context(
-                        self.draft_worker.draft_runner.tp_group
-                    ),
-                    speculative_moe_backend_context(),
-                    speculative_moe_a2a_backend_context(),
-                    spec_stage_span("draft"),
-                ):
-                    verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
+                self.activate_step_by_batch(batch.seq_lens.shape[0])
+
+                if batch.spec_info is None:
+                    capture_mode = (
+                        CaptureHiddenMode.NULL
+                        if self.speculative_algorithm.is_standalone()
+                        else CaptureHiddenMode.LAST
+                    )
+                    hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
+                        self.draft_worker.draft_runner
+                    )
+                    batch.spec_info = EagleDraftInput.create_idle_input(
+                        device=self.device,
+                        hidden_size=hidden_size,
+                        dtype=hidden_dtype,
+                        topk=self.topk,
+                        capture_hidden_mode=capture_mode,
+                        vocab_size=self.target_worker.model_config.vocab_size,
+                    )
+                if self.speculative_num_steps == 0:
+                    verify_input = self._build_trivial_verify_input(batch)
+                else:
+                    with (
+                        self.draft_worker.draft_tp_context(
+                            self.draft_worker.draft_runner.tp_group
+                        ),
+                        speculative_moe_backend_context(),
+                        speculative_moe_a2a_backend_context(),
+                        spec_stage_span("draft"),
+                    ):
+                        verify_input = self.draft_worker.draft(batch)
+
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
-            batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
-            # Publish before draft_extend so the fence is at verify-end.
+            batch_output = self.verify(
+                batch,
+                grammar_barrier=grammar_barrier,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+            if self._pp_enabled and not self._pp_is_last_rank:
+                return batch_output
+
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
             if (
-                self.speculative_num_steps == 0
+                not self._pp_enabled
+                and self.speculative_num_steps == 0
                 and envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.get()
             ):
                 self._stub_skipped_draft_extend(batch, batch_output)
@@ -1272,8 +1347,110 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     spec_stage_span("draft_extend"),
                 ):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
+                    if self._pp_enabled:
+                        batch.forward_mode = ForwardMode.DECODE
+                        batch.spec_info = batch_output.next_draft_input
+                        batch.seq_lens = batch_output.new_seq_lens
+                        (
+                            pp_draft_tokens,
+                            pp_parent_list,
+                            pp_top_scores_index,
+                        ) = self.draft_worker.draft(batch)
+
+            if self._pp_enabled:
+                batch_output.pp_verify_input_raw = EaglePPVerifyInputRaw(
+                    draft_tokens=pp_draft_tokens.reshape(
+                        batch.batch_size(), self.speculative_num_draft_tokens
+                    ).tolist(),
+                    bonus_tokens=batch_output.next_draft_input.bonus_tokens.to(
+                        torch.int64
+                    ).tolist(),
+                    top_scores_index=pp_top_scores_index.tolist(),
+                    parent_list=pp_parent_list.tolist(),
+                    accept_lens=batch_output.accept_lens.tolist(),
+                    accept_index=(
+                        batch_output.accept_index.tolist() if self.topk > 1 else None
+                    ),
+                )
 
             return batch_output
+
+    def _build_idle_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
+        return EagleVerifyInput.create_idle_input(
+            self.topk,
+            self.speculative_num_steps,
+            self.speculative_num_draft_tokens,
+            device=self.device,
+        )
+
+    def _build_verify_input_from_pp_raw(self, batch: ScheduleBatch) -> EagleVerifyInput:
+        raw: EaglePPVerifyInputRaw = batch.spec_info
+        device = batch.seq_lens.device
+        num_draft = self.speculative_num_draft_tokens
+        bonus_tokens = torch.tensor(raw.bonus_tokens, dtype=torch.long, device=device)
+        draft_tokens = torch.tensor(raw.draft_tokens, dtype=torch.long, device=device)
+        parent_list = torch.tensor(raw.parent_list, dtype=torch.long, device=device)
+        top_scores_index = torch.tensor(
+            raw.top_scores_index, dtype=torch.long, device=device
+        )
+        bs = batch.seq_lens.shape[0]
+        assert parent_list.shape == (bs, num_draft - 1), (
+            f"topology shape mismatch: {parent_list.shape} vs "
+            f"({bs}, {num_draft - 1})"
+        )
+
+        attn_backend = self.target_worker.model_runner.attn_backend
+        verify_mask = attn_backend.verify_mask
+        if verify_mask is None:
+            tree_mask_buf, mask_mode, fill_mask = None, self.tree_mask_mode, True
+        else:
+            mask_mode, fill_mask = verify_mask.mode, verify_mask.is_read
+            tree_mask_buf = verify_mask.buffer if verify_mask.fits(bs) else None
+        seq_lens_sum = batch.seq_lens_sum
+        if seq_lens_sum is None:
+            if tree_mask_buf is not None or mask_mode == TreeMaskMode.QLEN_ONLY:
+                seq_lens_sum = 0
+            else:
+                seq_lens_sum = bs * attn_backend.max_context_len
+
+        (
+            tree_mask,
+            positions,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            draft_tokens_arranged,
+        ) = build_tree_kernel_efficient(
+            bonus_tokens,
+            parent_list,
+            top_scores_index,
+            draft_tokens[:, 1:],
+            batch.seq_lens,
+            seq_lens_sum,
+            self.topk,
+            self.speculative_num_steps,
+            num_draft,
+            mask_mode,
+            tree_mask_buf,
+            fill_prefix_mask=fill_mask,
+        )
+        draft_tokens_arranged = draft_tokens_arranged.to(torch.int64)
+        batch.input_ids = draft_tokens_arranged
+        return EagleVerifyInput(
+            draft_token=draft_tokens_arranged,
+            custom_mask=tree_mask,
+            positions=positions,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_cum_len=None,
+            spec_steps=self.speculative_num_steps,
+            topk=self.topk,
+            draft_token_num=num_draft,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            seq_lens_sum=batch.seq_lens_sum,
+            seq_lens_cpu=batch.seq_lens_cpu,
+        )
 
     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
         """Build a 1-node EagleVerifyInput rooted at the previous bonus token.
@@ -1570,7 +1747,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
             dw._rebuild_topk1_chain_buffers()
 
-    def verify(self, batch: ScheduleBatch, grammar_barrier=None):
+    def verify(self, batch: ScheduleBatch, grammar_barrier=None, pp_proxy_tensors=None):
         return run_eagle_verify(
             batch,
             target_worker=self.target_worker,
@@ -1584,6 +1761,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             metadata_ready_pre_pad=False,
             finalize_tree_path=True,
             grammar_barrier=grammar_barrier,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):

@@ -954,6 +954,7 @@ class TestBuildDecodeRegistry(unittest.TestCase):
         pp = SimpleNamespace(
             tensors={"hidden_states": torch.ones((3, 2), dtype=torch.int32)}
         )
+        hs.fill_(9)
         reg.fill_from(
             fb,
             raw_bs=3,
@@ -963,7 +964,7 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             pp_proxy_tensors=pp,
         )
         self.assertTrue(torch.all(hs[:3] == 1))
-        self.assertTrue(torch.all(hs[3:] == 0))  # tail untouched
+        self.assertTrue(torch.all(hs[3:] == 0))  # stale graph tail cleared
 
         hs.fill_(2)
         reg = build_prefill_registry(

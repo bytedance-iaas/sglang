@@ -1,10 +1,11 @@
 import logging
-from dataclasses import dataclass
-from typing import List, Optional
+from dataclasses import asdict, dataclass
+from typing import List, Optional, Tuple
 
 import torch
 
 from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
@@ -387,3 +388,106 @@ class EagleDraftExtendInput(SpecInput):
             req_to_token.size(1),
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, None
+
+
+@dataclass
+class EaglePPVerifyInputRaw(SpecInput):
+    """CPU-side draft tree relayed from the PP last rank to every stage.
+
+    Each stage rebuilds an :class:`EagleVerifyInput` against its own attention
+    backend buffers.  Relaying the raw tree avoids sharing rank-local masks and
+    positions and gives every stage the same verify topology.
+    """
+
+    draft_tokens: List[List[int]]
+    bonus_tokens: List[int]
+    top_scores_index: List[List[int]]
+    parent_list: List[List[int]]
+    accept_lens: List[int]
+    accept_index: Optional[List] = None
+
+    def __post_init__(self):
+        super().__init__(SpecInputType.EAGLE_PP_VERIFY_INPUT_RAW)
+
+    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
+        num_draft = (
+            len(self.draft_tokens[0])
+            if self.draft_tokens and isinstance(self.draft_tokens[0], list)
+            else 1
+        )
+        return num_draft, num_draft
+
+    def to_tensor_dict(self) -> dict:
+        return {"pp_spec_output": asdict(self)}
+
+    @classmethod
+    def from_pp_outputs(cls, pp_outputs):
+        return cls(**pp_outputs["pp_spec_output"])
+
+    @classmethod
+    def build_dummy_for_decode(
+        cls, batch: ScheduleBatch, num_draft: int
+    ) -> "EaglePPVerifyInputRaw":
+        return cls.build_dummy_from_bonus_tokens(batch.input_ids, num_draft)
+
+    @classmethod
+    def build_dummy_from_bonus_tokens(
+        cls, bonus_tokens: torch.Tensor, num_draft: int
+    ) -> "EaglePPVerifyInputRaw":
+        bonus_tokens = bonus_tokens.tolist()
+        bs = len(bonus_tokens)
+        parent_width = max(num_draft - 1, 0)
+        draft_tokens = [bonus_tokens[i : i + 1] * num_draft for i in range(bs)]
+        parent_row = list(range(-1, parent_width - 1))
+        score_row = list(range(parent_width))
+        return cls(
+            draft_tokens=draft_tokens,
+            bonus_tokens=bonus_tokens,
+            top_scores_index=[score_row[:] for _ in range(bs)],
+            parent_list=[parent_row[:] for _ in range(bs)],
+            accept_lens=[1] * bs,
+            accept_index=None,
+        )
+
+    def filter_batch(
+        self,
+        new_indices: torch.Tensor,
+        has_been_filtered: bool = False,
+        new_indices_cpu: Optional[List[int]] = None,
+    ):
+        del has_been_filtered
+        idx = new_indices_cpu if new_indices_cpu is not None else new_indices.tolist()
+
+        def pick(values):
+            return [values[i] for i in idx]
+
+        try:
+            self.bonus_tokens = pick(self.bonus_tokens)
+            self.draft_tokens = pick(self.draft_tokens)
+            self.top_scores_index = pick(self.top_scores_index)
+            self.parent_list = pick(self.parent_list)
+            self.accept_lens = pick(self.accept_lens)
+            if self.accept_index is not None:
+                self.accept_index = pick(self.accept_index)
+        except TypeError as exc:
+            raise RuntimeError(
+                "EaglePPVerifyInputRaw.filter_batch requires a relayed or dummy "
+                "draft tree for every PP + EAGLE decode batch."
+            ) from exc
+
+    def merge_batch(self, other: "EaglePPVerifyInputRaw"):
+        try:
+            if self.accept_index is not None and other.accept_index is not None:
+                self.accept_index += other.accept_index
+            else:
+                self.accept_index = None
+            self.draft_tokens += other.draft_tokens
+            self.bonus_tokens += other.bonus_tokens
+            self.top_scores_index += other.top_scores_index
+            self.parent_list += other.parent_list
+            self.accept_lens += other.accept_lens
+        except TypeError as exc:
+            raise RuntimeError(
+                "EaglePPVerifyInputRaw.merge_batch requires a relayed or dummy "
+                "draft tree for every PP + EAGLE decode batch."
+            ) from exc

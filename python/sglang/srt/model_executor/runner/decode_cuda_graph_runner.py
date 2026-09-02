@@ -75,6 +75,7 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     freeze_gc,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_executor.runner.base_runner import resolve_pp_proxy_num_tokens
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     maybe_flashinfer_autotune_speculative_draft,
 )
@@ -931,7 +932,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # pipeline parallelism
         if self.pp_size > 1:
             pp_proxy_tensors = PPProxyTensors(
-                {k: v[:num_tokens] for k, v in buffers.pp_proxy_tensors.items()}
+                {
+                    key: value[
+                        : resolve_pp_proxy_num_tokens(
+                            tensor_name=key,
+                            num_tokens=num_tokens,
+                            forward_mode=self.capture_forward_mode,
+                            pp_rank=self.model_runner.ps.pp_rank,
+                            attn_tp_size=self.model_runner.ps.attn_tp_size,
+                            attn_cp_size=self.model_runner.ps.attn_cp_size,
+                            require_attn_tp_gather_=self.require_attn_tp_gather,
+                        )
+                    ]
+                    for key, value in buffers.pp_proxy_tensors.items()
+                }
             )
 
         if self.require_mlp_tp_gather:
@@ -1512,7 +1526,22 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         else:
             assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            return PPProxyTensors(
+                {
+                    key: value[
+                        : resolve_pp_proxy_num_tokens(
+                            tensor_name=key,
+                            num_tokens=self.raw_num_token,
+                            forward_mode=forward_batch.forward_mode,
+                            pp_rank=self.model_runner.ps.pp_rank,
+                            attn_tp_size=self.model_runner.ps.attn_tp_size,
+                            attn_cp_size=self.model_runner.ps.attn_cp_size,
+                            require_attn_tp_gather_=self.require_attn_tp_gather,
+                        )
+                    ]
+                    for key, value in output.tensors.items()
+                }
+            )
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None

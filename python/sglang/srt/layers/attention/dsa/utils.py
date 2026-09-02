@@ -204,7 +204,12 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
 
     global_num_tokens = forward_batch.global_num_tokens_cpu.copy()
     sync_group_size = len(global_num_tokens)
+    attn_tp_size = get_parallel().attn_tp_size
     attn_cp_size = get_parallel().attn_cp_size
+    # Mirror the attention-TP padding performed by prepare_mlp_sync_batch.
+    # Eager multi-step draft plans DSA metadata before the live batch is padded.
+    for i in range(sync_group_size):
+        global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
     # Must mirror ForwardBatch.prepare_mlp_sync_batch, which applies cp_align_size only when
     # CP-v2 is disabled. Under enable_cp_v2() the speculative forwards (TARGET_VERIFY /
     # DRAFT_EXTEND_V2) reach here with is_cp_v2_active False, and q is padded to attn_tp_size only

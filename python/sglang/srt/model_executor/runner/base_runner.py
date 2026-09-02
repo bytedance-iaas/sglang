@@ -67,6 +67,30 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def resolve_pp_proxy_num_tokens(
+    *,
+    tensor_name: str,
+    num_tokens: int,
+    forward_mode: ForwardMode,
+    pp_rank: int,
+    attn_tp_size: int,
+    attn_cp_size: int,
+    require_attn_tp_gather_: bool,
+) -> int:
+    """Return the rank-local PP proxy width for capture and replay."""
+    if pp_rank == 0:
+        return num_tokens
+
+    split_size = 1
+    if forward_mode == ForwardMode.EXTEND and attn_cp_size > 1:
+        split_size = attn_cp_size
+    elif tensor_name != "topk_indices" and require_attn_tp_gather_ and attn_tp_size > 1:
+        split_size = attn_tp_size
+
+    # Match prepare_mlp_sync_batch padding for odd token counts.
+    return (num_tokens + split_size - 1) // split_size
+
+
 def _allocate_decode_buffers(
     *,
     device: torch.device,
@@ -530,16 +554,21 @@ class BaseRunner(ABC):
             extend_start_loc = None
 
         if get_parallel().pp_size > 1:
-            # PP0 already cp-split hidden_states before send.
-            pp_hidden_tokens = num_tokens
-            if (
-                capture_forward_mode == ForwardMode.EXTEND
-                and mr.ps.pp_rank != 0
-                and mr.ps.attn_cp_size > 1
-            ):
-                pp_hidden_tokens = num_tokens // mr.ps.attn_cp_size
             pp_proxy_tensors = PPProxyTensors(
-                {k: v[:pp_hidden_tokens] for k, v in buffers.pp_proxy_tensors.items()}
+                {
+                    key: value[
+                        : resolve_pp_proxy_num_tokens(
+                            tensor_name=key,
+                            num_tokens=num_tokens,
+                            forward_mode=capture_forward_mode,
+                            pp_rank=mr.ps.pp_rank,
+                            attn_tp_size=mr.ps.attn_tp_size,
+                            attn_cp_size=mr.ps.attn_cp_size,
+                            require_attn_tp_gather_=require_attn_tp_gather(),
+                        )
+                    ]
+                    for key, value in buffers.pp_proxy_tensors.items()
+                }
             )
 
         # TP-gather requirements for global token metadata.
