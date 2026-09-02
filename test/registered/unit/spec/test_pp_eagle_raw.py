@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.layers.attention.verify_mask import VerifyMask
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     _assert_pp_mtp_compat,
 )
@@ -207,6 +208,42 @@ class TestEaglePPLastRankDraftOwnership(unittest.TestCase):
         verify_input = EAGLEWorkerV2._build_idle_verify_input(worker, SimpleNamespace())
         draft_worker.draft.assert_not_called()
         self.assertTrue(verify_input.is_verify_input())
+
+    def test_prepare_next_draft_preserves_idle_companion_mode(self):
+        next_draft_input = object()
+        new_seq_lens = torch.empty((0,), dtype=torch.int64)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.IDLE, spec_info=None, seq_lens=None
+        )
+
+        EAGLEWorkerV2._prepare_pp_next_draft_batch(
+            batch,
+            SimpleNamespace(
+                next_draft_input=next_draft_input, new_seq_lens=new_seq_lens
+            ),
+        )
+
+        self.assertEqual(batch.forward_mode, ForwardMode.IDLE)
+        self.assertIs(batch.spec_info, next_draft_input)
+        self.assertIs(batch.seq_lens, new_seq_lens)
+
+    def test_prepare_next_draft_promotes_active_batch_to_decode(self):
+        next_draft_input = object()
+        new_seq_lens = torch.tensor([17], dtype=torch.int64)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND, spec_info=None, seq_lens=None
+        )
+
+        EAGLEWorkerV2._prepare_pp_next_draft_batch(
+            batch,
+            SimpleNamespace(
+                next_draft_input=next_draft_input, new_seq_lens=new_seq_lens
+            ),
+        )
+
+        self.assertEqual(batch.forward_mode, ForwardMode.DECODE)
+        self.assertIs(batch.spec_info, next_draft_input)
+        self.assertIs(batch.seq_lens, new_seq_lens)
 
     def test_pp_draft_keeps_checkpoint_embedding_and_shares_only_head(self):
         target_model = SimpleNamespace(

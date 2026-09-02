@@ -160,6 +160,37 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         self.assertEqual(result, (None, None, None, None))
         self.assertEqual(worker.draft_runner.forward.call_count, 2)
 
+    def test_pp_idle_draft_skips_attention_metadata_and_returns_empty_raw_tree(self):
+        worker = object.__new__(EagleDraftWorker)
+        worker.req_to_token_pool = None
+        worker.cuda_graph_runner = None
+        worker.draft_runner = SimpleNamespace(canary_manager=None)
+        worker.draft_attn_backend = SimpleNamespace(init_forward_metadata=MagicMock())
+        worker.topk = 1
+        worker.speculative_num_steps = 3
+        worker.speculative_num_draft_tokens = 4
+        worker.server_args = SimpleNamespace(pp_size=2)
+        worker.seed_dsa_topk_from_draft_extend = True
+        worker.draft_forward = MagicMock(return_value=(None, None, None, None))
+        draft_input = SimpleNamespace(dsa_topk_indices=None)
+        batch = SimpleNamespace(
+            spec_info=draft_input,
+            forward_mode=ForwardMode.IDLE,
+        )
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.IDLE)
+
+        with patch(
+            "sglang.srt.speculative.eagle_worker_v2.prepare_for_draft",
+            return_value=(forward_batch, False),
+        ):
+            draft_tokens, parent_list, top_scores_index = worker.draft(batch)
+
+        worker.draft_attn_backend.init_forward_metadata.assert_not_called()
+        worker.draft_forward.assert_called_once_with(forward_batch)
+        self.assertEqual(tuple(draft_tokens.shape), (0, 4))
+        self.assertEqual(tuple(parent_list.shape), (0, 3))
+        self.assertEqual(tuple(top_scores_index.shape), (0, 3))
+
 
 class TestEagleWorkerV2BackendFallback(CustomTestCase):
     def setUp(self):

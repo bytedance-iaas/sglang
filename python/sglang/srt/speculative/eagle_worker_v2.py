@@ -1370,9 +1370,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
                     if self._pp_enabled:
-                        batch.forward_mode = ForwardMode.DECODE
-                        batch.spec_info = batch_output.next_draft_input
-                        batch.seq_lens = batch_output.new_seq_lens
+                        self._prepare_pp_next_draft_batch(batch, batch_output)
                         (
                             pp_draft_tokens,
                             pp_parent_list,
@@ -1396,6 +1394,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
 
             return batch_output
+
+    @staticmethod
+    def _prepare_pp_next_draft_batch(
+        batch: ScheduleBatch, batch_output: GenerationBatchResult
+    ) -> None:
+        # Active requests draft the next decode tree.  An IDLE DP companion
+        # must retain its mode so EagleDraftWorker takes the zero-token eager
+        # path: it participates in every MegaMoE collective without planning
+        # DSA metadata for a nonexistent request.
+        if not batch.forward_mode.is_idle():
+            batch.forward_mode = ForwardMode.DECODE
+        batch.spec_info = batch_output.next_draft_input
+        batch.seq_lens = batch_output.new_seq_lens
 
     def _build_idle_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
         return EagleVerifyInput.create_idle_input(
