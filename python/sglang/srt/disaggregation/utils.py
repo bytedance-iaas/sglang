@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import random
 from collections import deque
 from contextlib import nullcontext
@@ -221,7 +222,40 @@ def poll_and_all_reduce_attn_cp_tp_group(
     pollers,
     attn_cp_cpu_group: dist.ProcessGroup,
     attn_tp_cpu_group: dist.ProcessGroup,
+    ordered_keys: Optional[List[str]] = None,
 ):
+    # A positional all-reduce is safe only when every local attention rank is
+    # polling the same requests in the same order.  Request ingress and aborts
+    # can transiently skew the rank-local queues; defer the poll until the
+    # queues converge instead of entering collectives with different shapes.
+    if ordered_keys is not None:
+        assert len(ordered_keys) == len(pollers)
+        digest = hashlib.blake2b(digest_size=8)
+        for key in ordered_keys:
+            encoded_key = key.encode("utf-8")
+            digest.update(len(encoded_key).to_bytes(8, "little"))
+            digest.update(encoded_key)
+        signature = torch.tensor(
+            [
+                len(ordered_keys),
+                int.from_bytes(digest.digest(), "little", signed=True),
+            ],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        signatures_match = True
+        for group in (attn_tp_cpu_group, attn_cp_cpu_group):
+            gathered_signatures = [
+                torch.empty_like(signature) for _ in range(dist.get_world_size(group))
+            ]
+            dist.all_gather(gathered_signatures, signature, group=group)
+            signatures_match &= all(
+                torch.equal(signature, gathered_signature)
+                for gathered_signature in gathered_signatures
+            )
+        if not signatures_match:
+            return [KVPoll.Bootstrapping] * len(pollers)
+
     # First sync across attn-tp ranks so all TP participants for a given (dp, cp)
     # shard observe the same status transitions.
     polls = poll_and_all_reduce(pollers, attn_tp_cpu_group)
@@ -934,11 +968,25 @@ def build_kv_layer_ids(
     Returns [] for pools that cannot report ids, leaving the peers on positional
     pairing.
     """
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+    from sglang.srt.mem_cache.memory_pool import (
+        HybridLinearKVPool,
+        MLATokenToKVPool,
+    )
 
-    if not isinstance(token_to_kv_pool, HybridLinearKVPool):
+    if isinstance(token_to_kv_pool, HybridLinearKVPool):
+        layer_ids = token_to_kv_pool.get_kv_layer_ids()
+    elif isinstance(token_to_kv_pool, MLATokenToKVPool):
+        start_layer = token_to_kv_pool.start_layer
+        end_layer = token_to_kv_pool.end_layer
+        if end_layer - start_layer != token_to_kv_pool.layer_num:
+            raise RuntimeError(
+                "MLA KV layer bounds must match the registered entries: "
+                f"start={start_layer}, end={end_layer}, "
+                f"entries={token_to_kv_pool.layer_num}"
+            )
+        layer_ids = list(range(start_layer, end_layer))
+    else:
         return []
-    layer_ids = token_to_kv_pool.get_kv_layer_ids()
     if draft_token_to_kv_pool is None:
         return layer_ids
 
@@ -1065,6 +1113,58 @@ def append_state_component(
     kv_args.state_conv_shard_groups.append(conv_shard_groups or [])
     kv_args.state_slice_outer_counts.append(slice_outer_counts or [])
     kv_args.state_layer_ids.append(layer_ids or [])
+
+
+def build_dsa_state_layer_ids(
+    *,
+    token_to_kv_pool,
+    num_entries: int,
+    total_kv_layers: int,
+    is_draft: bool = False,
+) -> List[int]:
+    """Global layer ids aligned with a DSA pool's indexer-state entries.
+
+    A normal DSA pool registers every layer owned by its PP stage.  The
+    optional prefill-CP layer-split pool registers only the contiguous subset
+    owned by the current CP rank.  EAGLE draft layers use a reserved band
+    above the target model, matching ``build_kv_layer_ids``.
+    """
+    start_layer = token_to_kv_pool.start_layer
+    end_layer = token_to_kv_pool.end_layer
+    layer_num = token_to_kv_pool.layer_num
+    if end_layer - start_layer != layer_num:
+        raise RuntimeError(
+            "DSA state layer bounds must match the pool: "
+            f"start={start_layer}, end={end_layer}, layers={layer_num}"
+        )
+
+    if getattr(token_to_kv_pool, "layer_shard_enabled", False):
+        owned_start, owned_end = token_to_kv_pool._owned_local_layer_range()
+        if not (0 <= owned_start <= owned_end <= layer_num):
+            raise RuntimeError(
+                "DSA layer-split ownership is outside the PP stage: "
+                f"owned=[{owned_start},{owned_end}), layers={layer_num}"
+            )
+        layer_ids = list(
+            range(start_layer + owned_start, start_layer + owned_end)
+        )
+    else:
+        layer_ids = list(range(start_layer, end_layer))
+
+    if len(layer_ids) != num_entries:
+        raise RuntimeError(
+            "DSA state layer ids must cover every registered entry: "
+            f"ids={len(layer_ids)}, entries={num_entries}"
+        )
+    if not is_draft:
+        return layer_ids
+    if total_kv_layers is None:
+        raise RuntimeError(
+            "DSA draft state layer ids require the target model layer count"
+        )
+
+    band_index = {lid: i for i, lid in enumerate(dict.fromkeys(layer_ids))}
+    return [total_kv_layers + band_index[lid] for lid in layer_ids]
 
 
 def setup_state_kv_args(
@@ -1204,6 +1304,13 @@ def setup_state_kv_args(
                 layer_ids,
             )
         elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
+            state_layer_ids = []
+            if isinstance(token_to_kv_pool, DSATokenToKVPool):
+                state_layer_ids = build_dsa_state_layer_ids(
+                    token_to_kv_pool=token_to_kv_pool,
+                    num_entries=len(data_ptrs),
+                    total_kv_layers=total_kv_layers,
+                )
             if draft_token_to_kv_pool is not None and isinstance(
                 draft_token_to_kv_pool, DSATokenToKVPool
             ):
@@ -1212,9 +1319,16 @@ def setup_state_kv_args(
                     draft_data_lens,
                     draft_item_lens,
                 ) = draft_token_to_kv_pool.get_state_buf_infos()
+                draft_state_layer_ids = build_dsa_state_layer_ids(
+                    token_to_kv_pool=draft_token_to_kv_pool,
+                    num_entries=len(draft_data_ptrs),
+                    total_kv_layers=total_kv_layers,
+                    is_draft=True,
+                )
                 data_ptrs = data_ptrs + draft_data_ptrs
                 data_lens = data_lens + draft_data_lens
                 item_lens = item_lens + draft_item_lens
+                state_layer_ids = state_layer_ids + draft_state_layer_ids
             if isinstance(token_to_kv_pool, NPUMLATokenToKVPool):
                 kv_args.kv_buf_groups = (
                     len(kv_args.kv_data_ptrs) // token_to_kv_pool.layer_num
@@ -1222,7 +1336,12 @@ def setup_state_kv_args(
                 kv_args.total_kv_layers = total_kv_layers
             else:
                 append_state_component(
-                    kv_args, StateType.DSA, data_ptrs, data_lens, item_lens
+                    kv_args,
+                    StateType.DSA,
+                    data_ptrs,
+                    data_lens,
+                    item_lens,
+                    layer_ids=state_layer_ids,
                 )
 
     if is_npu() and isinstance(token_to_kv_pool, DSV4NPUTokenToKVPool):

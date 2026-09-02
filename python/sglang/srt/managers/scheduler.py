@@ -96,8 +96,15 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     unified_memory_disagg_move_gate,
 )
-from sglang.srt.distributed import get_pp_group, get_world_group
-from sglang.srt.distributed.parallel_state import get_tp_group
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_pp_output_group,
+    get_world_group,
+)
+from sglang.srt.distributed.parallel_state import (
+    create_custom_parallel_group,
+    get_tp_group,
+)
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs, exportable_env_vars
@@ -267,7 +274,11 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
-from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from sglang.srt.managers.scheduler_pp_mixin import (
+    _PP_DISAGG_SCHEDULER_FENCE_PHASES,
+    SchedulerPPMixin,
+    _pp_attention_dp_control_ranks,
+)
 from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
@@ -1129,7 +1140,47 @@ class Scheduler(
         self.attn_cp_group = get_parallel().attn_cp_group
         self.attn_cp_cpu_group = self.attn_cp_group.cpu_group
         self.pp_group = get_pp_group()
+        self.pp_output_group = get_pp_output_group()
         self.world_group = get_world_group()
+        self.pp_disagg_control_group = None
+        self.pp_disagg_local_control_group = None
+        if (
+            get_disagg().disaggregation_mode in ("prefill", "decode")
+            and self.ps.pp_size > 1
+        ):
+            # The PP consensus ring has a fixed typed phase sequence. Keep it
+            # off the untagged world Gloo stream used by request propagation
+            # and linear PP metadata so those protocols cannot cross-match.
+            self.pp_disagg_control_group = create_custom_parallel_group(
+                self.pp_group.ranks, backend="gloo"
+            )
+            logger.info(
+                "Initialized PP disaggregation control group: ranks=%s",
+                self.pp_group.ranks,
+            )
+            local_control_ranks = _pp_attention_dp_control_ranks(
+                self.ps, self.tp_group.ranks
+            )
+            self.pp_disagg_local_control_group = create_custom_parallel_group(
+                local_control_ranks, backend="gloo"
+            )
+            logger.info(
+                "Initialized PP disaggregation local control group: ranks=%s",
+                local_control_ranks,
+            )
+        self.pp_disagg_scheduler_fence_groups = {}
+        if get_disagg().disaggregation_mode == "prefill" and self.ps.pp_size > 1:
+            control_ranks = _pp_attention_dp_control_ranks(self.ps, self.tp_group.ranks)
+            for phase in _PP_DISAGG_SCHEDULER_FENCE_PHASES:
+                self.pp_disagg_scheduler_fence_groups[phase] = (
+                    create_custom_parallel_group(control_ranks, backend="gloo")
+                )
+                logger.info(
+                    "Initialized PP disaggregation scheduler fence group: "
+                    "phase=%s ranks=%s",
+                    phase,
+                    control_ranks,
+                )
 
         # NOTE: dp_tp_* are request/data-plane coordination groups (not tensor collectives).
         # When DP attention is enabled, scope to the attention-TP group; otherwise use

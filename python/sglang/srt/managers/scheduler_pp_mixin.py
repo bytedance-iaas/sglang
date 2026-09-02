@@ -6,7 +6,7 @@ import time
 from array import array
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -54,8 +54,55 @@ from sglang.srt.utils.common import get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
 
+_PP_DISAGG_SCHEDULER_FENCE_PHASES = (
+    "iteration_start",
+    "bootstrap_poll",
+    "bootstrap_done",
+    "transfer_done",
+)
+PP_CONTROL_RING_MESSAGE_MARKER = "sglang_pp_control_ring_v1"
+
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
+
+
+def _pp_attention_dp_control_ranks(ps, tp_ranks: List[int]) -> List[int]:
+    """Return the scheduler ranks that must stay in one PP-stage phase."""
+    group_size = ps.attn_tp_size * ps.attn_cp_size
+    assert len(tp_ranks) == ps.tp_size
+    group_start = ps.attn_dp_rank * group_size
+    group_end = group_start + group_size
+    assert group_end <= len(tp_ranks)
+    return tp_ranks[group_start:group_end]
+
+
+def _pp_fence_scheduler_phase(group) -> None:
+    """Fence one PP scheduler phase on a dedicated control-only group."""
+    if group is not None:
+        torch.distributed.barrier(group=group)
+
+
+def _pp_pack_control_ring_message(phase: str, has_payload: bool, payload):
+    return (
+        PP_CONTROL_RING_MESSAGE_MARKER,
+        phase,
+        has_payload,
+        payload if has_payload else None,
+    )
+
+
+def _pp_unpack_control_ring_message(message, expected_phase: str):
+    if (
+        not isinstance(message, tuple)
+        or len(message) != 4
+        or message[0] != PP_CONTROL_RING_MESSAGE_MARKER
+        or message[1] != expected_phase
+        or not isinstance(message[2], bool)
+    ):
+        raise RuntimeError(
+            f"Invalid PP control-ring message for phase {expected_phase}: {message!r}"
+        )
+    return message[2], message[3]
 
 
 def should_pp_allgather_tensors(
@@ -135,6 +182,9 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                _pp_fence_scheduler_phase(
+                    self.pp_disagg_scheduler_fence_groups["iteration_start"]
+                )
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
@@ -258,13 +308,9 @@ class SchedulerPPMixin:
         # PD additional state initialization
         bmbs = [None] * self.pp_loop_size
         tmbs = [None] * self.pp_loop_size
-        consensus_bootstrapped_rids: Optional[List[str]] = None
         transferred_rids: List[str] = []
-        release_rids: Optional[List[str]] = None
         send_bootstrapped_work = []
         send_transfer_work = []
-        send_consensus_bootstrapped_work = []
-        send_release_work = []
 
         while True:
             server_is_idle = True
@@ -282,17 +328,27 @@ class SchedulerPPMixin:
 
                 recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
-
-                if not self.pp_group.is_last_rank:
-                    self._pp_commit_comm_work(self.send_req_work)
+                self.send_req_work = self._pp_forward_stage_payload(
+                    self.send_req_work, recv_reqs
+                )
 
                 bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
                 bmbs[mb_id] = bootstrapped_rids
-                self._pp_commit_comm_work(send_bootstrapped_work)
+                send_bootstrapped_work = self._pp_forward_stage_payload(
+                    send_bootstrapped_work, bootstrapped_rids
+                )
+                _pp_fence_scheduler_phase(
+                    self.pp_disagg_scheduler_fence_groups["bootstrap_done"]
+                )
 
                 transferred_rids = self._pp_pd_get_prefill_transferred_ids()
-                self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
+                send_transfer_work = self._pp_forward_stage_payload(
+                    send_transfer_work, transferred_rids
+                )
+                _pp_fence_scheduler_phase(
+                    self.pp_disagg_scheduler_fence_groups["transfer_done"]
+                )
 
                 self.process_prefill_chunk(
                     last_batch=self.last_batch, running_batch=self.running_batch
@@ -328,38 +384,42 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                # A downstream stage receives this linear proxy before it can
+                # enter the wraparound control rings below. Complete the proxy
+                # exchange here so both stages reach those rings in one order.
+                if not self.pp_group.is_last_rank and cur_batch:
+                    self.device_module.current_stream().wait_event(self.launch_event)
+                    self._pp_send_and_commit_proxy(
+                        result.pp_hidden_states_proxy_tensors.tensors
+                    )
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
+                            relay_output_immediately=True,
                         )
                     )
-                send_consensus_bootstrapped_work, consensus_bootstrapped_rids = (
-                    self._pp_pd_send_consensus_bootstrapped_ids(
-                        bmbs,
-                        next_first_rank_mb_id,
-                        consensus_bootstrapped_rids,
-                        bootstrapped_rids,
-                    )
+                # Every slot participates in both phases. Typed no-ops preserve
+                # protocol position while the dedicated communicator prevents
+                # cross-matching with request and linear metadata traffic.
+                next_consensus_bootstrapped_rids = self._pp_run_control_ring_phase(
+                    phase="prefill_bootstrap_consensus",
+                    origin_has_payload=(
+                        self.pp_group.is_last_rank
+                        and bmbs[next_first_rank_mb_id] is not None
+                    ),
+                    origin_payload=bootstrapped_rids,
+                    process_payload=self.process_bootstrapped_queue,
                 )
-                send_release_work, release_rids = (
-                    self._pp_pd_send_consensus_release_ids(
-                        tmbs, next_first_rank_mb_id, release_rids, transferred_rids
-                    )
+                next_release_rids = self._pp_run_control_ring_phase(
+                    phase="prefill_release_consensus",
+                    origin_has_payload=(
+                        self.pp_group.is_last_rank
+                        and tmbs[next_first_rank_mb_id] is not None
+                    ),
+                    origin_payload=transferred_rids,
                 )
-
-                if bmbs[next_mb_id] is not None:
-                    next_consensus_bootstrapped_rids = (
-                        self._pp_recv_pyobj_from_prev_stage()
-                    )
-                    next_consensus_bootstrapped_rids = self.process_bootstrapped_queue(
-                        next_consensus_bootstrapped_rids
-                    )
-                self._pp_commit_comm_work(send_consensus_bootstrapped_work)
-                if tmbs[next_mb_id] is not None:
-                    next_release_rids = self._pp_recv_pyobj_from_prev_stage()
-                self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
@@ -369,32 +429,10 @@ class SchedulerPPMixin:
                     )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
-                if tmbs[next_mb_id] is not None:
+                if next_release_rids is not None:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
-                if not self.pp_group.is_last_rank:
-                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
-                    )
-                    send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
-                        bootstrapped_rids, async_send=True
-                    )
-                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
-                        transferred_rids, async_send=True
-                    )
-                    if cur_batch:
-                        self.device_module.current_stream().wait_event(
-                            self.launch_event
-                        )
-                        self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                            result.pp_hidden_states_proxy_tensors.tensors,
-                            async_send=True,
-                            msg_type="proxy",
-                        )
 
                 self.pp_outputs = next_pp_outputs
-                release_rids = next_release_rids
-                consensus_bootstrapped_rids = next_consensus_bootstrapped_rids
-
                 self.running_batch.batch_is_full = False
 
             # When the server is idle, self-check and re-init some states
@@ -409,15 +447,9 @@ class SchedulerPPMixin:
         rmbs = [None] * self.pp_loop_size
         pmbs = [None] * self.pp_loop_size
         tmbs = [None] * self.pp_loop_size
-        consensus_retract_rids: Optional[List[str]] = None
-        consensus_prealloc_rids: Optional[List[str]] = None
-        release_rids: Optional[List[str]] = None  # consensus transferred rids
         send_retract_work = []
         send_prealloc_work = []
         send_transfer_work = []
-        send_consensus_retract_work = []
-        send_consensus_prealloc_work = []
-        send_release_work = []
 
         while True:
             server_is_idle = True
@@ -436,22 +468,28 @@ class SchedulerPPMixin:
 
                 recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
-
-                if not self.pp_group.is_last_rank:
-                    self._pp_commit_comm_work(self.send_req_work)
+                self.send_req_work = self._pp_forward_stage_payload(
+                    self.send_req_work, recv_reqs
+                )
 
                 # reaching consensus through PP ranks
                 retract_rids = self._pp_pd_get_retract_ids(mb_id)
                 rmbs[mb_id] = retract_rids
-                self._pp_commit_comm_work(send_retract_work)
+                send_retract_work = self._pp_forward_stage_payload(
+                    send_retract_work, retract_rids
+                )
 
                 prealloc_rids = self._pp_pd_get_prealloc_ids()
                 pmbs[mb_id] = prealloc_rids
-                self._pp_commit_comm_work(send_prealloc_work)
+                send_prealloc_work = self._pp_forward_stage_payload(
+                    send_prealloc_work, prealloc_rids
+                )
 
                 transferred_rids = self._pp_pd_get_decode_transferred_ids()
                 tmbs[mb_id] = transferred_rids
-                self._pp_commit_comm_work(send_transfer_work)
+                send_transfer_work = self._pp_forward_stage_payload(
+                    send_transfer_work, transferred_rids
+                )
 
                 # get batch to run and proxy tensors if needed
                 plan = self.get_next_disagg_decode_batch_to_run(
@@ -488,64 +526,55 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                if (
+                    not self.pp_group.is_last_rank
+                    and cur_batch
+                    and not cur_batch.forward_mode.is_prebuilt()
+                ):
+                    self.device_module.current_stream().wait_event(self.launch_event)
+                    self._pp_send_and_commit_proxy(
+                        result.pp_hidden_states_proxy_tensors.tensors
+                    )
 
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
+                            relay_output_immediately=True,
                         )
                     )
 
-                # reach consensus on last rank and send to PP=0
-                # otherwise, just pass along previous consensus
-                send_consensus_retract_work, consensus_retract_rids = (
-                    self._pp_pd_send_consensus_bootstrapped_ids(
-                        rmbs,
-                        next_first_rank_mb_id,
-                        consensus_retract_rids,
-                        retract_rids,
-                    )
+                next_consensus_retract_rids = self._pp_run_control_ring_phase(
+                    phase="decode_retract_consensus",
+                    origin_has_payload=(
+                        self.pp_group.is_last_rank
+                        and rmbs[next_first_rank_mb_id] is not None
+                    ),
+                    origin_payload=retract_rids,
+                    process_payload=self.process_retract_queue,
                 )
-
-                send_consensus_prealloc_work, consensus_prealloc_rids = (
-                    self._pp_pd_send_consensus_bootstrapped_ids(
-                        pmbs,
-                        next_first_rank_mb_id,
-                        consensus_prealloc_rids,
-                        prealloc_rids,
-                    )
+                next_consensus_prealloc_rids = self._pp_run_control_ring_phase(
+                    phase="decode_prealloc_consensus",
+                    origin_has_payload=(
+                        self.pp_group.is_last_rank
+                        and pmbs[next_first_rank_mb_id] is not None
+                    ),
+                    origin_payload=prealloc_rids,
+                    process_payload=self.process_prealloc_queue,
                 )
-
-                send_release_work, release_rids = (
-                    self._pp_pd_send_consensus_release_ids(
-                        tmbs, next_first_rank_mb_id, release_rids, transferred_rids
-                    )
+                next_release_rids = self._pp_run_control_ring_phase(
+                    phase="decode_release_consensus",
+                    origin_has_payload=(
+                        self.pp_group.is_last_rank
+                        and tmbs[next_first_rank_mb_id] is not None
+                    ),
+                    origin_payload=transferred_rids,
+                    process_payload=self.process_decode_transfer_queue,
                 )
 
                 if get_disagg().disaggregation_decode_enable_offload_kvcache:
                     self.decode_offload_manager.check_offload_progress()
-
-                if rmbs[next_mb_id] is not None:
-                    next_consensus_retract_rids = self._pp_recv_pyobj_from_prev_stage()
-                    next_consensus_retract_rids = self.process_retract_queue(
-                        next_consensus_retract_rids
-                    )
-                self._pp_commit_comm_work(send_consensus_retract_work)
-
-                if pmbs[next_mb_id] is not None:
-                    next_consensus_prealloc_rids = self._pp_recv_pyobj_from_prev_stage()
-                    next_consensus_prealloc_rids = self.process_prealloc_queue(
-                        next_consensus_prealloc_rids
-                    )
-                self._pp_commit_comm_work(send_consensus_prealloc_work)
-
-                if tmbs[next_mb_id] is not None:
-                    next_release_rids = self._pp_recv_pyobj_from_prev_stage()
-                    next_release_rids = self.process_decode_transfer_queue(
-                        next_release_rids
-                    )
-                self._pp_commit_comm_work(send_release_work)
 
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
@@ -557,34 +586,7 @@ class SchedulerPPMixin:
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
-                if not self.pp_group.is_last_rank:
-                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
-                    )
-                    send_retract_work = self._pp_send_pyobj_to_next_stage(
-                        retract_rids, async_send=True
-                    )
-                    send_prealloc_work = self._pp_send_pyobj_to_next_stage(
-                        prealloc_rids, async_send=True
-                    )
-                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
-                        transferred_rids, async_send=True
-                    )
-                    if cur_batch and not cur_batch.forward_mode.is_prebuilt():
-                        self.device_module.current_stream().wait_event(
-                            self.launch_event
-                        )
-                        self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                            result.pp_hidden_states_proxy_tensors.tensors,
-                            async_send=True,
-                            msg_type="proxy",
-                        )
-
                 self.pp_outputs = next_pp_outputs
-                release_rids = next_release_rids
-                consensus_retract_rids = next_consensus_retract_rids
-                consensus_prealloc_rids = next_consensus_prealloc_rids
-
                 self.running_batch.batch_is_full = False
 
             # When the server is idle, self-check and re-init some states
@@ -866,6 +868,9 @@ class SchedulerPPMixin:
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
         # communicate pre-consensus bootstrapp reqs
         if self.pp_group.is_first_rank:
+            _pp_fence_scheduler_phase(
+                self.pp_disagg_scheduler_fence_groups["bootstrap_poll"]
+            )
             # First rank, pop the bootstrap reqs from the bootstrap queue
             good_bootstrapped_rids, bad_bootstrapped_rids = self.get_rids(
                 self.disagg_prefill_bootstrap_queue.queue,
@@ -876,6 +881,9 @@ class SchedulerPPMixin:
         else:
             # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
             prev_bootstrapped_rids = self._pp_recv_pyobj_from_prev_stage()
+            _pp_fence_scheduler_phase(
+                self.pp_disagg_scheduler_fence_groups["bootstrap_poll"]
+            )
             prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
                 prev_bootstrapped_rids
             )
@@ -930,50 +938,63 @@ class SchedulerPPMixin:
             )
         return transferred_rids
 
-    def _pp_pd_send_consensus_bootstrapped_ids(
+    def _pp_run_control_ring_phase(
         self: Scheduler,
-        bmbs: List[List[str]],
-        next_first_rank_mb_id: int,
-        consensus_bootstrapped_rids: List[str],
-        bootstrapped_rids: List[str],
+        phase: str,
+        origin_has_payload: bool,
+        origin_payload,
+        process_payload: Optional[Callable] = None,
     ):
-        # 3 (Release): send the release rids from last stage to the first stage
-        send_consensus_bootstrapped_work = []
+        """Run one unconditional, typed consensus phase around the PP ring."""
+        assert self.pp_disagg_control_group is not None
+        send_work = []
         if self.pp_group.is_last_rank:
-            if bmbs[next_first_rank_mb_id] is not None:
-                consensus_bootstrapped_rids = bootstrapped_rids
-                send_consensus_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
-                    consensus_bootstrapped_rids, async_send=True
-                )
-        # 4 (Release): send the release rids from non last rank to the next rank
-        else:
-            if consensus_bootstrapped_rids is not None:
-                send_consensus_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
-                    consensus_bootstrapped_rids, async_send=True
-                )
-        return send_consensus_bootstrapped_work, consensus_bootstrapped_rids
+            message = _pp_pack_control_ring_message(
+                phase, origin_has_payload, origin_payload
+            )
+            send_work = self._pp_send_pyobj_to_next_stage(
+                message,
+                async_send=True,
+                group=self.pp_disagg_control_group,
+            )
 
-    def _pp_pd_send_consensus_release_ids(
-        self: Scheduler,
-        tmbs: List[List[str]],
-        next_first_rank_mb_id: int,
-        release_rids: List[str],
-        transferred_rids: List[str],
-    ):
-        send_release_work = []
+        message = self._pp_recv_pyobj_from_prev_stage(
+            group=self.pp_disagg_control_group,
+            local_group=self.pp_disagg_local_control_group,
+        )
+        has_payload, payload = _pp_unpack_control_ring_message(message, phase)
+        if has_payload and process_payload is not None:
+            payload = process_payload(payload)
+        message = _pp_pack_control_ring_message(phase, has_payload, payload)
+
+        if not self.pp_group.is_last_rank:
+            send_work = self._pp_send_pyobj_to_next_stage(
+                message,
+                async_send=True,
+                group=self.pp_disagg_control_group,
+            )
+
+        self._pp_commit_comm_work(send_work)
+        return payload if has_payload else None
+
+    def _pp_forward_stage_payload(
+        self: Scheduler, previous_work: List[P2PWork], payload
+    ) -> List[P2PWork]:
+        """Forward a linear PP payload before entering any wraparound ring."""
+        self._pp_commit_comm_work(previous_work)
         if self.pp_group.is_last_rank:
-            if tmbs[next_first_rank_mb_id] is not None:
-                release_rids = transferred_rids
-                send_release_work = self._pp_send_pyobj_to_next_stage(
-                    release_rids, async_send=True
-                )
-        # 4 (Release): send the release rids from non last rank to the next rank
-        else:
-            if release_rids is not None:
-                send_release_work = self._pp_send_pyobj_to_next_stage(
-                    release_rids, async_send=True
-                )
-        return send_release_work, release_rids
+            return []
+        return self._pp_send_pyobj_to_next_stage(payload, async_send=True)
+
+    def _pp_send_and_commit_proxy(
+        self: Scheduler, tensor_dict: Dict[str, torch.Tensor]
+    ) -> None:
+        self.send_proxy_work = self._pp_send_dict_to_next_stage(
+            tensor_dict,
+            async_send=True,
+            msg_type="proxy",
+        )
+        self._pp_commit_comm_work(self.send_proxy_work)
 
     def _pp_commit_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
         for p2p_work in work:
@@ -984,6 +1005,7 @@ class SchedulerPPMixin:
         self: Scheduler,
         next_first_rank_mb_id: int,
         next_mb_id: int,
+        relay_output_immediately: bool = False,
     ) -> Tuple[
         Optional[PPProxyTensors],
         Optional[GenerationBatchResult],
@@ -1002,41 +1024,63 @@ class SchedulerPPMixin:
             self.mb_metadata,
             self.last_rank_comm_queue,
             self.pp_outputs,
+            relay_output_immediately=relay_output_immediately,
         )
         return next_pp_outputs, next_batch_result, d2h_event
 
-    def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
+    def _pp_send_pyobj_to_next_stage(
+        self: Scheduler,
+        data,
+        async_send: bool = False,
+        group: Optional[torch.distributed.ProcessGroup] = None,
+    ):
         p2p_work = []
         if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+            group = self.world_group.cpu_group if group is None else group
             dp_offset = (
                 self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
             )
             p2p_work = point_to_point_pyobj(
                 data,
                 self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                self.world_group.cpu_group,
+                group,
                 self.ps.pp_rank * self.ps.tp_size + dp_offset,
                 ((self.ps.pp_rank + 1) % self.ps.pp_size) * self.ps.tp_size + dp_offset,
                 async_send=async_send,
             )
         return p2p_work
 
-    def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
+    def _pp_recv_pyobj_from_prev_stage(
+        self: Scheduler,
+        group: Optional[torch.distributed.ProcessGroup] = None,
+        local_group: Optional[torch.distributed.ProcessGroup] = None,
+    ):
         if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+            group = self.world_group.cpu_group if group is None else group
             dp_offset = (
                 self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
             )
             data = point_to_point_pyobj(
                 [],
                 self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                self.world_group.cpu_group,
+                group,
                 ((self.ps.pp_rank - 1) % self.ps.pp_size) * self.ps.tp_size + dp_offset,
                 self.ps.pp_rank * self.ps.tp_size + dp_offset,
             )
         else:
             data = None
 
-        if self.ps.attn_tp_size > 1:
+        if local_group is not None:
+            local_ranks = _pp_attention_dp_control_ranks(
+                self.ps, self.tp_group.ranks
+            )
+            data = broadcast_pyobj(
+                data,
+                torch.distributed.get_rank(),
+                local_group,
+                src=local_ranks[0],
+            )
+        elif self.ps.attn_tp_size > 1:
             data = broadcast_pyobj(
                 data,
                 self.attn_tp_group.rank,
@@ -1044,7 +1088,7 @@ class SchedulerPPMixin:
                 src=self.attn_tp_group.ranks[0],
             )
 
-        if self.ps.attn_cp_size > 1:
+        if local_group is None and self.ps.attn_cp_size > 1:
             data = broadcast_pyobj(
                 data,
                 self.attn_cp_group.rank,
@@ -1098,9 +1142,14 @@ class SchedulerPPMixin:
                 "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
             )
         tensor_dict["__msg_type__"] = msg_type
+        # Proxy tensors and reverse/relayed outputs are independent streams
+        # that can overlap. Keep their untagged P2P sequence spaces separate.
+        tensor_group = (
+            self.pp_output_group if msg_type == "output" else self.pp_group
+        )
         p2p_work = []
         p2p_work.extend(
-            self.pp_group.send_tensor_dict(
+            tensor_group.send_tensor_dict(
                 tensor_dict=tensor_dict,
                 all_gather_group=(
                     self.attn_tp_group if self.require_attn_tp_allgather else None
@@ -1125,8 +1174,11 @@ class SchedulerPPMixin:
             if inbox_queue:
                 return inbox_queue.popleft()
 
+        tensor_group = (
+            self.pp_output_group if expected_kind == "output" else self.pp_group
+        )
         while True:
-            tensor_dict = self.pp_group.recv_tensor_dict(
+            tensor_dict = tensor_group.recv_tensor_dict(
                 all_gather_group=all_gather_group
             )
             received_kind = tensor_dict.get("__msg_type__", "default")
@@ -1349,6 +1401,7 @@ class SchedulerPPMixin:
         mb_metadata: List[PPBatchMetadata],
         last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]],
         pp_outputs: PPProxyTensors | None,
+        relay_output_immediately: bool = False,
     ) -> Tuple[
         Optional[PPProxyTensors],
         Optional[GenerationBatchResult],
@@ -1401,7 +1454,28 @@ class SchedulerPPMixin:
                 d2h_event = self.device_module.Event()
                 d2h_event.record(self.device_module.current_stream())
 
-        if send_first:
+        if relay_output_immediately and self.pp_group.is_last_rank:
+            # The last PP stage is the unique origin of the output ring. Keep
+            # this first injection outstanding: rank zero does not post the
+            # matching receive until the next scheduler slot. The wrapper
+            # commits it at the start of that slot, while the dedicated PD
+            # control group lets the intervening control phases progress.
+            send_output_work = _do_send()
+            _do_recv()
+        elif relay_output_immediately:
+            # A non-last stage must relay the payload received in this slot,
+            # instead of deferring it until the next scheduler slot. Otherwise
+            # the last stage waits on output while rank zero waits in control.
+            _do_recv()
+            if next_pp_outputs is not None:
+                send_output_work = self._pp_send_dict_to_next_stage(
+                    next_pp_outputs.tensors,
+                    async_send=True,
+                    msg_type="output",
+                )
+            self._pp_commit_comm_work(send_output_work)
+            send_output_work = []
+        elif send_first:
             send_output_work = _do_send()
             _do_recv()
         else:
@@ -1460,10 +1534,15 @@ class SchedulerPPMixin:
         """
         Used by PP, get the required rids with the given poll statuses.
         """
+        pollers = [
+            req.disagg_kv_sender if is_send else req.kv_receiver for req in req_queue
+        ]
+        ordered_keys = [req.rid if is_send else req.req.rid for req in req_queue]
         polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender if is_send else req.kv_receiver for req in req_queue],
+            pollers,
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
+            ordered_keys=ordered_keys,
         )
         rids: List = []
         for poll_statuses in poll_statuses_group:

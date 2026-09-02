@@ -2,18 +2,26 @@
 hybrid-linear models (HybridLinearKVPool)."""
 
 import unittest
+from types import MethodType
 from types import SimpleNamespace
 
 import numpy as np
 
 from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.srt.disaggregation.prefill import _transfer_start_layer
 from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
+    build_dsa_state_layer_ids,
     build_transfer_entry_pairs,
+    setup_state_kv_args,
 )
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
+    HybridLinearKVPool,
+    MLATokenToKVPool,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -185,6 +193,30 @@ def _hybrid_pool_with_ids(*, layer_ids: list) -> HybridLinearKVPool:
     return pool
 
 
+def _mla_pool(*, start_layer: int, end_layer: int) -> MLATokenToKVPool:
+    pool = MLATokenToKVPool.__new__(MLATokenToKVPool)
+    pool.start_layer = start_layer
+    pool.end_layer = end_layer
+    pool.layer_num = end_layer - start_layer
+    return pool
+
+
+def _dsa_pool(
+    *, start_layer: int, end_layer: int, ptr_base: int
+) -> DSATokenToKVPool:
+    pool = DSATokenToKVPool.__new__(DSATokenToKVPool)
+    pool.start_layer = start_layer
+    pool.end_layer = end_layer
+    pool.layer_num = end_layer - start_layer
+    count = pool.layer_num
+    pool.get_state_buf_infos = lambda: (
+        list(range(ptr_base, ptr_base + count)),
+        [4096] * count,
+        [64] * count,
+    )
+    return pool
+
+
 class TestBuildKvLayerIds(CustomTestCase):
     """Bug regression: enabling EAGLE appended draft KV buffers to kv_data_ptrs
     while kv_layer_ids described only the target's entries, so the ids were
@@ -233,6 +265,28 @@ class TestBuildKvLayerIds(CustomTestCase):
             [],
         )
 
+    def test_mla_stage_publishes_global_layer_ids(self):
+        self.assertEqual(
+            build_kv_layer_ids(
+                token_to_kv_pool=_mla_pool(start_layer=40, end_layer=78),
+                draft_token_to_kv_pool=None,
+                num_draft_entries=0,
+                num_hidden_layers=78,
+            ),
+            list(range(40, 78)),
+        )
+
+    def test_mla_layer_bounds_must_match_registered_entries(self):
+        pool = _mla_pool(start_layer=40, end_layer=78)
+        pool.layer_num = 39
+        with self.assertRaisesRegex(RuntimeError, "MLA KV layer bounds"):
+            build_kv_layer_ids(
+                token_to_kv_pool=pool,
+                draft_token_to_kv_pool=None,
+                num_draft_entries=0,
+                num_hidden_layers=78,
+            )
+
     def test_ragged_draft_registration_is_rejected(self):
         with self.assertRaises(RuntimeError):
             build_kv_layer_ids(
@@ -278,6 +332,120 @@ class TestDraftBandPairsAcrossPipelineStages(CustomTestCase):
                 (2 * len(stage1) + 1, 2 * len(full) + 1),
             ],
         )
+
+    def test_mla_stage1_ignores_decode_only_eagle_entry(self):
+        src = build_kv_layer_ids(
+            token_to_kv_pool=_mla_pool(start_layer=40, end_layer=78),
+            draft_token_to_kv_pool=None,
+            num_draft_entries=0,
+            num_hidden_layers=78,
+        )
+        dst = build_kv_layer_ids(
+            token_to_kv_pool=_mla_pool(start_layer=40, end_layer=78),
+            draft_token_to_kv_pool=_mla_pool(start_layer=0, end_layer=1),
+            num_draft_entries=1,
+            num_hidden_layers=78,
+        )
+        self.assertEqual(src, list(range(40, 78)))
+        self.assertEqual(dst, list(range(40, 79)))
+        self.assertEqual(
+            build_transfer_entry_pairs(
+                src, dst, len(src), len(dst), allow_positional_fallback=False
+            ),
+            [(i, i) for i in range(38)],
+        )
+
+    def test_dsa_state_stage1_ignores_decode_only_eagle_entry(self):
+        prefill = _dsa_pool(start_layer=40, end_layer=78, ptr_base=1000)
+        decode = _dsa_pool(start_layer=40, end_layer=78, ptr_base=2000)
+        draft = _dsa_pool(start_layer=0, end_layer=1, ptr_base=3000)
+        prefill_args, decode_args = KVArgs(), KVArgs()
+
+        setup_state_kv_args(prefill_args, prefill, total_kv_layers=78)
+        setup_state_kv_args(decode_args, decode, draft, total_kv_layers=78)
+
+        self.assertEqual(prefill_args.state_types, [StateType.DSA])
+        self.assertEqual(decode_args.state_types, [StateType.DSA])
+        self.assertEqual(prefill_args.state_layer_ids[0], list(range(40, 78)))
+        self.assertEqual(decode_args.state_layer_ids[0], list(range(40, 79)))
+        self.assertEqual(
+            build_transfer_entry_pairs(
+                prefill_args.state_layer_ids[0],
+                decode_args.state_layer_ids[0],
+                len(prefill_args.state_data_ptrs[0]),
+                len(decode_args.state_data_ptrs[0]),
+                allow_positional_fallback=False,
+            ),
+            [(i, i) for i in range(38)],
+        )
+
+    def test_dsa_state_layer_metadata_fails_closed_on_entry_mismatch(self):
+        pool = _dsa_pool(start_layer=40, end_layer=78, ptr_base=1000)
+        with self.assertRaisesRegex(RuntimeError, "cover every registered entry"):
+            build_dsa_state_layer_ids(
+                token_to_kv_pool=pool,
+                num_entries=39,
+                total_kv_layers=78,
+            )
+
+    def test_layer_split_dsa_state_reports_only_owned_global_layers(self):
+        pool = _dsa_pool(start_layer=40, end_layer=78, ptr_base=1000)
+        pool.layer_shard_enabled = True
+        pool._owned_local_layer_range = lambda: (5, 10)
+        self.assertEqual(
+            build_dsa_state_layer_ids(
+                token_to_kv_pool=pool,
+                num_entries=5,
+                total_kv_layers=78,
+            ),
+            list(range(45, 50)),
+        )
+
+    def test_mooncake_generic_state_transfer_forwards_layer_ids(self):
+        manager = MooncakeKVManager.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(
+            state_types=[StateType.DSA],
+            state_data_ptrs=[list(range(1000, 1038))],
+            state_item_lens=[[64] * 38],
+            state_dim_per_tensor=[[]],
+            state_conv_shard_groups=[[]],
+            state_slice_outer_counts=[[]],
+            state_layer_ids=[list(range(40, 78))],
+        )
+        manager.is_mla_backend = True
+        manager.attn_tp_size = 8
+        manager.pp_size = 2
+        recorded = {}
+
+        def record_send(_self, **kwargs):
+            recorded.update(kwargs)
+            return 0
+
+        manager._send_kvcache_generic = MethodType(record_send, manager)
+        req = SimpleNamespace(
+            mooncake_session_id="session",
+            dst_state_indices=[[9]],
+        )
+        target = SimpleNamespace(
+            dst_state_data_ptrs=[list(range(2000, 2039))],
+            dst_state_item_lens=[[64] * 39],
+            dst_state_dim_per_tensor=[[]],
+            dst_state_layer_ids=[list(range(40, 79))],
+            dst_attn_tp_size=8,
+        )
+
+        rc = MooncakeKVManager.maybe_send_extra(
+            manager,
+            req=req,
+            prefill_state_indices=[[7]],
+            executor=None,
+            target_rank_registration_info=target,
+        )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(recorded["state_type"], StateType.DSA)
+        self.assertEqual(recorded["src_layer_ids"], list(range(40, 78)))
+        self.assertEqual(recorded["dst_layer_ids"], list(range(40, 79)))
 
 
 if __name__ == "__main__":
