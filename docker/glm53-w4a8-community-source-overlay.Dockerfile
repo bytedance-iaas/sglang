@@ -39,8 +39,8 @@ RUN set -eux; \
     sed -i "s/torch==2.13.0/torch==$(python3 -c 'import torch; print(torch.__version__)')/g" \
       /tmp/sglang-kernel-src/pyproject.toml; \
     mkdir -p /tmp/sglang-kernel-wheel; \
-    CMAKE_ARGS="-DENABLE_BELOW_SM90=OFF -DSGL_KERNEL_BUILD_SM100=OFF -DSGL_KERNEL_ENABLE_FA3=ON -DSGL_KERNEL_COMPILE_THREADS=2" \
-      CMAKE_BUILD_PARALLEL_LEVEL=8 \
+    CMAKE_ARGS="-DENABLE_BELOW_SM90=OFF -DSGL_KERNEL_BUILD_SM100=OFF -DSGL_KERNEL_ENABLE_FA3=ON -DSGL_KERNEL_COMPILE_THREADS=4" \
+      CMAKE_BUILD_PARALLEL_LEVEL=16 \
       python3 -m pip wheel --no-build-isolation --no-deps \
       --wheel-dir /tmp/sglang-kernel-wheel /tmp/sglang-kernel-src; \
     python3 -m pip install --no-deps --force-reinstall \
