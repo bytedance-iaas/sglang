@@ -179,6 +179,11 @@ option(SGL_KERNEL_ENABLE_FA3_SPARSE_MASK  "Enable FA3 sparse mask kernels" OFF)
 option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
 option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
 option(SGL_KERNEL_BUILD_SM100             "Build SM100+ common ops and gencode" ON)
+option(
+    SGL_KERNEL_FLASHMLA_ENABLE_SM100
+    "Build SM100 FlashMLA instantiations required by the upstream Python API"
+    ${SGL_KERNEL_BUILD_SM100}
+)
 
 if (SGL_KERNEL_ENABLE_BF16)
     list(APPEND SGL_KERNEL_CUDA_FLAGS

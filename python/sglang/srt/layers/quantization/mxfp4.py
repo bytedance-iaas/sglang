@@ -643,6 +643,29 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer._mxfp4_backend = "marlin"
             return
 
+        if self.use_mega_moe and get_platform().is_sm90:
+            from sglang.srt.layers.moe.mega_moe_sm90 import (
+                build_sm90_fp4_mega_moe_experts_weights,
+            )
+            from sglang.srt.layers.quantization.mxfp8_block_convert import (
+                _ue8m0_to_fp32,
+            )
+
+            # The SM90 FP4 MegaMoE kernel has a dedicated weight transform. It
+            # consumes packed E2M1 weights and decoded per-32 UE8M0 scales; the
+            # generic DeepGEMM scale-layout transform is an SM100 contract.
+            layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
+            layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
+            layer.w13_weight_scale.data = _ue8m0_to_fp32(
+                layer.w13_weight_scale.data
+            )
+            layer.w2_weight_scale.data = _ue8m0_to_fp32(
+                layer.w2_weight_scale.data
+            )
+            build_sm90_fp4_mega_moe_experts_weights(layer)
+            layer._mxfp4_backend = "deep_gemm"
+            return
+
         if self.use_deep_gemm or self.use_mega_moe:
             from deep_gemm import transform_sf_into_required_layout
 

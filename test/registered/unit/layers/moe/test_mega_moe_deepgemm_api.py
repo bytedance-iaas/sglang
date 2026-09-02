@@ -13,7 +13,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.layers.moe import mega_moe
+from sglang.srt.layers.moe import mega_moe, mega_moe_sm90
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -135,11 +135,70 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         with (
             patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
             patch.object(mega_moe, "_mega_moe_mma_type", return_value="mxf4xmxf4"),
+            patch(
+                "sglang.srt.layers.quantization.mxfp4.get_platform",
+                return_value=SimpleNamespace(is_sm90=False),
+            ),
         ):
             method.process_weights_after_loading(layer)
 
         call = deep_gemm.transform_weights_for_mega_moe.call_args
         self.assertEqual(call.kwargs.get("mma_type"), "mxf4xmxf4")
+
+    def test_sm90_mxf4_weight_transform_uses_native_fp4_contract(self):
+        from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+        deep_gemm = ModuleType("deep_gemm")
+        deep_gemm.fp8_fp4_mega_moe = MagicMock()
+        deep_gemm.mega_moe_pre_dispatch_sm90 = MagicMock()
+        deep_gemm._C = SimpleNamespace(fp8_fp4_mega_moe_sm90=MagicMock())
+        l1 = (torch.ones((1,), dtype=torch.int8), torch.ones((1,), dtype=torch.int32))
+        l2 = (torch.ones((1,), dtype=torch.int8), torch.ones((1,), dtype=torch.int32))
+        deep_gemm.transform_weights_for_mega_moe_sm90_fp4 = MagicMock(
+            return_value=(l1, l2)
+        )
+        deep_gemm.transform_sf_into_required_layout = MagicMock()
+
+        method = object.__new__(Mxfp4MoEMethod)
+        method.use_marlin = False
+        method.use_deep_gemm = False
+        method.use_mega_moe = True
+        layer = SimpleNamespace(
+            w13_weight=torch.nn.Parameter(
+                torch.zeros((1, 32, 16), dtype=torch.uint8), requires_grad=False
+            ),
+            w13_weight_scale=torch.nn.Parameter(
+                torch.full((1, 32, 4), 127, dtype=torch.uint8),
+                requires_grad=False,
+            ),
+            w2_weight=torch.nn.Parameter(
+                torch.zeros((1, 32, 16), dtype=torch.uint8), requires_grad=False
+            ),
+            w2_weight_scale=torch.nn.Parameter(
+                torch.full((1, 32, 4), 127, dtype=torch.uint8),
+                requires_grad=False,
+            ),
+        )
+
+        with (
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch(
+                "sglang.srt.layers.quantization.mxfp4.get_platform",
+                return_value=SimpleNamespace(is_sm90=True),
+            ),
+        ):
+            method.process_weights_after_loading(layer)
+
+        transform = deep_gemm.transform_weights_for_mega_moe_sm90_fp4
+        transform.assert_called_once()
+        l1_input, l2_input = transform.call_args.args
+        self.assertEqual(l1_input[0].dtype, torch.int8)
+        self.assertEqual(l2_input[0].dtype, torch.int8)
+        self.assertTrue(torch.all(l1_input[1] == 1.0))
+        self.assertTrue(torch.all(l2_input[1] == 1.0))
+        deep_gemm.transform_sf_into_required_layout.assert_not_called()
+        self.assertTrue(layer._mega_moe_sm90_fp4_weights)
+        self.assertTrue(layer._mega_moe_weights_built)
 
     def test_mxf4_pre_dispatch_uses_typed_api(self):
         deep_gemm = ModuleType("deep_gemm")
@@ -256,6 +315,71 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         actual = mega_moe._interleave_mega_moe_gate_up(source, gran=16)
 
         torch.testing.assert_close(actual, expected)
+
+    def test_sm90_fp4_availability_requires_marker_and_native_kernel(self):
+        deep_gemm = ModuleType("deep_gemm")
+        deep_gemm.fp8_fp4_mega_moe = MagicMock()
+        deep_gemm.mega_moe_pre_dispatch_sm90 = MagicMock()
+        deep_gemm._C = SimpleNamespace(fp8_fp4_mega_moe_sm90=MagicMock())
+        experts = SimpleNamespace(_mega_moe_sm90_fp4_weights=True)
+
+        with (
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch.object(mega_moe_sm90, "_device_sm", 90),
+        ):
+            self.assertTrue(mega_moe_sm90.is_sm90_fp4_mega_moe_available(experts))
+            del deep_gemm._C.fp8_fp4_mega_moe_sm90
+            self.assertFalse(mega_moe_sm90.is_sm90_fp4_mega_moe_available(experts))
+
+    def test_sm90_fp4_dispatch_uses_fp8_fp4_kernel(self):
+        deep_gemm = ModuleType("deep_gemm")
+        deep_gemm.mega_moe_pre_dispatch_sm90 = MagicMock()
+        deep_gemm.fp8_fp4_mega_moe = MagicMock()
+        deep_gemm.fp8_mega_moe = MagicMock()
+        experts = SimpleNamespace(
+            _mega_moe_sm90_fp4_weights=True,
+            should_fuse_routed_scaling_factor_in_topk=True,
+            mega_l1_weights=(torch.empty(0), torch.empty(0)),
+            mega_l2_weights=(torch.empty(0), torch.empty(0)),
+        )
+        moe = SimpleNamespace(
+            experts=experts,
+            config=SimpleNamespace(hidden_size=4, swiglu_limit=None),
+            routed_scaling_factor=1.0,
+        )
+        buffer = SimpleNamespace(
+            x=torch.empty((1, 4)),
+            x_sf=torch.empty((1, 1)),
+            topk_idx=torch.empty((1, 1), dtype=torch.int32),
+            topk_weights=torch.empty((1, 1)),
+        )
+
+        with (
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch.object(
+                mega_moe_sm90,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(enable_w4a4_mxfp4_megamoe=False)
+                ),
+            ),
+        ):
+            output = mega_moe_sm90.run_sm90_mega_routed(
+                moe,
+                torch.ones((1, 4), dtype=torch.bfloat16),
+                torch.zeros((1, 1), dtype=torch.int32),
+                torch.ones((1, 1)),
+                buffer,
+                1,
+            )
+
+        self.assertEqual(output.shape, (1, 4))
+        deep_gemm.mega_moe_pre_dispatch_sm90.assert_called_once()
+        deep_gemm.fp8_fp4_mega_moe.assert_called_once()
+        self.assertEqual(
+            deep_gemm.fp8_fp4_mega_moe.call_args.kwargs["recipe"], (1, 1, 32)
+        )
+        deep_gemm.fp8_mega_moe.assert_not_called()
 
 
 if __name__ == "__main__":

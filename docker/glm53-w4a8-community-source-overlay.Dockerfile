@@ -39,7 +39,7 @@ RUN set -eux; \
     sed -i "s/torch==2.13.0/torch==$(python3 -c 'import torch; print(torch.__version__)')/g" \
       /tmp/sglang-kernel-src/pyproject.toml; \
     mkdir -p /tmp/sglang-kernel-wheel; \
-    CMAKE_ARGS="-DENABLE_BELOW_SM90=OFF -DSGL_KERNEL_BUILD_SM100=OFF -DSGL_KERNEL_ENABLE_FA3=ON -DSGL_KERNEL_COMPILE_THREADS=4" \
+    CMAKE_ARGS="-DENABLE_BELOW_SM90=OFF -DSGL_KERNEL_BUILD_SM100=OFF -DSGL_KERNEL_FLASHMLA_ENABLE_SM100=ON -DSGL_KERNEL_ENABLE_FA3=ON -DSGL_KERNEL_COMPILE_THREADS=4" \
       CMAKE_BUILD_PARALLEL_LEVEL=16 \
       python3 -m pip wheel --no-build-isolation --no-deps \
       --wheel-dir /tmp/sglang-kernel-wheel /tmp/sglang-kernel-src; \
@@ -48,6 +48,7 @@ RUN set -eux; \
     test "$(python3 -c 'from importlib.metadata import version; print(version("sglang-kernel"))')" = "${SGLANG_KERNEL_VERSION}"; \
     test "$(python3 -c 'from importlib.metadata import requires; print(next(x.split("==", 1)[1] for x in requires("sglang-kernel") if x.startswith("torch==")))')" = "$(python3 -c 'import torch; print(torch.__version__)')"; \
     python3 -c 'from importlib.metadata import distribution; files = tuple(map(str, distribution("sglang-kernel").files or ())); assert any(path.startswith("sgl_kernel/sm90/common_ops.") and path.endswith(".so") for path in files), files; assert not any(path.startswith("sgl_kernel/sm100/common_ops.") for path in files), files; assert any(path.startswith("sgl_kernel/flash_ops.") and path.endswith(".so") for path in files), files; assert any(path.startswith("sgl_kernel/flashmla_ops.") and path.endswith(".so") for path in files), files'; \
+    python3 -c 'import sgl_kernel.flashmla_ops'; \
     rm -rf /tmp/sglang-kernel-src /tmp/sglang-kernel-wheel; \
     printf '%s\n' "${SGLANG_SOURCE_ARCHIVE_SHA256}" > /opt/sglang-source-archive-sha256; \
     PYTHONPATH=/glm53-community/sglang/python python3 -c 'import importlib.machinery, pathlib; expected = pathlib.Path("/glm53-community/sglang/python/sglang/__init__.py"); actual = pathlib.Path(importlib.machinery.PathFinder.find_spec("sglang").origin).resolve(); print(f"SGLANG_SPEC_ORIGIN={actual}"); assert actual == expected'
