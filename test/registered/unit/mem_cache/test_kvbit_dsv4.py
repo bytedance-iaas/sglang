@@ -4,11 +4,11 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4SingleKVPool,
     DeepSeekV4TokenToKVPool,
 )
+from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
 from sglang.srt.mem_cache.kvbit_dsv4 import (
     DSV4_BU4_LAYOUT,
     DSV4KVBitPackedSWAPool,
@@ -83,24 +83,84 @@ class TestDSV4KVBitLayout(CustomTestCase):
 class TestDSV4KVBitCapability(CustomTestCase):
     """Enabling storage must never silently fall back to native scratch."""
 
-    def test_environment_switch_is_off_by_default_and_restored(self):
-        envs.SGLANG_ENABLE_KVBIT.clear()
-        self.addCleanup(envs.SGLANG_ENABLE_KVBIT.clear)
-        self.assertFalse(envs.SGLANG_ENABLE_KVBIT.get())
-        with envs.SGLANG_ENABLE_KVBIT.override(True):
-            self.assertTrue(envs.SGLANG_ENABLE_KVBIT.get())
-        self.assertFalse(envs.SGLANG_ENABLE_KVBIT.get())
-
     def test_only_target_worker_is_eligible(self):
         self.assertTrue(
-            dsv4_kvbit_enabled_for_worker(enabled=True, is_draft_worker=False)
+            dsv4_kvbit_enabled_for_worker(kv_cache_dtype="kvbit", is_draft_worker=False)
         )
         self.assertFalse(
-            dsv4_kvbit_enabled_for_worker(enabled=True, is_draft_worker=True)
+            dsv4_kvbit_enabled_for_worker(kv_cache_dtype="kvbit", is_draft_worker=True)
         )
         self.assertFalse(
-            dsv4_kvbit_enabled_for_worker(enabled=False, is_draft_worker=False)
+            dsv4_kvbit_enabled_for_worker(kv_cache_dtype="auto", is_draft_worker=False)
         )
+
+    def test_target_kvbit_keeps_tag_and_resolves_backing_dtype_as_auto(self):
+        tag, dtype = configure_kv_cache_dtype(
+            server_args_kv_cache_dtype="kvbit",
+            model=SimpleNamespace(quant_config=None),
+            model_dtype=torch.bfloat16,
+            is_draft_worker=False,
+            is_dflash=False,
+            speculative_draft_attention_backend="fa3",
+        )
+
+        self.assertEqual(tag, "kvbit")
+        self.assertEqual(dtype, torch.bfloat16)
+
+        fp8_tag, fp8_dtype = configure_kv_cache_dtype(
+            server_args_kv_cache_dtype="kvbit",
+            model=SimpleNamespace(
+                quant_config=SimpleNamespace(kv_cache_quant_algo="FP8")
+            ),
+            model_dtype=torch.bfloat16,
+            is_draft_worker=False,
+            is_dflash=False,
+            speculative_draft_attention_backend="fa3",
+        )
+
+        self.assertEqual(fp8_tag, "kvbit")
+        self.assertEqual(fp8_dtype, torch.float8_e4m3fn)
+
+    def test_draft_defaults_to_auto_instead_of_inheriting_kvbit(self):
+        tag, dtype = configure_kv_cache_dtype(
+            server_args_kv_cache_dtype="kvbit",
+            model=SimpleNamespace(quant_config=None),
+            model_dtype=torch.bfloat16,
+            is_draft_worker=True,
+            is_dflash=False,
+            speculative_draft_attention_backend="fa3",
+        )
+
+        self.assertEqual(tag, "auto")
+        self.assertEqual(dtype, torch.bfloat16)
+
+    def test_explicit_draft_dtype_takes_precedence_over_target_kvbit(self):
+        tag, dtype = configure_kv_cache_dtype(
+            server_args_kv_cache_dtype="kvbit",
+            speculative_draft_kv_cache_dtype="fp8_e5m2",
+            model=SimpleNamespace(quant_config=None),
+            model_dtype=torch.bfloat16,
+            is_draft_worker=True,
+            is_dflash=False,
+            speculative_draft_attention_backend="fa3",
+        )
+
+        self.assertEqual(tag, "fp8_e5m2")
+        self.assertEqual(dtype, torch.float8_e5m2)
+
+    def test_explicit_draft_auto_takes_precedence_over_target_kvbit(self):
+        tag, dtype = configure_kv_cache_dtype(
+            server_args_kv_cache_dtype="kvbit",
+            speculative_draft_kv_cache_dtype="auto",
+            model=SimpleNamespace(quant_config=None),
+            model_dtype=torch.bfloat16,
+            is_draft_worker=True,
+            is_dflash=False,
+            speculative_draft_attention_backend="fa3",
+        )
+
+        self.assertEqual(tag, "auto")
+        self.assertEqual(dtype, torch.bfloat16)
 
     def test_capability_gate_rejects_each_missing_direct_operation(self):
         with self.assertRaisesRegex(RuntimeError, "scratch fallback is disabled"):

@@ -98,7 +98,7 @@ def require_dsv4_kvbit_runtime_capability(
         missing.append("direct packed decode")
     if missing:
         raise RuntimeError(
-            "SGLANG_ENABLE_KVBIT requires DSV4 "
+            "--kv-cache-dtype kvbit requires DSV4 "
             + " and ".join(missing)
             + " capability; native/scratch fallback is disabled."
         )
@@ -115,8 +115,10 @@ def validate_dsv4_bu4_geometry(nope_dim: int, rope_dim: int) -> None:
         )
 
 
-def dsv4_kvbit_enabled_for_worker(*, enabled: bool, is_draft_worker: bool) -> bool:
-    return enabled and not is_draft_worker
+def dsv4_kvbit_enabled_for_worker(
+    *, kv_cache_dtype: str | None, is_draft_worker: bool
+) -> bool:
+    return kv_cache_dtype == "kvbit" and not is_draft_worker
 
 
 def dsv4_kvbit_target_persistent_savings(

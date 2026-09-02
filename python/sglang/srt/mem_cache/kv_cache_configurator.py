@@ -1263,7 +1263,7 @@ class KVCacheConfigurator:
         req_to_token_pool: ReqToTokenPool,
     ) -> KVCache:
         enable_kvbit_swa = dsv4_kvbit_enabled_for_worker(
-            enabled=envs.SGLANG_ENABLE_KVBIT.get(),
+            kv_cache_dtype=self.kv_cache_dtype_str,
             is_draft_worker=self.is_draft_worker,
         )
         if enable_kvbit_swa:

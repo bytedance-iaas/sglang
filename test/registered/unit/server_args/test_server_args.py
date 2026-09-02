@@ -29,6 +29,7 @@ from sglang.srt.arg_groups.hisparse_hook import (
 )
 from sglang.srt.arg_groups.kv_cache_hook import (
     handle_cache_compatibility,
+    handle_kvbit_kv_cache_compatibility,
     validate_prefill_only_disable_kv_cache_args,
 )
 from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
@@ -104,6 +105,88 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_kvbit_kv_cache_dtype_cli_choice(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        args = parser.parse_args(
+            ["--model-path", "dummy-model", "--kv-cache-dtype", "kvbit"]
+        )
+
+        self.assertEqual(args.kv_cache_dtype, "kvbit")
+
+    def test_kvbit_rejects_non_dsv4_model(self):
+        cfg = SimpleNamespace(kv_cache_dtype="kvbit")
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
+        )
+        platform = SimpleNamespace(is_cuda=True, is_sm90=True)
+        with (
+            patch(
+                "sglang.srt.arg_groups.kv_cache_hook.resolving_view",
+                return_value=cfg,
+            ),
+            patch(
+                "sglang.srt.arg_groups.kv_cache_hook.model_config_of",
+                return_value=model_config,
+            ),
+            patch(
+                "sglang.srt.arg_groups.kv_cache_hook.get_platform",
+                return_value=platform,
+            ),
+            self.assertRaisesRegex(ValueError, "only DeepSeek V4"),
+        ):
+            handle_kvbit_kv_cache_compatibility(object())
+
+    def test_kvbit_rejects_non_sm90_platforms(self):
+        cfg = SimpleNamespace(kv_cache_dtype="kvbit")
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
+        )
+        for platform, message in (
+            (SimpleNamespace(is_cuda=False, is_sm90=False), "requires a CUDA GPU"),
+            (SimpleNamespace(is_cuda=True, is_sm90=False), "requires an SM90"),
+        ):
+            with (
+                self.subTest(platform=platform),
+                patch(
+                    "sglang.srt.arg_groups.kv_cache_hook.resolving_view",
+                    return_value=cfg,
+                ),
+                patch(
+                    "sglang.srt.arg_groups.kv_cache_hook.model_config_of",
+                    return_value=model_config,
+                ),
+                patch(
+                    "sglang.srt.arg_groups.kv_cache_hook.get_platform",
+                    return_value=platform,
+                ),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                handle_kvbit_kv_cache_compatibility(object())
+
+    def test_kvbit_accepts_dsv4_on_sm90(self):
+        cfg = SimpleNamespace(kv_cache_dtype="kvbit")
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
+        )
+        platform = SimpleNamespace(is_cuda=True, is_sm90=True)
+        with (
+            patch(
+                "sglang.srt.arg_groups.kv_cache_hook.resolving_view",
+                return_value=cfg,
+            ),
+            patch(
+                "sglang.srt.arg_groups.kv_cache_hook.model_config_of",
+                return_value=model_config,
+            ),
+            patch(
+                "sglang.srt.arg_groups.kv_cache_hook.get_platform",
+                return_value=platform,
+            ),
+        ):
+            handle_kvbit_kv_cache_compatibility(object())
+
     def test_weight_cache_daemon_allows_static_eplb(self):
         args = ServerArgs(
             model_path="dummy",

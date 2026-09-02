@@ -872,7 +872,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     def _apply_kvbit_target_swa_budget(self, kvc: KVCacheConfigurator) -> None:
         self.kvbit_packed_swa = dsv4_kvbit_enabled_for_worker(
-            enabled=envs.SGLANG_ENABLE_KVBIT.get(),
+            kv_cache_dtype=kvc.kv_cache_dtype_str,
             is_draft_worker=kvc.is_draft_worker,
         )
         if self.kvbit_packed_swa:

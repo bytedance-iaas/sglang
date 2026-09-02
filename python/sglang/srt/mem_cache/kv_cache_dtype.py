@@ -30,10 +30,23 @@ def configure_kv_cache_dtype(
     speculative_draft_kv_cache_dtype: Optional[str] = None,
 ) -> tuple[Optional[str], torch.dtype]:
     resolved_kv_cache_dtype: Optional[str] = None
-    if is_draft_worker and speculative_draft_kv_cache_dtype is not None:
-        server_args_kv_cache_dtype = speculative_draft_kv_cache_dtype
-        if server_args_kv_cache_dtype != "auto":
+    if is_draft_worker:
+        if speculative_draft_kv_cache_dtype is not None:
+            server_args_kv_cache_dtype = speculative_draft_kv_cache_dtype
             resolved_kv_cache_dtype = server_args_kv_cache_dtype
+        elif server_args_kv_cache_dtype == "kvbit":
+            # KVBit is target-only. The draft must resolve independently from
+            # auto unless the user explicitly selected a draft dtype.
+            server_args_kv_cache_dtype = "auto"
+            resolved_kv_cache_dtype = "auto"
+
+    use_kvbit = server_args_kv_cache_dtype == "kvbit"
+    if use_kvbit:
+        # Keep "kvbit" as the target worker's routing tag while resolving the
+        # backing torch dtype exactly as --kv-cache-dtype auto would.
+        server_args_kv_cache_dtype = "auto"
+        resolved_kv_cache_dtype = "kvbit"
+
     if server_args_kv_cache_dtype == "auto":
         quant_config = getattr(model, "quant_config", None)
         kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
@@ -42,7 +55,8 @@ def configure_kv_cache_dtype(
             and kv_cache_quant_algo.upper() == "FP8"
         ):
             kv_cache_dtype = fp8_dtype if _is_hip else torch.float8_e4m3fn
-            resolved_kv_cache_dtype = TORCH_DTYPE_TO_KV_CACHE_STR[kv_cache_dtype]
+            if not use_kvbit:
+                resolved_kv_cache_dtype = TORCH_DTYPE_TO_KV_CACHE_STR[kv_cache_dtype]
         else:
             kv_cache_dtype = model_dtype
     elif server_args_kv_cache_dtype == "fp8_e5m2":
