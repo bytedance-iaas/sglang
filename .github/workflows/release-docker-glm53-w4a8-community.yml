@@ -163,7 +163,7 @@ jobs:
             test "$(cat /opt/sgl-deep-gemm/source-commit)" = "$3"
             test "$(cat /opt/sglang-source-archive-sha256)" = "$4"
             test "$(python3 -c '"'"'from importlib.metadata import version; print(version("sglang-kernel"))'"'"')" = "$5"
-            python3 -c '"'"'import sgl_kernel; assert hasattr(sgl_kernel, "__path__")'"'"'
+            python3 -c '"'"'from importlib.metadata import distribution; files = tuple(map(str, distribution("sglang-kernel").files or ())); assert any(path.startswith("sgl_kernel/sm90/common_ops.") and path.endswith(".so") for path in files), files'"'"'
             PYTHONPATH=/glm53-community/sglang/python python3 -c '"'"'import importlib.machinery, pathlib; expected = pathlib.Path("/glm53-community/sglang/python/sglang/__init__.py"); actual = pathlib.Path(importlib.machinery.PathFinder.find_spec("sglang").origin).resolve(); assert actual == expected'"'"'
             python3 -c '"'"'import deep_gemm; assert callable(getattr(deep_gemm, "fp8_fp4_mega_moe", None)); assert callable(getattr(deep_gemm, "mega_moe_pre_dispatch_sm90", None)); assert callable(getattr(deep_gemm._C, "fp8_fp4_mega_moe_sm90", None))'"'"'
             PYTHONPATH=/glm53-community/sglang/python python3 -m pytest -q /glm53-community/sglang/test/registered/unit/model_loader/test_mxfp4_packed_expert_names.py
