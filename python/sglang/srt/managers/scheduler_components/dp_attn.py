@@ -94,6 +94,7 @@ class MLPSyncBatchInfo:
     num_tokens_for_logprob: int
     can_run_decode_cuda_graph: bool
     can_run_prefill_cuda_graph: bool
+    can_draft_cuda_graph: bool
     is_extend_in_batch: bool
     local_can_run_tbo: bool
     local_forward_mode: int
@@ -116,6 +117,7 @@ class MLPSyncBatchInfo:
                 int(self.local_can_run_tbo),
                 self.local_forward_mode,
                 int(self.can_run_prefill_cuda_graph),
+                int(self.can_draft_cuda_graph),
             ],
             device=device,
             dtype=dtype,
@@ -131,6 +133,7 @@ class MLPSyncBatchInfo:
                 1,  # local_can_run_tbo
                 ForwardMode.IDLE.value,  # local_forward_mode
                 0,  # can_run_prefill_cuda_graph
+                1,  # can_draft_cuda_graph
             ],
             device=device,
             dtype=dtype,
@@ -212,6 +215,7 @@ class MLPSyncBatchInfo:
         self.can_run_decode_cuda_graph = bool(tp0_info_cpu[:, 2].min())
         self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
         self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())
+        self.can_draft_cuda_graph = bool(tp0_info_cpu[:, 7].min())
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 tp0_info_cpu[:, 5].tolist()
@@ -240,6 +244,7 @@ def _update_gather_batch(
 
     # Check forward mode for cuda graph
     batch.can_run_decode_cuda_graph = mlp_sync_info.can_run_decode_cuda_graph
+    batch.can_run_dp_draft_cuda_graph = mlp_sync_info.can_draft_cuda_graph
     batch.can_run_dp_prefill_cuda_graph = mlp_sync_info.can_run_prefill_cuda_graph
 
 
@@ -400,6 +405,13 @@ def prepare_mlp_sync_batch_raw(
         spec_algorithm=model_runner.spec_algorithm,
         model_config=model_runner.model_config,
     )
+    # A seedless DSA draft must run eagerly on every DP/MoE rank. Reuse the
+    # scheduler metadata collective below so the decision is min-reduced with
+    # no additional collective or phase boundary.
+    can_draft_cuda_graph = not (
+        local_batch is not None
+        and getattr(local_batch, "force_disable_draft_cuda_graph", False)
+    )
 
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
     if local_batch is not None:
@@ -441,6 +453,7 @@ def prepare_mlp_sync_batch_raw(
         num_tokens_for_logprob=num_tokens_for_logprob,
         can_run_decode_cuda_graph=can_run_decode_cuda_graph,
         can_run_prefill_cuda_graph=can_run_prefill_cuda_graph,
+        can_draft_cuda_graph=can_draft_cuda_graph,
         is_extend_in_batch=is_extend_in_batch,
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,

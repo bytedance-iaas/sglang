@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
@@ -17,6 +18,36 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestPPEaglePrebuiltMerge(unittest.TestCase):
+    def test_seedless_draft_vote_is_set_before_dp_metadata_sync(self):
+        batch = SimpleNamespace(
+            is_empty=lambda: False, force_disable_draft_cuda_graph=False
+        )
+        draft_worker = SimpleNamespace(
+            requires_dp_attention_eager_forward=lambda candidate: candidate is batch
+        )
+
+        def prepare(candidate):
+            self.assertTrue(candidate.force_disable_draft_cuda_graph)
+            return candidate
+
+        scheduler = SimpleNamespace(
+            get_new_prebuilt_batch=lambda _running: None,
+            update_running_batch=lambda running: running,
+            draft_worker=draft_worker,
+            dp_attn_adapter=SimpleNamespace(maybe_prepare_mlp_sync_batch=prepare),
+        )
+        with patch(
+            "sglang.srt.disaggregation.decode.set_schedule_time_batch"
+        ) as set_schedule_time:
+            plan = (
+                SchedulerDisaggregationDecodeMixin.get_next_disagg_decode_batch_to_run(
+                    scheduler, batch
+                )
+            )
+
+        self.assertIs(plan.batch_to_run, batch)
+        set_schedule_time.assert_called_once_with(batch)
+
     @staticmethod
     def _batch(draft_input):
         return SimpleNamespace(

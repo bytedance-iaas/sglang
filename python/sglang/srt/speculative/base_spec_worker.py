@@ -190,6 +190,14 @@ class BaseSpecWorker(ABC):
         # ngram has no draft worker at all (returns None via its override).
         return self._draft_worker
 
+    def requires_dp_attention_eager_forward(self, batch) -> bool:
+        """Whether this rank requires eager speculative draft execution.
+
+        The scheduler folds this rank-local result into the existing DP
+        MLP-sync metadata collective before the MoE forward.
+        """
+        return False
+
     @property
     def graph_memory_usage(self) -> dict[str, float]:
         if self.draft_worker is None:

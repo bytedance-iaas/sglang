@@ -1,5 +1,6 @@
 """CPU contracts for compressed-tensors MXFP4 expert checkpoint names."""
 
+import unittest
 from types import SimpleNamespace
 from unittest import TestCase, mock
 
@@ -63,8 +64,7 @@ class TestMxfp4PackedExpertNames(TestCase):
             "sglang.srt.layers.moe.fused_moe_triton.FusedMoE",
             _DummyFusedMoE,
         ), mock.patch(
-            "sglang.srt.layers.quantization.mxfp4."
-            "Mxfp4MoEMethod",
+            "sglang.srt.layers.quantization.mxfp4." "Mxfp4MoEMethod",
             return_value="generic-mxfp4",
         ) as generic_method:
             method = config.get_quant_method(layer, "model.layers.3.mlp.experts")
@@ -128,3 +128,7 @@ class TestMxfp4PackedExpertNames(TestCase):
             _normalize_mxfp4_packed_expert_weight_name(name, _quant_config()),
             name,
         )
+
+
+if __name__ == "__main__":
+    unittest.main()

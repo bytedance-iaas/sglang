@@ -169,6 +169,53 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
 
+    def test_dp_attention_eager_vote_uses_resolved_seed_contract(self):
+        worker = object.__new__(EAGLEWorkerV2)
+
+        worker._draft_worker = None
+        self.assertFalse(
+            worker.requires_dp_attention_eager_forward(
+                SimpleNamespace(spec_info=SimpleNamespace())
+            )
+        )
+
+        worker._draft_worker = SimpleNamespace(seed_dsa_topk_from_draft_extend=False)
+        self.assertFalse(
+            worker.requires_dp_attention_eager_forward(
+                SimpleNamespace(spec_info=SimpleNamespace())
+            )
+        )
+
+        worker._draft_worker.seed_dsa_topk_from_draft_extend = True
+        for spec_info, expected in (
+            (None, False),
+            (SimpleNamespace(dsa_topk_indices=None, future_indices=None), True),
+            (SimpleNamespace(dsa_topk_indices=object(), future_indices=None), False),
+            (
+                SimpleNamespace(
+                    dsa_topk_indices=object(),
+                    future_indices=object(),
+                    future_dsa_topk_indices_available=False,
+                ),
+                True,
+            ),
+            (
+                SimpleNamespace(
+                    dsa_topk_indices=None,
+                    future_indices=object(),
+                    future_dsa_topk_indices_available=True,
+                ),
+                False,
+            ),
+        ):
+            with self.subTest(spec_info=spec_info, expected=expected):
+                self.assertEqual(
+                    worker.requires_dp_attention_eager_forward(
+                        SimpleNamespace(spec_info=spec_info)
+                    ),
+                    expected,
+                )
+
     def test_missing_seed_cuda_graph_fallback(self):
         graph_result = (
             [],
@@ -205,6 +252,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 worker.speculative_num_draft_tokens = 2
                 worker.device = DEVICE
                 worker.tree_mask_mode = None
+                worker.server_args = SimpleNamespace(pp_size=1)
                 worker.seed_dsa_topk_from_draft_extend = seed_enabled
                 worker.index_share_for_mtp_iteration = True
                 forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
