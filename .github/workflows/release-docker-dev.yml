@@ -38,7 +38,7 @@ on:
         type: boolean
         default: true
       private_debug_base_only:
-        description: "Volcengine fork only: build and publish exactly one AMD64 CUDA 13 base image, without compiling a kernel wheel or building SBO/W4A8 variants."
+        description: "Volcengine fork only: build and publish exactly one AMD64 CUDA 13 base image without compiling a kernel wheel."
         required: false
         type: boolean
         default: false
@@ -299,53 +299,22 @@ jobs:
   build-dev:
     needs: [build-dev-kernel-wheel]
     if: ${{ github.repository == 'bytedance-iaas/sglang' && !inputs.private_debug_base_only && inputs.private_debug_verify_image == '' && always() && (needs.build-dev-kernel-wheel.result == 'success' || needs.build-dev-kernel-wheel.result == 'skipped') }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - cuda_key: cu130
-            cuda_version: 13.0.1
-            cuda_suffix: cu130
-            publish_default_cuda_alias: true
-            hopper_sbo: 0
-            w4a8_per_tensor_transfer: 0
-            variant_suffix: ""
-            artifact_name: sgl-kernel-x86-cu13
-          - cuda_key: cu130
-            cuda_version: 13.0.1
-            cuda_suffix: cu130
-            publish_default_cuda_alias: true
-            hopper_sbo: 1
-            w4a8_per_tensor_transfer: 0
-            variant_suffix: sbo
-            artifact_name: sgl-kernel-x86-cu13
-          - cuda_key: cu130
-            cuda_version: 13.0.1
-            cuda_suffix: cu130
-            publish_default_cuda_alias: true
-            hopper_sbo: 0
-            w4a8_per_tensor_transfer: 1
-            variant_suffix: w4a8
-            artifact_name: sgl-kernel-x86-cu13
     uses: ./.github/workflows/_docker-build-and-publish.yml
     with:
       docker_target: framework_final
       checkout_ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
-      cuda_key: ${{ matrix.cuda_key }}
-      cuda_version: ${{ matrix.cuda_version }}
-      cuda_suffix: ${{ matrix.cuda_suffix }}
-      publish_default_cuda_alias: ${{ matrix.publish_default_cuda_alias }}
-      variant_suffix: ${{ matrix.variant_suffix }}
+      cuda_key: cu130
+      cuda_version: 13.0.1
+      cuda_suffix: cu130
+      publish_default_cuda_alias: true
       tag_mode: ${{ github.event_name == 'schedule' && 'nightly' || 'manual' }}
       tag_value: ${{ inputs.tag }}
       use_environment: prod
-      artifact_name: ${{ (github.event_name == 'schedule' || inputs.compile_kernel) && matrix.artifact_name || '' }}
+      artifact_name: ${{ (github.event_name == 'schedule' || inputs.compile_kernel) && 'sgl-kernel-x86-cu13' || '' }}
       extra_build_args: >-
         --build-arg BRANCH_TYPE=local
         --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
         --build-arg INSTALL_LOCAL_SGL_KERNEL_WHEEL=${{ (github.event_name == 'schedule' || inputs.compile_kernel) && '1' || '0' }}
-        --build-arg HOPPER_SBO=${{ matrix.hopper_sbo }}
-        --build-arg W4A8_PER_TENSOR_TRANSFER=${{ matrix.w4a8_per_tensor_transfer }}
         --build-arg HTTP_PROXY=http://100.68.162.211:3128
         --build-arg HTTPS_PROXY=http://100.68.162.211:3128
         --build-arg ALL_PROXY=http://100.68.162.211:3128
@@ -371,8 +340,6 @@ jobs:
         --build-arg BRANCH_TYPE=local
         --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
         --build-arg INSTALL_LOCAL_SGL_KERNEL_WHEEL=0
-        --build-arg HOPPER_SBO=0
-        --build-arg W4A8_PER_TENSOR_TRANSFER=0
         --build-arg HTTP_PROXY=http://100.68.162.211:3128
         --build-arg HTTPS_PROXY=http://100.68.162.211:3128
         --build-arg ALL_PROXY=http://100.68.162.211:3128
