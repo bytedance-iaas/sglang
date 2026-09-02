@@ -2203,8 +2203,8 @@ class ServerArgs:
             "DFLASH draft costs 10240 bytes/token in bf16. Setting fp8_e4m3 halves the draft "
             "pool; the saving shows up as free device memory, so raise "
             "--mem-fraction-static to convert it into KV capacity. Defaults to "
-            "auto when target --kv-cache-dtype is kvbit; otherwise follows the "
-            "target dtype. An explicit draft dtype always takes precedence.",
+            "fp8_e4m3 when target --kv-cache-dtype is kvbit; otherwise follows "
+            "the target dtype. An explicit draft dtype always takes precedence.",
             choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16"],
         ),
         NS("spec"),

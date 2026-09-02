@@ -121,7 +121,7 @@ class TestDSV4KVBitCapability(CustomTestCase):
         self.assertEqual(fp8_tag, "kvbit")
         self.assertEqual(fp8_dtype, torch.float8_e4m3fn)
 
-    def test_draft_defaults_to_auto_instead_of_inheriting_kvbit(self):
+    def test_draft_defaults_to_fp8_instead_of_inheriting_kvbit(self):
         tag, dtype = configure_kv_cache_dtype(
             server_args_kv_cache_dtype="kvbit",
             model=SimpleNamespace(quant_config=None),
@@ -131,8 +131,8 @@ class TestDSV4KVBitCapability(CustomTestCase):
             speculative_draft_attention_backend="fa3",
         )
 
-        self.assertEqual(tag, "auto")
-        self.assertEqual(dtype, torch.bfloat16)
+        self.assertEqual(tag, "fp8_e4m3")
+        self.assertEqual(dtype, torch.float8_e4m3fn)
 
     def test_explicit_draft_dtype_takes_precedence_over_target_kvbit(self):
         tag, dtype = configure_kv_cache_dtype(

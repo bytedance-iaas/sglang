@@ -35,10 +35,11 @@ def configure_kv_cache_dtype(
             server_args_kv_cache_dtype = speculative_draft_kv_cache_dtype
             resolved_kv_cache_dtype = server_args_kv_cache_dtype
         elif server_args_kv_cache_dtype == "kvbit":
-            # KVBit is target-only. The draft must resolve independently from
-            # auto unless the user explicitly selected a draft dtype.
-            server_args_kv_cache_dtype = "auto"
-            resolved_kv_cache_dtype = "auto"
+            # KVBit is target-only. DSV4's draft pool uses the existing
+            # 584-byte FP8 layout, so preserve that default unless the user
+            # explicitly selected a draft dtype.
+            server_args_kv_cache_dtype = "fp8_e4m3"
+            resolved_kv_cache_dtype = "fp8_e4m3"
 
     use_kvbit = server_args_kv_cache_dtype == "kvbit"
     if use_kvbit:
