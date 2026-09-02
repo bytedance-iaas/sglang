@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager, nullcontext
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -2966,8 +2966,12 @@ class DeepseekV2Model(nn.Module):
 
 
 class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
-    # for quark model load
-    packed_modules_mapping = {}
+    # Quantization configs name the unfused checkpoint projections. Keep this
+    # mapping available before DeepseekV2MLP constructs its fused linear so
+    # ignore/target matching preserves the source-layer quantization scheme.
+    packed_modules_mapping: ClassVar[dict[str, list[str]]] = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
     def __init__(
         self,

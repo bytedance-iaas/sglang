@@ -9,14 +9,25 @@ from typing import Iterable, List, Mapping, Optional
 from compressed_tensors import CompressionFormat
 from torch.nn import Module
 
+# ``mxfp4_pack_quantized`` is absent from older compressed-tensors releases.
+# Keep those installations importable for unrelated formats while treating
+# MXFP4 checkpoints as activation-quantized whenever the enum is available.
+_MXFP4_FORMAT = getattr(CompressionFormat, "mxfp4_pack_quantized", None)
+MXFP4_PACK_QUANTIZED_FORMAT = _MXFP4_FORMAT.value if _MXFP4_FORMAT is not None else None
+
 
 def is_activation_quantization_format(format: str) -> bool:
     _ACTIVATION_QUANTIZATION_FORMATS = [
-        CompressionFormat.naive_quantized.value,
-        CompressionFormat.int_quantized.value,
-        CompressionFormat.float_quantized.value,
-        CompressionFormat.nvfp4_pack_quantized.value,
-        CompressionFormat.pack_quantized.value,
+        value
+        for value in (
+            CompressionFormat.naive_quantized.value,
+            CompressionFormat.int_quantized.value,
+            CompressionFormat.float_quantized.value,
+            CompressionFormat.nvfp4_pack_quantized.value,
+            CompressionFormat.pack_quantized.value,
+            MXFP4_PACK_QUANTIZED_FORMAT,
+        )
+        if value is not None
     ]
     return format in _ACTIVATION_QUANTIZATION_FORMATS
 
