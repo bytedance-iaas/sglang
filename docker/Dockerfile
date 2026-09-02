@@ -40,8 +40,11 @@ ENV PATH="${PATH}:/usr/local/nvidia/bin" \
 
 # Replace Ubuntu sources if specified
 RUN if [ -n "$UBUNTU_MIRROR" ]; then \
-    sed -i "s|http://.*archive.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list && \
-    sed -i "s|http://.*security.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list; \
+    for sources_file in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do \
+        if [ -f "$sources_file" ]; then \
+            sed -i -E "s#https?://(archive|security)\.ubuntu\.com#$UBUNTU_MIRROR#g" "$sources_file"; \
+        fi; \
+    done; \
 fi
 
 # Python setup (combined with apt update to reduce layers)
