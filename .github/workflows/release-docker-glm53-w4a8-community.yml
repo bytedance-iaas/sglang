@@ -179,7 +179,10 @@ jobs:
             PYTHONPATH=/glm53-community/sglang/python python3 -m pytest -q \
               /glm53-community/sglang/test/registered/unit/managers/test_pp_output_channel.py \
               /glm53-community/sglang/test/registered/unit/managers/test_scheduler_pp_transport.py \
+              /glm53-community/sglang/test/registered/unit/managers/test_pp_cp_rank_offsets.py \
               /glm53-community/sglang/test/registered/unit/spec/test_pp_eagle_raw.py \
+              /glm53-community/sglang/test/registered/unit/disaggregation/test_disaggregation_wire.py \
+              /glm53-community/sglang/test/registered/unit/disaggregation/test_pp_hybrid_kv_transfer.py \
               /glm53-community/sglang/test/registered/unit/disaggregation/test_pp_eagle_prebuilt_merge.py \
               /glm53-community/sglang/test/registered/unit/model_executor/runner/test_pp_proxy_num_tokens.py \
               /glm53-community/sglang/test/registered/unit/layers/attention/test_dsa_padding.py \
