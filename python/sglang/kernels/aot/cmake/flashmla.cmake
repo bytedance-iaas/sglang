@@ -1,9 +1,9 @@
 # flash_mla
-# sm90 dense decode HEAD_DIM_K=512 support (sgl-project/FlashMLA#9, merged).
+# Fixed-BU4 sparse decode support for DSV4 packed persistent KV.
 FetchContent_Declare(
     repo-flashmla
-    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/FlashMLA/archive/c1dee569a494b184811a08171a690ece21420262.tar.gz
-    URL_HASH SHA256=77d3f1714b5903dc8f7a99fbc3a5d9a2b886e449f994b6c4b1d2feeacb467b1e
+    URL      https://${GITHUB_ARTIFACTORY}/yuyu5333/FlashMLA/archive/f45de930aa8124749ac6f2777ee9e6a7f398da8f.tar.gz
+    URL_HASH SHA256=c0d8f1bfcf67810f279bbefd2fb343ee33227e249cd0d047d796c09d5c3a3bb9
 )
 FetchContent_Populate(repo-flashmla)
 

@@ -1,4 +1,3 @@
-import math
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -16,6 +15,7 @@ from sglang.srt.mem_cache.kvbit_dsv4 import (
     DSV4KVBitRuntimeCapability,
     decode_dsv4_bu4_reference,
     dsv4_kvbit_enabled_for_worker,
+    dsv4_kvbit_flashmla_packed_kwargs,
     dsv4_kvbit_sparse_decode,
     encode_dsv4_bu4_reference,
     fold_dsv4_h256,
@@ -365,19 +365,23 @@ class TestDSV4KVBitAttentionMath(CustomTestCase):
         torch.testing.assert_close(output, valid_output)
         torch.testing.assert_close(lse, valid_lse)
 
-    def test_ratio_four_and_128_use_packed_swa_and_packed_extra(self):
+    def test_all_ratios_use_one_flashmla_packed_decode(self):
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             DeepseekV4AttnBackend,
         )
 
-        for ratio in (4, 128):
+        for ratio in (0, 4, 128):
             with self.subTest(compress_ratio=ratio):
                 backend = object.__new__(DeepseekV4AttnBackend)
                 backend.page_size = 256
                 backend.softmax_scale = 512**-0.5
                 backend.head_dim_v = 512
-                extra_page_size = 64 if ratio == 4 else 2
-                extra_cache = torch.zeros(1, extra_page_size * 380, dtype=torch.uint8)
+                extra_page_size = {0: None, 4: 64, 128: 2}[ratio]
+                extra_cache = (
+                    None
+                    if extra_page_size is None
+                    else torch.zeros(1, extra_page_size * 380, dtype=torch.uint8)
+                )
                 backend.token_to_kv_pool = SimpleNamespace(
                     get_extra_key_buffer=lambda _layer_id, value=extra_cache: value,
                     get_extra_key_page_size=lambda _layer_id, value=extra_page_size: (
@@ -396,35 +400,57 @@ class TestDSV4KVBitAttentionMath(CustomTestCase):
                     get_flashmla_metadata=lambda _ratio: object(),
                 )
                 q = torch.zeros(1, 2, 512, dtype=torch.bfloat16)
-                swa_output = torch.ones(1, 1, 2, 512, dtype=torch.bfloat16)
-                extra_output = torch.full_like(swa_output, 3)
-                swa_lse = torch.full((1, 2, 1), math.log(2.0))
-                extra_lse = torch.zeros(1, 2, 1)
+                expected = torch.randn(1, 1, 2, 512, dtype=torch.bfloat16)
+                swa_cache = torch.zeros(1, 256 * 380, dtype=torch.uint8)
 
-                with patch(
-                    "sglang.srt.layers.attention.deepseek_v4_backend."
-                    "dsv4_kvbit_sparse_decode",
-                    side_effect=((swa_output, swa_lse), (extra_output, extra_lse)),
-                ) as sparse_decode:
+                def packed_kwargs(cache, *, page_size):
+                    return {
+                        "packed_kcache": cache.view(-1, 380),
+                        "scale_kcache": torch.ones(448),
+                        "R_matrix": torch.eye(448, dtype=torch.bfloat16),
+                        "zero_point": torch.zeros(448),
+                        "dim_of_bit": torch.arange(448).repeat_interleave(4),
+                        "bitpos_in_dim": torch.arange(4).repeat(448),
+                        "bit_uniform": 4,
+                    }
+
+                with (
+                    patch(
+                        "sglang.srt.layers.attention.deepseek_v4_backend."
+                        "dsv4_kvbit_flashmla_packed_kwargs",
+                        side_effect=packed_kwargs,
+                    ),
+                    patch(
+                        "sgl_kernel.flash_mla.flash_mla_with_kvcache",
+                        return_value=(expected, torch.zeros(1, 2, 1)),
+                    ) as flashmla,
+                ):
                     output = backend._forward_kvbit(
                         q=q,
                         layer_id=0,
                         compress_ratio=ratio,
-                        packed_swa_cache=torch.zeros(1, 256 * 380, dtype=torch.uint8),
+                        packed_swa_cache=swa_cache,
                         core_attn_metadata=core,
                         attn_sink=torch.zeros(2),
                     )
 
-                torch.testing.assert_close(
-                    output.float(), torch.full_like(output, 5.0 / 3.0).float()
-                )
-                self.assertEqual(sparse_decode.call_count, 2)
-                swa_call, extra_call = sparse_decode.call_args_list
-                self.assertIsNotNone(swa_call.kwargs["attn_sink"])
-                self.assertEqual(swa_call.kwargs["page_size"], 256)
-                self.assertIs(extra_call.kwargs["packed"], extra_cache)
-                self.assertIsNone(extra_call.kwargs["attn_sink"])
-                self.assertEqual(extra_call.kwargs["page_size"], extra_page_size)
+                torch.testing.assert_close(output, expected.squeeze(1))
+                flashmla.assert_called_once()
+                call = flashmla.call_args.kwargs
+                self.assertFalse(call.get("q_nope_is_folded", False))
+                self.assertTrue(call["identity_tail_bypass"])
+                self.assertEqual(call["bit_uniform"], 4)
+                self.assertEqual(tuple(call["k_cache"].shape), (1, 256, 1, 380))
+                self.assertIs(call["packed_kcache"]._base, swa_cache)
+                if ratio == 0:
+                    self.assertIsNone(call["extra_k_cache"])
+                    self.assertIsNone(call["extra_packed_kcache"])
+                else:
+                    self.assertEqual(
+                        tuple(call["extra_k_cache"].shape),
+                        (1, extra_page_size, 1, 380),
+                    )
+                    self.assertIs(call["extra_packed_kcache"]._base, extra_cache)
 
 
 class TestDSV4KVBitPackedCompressor(CustomTestCase):
@@ -583,6 +609,129 @@ class TestDSV4KVBitPackedCompressor(CustomTestCase):
             captured["loc"], torch.tensor([11, -1], dtype=torch.int32)
         )
         self.assertIs(captured["cache_k"], compressed)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_flashmla_metadata_matches_fixed_bu4_layout(self):
+        packed = torch.zeros(2, 64 * 380, dtype=torch.uint8, device="cuda")
+
+        first = dsv4_kvbit_flashmla_packed_kwargs(packed, page_size=64)
+        second = dsv4_kvbit_flashmla_packed_kwargs(packed, page_size=64)
+
+        self.assertEqual(tuple(first["packed_kcache"].shape), (128, 380))
+        self.assertEqual(first["bit_uniform"], 4)
+        self.assertEqual(first["R_matrix"].dtype, torch.bfloat16)
+        self.assertEqual(tuple(first["R_matrix"].shape), (448, 448))
+        self.assertEqual(tuple(first["dim_of_bit"].shape), (1792,))
+        self.assertEqual(tuple(first["bitpos_in_dim"].shape), (1792,))
+        self.assertEqual(first["R_matrix"].data_ptr(), second["R_matrix"].data_ptr())
+        torch.testing.assert_close(
+            first["R_matrix"][256:, 256:].float(),
+            torch.eye(192, device="cuda"),
+            atol=0,
+            rtol=0,
+        )
+        h256 = first["R_matrix"][:256, :256].float()
+        torch.testing.assert_close(
+            h256 @ h256.T,
+            torch.eye(256, device="cuda"),
+            atol=0.02,
+            rtol=0,
+        )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_flashmla_fused_swa_and_extra_match_cpu_reference(self):
+        from sgl_kernel.flash_mla import FlashMLASchedMeta, flash_mla_with_kvcache
+
+        torch.manual_seed(17)
+        swa_keys = torch.randn(3, 512, dtype=torch.bfloat16) * 0.1
+        extra_keys = torch.randn(3, 512, dtype=torch.bfloat16) * 0.1
+        q = torch.randn(1, 1, 2, 512, dtype=torch.bfloat16) * 0.1
+        sink = torch.tensor([-0.2, 0.3], dtype=torch.float32)
+
+        for extra_page_size, extra_locs in (
+            (64, torch.tensor([1, 63, 64], dtype=torch.int32)),
+            (2, torch.tensor([0, 1, 2], dtype=torch.int32)),
+        ):
+            with self.subTest(extra_page_size=extra_page_size):
+                swa_pool = DSV4KVBitPackedSWAPool(
+                    size=256,
+                    page_size=256,
+                    dtype=torch.bfloat16,
+                    qk_nope_head_dim=448,
+                    qk_rope_head_dim=64,
+                    layer_num=1,
+                    device="cuda",
+                    enable_memory_saver=False,
+                )
+                extra_pool = DSV4KVBitPackedSWAPool(
+                    size=extra_page_size,
+                    page_size=extra_page_size,
+                    dtype=torch.bfloat16,
+                    qk_nope_head_dim=448,
+                    qk_rope_head_dim=64,
+                    layer_num=1,
+                    device="cuda",
+                    enable_memory_saver=False,
+                )
+                swa_locs = torch.tensor([1, 255, 256], dtype=torch.int32)
+                swa_pool.set_key_buffer_fused(0, swa_locs.cuda(), swa_keys.cuda())
+                extra_pool.set_key_buffer_fused(0, extra_locs.cuda(), extra_keys.cuda())
+                swa_cache = swa_pool.get_key_buffer(0)
+                extra_cache = extra_pool.get_key_buffer(0)
+                swa_kwargs = dsv4_kvbit_flashmla_packed_kwargs(swa_cache, page_size=256)
+                extra_rows = dsv4_kvbit_flashmla_packed_kwargs(
+                    extra_cache, page_size=extra_page_size
+                )["packed_kcache"]
+                swa_indices = torch.full(
+                    (1, 1, 64), -1, dtype=torch.int32, device="cuda"
+                )
+                extra_indices = torch.full_like(swa_indices, -1)
+                swa_indices[0, 0, :3] = swa_locs.cuda()
+                extra_indices[0, 0, :3] = extra_locs.cuda()
+                lengths = torch.tensor([3], dtype=torch.int32, device="cuda")
+
+                output, _ = flash_mla_with_kvcache(
+                    q=q.cuda(),
+                    k_cache=swa_cache.view(swa_cache.shape[0], 256, 1, 380),
+                    block_table=None,
+                    cache_seqlens=None,
+                    head_dim_v=512,
+                    tile_scheduler_metadata=FlashMLASchedMeta(),
+                    softmax_scale=512**-0.5,
+                    is_fp8_kvcache=True,
+                    indices=swa_indices,
+                    attn_sink=sink.cuda(),
+                    extra_k_cache=extra_cache.view(
+                        extra_cache.shape[0], extra_page_size, 1, 380
+                    ),
+                    extra_indices_in_kvcache=extra_indices,
+                    topk_length=lengths,
+                    extra_topk_length=lengths,
+                    identity_tail_bypass=True,
+                    extra_packed_kcache=extra_rows,
+                    **swa_kwargs,
+                )
+                output = output.cpu().float()
+
+                all_keys = torch.cat(
+                    (
+                        decode_dsv4_bu4_reference(encode_dsv4_bu4_reference(swa_keys)),
+                        decode_dsv4_bu4_reference(
+                            encode_dsv4_bu4_reference(extra_keys)
+                        ),
+                    ),
+                    dim=0,
+                ).float()
+                scores = torch.einsum("qhd,kd->qhk", q[0].float(), all_keys) * (
+                    512**-0.5
+                )
+                scores = torch.cat((scores, sink.view(1, 2, 1)), dim=-1)
+                expected = torch.einsum(
+                    "qhk,kd->qhd",
+                    torch.softmax(scores, dim=-1)[..., :-1],
+                    all_keys,
+                )
+                torch.testing.assert_close(output[0], expected, atol=0.04, rtol=0.04)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_cuda_fused_write_and_direct_decode_match_cpu_reference(self):

@@ -1269,9 +1269,9 @@ class KVCacheConfigurator:
         if enable_kvbit_swa:
             if not current_platform.is_cuda():
                 raise RuntimeError("DSV4 KVBit packed persistent KV is CUDA-only.")
-            if get_platform().is_sm120:
+            if not get_platform().is_sm90:
                 raise RuntimeError(
-                    "DSV4 KVBit packed persistent KV does not support SM120."
+                    "DSV4 KVBit FlashMLA packed persistent KV requires SM90."
                 )
             if get_memory().enable_hisparse:
                 raise RuntimeError(

@@ -68,10 +68,7 @@ from sglang.srt.layers.attention.verify_mask import (
 )
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.mem_cache.kvbit_dsv4 import (
-    dsv4_kvbit_sparse_decode,
-    merge_attention_states_natural_log,
-)
+from sglang.srt.mem_cache.kvbit_dsv4 import dsv4_kvbit_flashmla_packed_kwargs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     get_parallel,
@@ -1678,7 +1675,7 @@ class DeepseekV4AttnBackend(
         core_attn_metadata: DSV4AttnMetadata,
         attn_sink: torch.Tensor,
     ) -> torch.Tensor:
-        """Attend packed SWA directly and merge native compressed KV by ln-LSE."""
+        """Attend packed SWA and compressed KV in one FlashMLA sparse decode."""
 
         def match_num_queries(x: Optional[torch.Tensor], value: int):
             if x is None or x.shape[0] == q.shape[0]:
@@ -1694,45 +1691,70 @@ class DeepseekV4AttnBackend(
         if swa_indices.ndim == 2:
             swa_indices = swa_indices.unsqueeze(1)
 
-        swa_output, swa_lse = dsv4_kvbit_sparse_decode(
-            q=q,
-            packed=packed_swa_cache,
+        swa_packed_kwargs = dsv4_kvbit_flashmla_packed_kwargs(
+            packed_swa_cache, page_size=self.page_size
+        )
+        swa_shape_carrier = packed_swa_cache.view(
+            packed_swa_cache.shape[0],
+            self.page_size,
+            1,
+            -1,
+        )
+
+        extra_shape_carrier = None
+        extra_packed_rows = None
+        extra_indices = None
+        extra_lengths = None
+        if compress_ratio != 0:
+            if compress_ratio == 4:
+                extra_indices = core_attn_metadata.c4_sparse_page_indices
+                extra_lengths = core_attn_metadata.c4_sparse_topk_lengths
+            else:
+                extra_indices = core_attn_metadata.c128_page_indices
+                extra_lengths = core_attn_metadata.c128_topk_lengths_clamp1
+            extra_indices = match_num_queries(extra_indices, value=-1)
+            extra_lengths = match_num_queries(extra_lengths, value=1)
+            if extra_indices.ndim == 2:
+                extra_indices = extra_indices.unsqueeze(1)
+
+            extra_cache = self.token_to_kv_pool.get_extra_key_buffer(layer_id)
+            extra_page_size = self.token_to_kv_pool.get_extra_key_page_size(layer_id)
+            extra_shape_carrier = extra_cache.view(
+                extra_cache.shape[0],
+                extra_page_size,
+                1,
+                -1,
+            )
+            extra_packed_rows = dsv4_kvbit_flashmla_packed_kwargs(
+                extra_cache, page_size=extra_page_size
+            )["packed_kcache"]
+
+        assert swa_indices.shape[-1] % 64 == 0
+        if extra_indices is not None:
+            assert extra_indices.shape[-1] % 64 == 0
+
+        from sgl_kernel.flash_mla import flash_mla_with_kvcache
+
+        output, _ = flash_mla_with_kvcache(
+            q=q.contiguous(),
+            k_cache=swa_shape_carrier,
+            block_table=None,
+            cache_seqlens=None,
+            head_dim_v=self.head_dim_v,
+            tile_scheduler_metadata=core_attn_metadata.get_flashmla_metadata(
+                compress_ratio
+            ),
+            softmax_scale=self.softmax_scale,
+            is_fp8_kvcache=True,
             indices=swa_indices,
-            lengths=swa_lengths,
             attn_sink=attn_sink,
-            page_size=self.page_size,
-            softmax_scale=self.softmax_scale,
-        )
-        if compress_ratio == 0:
-            return swa_output.squeeze(1)
-
-        if compress_ratio == 4:
-            extra_indices = core_attn_metadata.c4_sparse_page_indices
-            extra_lengths = core_attn_metadata.c4_sparse_topk_lengths
-        else:
-            extra_indices = core_attn_metadata.c128_page_indices
-            extra_lengths = core_attn_metadata.c128_topk_lengths_clamp1
-        extra_indices = match_num_queries(extra_indices, value=-1)
-        extra_lengths = match_num_queries(extra_lengths, value=1)
-        if extra_indices.ndim == 2:
-            extra_indices = extra_indices.unsqueeze(1)
-
-        extra_k_cache = self.token_to_kv_pool.get_extra_key_buffer(layer_id)
-        extra_page_size = self.token_to_kv_pool.get_extra_key_page_size(layer_id)
-        extra_output, extra_lse = dsv4_kvbit_sparse_decode(
-            q=q,
-            packed=extra_k_cache,
-            indices=extra_indices,
-            lengths=extra_lengths,
-            attn_sink=None,
-            page_size=extra_page_size,
-            softmax_scale=self.softmax_scale,
-        )
-        output, _ = merge_attention_states_natural_log(
-            swa_output,
-            swa_lse,
-            extra_output,
-            extra_lse,
+            extra_k_cache=extra_shape_carrier,
+            extra_indices_in_kvcache=extra_indices,
+            topk_length=swa_lengths,
+            extra_topk_length=extra_lengths,
+            identity_tail_bypass=True,
+            extra_packed_kcache=extra_packed_rows,
+            **swa_packed_kwargs,
         )
         return output.squeeze(1)
 

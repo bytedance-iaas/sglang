@@ -36,6 +36,8 @@ DSV4_KVBIT_ROW_BYTES = 380
 DSV4_NATIVE_SWA_ROW_BYTES = 584
 DSV4_KVBIT_HADAMARD_DIM = 256
 
+_FLASHMLA_BU4_METADATA: dict[tuple[str, int | None], dict[str, torch.Tensor]] = {}
+
 
 class DSV4KVBitLayout(NamedTuple):
     nope_dim: int
@@ -604,6 +606,48 @@ def _reshape_packed_rows(packed: torch.Tensor, *, page_size: int) -> torch.Tenso
             f"packed page width must be {expected_page_bytes}, got {packed.shape[1]}"
         )
     return packed.reshape(-1, DSV4_BU4_LAYOUT.row_bytes)
+
+
+def dsv4_kvbit_flashmla_packed_kwargs(
+    packed: torch.Tensor, *, page_size: int
+) -> dict[str, torch.Tensor | int]:
+    """Expose the fixed BU4 rows and immutable metadata to FlashMLA."""
+    if packed.device.type != "cuda":
+        raise ValueError("FlashMLA packed KV requires a CUDA tensor")
+    rows = _reshape_packed_rows(packed, page_size=page_size)
+    device = packed.device
+    cache_key = (device.type, device.index)
+    metadata = _FLASHMLA_BU4_METADATA.get(cache_key)
+    if metadata is None:
+        rotation = torch.eye(DSV4_KVBIT_NOPE_DIM, dtype=torch.bfloat16, device=device)
+        rotation[:DSV4_KVBIT_HADAMARD_DIM, :DSV4_KVBIT_HADAMARD_DIM] = fold_dsv4_h256(
+            torch.eye(
+                DSV4_KVBIT_HADAMARD_DIM,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+        )
+        metadata = {
+            "scale_kcache": torch.ones(
+                DSV4_KVBIT_NOPE_DIM, dtype=torch.float32, device=device
+            ),
+            "R_matrix": rotation,
+            "zero_point": torch.zeros(
+                DSV4_KVBIT_NOPE_DIM, dtype=torch.float32, device=device
+            ),
+            "dim_of_bit": torch.arange(
+                DSV4_KVBIT_NOPE_DIM, dtype=torch.int32, device=device
+            ).repeat_interleave(DSV4_KVBIT_BITS),
+            "bitpos_in_dim": torch.arange(
+                DSV4_KVBIT_BITS, dtype=torch.int32, device=device
+            ).repeat(DSV4_KVBIT_NOPE_DIM),
+        }
+        _FLASHMLA_BU4_METADATA[cache_key] = metadata
+    return {
+        "packed_kcache": rows,
+        **metadata,
+        "bit_uniform": DSV4_KVBIT_BITS,
+    }
 
 
 def write_dsv4_bu4_packed(
