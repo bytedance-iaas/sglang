@@ -34,14 +34,14 @@ if(${CUDA_VERSION} VERSION_GREATER 12.4)
         "-gencode=arch=compute_90a,code=sm_90a"
     )
 endif()
-if(${CUDA_VERSION} VERSION_GREATER 12.8)
+if(SGL_KERNEL_BUILD_SM100 AND ${CUDA_VERSION} VERSION_GREATER 12.8)
     # sm_100f is compatible with all sm_10x
     list(APPEND FLASHMLA_CUDA_FLAGS
         "-gencode=arch=compute_100f,code=sm_100f"
     )
     set(FLASHMLA_ENABLE_SM100 ON)
 endif()
-if(${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
+if(SGL_KERNEL_BUILD_SM100 AND ${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
     # Patch FlashMLA sources for SM103a support.
     # These patches are only needed (and only valid) with CUDA 13+.
 
