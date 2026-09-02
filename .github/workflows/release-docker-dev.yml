@@ -37,6 +37,10 @@ on:
         required: false
         type: boolean
         default: true
+      image_formats:
+        description: "Volcengine fork only: CSV of image formats to build (oci, zstd, nydus)."
+        required: false
+        default: "oci,zstd,nydus"
       private_debug_base_only:
         description: "Volcengine fork only: build and publish exactly one AMD64 CUDA 13 base image, without compiling a kernel wheel or building SBO/W4A8 variants."
         required: false
@@ -340,6 +344,7 @@ jobs:
       tag_value: ${{ inputs.tag }}
       use_environment: prod
       artifact_name: ${{ (github.event_name == 'schedule' || inputs.compile_kernel) && matrix.artifact_name || '' }}
+      image_formats: ${{ github.event_name == 'schedule' && 'oci,zstd,nydus' || inputs.image_formats }}
       extra_build_args: >-
         --build-arg BRANCH_TYPE=local
         --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
@@ -349,7 +354,9 @@ jobs:
         --build-arg HTTP_PROXY=http://100.68.162.211:3128
         --build-arg HTTPS_PROXY=http://100.68.162.211:3128
         --build-arg ALL_PROXY=http://100.68.162.211:3128
-        --build-arg NO_PROXY=localhost,127.0.0.1,::1,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com
+        --build-arg NO_PROXY=localhost,127.0.0.1,::1,archive.ubuntu.com,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,iaas-gpu-cn-beijing.cr.volces.com
+        --build-arg no_proxy=localhost,127.0.0.1,::1,archive.ubuntu.com,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,iaas-gpu-cn-beijing.cr.volces.com
+        --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com
         --build-arg BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_APT_URL || 'http://mirrors.ivolces.com/extra-tools/ubuntu' }}
         --build-arg BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL || 'https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system' }}
     secrets: inherit

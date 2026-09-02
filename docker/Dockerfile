@@ -40,15 +40,29 @@ ENV PATH="${PATH}:/usr/local/nvidia/bin" \
 
 # Replace Ubuntu sources if specified
 RUN if [ -n "$UBUNTU_MIRROR" ]; then \
-    sed -i "s|http://.*archive.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list && \
-    sed -i "s|http://.*security.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list; \
+    for sources_file in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do \
+        if [ -f "$sources_file" ]; then \
+            sed -i -E "s#https?://(archive|security)\.ubuntu\.com#$UBUNTU_MIRROR#g" "$sources_file"; \
+        fi; \
+    done; \
 fi
 
 # Python setup (combined with apt update to reduce layers)
 # Ubuntu 24.04 ships Python 3.12 in main, so we no longer need the deadsnakes
 # PPA. Dropping it avoids transient Launchpad 504s in `add-apt-repository`.
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
-    apt update && apt install -y --no-install-recommends wget curl software-properties-common \
+    retry_apt_update() { \
+        for i in 1 2 3 4 5; do \
+            rm -rf /var/lib/apt/lists/*; \
+            apt-get clean; \
+            apt-get update && return 0; \
+            echo "apt update attempt $i failed; sleeping 15s"; \
+            sleep 15; \
+        done; \
+        return 1; \
+    }; \
+    retry_apt_update \
+    && apt-get install -y --no-install-recommends wget curl software-properties-common \
     && apt install -y --no-install-recommends python3.12-full python3.12-dev \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
