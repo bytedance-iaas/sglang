@@ -23,6 +23,7 @@ jobs:
       BASE_IMAGE: iaas-gpu-cn-beijing.cr.volces.com/serving/sglang:glm52-w4a8-integrated-1e105705-pp-eagle-v1@sha256:692d9f218caa76270736a0ed3529c7ad467bfb816c8677b17615d52a0d5df74b
       SGL_DEEP_GEMM_COMMIT: aee79a715951a3d47dbbbdbd5387d8be8a131d53
       SGLANG_KERNEL_VERSION: 0.4.6.post1
+      SGLANG_KERNEL_BUILD_TORCH: 2.11.0+cu130
       VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
       VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
     steps:
@@ -123,6 +124,7 @@ jobs:
             --build-arg BASE_IMAGE="$BASE_IMAGE" \
             --build-arg SGL_DEEP_GEMM_COMMIT="$SGL_DEEP_GEMM_COMMIT" \
             --build-arg SGLANG_KERNEL_VERSION="$SGLANG_KERNEL_VERSION" \
+            --build-arg SGLANG_KERNEL_BUILD_TORCH="$SGLANG_KERNEL_BUILD_TORCH" \
             --build-arg SGLANG_BUILD_COMMIT="$SOURCE_COMMIT" \
             --build-arg SGLANG_SOURCE_TREE="$SOURCE_TREE" \
             --build-arg SGLANG_SOURCE_ARCHIVE_SHA256="$SOURCE_ARCHIVE_SHA256" \
@@ -163,6 +165,8 @@ jobs:
             test "$(cat /opt/sgl-deep-gemm/source-commit)" = "$3"
             test "$(cat /opt/sglang-source-archive-sha256)" = "$4"
             test "$(python3 -c '"'"'from importlib.metadata import version; print(version("sglang-kernel"))'"'"')" = "$5"
+            test "$(python3 -c '"'"'import torch; print(torch.__version__)'"'"')" = "2.11.0+cu130"
+            test "$(python3 -c '"'"'from importlib.metadata import requires; print(next(x.split("==", 1)[1] for x in requires("sglang-kernel") if x.startswith("torch==")))'"'"')" = "2.11.0+cu130"
             python3 -c '"'"'from importlib.metadata import distribution; files = tuple(map(str, distribution("sglang-kernel").files or ())); assert any(path.startswith("sgl_kernel/sm90/common_ops.") and path.endswith(".so") for path in files), files'"'"'
             PYTHONPATH=/glm53-community/sglang/python python3 -c '"'"'import importlib.machinery, pathlib; expected = pathlib.Path("/glm53-community/sglang/python/sglang/__init__.py"); actual = pathlib.Path(importlib.machinery.PathFinder.find_spec("sglang").origin).resolve(); assert actual == expected'"'"'
             python3 -c '"'"'import deep_gemm; assert callable(getattr(deep_gemm, "fp8_fp4_mega_moe", None)); assert callable(getattr(deep_gemm, "mega_moe_pre_dispatch_sm90", None)); assert callable(getattr(deep_gemm._C, "fp8_fp4_mega_moe_sm90", None))'"'"'
