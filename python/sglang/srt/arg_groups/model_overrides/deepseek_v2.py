@@ -52,11 +52,22 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 overrides["enable_dp_attention"] = True
                 overrides["moe_dense_tp_size"] = 1
                 if cfg.cp_strategy == "zigzag":
-                    overrides["moe_a2a_backend"] = "deepep"
+                    # MegaMoE has its own symmetric-memory all-to-all and is a
+                    # supported DSA CP backend. Preserve an explicit MegaMoE
+                    # selection; retain DeepEP as the default for every other
+                    # value so existing recipes keep their current behavior.
+                    moe_a2a_backend = (
+                        "megamoe"
+                        if cfg.moe_a2a_backend == "megamoe"
+                        else "deepep"
+                    )
+                    overrides["moe_a2a_backend"] = moe_a2a_backend
                     overrides["ep_size"] = cfg.tp_size
                     logger.warning(
                         "zigzag DSA CP requires moe_dense_tp_size=1, "
-                        "moe_a2a_backend=deepep, ep_size=tp_size, batch_size=1."
+                        "moe_a2a_backend in ('deepep', 'megamoe'), "
+                        "ep_size=tp_size, batch_size=1; using %s.",
+                        moe_a2a_backend,
                     )
                 else:
                     assert (

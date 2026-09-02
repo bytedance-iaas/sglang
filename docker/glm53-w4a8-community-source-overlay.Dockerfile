@@ -8,6 +8,7 @@ ARG SGLANG_SOURCE_ARCHIVE_SHA256
 ARG SGLANG_BUILD_URL
 ARG SGLANG_IMAGE_TAG
 ARG SGL_DEEP_GEMM_COMMIT
+ARG SGLANG_KERNEL_VERSION=0.4.6.post1
 
 USER root
 
@@ -31,6 +32,10 @@ RUN set -eux; \
     ln -s /glm53-community/sglang /sgl-workspace/sglang; \
     test "$(readlink -f /sgl-workspace/sglang)" = /glm53-community/sglang; \
     test "$(cat /opt/sgl-deep-gemm/source-commit)" = "${SGL_DEEP_GEMM_COMMIT}"; \
+    python3 -m pip install --no-deps --force-reinstall \
+      "sglang-kernel==${SGLANG_KERNEL_VERSION}"; \
+    test "$(python3 -c 'from importlib.metadata import version; print(version("sglang-kernel"))')" = "${SGLANG_KERNEL_VERSION}"; \
+    python3 -c 'import sgl_kernel; assert hasattr(sgl_kernel, "__path__")'; \
     printf '%s\n' "${SGLANG_SOURCE_ARCHIVE_SHA256}" > /opt/sglang-source-archive-sha256; \
     PYTHONPATH=/glm53-community/sglang/python python3 -c 'import importlib.machinery, pathlib; expected = pathlib.Path("/glm53-community/sglang/python/sglang/__init__.py"); actual = pathlib.Path(importlib.machinery.PathFinder.find_spec("sglang").origin).resolve(); print(f"SGLANG_SPEC_ORIGIN={actual}"); assert actual == expected'
 
@@ -47,6 +52,7 @@ LABEL org.opencontainers.image.revision=${SGLANG_BUILD_COMMIT} \
       ai.sglang.build.source-archive-sha256=${SGLANG_SOURCE_ARCHIVE_SHA256} \
       ai.sglang.build.url=${SGLANG_BUILD_URL} \
       ai.sglang.build.base-image=${BASE_IMAGE} \
+      ai.sglang.kernel.version=${SGLANG_KERNEL_VERSION} \
       ai.sglang.deepgemm.commit=${SGL_DEEP_GEMM_COMMIT} \
       ai.sglang.source.delivery="immutable-source-overlay"
 

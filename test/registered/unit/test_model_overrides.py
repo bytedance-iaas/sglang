@@ -2895,6 +2895,33 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                                 "attn_cp_size": 8,
                             },
                         )
+                        # An explicit MegaMoE selection must survive the DSA
+                        # zigzag CP defaults. The topology fields remain the
+                        # same as the default DeepEP recipe.
+                        result = _deepseek_family_overrides(
+                            _args(
+                                enable_prefill_cp=True,
+                                cp_strategy="zigzag",
+                                tp_size=8,
+                                dp_size=1,
+                                ep_size=1,
+                                moe_a2a_backend="megamoe",
+                                kv_cache_dtype="fp8_e4m3",
+                            ),
+                            None,
+                        )
+                        self.assertEqual(
+                            result,
+                            {
+                                "attention_backend": "dsa",
+                                "page_size": 64,
+                                "enable_dp_attention": True,
+                                "moe_dense_tp_size": 1,
+                                "moe_a2a_backend": "megamoe",
+                                "ep_size": 8,
+                                "attn_cp_size": 8,
+                            },
+                        )
                         # interleave CP with dp>1 must assert
                         with self.assertRaises(AssertionError):
                             _deepseek_family_overrides(
