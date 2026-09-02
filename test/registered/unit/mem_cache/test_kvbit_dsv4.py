@@ -643,10 +643,11 @@ class TestDSV4KVBitPackedCompressor(CustomTestCase):
         from sgl_kernel.flash_mla import FlashMLASchedMeta, flash_mla_with_kvcache
 
         torch.manual_seed(17)
+        num_heads = 64
         swa_keys = torch.randn(3, 512, dtype=torch.bfloat16) * 0.1
         extra_keys = torch.randn(3, 512, dtype=torch.bfloat16) * 0.1
-        q = torch.randn(1, 1, 128, 512, dtype=torch.bfloat16) * 0.1
-        sink = torch.linspace(-0.2, 0.3, 128, dtype=torch.float32)
+        q = torch.randn(1, 1, num_heads, 512, dtype=torch.bfloat16) * 0.1
+        sink = torch.linspace(-0.2, 0.3, num_heads, dtype=torch.float32)
 
         for extra_page_size, extra_locs in (
             (64, torch.tensor([1, 63, 64], dtype=torch.int32)),
@@ -725,7 +726,7 @@ class TestDSV4KVBitPackedCompressor(CustomTestCase):
                 scores = torch.einsum("qhd,kd->qhk", q[0].float(), all_keys) * (
                     512**-0.5
                 )
-                scores = torch.cat((scores, sink.view(1, 128, 1)), dim=-1)
+                scores = torch.cat((scores, sink.view(1, num_heads, 1)), dim=-1)
                 expected = torch.einsum(
                     "qhk,kd->qhd",
                     torch.softmax(scores, dim=-1)[..., :-1],
