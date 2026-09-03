@@ -740,11 +740,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         """Return whether this PP stage owns the speculative draft KV pool.
 
         DSV4 DSpark PD prefill keeps the full draft SWA pool on the final PP
-        stage, matching ``prepare_dspark_hicache_draft_plan``. Earlier stages
-        either have no draft pool or retain only a one-page lifecycle pool, so
-        charging the full draft geometry there understates the shared PP token
-        capacity. Other speculative layouts keep the existing budgeting
-        behavior.
+        stage, matching ``DSparkWorkerV2._build_hicache_draft_plan``. Earlier
+        stages either have no draft pool or retain only a one-page lifecycle
+        pool, so charging the full draft geometry there understates the shared
+        PP token capacity. Other speculative layouts keep the existing
+        budgeting behavior.
         """
 
         if not kvc.spec_algorithm.is_dspark():

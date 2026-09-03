@@ -11,7 +11,6 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod  # noqa: E402
-from sglang.srt.mem_cache.kv_cache_builder import get_draft_kv_pool  # noqa: E402
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig  # noqa: E402
 from sglang.srt.model_executor.runner.base_runner import (  # noqa: E402
     _allocate_decode_buffers,
@@ -323,19 +322,34 @@ class TestDSparkPPContext(CustomTestCase):
         worker._draft_worker.alloc_memory_pool.assert_not_called()
 
     def test_lifecycle_only_rank_does_not_publish_draft_pool(self):
-        worker = SimpleNamespace(is_lifecycle_only_pp_prefill_rank=True)
-        spec_algorithm = SimpleNamespace(
-            is_ngram=lambda: False,
-            is_dspark=lambda: True,
+        target_model_runner = SimpleNamespace(
+            spec_algorithm=object(),
+            mtp_draft_device_pools=(object(),),
         )
+        worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker._target_worker = SimpleNamespace(model_runner=target_model_runner)
+        worker._is_lifecycle_only_pp_prefill_rank = True
+        worker.server_args = SimpleNamespace(enable_hierarchical_cache=True)
 
-        self.assertIsNone(
-            get_draft_kv_pool(
-                draft_worker=worker,
-                spec_algorithm=spec_algorithm,
-                server_args=SimpleNamespace(enable_multi_layer_eagle=False),
-            )
+        worker.init_hicache_draft_plan()
+
+        self.assertEqual(worker.hicache_draft_plan.device_pools, ())
+        self.assertEqual(target_model_runner.mtp_draft_device_pools, ())
+
+    def test_non_owner_pp_rank_does_not_publish_hicache_draft_pool(self):
+        target_model_runner = SimpleNamespace(
+            mtp_draft_device_pools=(object(),),
         )
+        worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker._target_worker = SimpleNamespace(model_runner=target_model_runner)
+        worker._is_lifecycle_only_pp_prefill_rank = False
+        worker._is_pd_prefill = True
+        worker.ps = SimpleNamespace(pp_rank=1, pp_size=4)
+
+        plan = worker._build_hicache_draft_plan()
+
+        self.assertEqual(plan.device_pools, ())
+        self.assertEqual(target_model_runner.mtp_draft_device_pools, ())
 
     def test_non_last_pp_prefill_uses_minimal_draft_kv_pool(self):
         """A context-only PP rank must not reserve the full draft KV capacity."""

@@ -24,7 +24,11 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.base_spec_worker import (
+    BaseSpecWorker,
+    HiCacheDraftMode,
+    HiCacheDraftPlan,
+)
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import (
     build_block_pos_offsets,
@@ -392,6 +396,39 @@ class DSparkWorkerV2(BaseSpecWorker):
         if self._is_lifecycle_only_pp_prefill_rank:
             return ()
         return super()._draft_model_runners()
+
+    def _build_hicache_draft_plan(self) -> HiCacheDraftPlan:
+        target_runner = self.target_worker.model_runner
+        if (
+            not self._is_lifecycle_only_pp_prefill_rank
+            and self._is_pd_prefill
+            and self.ps.pp_size > 1
+            and self.ps.pp_rank != self.ps.pp_size - 1
+        ):
+            target_runner.mtp_draft_device_pools = ()
+            return HiCacheDraftPlan()
+
+        plan = super()._build_hicache_draft_plan()
+        if plan.mode != HiCacheDraftMode.PACKED:
+            return plan
+
+        target_pool = target_runner.token_to_kv_pool
+        draft_pool = plan.device_pools[0]
+        target_swa = target_pool.swa_kv_pool
+        draft_swa = draft_pool.swa_kv_pool
+        if target_pool.swa_page_size != draft_pool.swa_page_size:
+            raise ValueError("Target and DSpark draft SWA page sizes must match.")
+        if target_swa.bytes_per_page_padded != draft_swa.bytes_per_page_padded:
+            raise ValueError("Target and DSpark draft SWA page widths must match.")
+        if (
+            target_pool.full_to_swa_index_mapping
+            is not draft_pool.full_to_swa_index_mapping
+        ):
+            raise ValueError(
+                "Packed DSpark HiCache requires target and draft to share the "
+                "Full-to-SWA mapping."
+            )
+        return plan
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
