@@ -1007,6 +1007,13 @@ class EICHiRadixCache(RadixCache):
         # backlog drains at the single lockstep site (check_hicache_events) and
         # in the schedule_policy busy-wait, both PP-uniform.
         while len(self.ongoing_write_through) > 50:
+            if time.perf_counter() - start_time > 30.0:
+                logger.error(
+                    "evict write-through throttle timed out after 30s: "
+                    f"ongoing={len(self.ongoing_write_through)}; "
+                    "EIC write thread likely stalled, proceeding with eviction"
+                )
+                break
             self.writing_check()
             time.sleep(0.1)
 
