@@ -275,9 +275,9 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
 )
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_pp_mixin import (
-    _PP_DISAGG_SCHEDULER_FENCE_PHASES,
     SchedulerPPMixin,
     _pp_attention_dp_control_ranks,
+    _pp_disagg_scheduler_fence_specs,
 )
 from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
@@ -1169,9 +1169,11 @@ class Scheduler(
                 local_control_ranks,
             )
         self.pp_disagg_scheduler_fence_groups = {}
-        if get_disagg().disaggregation_mode == "prefill" and self.ps.pp_size > 1:
-            control_ranks = _pp_attention_dp_control_ranks(self.ps, self.tp_group.ranks)
-            for phase in _PP_DISAGG_SCHEDULER_FENCE_PHASES:
+        disagg_mode = get_disagg().disaggregation_mode
+        if disagg_mode in ("prefill", "decode") and self.ps.pp_size > 1:
+            for phase, control_ranks in _pp_disagg_scheduler_fence_specs(
+                disagg_mode, self.ps, self.tp_group.ranks
+            ):
                 self.pp_disagg_scheduler_fence_groups[phase] = (
                     create_custom_parallel_group(control_ranks, backend="gloo")
                 )

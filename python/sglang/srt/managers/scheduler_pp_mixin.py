@@ -54,11 +54,15 @@ from sglang.srt.utils.common import get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
 
-_PP_DISAGG_SCHEDULER_FENCE_PHASES = (
+_PP_PREFILL_DISAGG_SCHEDULER_FENCE_PHASES = (
     "iteration_start",
     "bootstrap_poll",
     "bootstrap_done",
     "transfer_done",
+)
+_PP_DECODE_DISAGG_SCHEDULER_FENCE_PHASES = ("decode_result_commit_done",)
+_PP_DISAGG_SCHEDULER_FENCE_PHASES = (
+    _PP_PREFILL_DISAGG_SCHEDULER_FENCE_PHASES + _PP_DECODE_DISAGG_SCHEDULER_FENCE_PHASES
 )
 PP_CONTROL_RING_MESSAGE_MARKER = "sglang_pp_control_ring_v1"
 
@@ -74,6 +78,27 @@ def _pp_attention_dp_control_ranks(ps, tp_ranks: List[int]) -> List[int]:
     group_end = group_start + group_size
     assert group_end <= len(tp_ranks)
     return tp_ranks[group_start:group_end]
+
+
+def _pp_disagg_scheduler_fence_specs(
+    disagg_mode: str, ps, tp_ranks: List[int]
+) -> List[Tuple[str, List[int]]]:
+    """Return scheduler-fence phases and their exact PP-stage participants."""
+    if disagg_mode == "prefill":
+        control_ranks = _pp_attention_dp_control_ranks(ps, tp_ranks)
+        return [
+            (phase, control_ranks)
+            for phase in _PP_PREFILL_DISAGG_SCHEDULER_FENCE_PHASES
+        ]
+    if disagg_mode == "decode":
+        # Decode result processing is asymmetric across attention-DP ranks.
+        # Fence every scheduler in this PP stage before the next metadata
+        # collective, including ranks whose prior microbatch was idle.
+        return [
+            (phase, list(tp_ranks))
+            for phase in _PP_DECODE_DISAGG_SCHEDULER_FENCE_PHASES
+        ]
+    return []
 
 
 def _pp_fence_scheduler_phase(group) -> None:
@@ -532,9 +557,14 @@ class SchedulerPPMixin:
                     and not cur_batch.forward_mode.is_prebuilt()
                 ):
                     self.device_module.current_stream().wait_event(self.launch_event)
-                    self._pp_send_and_commit_proxy(
-                        result.pp_hidden_states_proxy_tensors.tensors
-                    )
+                    # Keep the current Decode proxy send outstanding until the
+                    # next scheduler slot.  PP0 is one slot ahead of PP1 in the
+                    # depth-zero schedule: waiting here requires PP1 to post the
+                    # receive for this slot before it has completed the previous
+                    # output/result phase, which forms a cycle at high load.
+                    # ``send_proxy_work`` pins the payload and the next slot
+                    # commits it before another forward can reuse graph buffers.
+                    self._pp_send_proxy(result.pp_hidden_states_proxy_tensors.tensors)
 
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -585,6 +615,15 @@ class SchedulerPPMixin:
                             next_batch_result,
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+
+                # DP-attention ranks must not plan the next batch while the
+                # active rank is still committing the previous PP result.
+                # Fence on a control-only group spanning this whole PP stage
+                # so the next business collective starts in one scheduler
+                # phase.
+                _pp_fence_scheduler_phase(
+                    self.pp_disagg_scheduler_fence_groups["decode_result_commit_done"]
+                )
 
                 self.pp_outputs = next_pp_outputs
                 self.running_batch.batch_is_full = False
@@ -989,12 +1028,17 @@ class SchedulerPPMixin:
     def _pp_send_and_commit_proxy(
         self: Scheduler, tensor_dict: Dict[str, torch.Tensor]
     ) -> None:
+        """Send synchronously for paths that cannot retain a proxy payload."""
+        self._pp_send_proxy(tensor_dict)
+        self._pp_commit_comm_work(self.send_proxy_work)
+
+    def _pp_send_proxy(self: Scheduler, tensor_dict: Dict[str, torch.Tensor]) -> None:
+        """Start a proxy send and retain its work and payload until commit."""
         self.send_proxy_work = self._pp_send_dict_to_next_stage(
             tensor_dict,
             async_send=True,
             msg_type="proxy",
         )
-        self._pp_commit_comm_work(self.send_proxy_work)
 
     def _pp_commit_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
         for p2p_work in work:
@@ -1071,9 +1115,7 @@ class SchedulerPPMixin:
             data = None
 
         if local_group is not None:
-            local_ranks = _pp_attention_dp_control_ranks(
-                self.ps, self.tp_group.ranks
-            )
+            local_ranks = _pp_attention_dp_control_ranks(self.ps, self.tp_group.ranks)
             data = broadcast_pyobj(
                 data,
                 torch.distributed.get_rank(),
@@ -1144,9 +1186,7 @@ class SchedulerPPMixin:
         tensor_dict["__msg_type__"] = msg_type
         # Proxy tensors and reverse/relayed outputs are independent streams
         # that can overlap. Keep their untagged P2P sequence spaces separate.
-        tensor_group = (
-            self.pp_output_group if msg_type == "output" else self.pp_group
-        )
+        tensor_group = self.pp_output_group if msg_type == "output" else self.pp_group
         p2p_work = []
         p2p_work.extend(
             tensor_group.send_tensor_dict(
@@ -1455,19 +1495,31 @@ class SchedulerPPMixin:
                 d2h_event.record(self.device_module.current_stream())
 
         if relay_output_immediately and self.pp_group.is_last_rank:
-            # The last PP stage is the unique origin of the output ring. Keep
-            # this first injection outstanding: rank zero does not post the
-            # matching receive until the next scheduler slot. The wrapper
-            # commits it at the start of that slot, while the dedicated PD
-            # control group lets the intervening control phases progress.
-            send_output_work = _do_send()
+            # In a steady slot, consume the previous relay before injecting the
+            # next origin payload. Reversing this order makes the last stage's
+            # new send collide with the preceding stage's outstanding relay on
+            # the same untagged output communicator. In the initial injection
+            # slot _do_recv() is a no-op because there is no return target, so
+            # the last stage remains the unique sender that starts the ring.
             _do_recv()
+            # Keep the origin send outstanding: rank zero posts the matching
+            # receive in the next scheduler slot. The wrapper commits it at the
+            # start of that slot, while the dedicated PD control group lets the
+            # intervening control phases progress.
+            send_output_work = _do_send()
         elif relay_output_immediately:
             # A non-last stage must relay the payload received in this slot,
             # instead of deferring it until the next scheduler slot. Otherwise
             # the last stage waits on output while rank zero waits in control.
             _do_recv()
             if next_pp_outputs is not None:
+                # WorkNCCL.wait() only inserts a dependency on the CUDA stream;
+                # it does not wait for the receive at the Python boundary. This
+                # branch reverses direction on the same output communicator, so
+                # every tensor in the incoming dictionary must be complete before
+                # the first reverse send is enqueued. Otherwise the two peers can
+                # assign opposite-direction sends to the same NCCL P2P sequence.
+                self.schedule_stream.synchronize()
                 send_output_work = self._pp_send_dict_to_next_stage(
                     next_pp_outputs.tensors,
                     async_send=True,

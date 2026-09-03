@@ -1,3 +1,4 @@
+import inspect
 import unittest
 from collections import defaultdict, deque
 from contextlib import nullcontext
@@ -9,8 +10,8 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState  # noqa: E402
 from sglang.srt.distributed.bootstrap import _prewarm_nccl  # noqa: E402
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState  # noqa: E402
 from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa: E402
     SchedulerRequestReceiver,
 )
@@ -18,6 +19,7 @@ from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
     _PP_DISAGG_SCHEDULER_FENCE_PHASES,
     SchedulerPPMixin,
     _pp_attention_dp_control_ranks,
+    _pp_disagg_scheduler_fence_specs,
     _pp_fence_scheduler_phase,
     _pp_pack_control_ring_message,
     _pp_unpack_control_ring_message,
@@ -114,9 +116,7 @@ class TestPPCPRankOffsets(unittest.TestCase):
                 "sglang.srt.distributed.bootstrap.torch.cuda.current_device",
                 return_value=0,
             ),
-            patch(
-                "sglang.srt.distributed.bootstrap.dist.all_reduce"
-            ) as all_reduce,
+            patch("sglang.srt.distributed.bootstrap.dist.all_reduce") as all_reduce,
             patch(
                 "sglang.srt.distributed.bootstrap.dist.isend",
                 return_value=send_work,
@@ -125,12 +125,8 @@ class TestPPCPRankOffsets(unittest.TestCase):
                 "sglang.srt.distributed.bootstrap.dist.irecv",
                 return_value=recv_work,
             ) as irecv,
-            patch(
-                "sglang.srt.distributed.bootstrap.dist.barrier"
-            ) as barrier,
-            patch(
-                "sglang.srt.distributed.bootstrap.current_platform.synchronize"
-            ),
+            patch("sglang.srt.distributed.bootstrap.dist.barrier") as barrier,
+            patch("sglang.srt.distributed.bootstrap.current_platform.synchronize"),
         ):
             _prewarm_nccl(tp_size=8, pp_size=2, moe_ep_size=8)
 
@@ -219,6 +215,9 @@ class TestPPCPRankOffsets(unittest.TestCase):
         received_tensors = {"next_token_ids": object()}
         send_work = [object()]
         recorded_event = Mock()
+        schedule_stream = SimpleNamespace(
+            synchronize=Mock(side_effect=lambda: events.append("sync"))
+        )
         target = SimpleNamespace(
             forward_mode=SimpleNamespace(is_prebuilt=lambda: False)
         )
@@ -228,7 +227,7 @@ class TestPPCPRankOffsets(unittest.TestCase):
             copy_stream=SimpleNamespace(
                 wait_stream=lambda stream: events.append(("wait_stream", stream))
             ),
-            schedule_stream=object(),
+            schedule_stream=schedule_stream,
             device_module=SimpleNamespace(
                 Event=Mock(return_value=recorded_event),
                 current_stream=Mock(return_value=object()),
@@ -273,12 +272,14 @@ class TestPPCPRankOffsets(unittest.TestCase):
         self.assertIs(event, recorded_event)
         self.assertEqual(work, [])
         self.assertEqual(
-            events[-2:],
+            events[-3:],
             [
+                "sync",
                 ("send", received_tensors, True, "output"),
                 ("commit", send_work),
             ],
         )
+        schedule_stream.synchronize.assert_called_once_with()
         scheduler._pp_send_output_to_next_stage.assert_not_called()
 
     def test_pp_disagg_output_ring_last_stage_starts_relay_chain(self):
@@ -328,7 +329,7 @@ class TestPPCPRankOffsets(unittest.TestCase):
             )
 
         self.assertIs(work, send_work)
-        self.assertEqual(events, ["send", "recv"])
+        self.assertEqual(events, ["recv", "send"])
         scheduler._pp_commit_comm_work.assert_not_called()
 
     def test_pp_linear_payload_is_forwarded_before_following_control_phase(self):
@@ -383,6 +384,9 @@ class TestPPCPRankOffsets(unittest.TestCase):
         tensor_dict = {"hidden_states": object()}
         scheduler = SimpleNamespace(
             send_proxy_work=[],
+            _pp_send_proxy=lambda tensors: SchedulerPPMixin._pp_send_proxy(
+                scheduler, tensors
+            ),
             _pp_send_dict_to_next_stage=Mock(
                 side_effect=lambda tensors, async_send, msg_type: events.append(
                     ("send", tensors, async_send, msg_type)
@@ -403,6 +407,21 @@ class TestPPCPRankOffsets(unittest.TestCase):
                 ("send", tensor_dict, True, "proxy"),
                 ("commit", proxy_work),
             ],
+        )
+
+    def test_pp_proxy_send_retains_work_until_later_commit(self):
+        proxy_work = [object()]
+        tensor_dict = {"hidden_states": object()}
+        scheduler = SimpleNamespace(
+            send_proxy_work=[],
+            _pp_send_dict_to_next_stage=Mock(return_value=proxy_work),
+        )
+
+        SchedulerPPMixin._pp_send_proxy(scheduler, tensor_dict)
+
+        self.assertIs(scheduler.send_proxy_work, proxy_work)
+        scheduler._pp_send_dict_to_next_stage.assert_called_once_with(
+            tensor_dict, async_send=True, msg_type="proxy"
         )
 
     def test_pp_control_ring_forwards_typed_payload_on_dedicated_group(self):
@@ -446,16 +465,12 @@ class TestPPCPRankOffsets(unittest.TestCase):
         )
 
         self.assertEqual(result, payload)
-        self.assertEqual(
-            events[0], ("recv", control_group, local_control_group)
-        )
+        self.assertEqual(events[0], ("recv", control_group, local_control_group))
         self.assertEqual(events[1], ("process", payload))
         self.assertEqual(events[2], ("send", control_group))
         forwarded = scheduler._pp_send_pyobj_to_next_stage.call_args.args[0]
         self.assertEqual(
-            _pp_unpack_control_ring_message(
-                forwarded, "prefill_bootstrap_consensus"
-            ),
+            _pp_unpack_control_ring_message(forwarded, "prefill_bootstrap_consensus"),
             (True, payload),
         )
 
@@ -505,9 +520,7 @@ class TestPPCPRankOffsets(unittest.TestCase):
         process_payload.assert_not_called()
         originated = scheduler._pp_send_pyobj_to_next_stage.call_args.args[0]
         self.assertEqual(
-            _pp_unpack_control_ring_message(
-                originated, "prefill_release_consensus"
-            ),
+            _pp_unpack_control_ring_message(originated, "prefill_release_consensus"),
             (False, None),
         )
 
@@ -515,12 +528,8 @@ class TestPPCPRankOffsets(unittest.TestCase):
         message = _pp_pack_control_ring_message(
             "prefill_bootstrap_consensus", False, None
         )
-        with self.assertRaisesRegex(
-            RuntimeError, "prefill_release_consensus"
-        ):
-            _pp_unpack_control_ring_message(
-                message, "prefill_release_consensus"
-            )
+        with self.assertRaisesRegex(RuntimeError, "prefill_release_consensus"):
+            _pp_unpack_control_ring_message(message, "prefill_release_consensus")
 
     def test_pp_scheduler_fences_use_full_attention_dp_group_and_distinct_phases(
         self,
@@ -547,7 +556,50 @@ class TestPPCPRankOffsets(unittest.TestCase):
             [call.kwargs["group"] for call in barrier.call_args_list],
             [fence_groups[phase] for phase in _PP_DISAGG_SCHEDULER_FENCE_PHASES],
         )
-        self.assertEqual(len(set(fence_groups.values())), 4)
+        self.assertEqual(len(set(fence_groups.values())), 5)
+
+    def test_pp_scheduler_fence_specs_match_mode_and_stage(self):
+        shifted_tp_ranks = list(range(24, 32))
+        ps = _make_ps(attn_dp_rank=1)
+
+        prefill_specs = _pp_disagg_scheduler_fence_specs(
+            "prefill", ps, shifted_tp_ranks
+        )
+        self.assertEqual(
+            prefill_specs,
+            [
+                (phase, [28, 29, 30, 31])
+                for phase in _PP_DISAGG_SCHEDULER_FENCE_PHASES
+                if phase != "decode_result_commit_done"
+            ],
+        )
+        self.assertEqual(
+            _pp_disagg_scheduler_fence_specs("decode", ps, shifted_tp_ranks),
+            [("decode_result_commit_done", shifted_tp_ranks)],
+        )
+        self.assertEqual(
+            _pp_disagg_scheduler_fence_specs("null", ps, shifted_tp_ranks),
+            [],
+        )
+
+    def test_decode_forward_and_result_commit_finish_before_next_iteration(self):
+        source = inspect.getsource(SchedulerPPMixin.event_loop_pp_disagg_decode)
+        commit_previous_proxy = source.index(
+            "self._pp_commit_comm_work(self.send_proxy_work)"
+        )
+        launch = source.index("result, self.launch_event = self._pp_launch_batch(")
+        send_current_proxy = source.index(
+            "self._pp_send_proxy(result.pp_hidden_states_proxy_tensors.tensors)"
+        )
+        process = source.index("self._pp_process_batch_result(")
+        fence = source.index('"decode_result_commit_done"')
+        advance = source.index("self.pp_outputs = next_pp_outputs")
+        self.assertLess(commit_previous_proxy, launch)
+        self.assertLess(launch, send_current_proxy)
+        self.assertLess(send_current_proxy, process)
+        self.assertLess(launch, process)
+        self.assertLess(process, fence)
+        self.assertLess(fence, advance)
 
     def test_request_receiver_uses_cp_size_for_pp_recv_rank(self):
         ps = _make_ps()
@@ -585,9 +637,7 @@ class TestPPCPRankOffsets(unittest.TestCase):
         broadcasts = []
 
         def fake_point_to_point_pyobj(data, rank, group, src, dst, **kwargs):
-            calls.append(
-                (rank, group, src, dst, kwargs.get("async_send", False))
-            )
+            calls.append((rank, group, src, dst, kwargs.get("async_send", False)))
             return ["work"]
 
         with (
@@ -618,13 +668,16 @@ class TestPPCPRankOffsets(unittest.TestCase):
                 scheduler._pp_recv_pyobj_from_prev_stage(group=control_group),
                 ["work"],
             )
-            with patch(
-                "sglang.srt.managers.scheduler_pp_mixin."
-                "_pp_attention_dp_control_ranks",
-                return_value=[12, 13, 14, 15],
-            ), patch(
-                "sglang.srt.managers.scheduler_pp_mixin.torch.distributed.get_rank",
-                return_value=12,
+            with (
+                patch(
+                    "sglang.srt.managers.scheduler_pp_mixin."
+                    "_pp_attention_dp_control_ranks",
+                    return_value=[12, 13, 14, 15],
+                ),
+                patch(
+                    "sglang.srt.managers.scheduler_pp_mixin.torch.distributed.get_rank",
+                    return_value=12,
+                ),
             ):
                 self.assertEqual(
                     scheduler._pp_recv_pyobj_from_prev_stage(
