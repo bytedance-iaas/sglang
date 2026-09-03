@@ -1,5 +1,6 @@
 import sys
 import unittest
+from collections import OrderedDict
 from queue import Queue
 from types import SimpleNamespace
 from unittest import mock
@@ -943,6 +944,117 @@ class TestEICHiCacheRegression(unittest.TestCase):
         self.assertTrue(ret)
         self.assertEqual(c.write_queue.qsize(), 1)
         self.assertEqual(len(copied), 1)  # copy_func invoked once
+
+
+class EICMissingKeyTest(unittest.TestCase):
+    """A value whose head slice outlived its data slices keeps passing mexist, so
+    every later round re-admits it, re-loads it and fails again. The read result
+    must override that phantom until a write puts the value back."""
+
+    class _Buffers(list):
+        def append(self, *args):
+            list.append(self, args)
+
+    def _fake_eic(self):
+        return SimpleNamespace(
+            StatusCode=SimpleNamespace(
+                SUCCESS=0, FAILED=1, PARTIAL_FAILED=2, TIMEOUT=3, KEY_NOT_EXIST=5
+            ),
+            StringVector=list,
+            IOBuffers=self._Buffers,
+            GetOption=SimpleNamespace,
+            ExistOption=SimpleNamespace,
+        )
+
+    def _client(self, fake_eic):
+        from sglang.srt.mem_cache import eic_memory_pool
+
+        client = object.__new__(eic_memory_pool.EICKVClient)
+        client.eic_namespace = "poc"
+        client.missing_keys = OrderedDict()
+        client.connection = mock.Mock()
+        client.allocate_eic_read_buffer = lambda count: (
+            [
+                SimpleNamespace(
+                    data_ptr=lambda: 0, element_size=lambda: 1, numel=lambda: 1
+                )
+                for _ in range(count)
+            ],
+            None,
+            None,
+            False,
+        )
+        return client
+
+    def _get(self, client, fake_eic, keys, per_key_codes):
+        client.connection.mget.return_value = (
+            fake_eic.StatusCode.PARTIAL_FAILED,
+            None,
+            SimpleNamespace(status_codes=list(per_key_codes)),
+        )
+        return client.batch_get(keys)[1]
+
+    def _exists(self, client, fake_eic, keys):
+        client.connection.mexist.return_value = (
+            fake_eic.StatusCode.SUCCESS,
+            SimpleNamespace(status_codes=[fake_eic.StatusCode.SUCCESS] * len(keys)),
+        )
+        return client.exists_batch(keys)
+
+    def test_read_result_overrides_a_phantom_exists(self):
+        from sglang.srt.mem_cache import eic_memory_pool
+
+        fake_eic = self._fake_eic()
+        keys = ["k0", "k1", "k2"]
+        with mock.patch.object(eic_memory_pool, "eic", fake_eic):
+            client = self._client(fake_eic)
+            self.assertEqual(self._exists(client, fake_eic, keys), [True] * 3)
+
+            mask = self._get(client, fake_eic, keys, [0, 5, 0])
+            self.assertEqual(mask, [True, False, True])
+            self.assertEqual(list(client.missing_keys), ["k1"])
+
+            # The backend still claims a hit; only the read result knows better.
+            self.assertEqual(
+                self._exists(client, fake_eic, keys), [True, False, True]
+            )
+
+    def test_transient_failures_do_not_suppress(self):
+        from sglang.srt.mem_cache import eic_memory_pool
+
+        fake_eic = self._fake_eic()
+        keys = ["k0", "k1", "k2"]
+        with mock.patch.object(eic_memory_pool, "eic", fake_eic):
+            client = self._client(fake_eic)
+            mask = self._get(client, fake_eic, keys, [0, 3, 1])
+            self.assertEqual(mask, [True, False, False])
+            self.assertEqual(list(client.missing_keys), [])
+            self.assertEqual(self._exists(client, fake_eic, keys), [True] * 3)
+
+    def test_a_later_write_restores_the_key(self):
+        # The failure triggers a recompute whose write_through stores the value
+        # again; suppressing it past that point would recompute it forever.
+        from sglang.srt.mem_cache import eic_memory_pool
+
+        fake_eic = self._fake_eic()
+        with mock.patch.object(eic_memory_pool, "eic", fake_eic):
+            client = self._client(fake_eic)
+            client.mark_missing(["k1"])
+            client.clear_missing(["k1"])
+            self.assertEqual(
+                self._exists(client, fake_eic, ["k0", "k1"]), [True, True]
+            )
+
+    def test_missing_set_is_bounded(self):
+        from sglang.srt.mem_cache import eic_memory_pool
+
+        with mock.patch.object(eic_memory_pool, "eic", self._fake_eic()):
+            client = self._client(self._fake_eic())
+            cap = eic_memory_pool.MISSING_KEY_CAP
+            client.mark_missing([f"k{i}" for i in range(cap + 100)])
+            self.assertEqual(len(client.missing_keys), cap)
+            self.assertNotIn("k0", client.missing_keys)
+            self.assertIn(f"k{cap + 99}", client.missing_keys)
 
 
 if __name__ == "__main__":
