@@ -33,19 +33,7 @@ static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::option
     const std::optional<at::Tensor>& extra_indices,
     const std::optional<at::Tensor>& extra_topk_length,
     int64_t d_v,
-    double sm_scale,
-    const std::optional<at::Tensor>& packed_kcache = std::nullopt,
-    const std::optional<at::Tensor>& scale_kcache = std::nullopt,
-    const std::optional<at::Tensor>& R_matrix = std::nullopt,
-    const std::optional<at::Tensor>& zero_point = std::nullopt,
-    const std::optional<at::Tensor>& dim_of_bit = std::nullopt,
-    const std::optional<at::Tensor>& bitpos_in_dim = std::nullopt,
-    int64_t bit_uniform = 0,
-    const std::optional<at::Tensor>& q_for_extra = std::nullopt,
-    bool q_nope_is_folded = false,
-    bool identity_tail_bypass = false,
-    bool debug_u32_packed_load = false,
-    const std::optional<at::Tensor>& extra_packed_kcache = std::nullopt) {
+    double sm_scale) {
   return sparse_attn_decode_interface(
       q,
       kv,
@@ -58,19 +46,7 @@ static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::option
       extra_indices,
       extra_topk_length,
       static_cast<int>(d_v),
-      static_cast<float>(sm_scale),
-      packed_kcache,
-      scale_kcache,
-      R_matrix,
-      zero_point,
-      dim_of_bit,
-      bitpos_in_dim,
-      bit_uniform,
-      q_for_extra,
-      q_nope_is_folded,
-      identity_tail_bypass,
-      debug_u32_packed_load,
-      extra_packed_kcache);
+      static_cast<float>(sm_scale));
 }
 
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>> sgl_dense_decode_fwd(
@@ -95,70 +71,6 @@ static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::option
       num_splits);
 }
 
-static std::vector<at::Tensor> sgl_sparse_prefill_fwd(
-    const at::Tensor& q,
-    const at::Tensor& kv,
-    const at::Tensor& indices,
-    double sm_scale,
-    int64_t d_v,
-    const std::optional<at::Tensor>& attn_sink,
-    const std::optional<at::Tensor>& topk_length) {
-  return sparse_attn_prefill_interface(
-      q, kv, indices, static_cast<float>(sm_scale), static_cast<int>(d_v), attn_sink, topk_length);
-}
-
-static std::vector<at::Tensor> sgl_fwd_kvcache_mla(
-    at::Tensor q,
-    const at::Tensor& kv_cache,
-    int64_t head_size_v,
-    const at::Tensor& seqlens_k,
-    const at::Tensor& block_table,
-    double softmax_scale,
-    bool is_causal,
-    const at::Tensor& tile_scheduler_metadata,
-    const at::Tensor& num_splits,
-    bool is_fp8,
-    const std::optional<at::Tensor>& indices,
-    const std::optional<at::Tensor>&,
-    const std::optional<at::Tensor>&,
-    const std::optional<at::Tensor>&,
-    const std::optional<at::Tensor>&,
-    const std::optional<at::Tensor>&) {
-  const int head_size_v_int = static_cast<int>(head_size_v);
-  const float softmax_scale_float = static_cast<float>(softmax_scale);
-  std::optional<at::Tensor> tile_scheduler_metadata_opt = tile_scheduler_metadata;
-  std::optional<at::Tensor> num_splits_opt = num_splits;
-  if (indices.has_value()) {
-    TORCH_CHECK(is_fp8, "Sparse decode path requires is_fp8=true");
-    auto result = sparse_attn_decode_interface(
-        q,
-        kv_cache,
-        indices.value(),
-        std::nullopt,
-        std::nullopt,
-        tile_scheduler_metadata_opt,
-        num_splits_opt,
-        std::nullopt,
-        std::nullopt,
-        std::nullopt,
-        head_size_v_int,
-        softmax_scale_float);
-    return {std::get<0>(result), std::get<1>(result)};
-  }
-  TORCH_CHECK(!is_fp8, "Dense FP8 decode is exposed via fwd_kvcache_mla_fp8");
-  auto result = dense_attn_decode_interface(
-      q,
-      kv_cache,
-      head_size_v_int,
-      seqlens_k,
-      block_table,
-      softmax_scale_float,
-      is_causal,
-      tile_scheduler_metadata_opt,
-      num_splits_opt);
-  return {std::get<0>(result), std::get<1>(result)};
-}
-
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From FlashMLA
@@ -177,7 +89,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor? attn_sink, Tensor? extra_k_cache, Tensor? extra_indices_in_kvcache, Tensor? topk_length, Tensor? "
       "extra_topk_length) "
       "-> Tensor[]");
-  m.impl("fwd_kvcache_mla", torch::kCUDA, &sgl_fwd_kvcache_mla);
+  m.impl("fwd_kvcache_mla", torch::kCUDA, &fwd_kvcache_mla);
 
 #ifdef FLASHMLA_ENABLE_SM100
   m.def(
@@ -190,12 +102,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "sparse_decode_fwd(Tensor q, Tensor kv, Tensor indices, Tensor? topk_length, Tensor? attn_sink, "
       "Tensor? tile_scheduler_metadata, Tensor? num_splits, Tensor? extra_kv, Tensor? extra_indices, "
-      "Tensor? extra_topk_length, int d_v, float sm_scale, "
-      "Tensor? packed_kcache=None, Tensor? scale_kcache=None, Tensor? R_matrix=None, "
-      "Tensor? zero_point=None, Tensor? dim_of_bit=None, Tensor? bitpos_in_dim=None, "
-      "int bit_uniform=0, Tensor? q_for_extra=None, bool q_nope_is_folded=False, "
-      "bool identity_tail_bypass=False, bool debug_u32_packed_load=False, "
-      "Tensor? extra_packed_kcache=None) -> (Tensor, Tensor, Tensor?, Tensor?)");
+      "Tensor? extra_topk_length, int d_v, float sm_scale) -> (Tensor, Tensor, Tensor?, Tensor?)");
   m.impl("sparse_decode_fwd", torch::kCUDA, &sgl_sparse_decode_fwd);
 
   m.def(
@@ -208,7 +115,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "sparse_prefill_fwd(Tensor q, Tensor kv, Tensor indices, float sm_scale, int d_v, Tensor? attn_sink=None, "
       "Tensor? topk_length=None) -> Tensor[]");
-  m.impl("sparse_prefill_fwd", torch::kCUDA, &sgl_sparse_prefill_fwd);
+  m.impl("sparse_prefill_fwd", torch::kCUDA, &sparse_prefill_fwd);
 
   m.def(
       "fwd_kvcache_mla_fp8(Tensor q, Tensor kcache, int head_size_v, Tensor seqlens_k, Tensor block_table, float "

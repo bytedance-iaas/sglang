@@ -38,11 +38,11 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_compress_state_write_pad,
 )
 from sglang.srt.mem_cache.kvbit_dsv4 import (
-    DSV4_KVBIT_ROW_BYTES,
+    DSV4_INT4_LAYOUT,
     DSV4_NATIVE_SWA_ROW_BYTES,
     dsv4_kvbit_enabled_for_worker,
     dsv4_kvbit_target_persistent_savings,
-    validate_dsv4_bu4_geometry,
+    validate_dsv4_int4_geometry,
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.runtime_context import (
@@ -872,11 +872,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     def _apply_kvbit_target_swa_budget(self, kvc: KVCacheConfigurator) -> None:
         self.kvbit_packed_swa = dsv4_kvbit_enabled_for_worker(
-            enabled=envs.SGLANG_ENABLE_KVBIT.get(),
+            kv_cache_dtype=kvc.kv_cache_dtype_str,
             is_draft_worker=kvc.is_draft_worker,
         )
         if self.kvbit_packed_swa:
-            validate_dsv4_bu4_geometry(
+            validate_dsv4_int4_geometry(
                 self.qk_nope_head_dim,
                 self.qk_rope_head_dim,
             )
@@ -893,7 +893,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 "packed_row=%d, target_layers=%d, c4_layers=%d, "
                 "c128_layers=%d, savings_per_full_token=%.2f, scratch=disabled",
                 DSV4_NATIVE_SWA_ROW_BYTES,
-                DSV4_KVBIT_ROW_BYTES,
+                DSV4_INT4_LAYOUT.row_bytes,
                 self.num_layers_total,
                 self.num_layers_ca4,
                 self.num_layers_ca128,

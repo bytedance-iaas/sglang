@@ -1,4 +1,4 @@
-"""Built-in DeepSeek V4 BU4 KV-cache primitives.
+"""Built-in DeepSeek V4 packed KV-cache primitives.
 
 This module intentionally has no dependency on the external ``kvbit`` package.
 It owns the fixed DSV4 layout, a CPU reference codec, and the capability gate
@@ -30,13 +30,11 @@ DSV4_KVBIT_ROPE_DIM = 64
 DSV4_KVBIT_GROUP_SIZE = 64
 DSV4_KVBIT_BITS = 4
 DSV4_KVBIT_CODE_BYTES = 224
-DSV4_KVBIT_HEADER_BYTES = 28
 DSV4_KVBIT_ROPE_BYTES = 128
-DSV4_KVBIT_ROW_BYTES = 380
+DSV4_KVBIT_INT4_HEADER_BYTES = 16
+DSV4_KVBIT_INT4_ROW_BYTES = 368
 DSV4_NATIVE_SWA_ROW_BYTES = 584
 DSV4_KVBIT_HADAMARD_DIM = 256
-
-_FLASHMLA_BU4_METADATA: dict[tuple[str, int | None], dict[str, torch.Tensor]] = {}
 
 
 class DSV4KVBitLayout(NamedTuple):
@@ -65,15 +63,15 @@ class DSV4KVBitLayout(NamedTuple):
         }
 
 
-DSV4_BU4_LAYOUT = DSV4KVBitLayout(
+DSV4_INT4_LAYOUT = DSV4KVBitLayout(
     nope_dim=DSV4_KVBIT_NOPE_DIM,
     rope_dim=DSV4_KVBIT_ROPE_DIM,
     group_size=DSV4_KVBIT_GROUP_SIZE,
     bits=DSV4_KVBIT_BITS,
     code_bytes=DSV4_KVBIT_CODE_BYTES,
-    header_bytes=DSV4_KVBIT_HEADER_BYTES,
+    header_bytes=DSV4_KVBIT_INT4_HEADER_BYTES,
     rope_bytes=DSV4_KVBIT_ROPE_BYTES,
-    row_bytes=DSV4_KVBIT_ROW_BYTES,
+    row_bytes=DSV4_KVBIT_INT4_ROW_BYTES,
 )
 
 
@@ -98,25 +96,27 @@ def require_dsv4_kvbit_runtime_capability(
         missing.append("direct packed decode")
     if missing:
         raise RuntimeError(
-            "SGLANG_ENABLE_KVBIT requires DSV4 "
+            "--kv-cache-dtype int4 requires DSV4 "
             + " and ".join(missing)
             + " capability; native/scratch fallback is disabled."
         )
 
 
-def validate_dsv4_bu4_geometry(nope_dim: int, rope_dim: int) -> None:
+def validate_dsv4_int4_geometry(nope_dim: int, rope_dim: int) -> None:
     if (nope_dim, rope_dim) != (
-        DSV4_BU4_LAYOUT.nope_dim,
-        DSV4_BU4_LAYOUT.rope_dim,
+        DSV4_INT4_LAYOUT.nope_dim,
+        DSV4_INT4_LAYOUT.rope_dim,
     ):
         raise ValueError(
-            "DSV4 KVBit supports only the built-in 448-nope/64-rope BU4 "
+            "DSV4 INT4 supports only the built-in 448-nope/64-rope "
             f"layout, got {nope_dim}-nope/{rope_dim}-rope."
         )
 
 
-def dsv4_kvbit_enabled_for_worker(*, enabled: bool, is_draft_worker: bool) -> bool:
-    return enabled and not is_draft_worker
+def dsv4_kvbit_enabled_for_worker(
+    *, kv_cache_dtype: str | None, is_draft_worker: bool
+) -> bool:
+    return kv_cache_dtype == "int4" and not is_draft_worker
 
 
 def dsv4_kvbit_target_persistent_savings(
@@ -127,7 +127,7 @@ def dsv4_kvbit_target_persistent_savings(
     num_c128_layers: int,
     c4_shrink_factor: float = 1.0,
 ) -> float:
-    row_saving = DSV4_NATIVE_SWA_ROW_BYTES - DSV4_KVBIT_ROW_BYTES
+    row_saving = DSV4_NATIVE_SWA_ROW_BYTES - DSV4_INT4_LAYOUT.row_bytes
     return row_saving * (
         swa_ratio * num_target_layers
         + num_c4_layers / (4 * c4_shrink_factor)
@@ -194,10 +194,11 @@ def restore_dsv4_h256(x: torch.Tensor) -> torch.Tensor:
     return _hadamard_h256(x)
 
 
-def encode_dsv4_bu4_reference(kv: torch.Tensor) -> torch.Tensor:
-    """Encode post-norm/post-RoPE DSV4 KV rows into the fixed BU4 layout."""
+def encode_dsv4_int4_reference(kv: torch.Tensor) -> torch.Tensor:
+    """Encode signed INT4 DSV4 rows with one FP16 step per 64 NoPE values."""
     _require_cpu_tensor(kv, name="kv")
-    expected_dim = DSV4_BU4_LAYOUT.nope_dim + DSV4_BU4_LAYOUT.rope_dim
+    layout = DSV4_INT4_LAYOUT
+    expected_dim = layout.nope_dim + layout.rope_dim
     if kv.ndim < 1 or kv.shape[-1] != expected_dim:
         raise ValueError(f"kv last dimension must be {expected_dim}, got {kv.shape}")
     if not kv.is_floating_point():
@@ -205,97 +206,75 @@ def encode_dsv4_bu4_reference(kv: torch.Tensor) -> torch.Tensor:
 
     leading_shape = kv.shape[:-1]
     rows = fold_dsv4_h256(kv.reshape(-1, expected_dim))
-    nope = (
-        rows[:, : DSV4_BU4_LAYOUT.nope_dim]
-        .float()
-        .reshape(
-            -1,
-            DSV4_BU4_LAYOUT.nope_dim // DSV4_BU4_LAYOUT.group_size,
-            DSV4_BU4_LAYOUT.group_size,
-        )
-    )
-    group_min = nope.amin(dim=-1)
-    group_range = nope.amax(dim=-1) - group_min
-    scale = group_range / ((1 << DSV4_BU4_LAYOUT.bits) - 1)
-    safe_scale = torch.where(group_range > 0, scale, torch.ones_like(scale))
-    codes = torch.round((nope - group_min.unsqueeze(-1)) / safe_scale.unsqueeze(-1))
-    codes = torch.where(
-        group_range.unsqueeze(-1) > 0, codes, torch.zeros_like(codes)
-    ).clamp_(0, 15)
-    codes = codes.to(torch.uint8).reshape(-1, DSV4_BU4_LAYOUT.nope_dim)
-    packed_codes = codes[:, 0::2] | (codes[:, 1::2] << 4)
+    nope = rows[:, : layout.nope_dim].float().reshape(-1, 7, 64)
+    max_abs = nope.abs().amax(dim=-1)
+    stored_step = (max_abs / 7.0).clamp_max(torch.finfo(torch.float16).max)
+    stored_step = stored_step.to(torch.float16)
+    quant_step = stored_step.float()
+    has_step = quant_step > 0
+    safe_step = torch.where(has_step, quant_step, torch.ones_like(quant_step))
+    # torch.round is round-to-nearest-even; -8 remains reserved.
+    codes = torch.round(nope / safe_step.unsqueeze(-1)).clamp_(-7, 7).to(torch.int8)
+    codes = torch.where(has_step.unsqueeze(-1), codes, torch.zeros_like(codes))
+    unsigned_codes = codes.to(torch.uint8) & 0x0F
+    packed_codes = (
+        unsigned_codes[..., 0::2] | (unsigned_codes[..., 1::2] << 4)
+    ).reshape(-1, layout.code_bytes)
 
-    headers = (
-        torch.stack((group_min, group_range), dim=-1)
-        .to(torch.float16)
-        .contiguous()
-        .view(torch.uint8)
-        .reshape(-1, DSV4_BU4_LAYOUT.header_bytes)
-    )
+    headers = torch.zeros((rows.shape[0], layout.header_bytes), dtype=torch.uint8)
+    headers[:, :14] = stored_step.contiguous().view(torch.uint8).reshape(-1, 14)
     rope = (
-        rows[:, DSV4_BU4_LAYOUT.nope_dim :]
+        rows[:, layout.nope_dim :]
         .to(torch.bfloat16)
         .contiguous()
         .view(torch.uint8)
-        .reshape(-1, DSV4_BU4_LAYOUT.rope_bytes)
+        .reshape(-1, layout.rope_bytes)
     )
     packed = torch.cat((packed_codes, headers, rope), dim=-1)
-    return packed.reshape(*leading_shape, DSV4_BU4_LAYOUT.row_bytes)
+    return packed.reshape(*leading_shape, layout.row_bytes)
 
 
-def _decode_dsv4_bu4_stored_domain(packed: torch.Tensor) -> torch.Tensor:
+def _decode_dsv4_int4_stored_domain(
+    packed: torch.Tensor,
+) -> torch.Tensor:
     _require_cpu_tensor(packed, name="packed")
+    layout = DSV4_INT4_LAYOUT
     if packed.dtype != torch.uint8:
         raise TypeError(f"packed must have dtype torch.uint8, got {packed.dtype}")
-    if packed.ndim < 1 or packed.shape[-1] != DSV4_BU4_LAYOUT.row_bytes:
+    if packed.ndim < 1 or packed.shape[-1] != layout.row_bytes:
         raise ValueError(
-            f"packed last dimension must be {DSV4_BU4_LAYOUT.row_bytes}, "
-            f"got {packed.shape}"
+            f"packed last dimension must be {layout.row_bytes}, got {packed.shape}"
         )
 
     leading_shape = packed.shape[:-1]
-    rows = packed.reshape(-1, DSV4_BU4_LAYOUT.row_bytes)
-    packed_codes = rows[:, : DSV4_BU4_LAYOUT.code_bytes]
-    codes = torch.stack(
-        (packed_codes & 0x0F, packed_codes >> 4),
-        dim=-1,
-    ).reshape(-1, DSV4_BU4_LAYOUT.nope_dim)
-
-    headers = (
-        rows[
-            :,
-            DSV4_BU4_LAYOUT.header_offset : DSV4_BU4_LAYOUT.rope_offset,
-        ]
+    rows = packed.reshape(-1, layout.row_bytes)
+    packed_codes = rows[:, : layout.code_bytes]
+    unsigned_codes = torch.stack(
+        (packed_codes & 0x0F, packed_codes >> 4), dim=-1
+    ).reshape(-1, 7, 64)
+    codes = unsigned_codes.to(torch.int8)
+    codes = torch.where(codes >= 8, codes - 16, codes).float()
+    steps = (
+        rows[:, layout.header_offset : layout.header_offset + 14]
         .contiguous()
         .view(torch.float16)
-        .reshape(-1, DSV4_BU4_LAYOUT.nope_dim // DSV4_BU4_LAYOUT.group_size, 2)
+        .reshape(-1, 7)
         .float()
     )
-    group_min = headers[..., 0]
-    group_range = headers[..., 1]
-    scale = group_range / ((1 << DSV4_BU4_LAYOUT.bits) - 1)
-    nope = group_min.unsqueeze(-1) + codes.reshape(
-        -1,
-        DSV4_BU4_LAYOUT.nope_dim // DSV4_BU4_LAYOUT.group_size,
-        DSV4_BU4_LAYOUT.group_size,
-    ).float() * scale.unsqueeze(-1)
-    nope = nope.reshape(-1, DSV4_BU4_LAYOUT.nope_dim).to(torch.bfloat16)
-
+    nope = (codes * steps.unsqueeze(-1)).reshape(-1, layout.nope_dim)
     rope = (
-        rows[:, DSV4_BU4_LAYOUT.rope_offset :]
+        rows[:, layout.rope_offset :]
         .contiguous()
         .view(torch.bfloat16)
-        .reshape(-1, DSV4_BU4_LAYOUT.rope_dim)
+        .reshape(-1, layout.rope_dim)
     )
-    decoded = torch.cat((nope, rope), dim=-1)
-    return decoded.reshape(
-        *leading_shape, DSV4_BU4_LAYOUT.nope_dim + DSV4_BU4_LAYOUT.rope_dim
-    )
+    decoded = torch.cat((nope.to(torch.bfloat16), rope), dim=-1)
+    return decoded.reshape(*leading_shape, layout.nope_dim + layout.rope_dim)
 
 
-def decode_dsv4_bu4_reference(packed: torch.Tensor) -> torch.Tensor:
-    """Decode fixed-layout BU4 rows and restore their H256 prefix on CPU."""
-    return restore_dsv4_h256(_decode_dsv4_bu4_stored_domain(packed))
+def decode_dsv4_int4_reference(packed: torch.Tensor) -> torch.Tensor:
+    """Decode FP16-step signed INT4 rows and restore their H256 prefix."""
+    return restore_dsv4_h256(_decode_dsv4_int4_stored_domain(packed))
 
 
 def merge_attention_states_natural_log(
@@ -341,7 +320,7 @@ def merge_attention_states_natural_log(
 if _HAS_TRITON:
 
     @triton.jit
-    def _dsv4_bu4_pack_scatter_kernel(
+    def _dsv4_int4_pack_scatter_kernel(
         kv_ptr,
         loc_ptr,
         packed_ptr,
@@ -360,7 +339,6 @@ if _HAS_TRITON:
 
         offs = tl.arange(0, 512)
         values = tl.load(kv_ptr + row * stride_kv_row + offs).to(tl.float32)
-
         prefix = values
         partner = tl.gather(prefix, offs ^ 1, axis=0)
         prefix = tl.where((offs & 1) == 0, prefix + partner, partner - prefix)
@@ -381,14 +359,20 @@ if _HAS_TRITON:
         values = tl.where(offs < 256, prefix * 0.0625, values)
 
         grouped = tl.reshape(values, [8, 64])
-        group_min = tl.min(grouped, axis=1)
-        group_max = tl.max(grouped, axis=1)
-        group_range = group_max - group_min
-        safe_step = tl.where(group_range > 0, group_range / 15.0, 1.0)
-        codes = tl.floor((grouped - group_min[:, None]) / safe_step[:, None] + 0.5)
-        codes = tl.where(group_range[:, None] > 0, codes, 0.0)
-        codes = tl.minimum(tl.maximum(codes, 0.0), 15.0).to(tl.uint8)
-        paired = tl.reshape(codes, [8, 32, 2])
+        max_abs = tl.max(tl.abs(grouped), axis=1)
+        stored_step = tl.minimum(max_abs / 7.0, 65504.0).to(tl.float16)
+        quant_step = stored_step.to(tl.float32)
+        has_step = quant_step > 0
+        safe_step = tl.where(has_step, quant_step, 1.0)
+        normalized = grouped / safe_step[:, None]
+        lower = tl.floor(normalized)
+        fraction = normalized - lower
+        lower_i32 = lower.to(tl.int32)
+        round_up = (fraction > 0.5) | ((fraction == 0.5) & ((lower_i32 & 1) != 0))
+        rounded = lower_i32 + round_up.to(tl.int32)
+        rounded = tl.where(has_step[:, None], rounded, 0)
+        codes = tl.minimum(tl.maximum(rounded, -7), 7).to(tl.int8)
+        paired = tl.reshape(codes.to(tl.uint8) & 0x0F, [8, 32, 2])
         low, high = tl.split(paired)
         packed_codes = tl.reshape((low | (high << 4)), [256])
         code_offsets = tl.arange(0, 256)
@@ -399,30 +383,25 @@ if _HAS_TRITON:
         )
 
         group_offsets = tl.arange(0, 8)
-        header_ptr = dst + 224 + group_offsets * 4
         tl.store(
-            header_ptr.to(tl.pointer_type(tl.float16)),
-            group_min.to(tl.float16),
+            (dst + 224).to(tl.pointer_type(tl.float16)) + group_offsets,
+            stored_step,
             mask=valid_loc & (group_offsets < 7),
         )
-        tl.store(
-            (header_ptr + 2).to(tl.pointer_type(tl.float16)),
-            group_range.to(tl.float16),
-            mask=valid_loc & (group_offsets < 7),
-        )
+        tl.store(dst + 238 + group_offsets, 0, mask=valid_loc & (group_offsets < 2))
 
         rope_offsets = tl.arange(0, 64)
         rope = tl.load(kv_ptr + row * stride_kv_row + 448 + rope_offsets).to(
             tl.bfloat16
         )
         tl.store(
-            (dst + 252).to(tl.pointer_type(tl.bfloat16)) + rope_offsets,
+            (dst + 240).to(tl.pointer_type(tl.bfloat16)) + rope_offsets,
             rope,
             mask=valid_loc,
         )
 
     @triton.jit
-    def _dsv4_bu4_sparse_decode_kernel(
+    def _dsv4_int4_sparse_decode_kernel(
         q_ptr,
         packed_ptr,
         indices_ptr,
@@ -486,35 +465,29 @@ if _HAS_TRITON:
                     mask=valid_token[:, None],
                     other=0,
                 )
-                codes = tl.interleave(
+                unsigned_codes = tl.interleave(
                     (packed_codes & 0x0F).to(tl.float32),
                     ((packed_codes >> 4) & 0x0F).to(tl.float32),
                 )
-                header = row_ptr + 224 + group * 4
-                minimum_bits = tl.load(
-                    header.to(tl.pointer_type(tl.uint16)),
-                    mask=valid_token[:, None],
-                    other=0,
+                signed_codes = tl.where(
+                    unsigned_codes >= 8.0,
+                    unsigned_codes - 16.0,
+                    unsigned_codes,
                 )
-                range_bits = tl.load(
-                    (header + 2).to(tl.pointer_type(tl.uint16)),
+                scale = tl.load(
+                    (row_ptr + 224).to(tl.pointer_type(tl.float16)) + group,
                     mask=valid_token[:, None],
-                    other=0,
+                    other=0.0,
                 )
-                minimum = tl.cast(
-                    tl.reshape(minimum_bits, [BLOCK_N]), tl.float16, bitcast=True
-                ).to(tl.float32)
-                value_range = tl.cast(
-                    tl.reshape(range_bits, [BLOCK_N]), tl.float16, bitcast=True
-                ).to(tl.float32)
-                values = codes * (value_range[:, None] / 15.0) + minimum[:, None]
+                scale = tl.reshape(scale, [BLOCK_N]).to(tl.float32)
+                values = signed_codes * scale[:, None]
                 dim_offsets = group * 64 + tl.arange(0, 64)
                 q_group = tl.gather(q, dim_offsets, axis=0)
                 score += tl.sum(q_group[None, :] * values, axis=1)
 
             rope_offsets = tl.arange(0, 64)
             rope = tl.load(
-                (row_ptr + 252).to(tl.pointer_type(tl.bfloat16))
+                (row_ptr + 240).to(tl.pointer_type(tl.bfloat16))
                 + rope_offsets[None, :],
                 mask=valid_token[:, None],
                 other=0.0,
@@ -541,28 +514,22 @@ if _HAS_TRITON:
                     mask=valid_token[:, None],
                     other=0,
                 )
-                codes = tl.interleave(
+                unsigned_codes = tl.interleave(
                     (packed_codes & 0x0F).to(tl.float32),
                     ((packed_codes >> 4) & 0x0F).to(tl.float32),
                 )
-                header = row_ptr + 224 + group * 4
-                minimum_bits = tl.load(
-                    header.to(tl.pointer_type(tl.uint16)),
-                    mask=valid_token[:, None],
-                    other=0,
+                signed_codes = tl.where(
+                    unsigned_codes >= 8.0,
+                    unsigned_codes - 16.0,
+                    unsigned_codes,
                 )
-                range_bits = tl.load(
-                    (header + 2).to(tl.pointer_type(tl.uint16)),
+                scale = tl.load(
+                    (row_ptr + 224).to(tl.pointer_type(tl.float16)) + group,
                     mask=valid_token[:, None],
-                    other=0,
+                    other=0.0,
                 )
-                minimum = tl.cast(
-                    tl.reshape(minimum_bits, [BLOCK_N]), tl.float16, bitcast=True
-                ).to(tl.float32)
-                value_range = tl.cast(
-                    tl.reshape(range_bits, [BLOCK_N]), tl.float16, bitcast=True
-                ).to(tl.float32)
-                values = codes * (value_range[:, None] / 15.0) + minimum[:, None]
+                scale = tl.reshape(scale, [BLOCK_N]).to(tl.float32)
+                values = signed_codes * scale[:, None]
                 partial = tl.sum(probabilities[:, None] * values, axis=0)
                 relative = tl.maximum(tl.minimum(q_offsets - group * 64, 63), 0)
                 accumulator += tl.where(
@@ -597,67 +564,29 @@ if _HAS_TRITON:
         )
 
 
-def _reshape_packed_rows(packed: torch.Tensor, *, page_size: int) -> torch.Tensor:
+def _reshape_packed_rows(
+    packed: torch.Tensor,
+    *,
+    page_size: int,
+) -> torch.Tensor:
     if packed.dtype != torch.uint8 or packed.ndim != 2:
         raise ValueError("packed cache must be a rank-2 torch.uint8 tensor")
-    expected_page_bytes = page_size * DSV4_BU4_LAYOUT.row_bytes
+    expected_page_bytes = page_size * DSV4_INT4_LAYOUT.row_bytes
     if packed.shape[1] != expected_page_bytes:
         raise ValueError(
             f"packed page width must be {expected_page_bytes}, got {packed.shape[1]}"
         )
-    return packed.reshape(-1, DSV4_BU4_LAYOUT.row_bytes)
+    return packed.reshape(-1, DSV4_INT4_LAYOUT.row_bytes)
 
 
-def dsv4_kvbit_flashmla_packed_kwargs(
-    packed: torch.Tensor, *, page_size: int
-) -> dict[str, torch.Tensor | int]:
-    """Expose the fixed BU4 rows and immutable metadata to FlashMLA."""
-    if packed.device.type != "cuda":
-        raise ValueError("FlashMLA packed KV requires a CUDA tensor")
-    rows = _reshape_packed_rows(packed, page_size=page_size)
-    device = packed.device
-    cache_key = (device.type, device.index)
-    metadata = _FLASHMLA_BU4_METADATA.get(cache_key)
-    if metadata is None:
-        rotation = torch.eye(DSV4_KVBIT_NOPE_DIM, dtype=torch.bfloat16, device=device)
-        rotation[:DSV4_KVBIT_HADAMARD_DIM, :DSV4_KVBIT_HADAMARD_DIM] = fold_dsv4_h256(
-            torch.eye(
-                DSV4_KVBIT_HADAMARD_DIM,
-                dtype=torch.bfloat16,
-                device=device,
-            )
-        )
-        metadata = {
-            "scale_kcache": torch.ones(
-                DSV4_KVBIT_NOPE_DIM, dtype=torch.float32, device=device
-            ),
-            "R_matrix": rotation,
-            "zero_point": torch.zeros(
-                DSV4_KVBIT_NOPE_DIM, dtype=torch.float32, device=device
-            ),
-            "dim_of_bit": torch.arange(
-                DSV4_KVBIT_NOPE_DIM, dtype=torch.int32, device=device
-            ).repeat_interleave(DSV4_KVBIT_BITS),
-            "bitpos_in_dim": torch.arange(
-                DSV4_KVBIT_BITS, dtype=torch.int32, device=device
-            ).repeat(DSV4_KVBIT_NOPE_DIM),
-        }
-        _FLASHMLA_BU4_METADATA[cache_key] = metadata
-    return {
-        "packed_kcache": rows,
-        **metadata,
-        "bit_uniform": DSV4_KVBIT_BITS,
-    }
-
-
-def write_dsv4_bu4_packed(
+def write_dsv4_int4_packed(
     kv: torch.Tensor,
     loc: torch.Tensor,
     packed: torch.Tensor,
     *,
     page_size: int,
 ) -> None:
-    """H256-fold, BU4-encode, and scatter DSV4 rows without FP8 scratch."""
+    """H256-fold, signed-INT4/FP16-step encode, and scatter DSV4 rows."""
     if kv.device.type != "cuda" or not _HAS_TRITON:
         raise RuntimeError("DSV4 KVBit packed writes require CUDA and Triton")
     if kv.ndim != 2 or kv.shape[-1] != 512:
@@ -667,7 +596,7 @@ def write_dsv4_bu4_packed(
     if kv.device != loc.device or kv.device != packed.device:
         raise ValueError("kv, loc, and packed cache must be on the same device")
     _reshape_packed_rows(packed, page_size=page_size)
-    _dsv4_bu4_pack_scatter_kernel[(kv.shape[0],)](
+    _dsv4_int4_pack_scatter_kernel[(kv.shape[0],)](
         kv,
         loc,
         packed,
@@ -675,7 +604,7 @@ def write_dsv4_bu4_packed(
         packed.stride(0),
         packed.shape[0],
         PAGE_SIZE=page_size,
-        ROW_BYTES=DSV4_BU4_LAYOUT.row_bytes,
+        ROW_BYTES=DSV4_INT4_LAYOUT.row_bytes,
         num_warps=4,
         num_stages=1,
     )
@@ -703,7 +632,7 @@ def _dsv4_sparse_decode_reference(
         count = int(lengths[row])
         selected = indices[row, 0, :count].to(torch.long)
         selected = selected[(selected >= 0) & (selected < rows.shape[0])]
-        stored = _decode_dsv4_bu4_stored_domain(rows[selected].cpu()).to(q.device)
+        stored = _decode_dsv4_int4_stored_domain(rows[selected].cpu()).to(q.device)
         scores = torch.einsum("qhd,kd->qhk", q_folded[row].float(), stored.float())
         scores.mul_(softmax_scale)
         if attn_sink is not None:
@@ -764,7 +693,7 @@ def dsv4_kvbit_sparse_decode(
         dtype=torch.float32,
         device=q.device,
     )
-    _dsv4_bu4_sparse_decode_kernel[(q.shape[0], q.shape[2])](
+    _dsv4_int4_sparse_decode_kernel[(q.shape[0], q.shape[2])](
         q_folded,
         packed,
         indices,
@@ -784,7 +713,7 @@ def dsv4_kvbit_sparse_decode(
         num_heads=q.shape[2],
         index_width=indices.shape[-1],
         PAGE_SIZE=page_size,
-        ROW_BYTES=DSV4_BU4_LAYOUT.row_bytes,
+        ROW_BYTES=DSV4_INT4_LAYOUT.row_bytes,
         BLOCK_N=16,
         HAS_SINK=attn_sink is not None,
         num_warps=4,
@@ -794,7 +723,7 @@ def dsv4_kvbit_sparse_decode(
 
 
 class DSV4KVBitPackedSWAPool(KVCache):
-    """Persistent 380-byte target DSV4 rows with no native shadow or scratch."""
+    """Persistent packed target DSV4 rows with no native shadow or scratch."""
 
     is_dsv4_kvbit_packed_swa = True
     is_dsv4_kvbit_packed = True
@@ -812,7 +741,7 @@ class DSV4KVBitPackedSWAPool(KVCache):
         start_layer: int | None = None,
         end_layer: int | None = None,
     ):
-        validate_dsv4_bu4_geometry(qk_nope_head_dim, qk_rope_head_dim)
+        validate_dsv4_int4_geometry(qk_nope_head_dim, qk_rope_head_dim)
         if page_size not in (2, 64, 256):
             raise ValueError(
                 f"DSV4 KVBit requires page_size in (2, 64, 256), got {page_size}"
@@ -830,8 +759,8 @@ class DSV4KVBitPackedSWAPool(KVCache):
         self.store_dtype = torch.uint8
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
-        self.kv_cache_total_dim = DSV4_BU4_LAYOUT.row_bytes
-        self.bytes_per_page_padded = self.page_size * DSV4_BU4_LAYOUT.row_bytes
+        self.kv_cache_total_dim = DSV4_INT4_LAYOUT.row_bytes
+        self.bytes_per_page_padded = self.page_size * DSV4_INT4_LAYOUT.row_bytes
         self.num_pages = (self.size + self.page_size + 1) // self.page_size
         with (
             self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE),
@@ -844,7 +773,7 @@ class DSV4KVBitPackedSWAPool(KVCache):
             self.kv_buffer = [
                 torch.zeros(
                     self.num_pages,
-                    self.page_size * DSV4_BU4_LAYOUT.row_bytes,
+                    self.page_size * DSV4_INT4_LAYOUT.row_bytes,
                     dtype=torch.uint8,
                     device=self.device,
                 )
@@ -852,7 +781,7 @@ class DSV4KVBitPackedSWAPool(KVCache):
             ]
 
     def get_bytes_per_token(self) -> int:
-        return DSV4_BU4_LAYOUT.row_bytes
+        return DSV4_INT4_LAYOUT.row_bytes
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         return self.kv_buffer[layer_id - self.start_layer]
@@ -866,7 +795,7 @@ class DSV4KVBitPackedSWAPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
     ) -> None:
-        write_dsv4_bu4_packed(
+        write_dsv4_int4_packed(
             cache_k,
             loc,
             self.kv_buffer[layer_id - self.start_layer],

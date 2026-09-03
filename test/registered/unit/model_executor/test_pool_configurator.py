@@ -1007,7 +1007,7 @@ class TestDflashDraftKvBudget(CustomTestCase):
 
 
 class TestDSV4KVBitBudget(CustomTestCase):
-    """Target SWA/C4/C128 rows receive the 584-to-380-byte reduction."""
+    """Target SWA/C4/C128 rows receive the 584-to-368-byte reduction."""
 
     def _configurator(self):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
@@ -1024,56 +1024,47 @@ class TestDSV4KVBitBudget(CustomTestCase):
         return configurator
 
     def test_target_budget_uses_packed_rows_without_scratch_charge(self):
-        from sglang.srt.environ import envs
-
         configurator = self._configurator()
-        with envs.SGLANG_ENABLE_KVBIT.override(True):
-            configurator._apply_kvbit_target_swa_budget(
-                SimpleNamespace(is_draft_worker=False)
-            )
+        configurator._apply_kvbit_target_swa_budget(
+            SimpleNamespace(is_draft_worker=False, kv_cache_dtype_str="int4")
+        )
 
-        expected = 100_000.0 - (584 - 380) * (0.5 * 60 + 15 / 4 + 45 / 128)
+        expected = 100_000.0 - (584 - 368) * (0.5 * 60 + 15 / 4 + 45 / 128)
         self.assertEqual(configurator.bytes_per_full_token, expected)
         self.assertTrue(configurator.kvbit_packed_swa)
 
     def test_hisparse_c4_shrink_factor_reduces_only_c4_savings(self):
-        from sglang.srt.environ import envs
-
         configurator = self._configurator()
         configurator.c4_shrink_factor = 2
-        with envs.SGLANG_ENABLE_KVBIT.override(True):
-            configurator._apply_kvbit_target_swa_budget(
-                SimpleNamespace(is_draft_worker=False)
-            )
+        configurator._apply_kvbit_target_swa_budget(
+            SimpleNamespace(is_draft_worker=False, kv_cache_dtype_str="int4")
+        )
 
-        expected = 100_000.0 - (584 - 380) * (0.5 * 60 + 15 / (4 * 2) + 45 / 128)
+        expected = 100_000.0 - (584 - 368) * (0.5 * 60 + 15 / (4 * 2) + 45 / 128)
         self.assertEqual(configurator.bytes_per_full_token, expected)
 
     def test_draft_and_disabled_budgets_remain_native(self):
-        from sglang.srt.environ import envs
-
-        for enabled, is_draft_worker in ((False, False), (True, True)):
-            with self.subTest(enabled=enabled, is_draft_worker=is_draft_worker):
+        for kv_cache_dtype, is_draft_worker in (("auto", False), ("int4", True)):
+            with self.subTest(
+                kv_cache_dtype=kv_cache_dtype, is_draft_worker=is_draft_worker
+            ):
                 configurator = self._configurator()
-                with envs.SGLANG_ENABLE_KVBIT.override(enabled):
-                    configurator._apply_kvbit_target_swa_budget(
-                        SimpleNamespace(is_draft_worker=is_draft_worker)
+                configurator._apply_kvbit_target_swa_budget(
+                    SimpleNamespace(
+                        is_draft_worker=is_draft_worker,
+                        kv_cache_dtype_str=kv_cache_dtype,
                     )
+                )
 
                 self.assertEqual(configurator.bytes_per_full_token, 100_000.0)
                 self.assertFalse(configurator.kvbit_packed_swa)
 
     def test_target_budget_rejects_non_dsv4_geometry(self):
-        from sglang.srt.environ import envs
-
         configurator = self._configurator()
         configurator.qk_nope_head_dim = 512
-        with (
-            envs.SGLANG_ENABLE_KVBIT.override(True),
-            self.assertRaisesRegex(ValueError, "448-nope/64-rope"),
-        ):
+        with self.assertRaisesRegex(ValueError, "448-nope/64-rope"):
             configurator._apply_kvbit_target_swa_budget(
-                SimpleNamespace(is_draft_worker=False)
+                SimpleNamespace(is_draft_worker=False, kv_cache_dtype_str="int4")
             )
 
 

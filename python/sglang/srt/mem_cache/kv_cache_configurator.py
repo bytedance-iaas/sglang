@@ -52,7 +52,7 @@ from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.kvbit_dsv4 import (
     dsv4_kvbit_enabled_for_worker,
     require_dsv4_kvbit_runtime_capability,
-    validate_dsv4_bu4_geometry,
+    validate_dsv4_int4_geometry,
 )
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
@@ -1263,7 +1263,7 @@ class KVCacheConfigurator:
         req_to_token_pool: ReqToTokenPool,
     ) -> KVCache:
         enable_kvbit_swa = dsv4_kvbit_enabled_for_worker(
-            enabled=envs.SGLANG_ENABLE_KVBIT.get(),
+            kv_cache_dtype=self.kv_cache_dtype_str,
             is_draft_worker=self.is_draft_worker,
         )
         if enable_kvbit_swa:
@@ -1286,7 +1286,7 @@ class KVCacheConfigurator:
                 raise RuntimeError(
                     "DSV4 KVBit packed persistent KV does not support disaggregation."
                 )
-            validate_dsv4_bu4_geometry(
+            validate_dsv4_int4_geometry(
                 self.model_config.qk_nope_head_dim,
                 self.model_config.qk_rope_head_dim,
             )

@@ -103,18 +103,6 @@ def flash_mla_with_kvcache(
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
-    packed_kcache: Optional[torch.Tensor] = None,
-    scale_kcache: Optional[torch.Tensor] = None,
-    R_matrix: Optional[torch.Tensor] = None,
-    zero_point: Optional[torch.Tensor] = None,
-    dim_of_bit: Optional[torch.Tensor] = None,
-    bitpos_in_dim: Optional[torch.Tensor] = None,
-    bit_uniform: int = 0,
-    q_for_extra: Optional[torch.Tensor] = None,
-    q_nope_is_folded: bool = False,
-    identity_tail_bypass: bool = False,
-    debug_u32_packed_load: bool = False,
-    extra_packed_kcache: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -159,18 +147,6 @@ def flash_mla_with_kvcache(
             extra_indices_in_kvcache=extra_indices_in_kvcache,
             topk_length=topk_length,
             extra_topk_length=extra_topk_length,
-            packed_kcache=packed_kcache,
-            scale_kcache=scale_kcache,
-            R_matrix=R_matrix,
-            zero_point=zero_point,
-            dim_of_bit=dim_of_bit,
-            bitpos_in_dim=bitpos_in_dim,
-            bit_uniform=bit_uniform,
-            q_for_extra=q_for_extra,
-            q_nope_is_folded=q_nope_is_folded,
-            identity_tail_bypass=identity_tail_bypass,
-            debug_u32_packed_load=debug_u32_packed_load,
-            extra_packed_kcache=extra_packed_kcache,
         )
 
     assert num_splits is not None
@@ -181,18 +157,6 @@ def flash_mla_with_kvcache(
     assert extra_indices_in_kvcache is None
     assert topk_length is None
     assert extra_topk_length is None
-    assert packed_kcache is None
-    assert scale_kcache is None
-    assert R_matrix is None
-    assert zero_point is None
-    assert dim_of_bit is None
-    assert bitpos_in_dim is None
-    assert bit_uniform == 0
-    assert q_for_extra is None
-    assert not q_nope_is_folded
-    assert not identity_tail_bypass
-    assert not debug_u32_packed_load
-    assert extra_packed_kcache is None
     if indices is not None:
         assert causal == False, "causal must be `false` if sparse attention is enabled."
     assert (descale_q is None) == (
@@ -252,18 +216,6 @@ def _flash_mla_with_kvcache_sched_meta(
     extra_indices_in_kvcache: Optional[torch.Tensor],
     topk_length: Optional[torch.Tensor],
     extra_topk_length: Optional[torch.Tensor],
-    packed_kcache: Optional[torch.Tensor],
-    scale_kcache: Optional[torch.Tensor],
-    R_matrix: Optional[torch.Tensor],
-    zero_point: Optional[torch.Tensor],
-    dim_of_bit: Optional[torch.Tensor],
-    bitpos_in_dim: Optional[torch.Tensor],
-    bit_uniform: int,
-    q_for_extra: Optional[torch.Tensor],
-    q_nope_is_folded: bool,
-    identity_tail_bypass: bool,
-    debug_u32_packed_load: bool,
-    extra_packed_kcache: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert num_splits is None, "num_splits must be None with FlashMLASchedMeta"
 
@@ -327,18 +279,6 @@ def _flash_mla_with_kvcache_sched_meta(
                 extra_topk_length,
                 head_dim_v,
                 softmax_scale,
-                packed_kcache,
-                scale_kcache,
-                R_matrix,
-                zero_point,
-                dim_of_bit,
-                bitpos_in_dim,
-                bit_uniform,
-                q_for_extra,
-                q_nope_is_folded,
-                identity_tail_bypass,
-                debug_u32_packed_load,
-                extra_packed_kcache,
             )
         )
     else:

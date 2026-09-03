@@ -68,7 +68,7 @@ from sglang.srt.layers.attention.verify_mask import (
 )
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.mem_cache.kvbit_dsv4 import dsv4_kvbit_flashmla_packed_kwargs
+from sglang.srt.mem_cache.kvbit_dsv4 import DSV4_INT4_LAYOUT
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     get_parallel,
@@ -1691,18 +1691,14 @@ class DeepseekV4AttnBackend(
         if swa_indices.ndim == 2:
             swa_indices = swa_indices.unsqueeze(1)
 
-        swa_packed_kwargs = dsv4_kvbit_flashmla_packed_kwargs(
-            packed_swa_cache, page_size=self.page_size
-        )
         swa_shape_carrier = packed_swa_cache.view(
             packed_swa_cache.shape[0],
             self.page_size,
             1,
-            -1,
+            DSV4_INT4_LAYOUT.row_bytes,
         )
 
         extra_shape_carrier = None
-        extra_packed_rows = None
         extra_indices = None
         extra_lengths = None
         if compress_ratio != 0:
@@ -1723,38 +1719,35 @@ class DeepseekV4AttnBackend(
                 extra_cache.shape[0],
                 extra_page_size,
                 1,
-                -1,
+                DSV4_INT4_LAYOUT.row_bytes,
             )
-            extra_packed_rows = dsv4_kvbit_flashmla_packed_kwargs(
-                extra_cache, page_size=extra_page_size
-            )["packed_kcache"]
-
         assert swa_indices.shape[-1] % 64 == 0
         if extra_indices is not None:
             assert extra_indices.shape[-1] % 64 == 0
 
-        from sgl_kernel.flash_mla import flash_mla_with_kvcache
+        common_kwargs = {
+            "q": q.contiguous(),
+            "k_cache": swa_shape_carrier,
+            "head_dim_v": self.head_dim_v,
+            "sched_meta": core_attn_metadata.get_flashmla_metadata(compress_ratio),
+            "softmax_scale": self.softmax_scale,
+            "indices": swa_indices,
+            "attn_sink": attn_sink,
+            "extra_k_cache": extra_shape_carrier,
+            "extra_indices_in_kvcache": extra_indices,
+            "topk_length": swa_lengths,
+            "extra_topk_length": extra_lengths,
+        }
+        from sgl_kernel.kvbit_flash_mla import kvbit_int4_flash_mla_with_kvcache
 
-        output, _ = flash_mla_with_kvcache(
-            q=q.contiguous(),
-            k_cache=swa_shape_carrier,
-            block_table=None,
-            cache_seqlens=None,
-            head_dim_v=self.head_dim_v,
-            tile_scheduler_metadata=core_attn_metadata.get_flashmla_metadata(
-                compress_ratio
+        output, _ = kvbit_int4_flash_mla_with_kvcache(
+            **common_kwargs,
+            packed_kcache=packed_swa_cache.view(-1, DSV4_INT4_LAYOUT.row_bytes),
+            extra_packed_kcache=(
+                None
+                if extra_shape_carrier is None
+                else extra_shape_carrier.view(-1, DSV4_INT4_LAYOUT.row_bytes)
             ),
-            softmax_scale=self.softmax_scale,
-            is_fp8_kvcache=True,
-            indices=swa_indices,
-            attn_sink=attn_sink,
-            extra_k_cache=extra_shape_carrier,
-            extra_indices_in_kvcache=extra_indices,
-            topk_length=swa_lengths,
-            extra_topk_length=extra_lengths,
-            identity_tail_bypass=True,
-            extra_packed_kcache=extra_packed_rows,
-            **swa_packed_kwargs,
         )
         return output.squeeze(1)
 
