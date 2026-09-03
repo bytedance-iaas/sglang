@@ -4,6 +4,7 @@ from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import get_num_new_pages
 
@@ -348,13 +349,26 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
+        # Negative indices are sentinels (for example, last_loc=-1), and values
+        # beyond the mapping table may come from full-only pools. Do not use
+        # either as gather indices into full_to_swa_index_mapping.
+        free_index = free_index[
+            (free_index >= 0) & (free_index < self.full_to_swa_index_mapping.shape[0])
+        ]
+        if free_index.numel() == 0:
+            return
+
         if self.page_size == 1:
             mapping_indices = free_index
         else:
             mapping_indices = self._expand_to_full_pages(free_index)
 
         swa_indices = self.full_to_swa_index_mapping[mapping_indices]
-        swa_indices = swa_indices[swa_indices > 0]
+        if get_global_server_args().enable_eic_cache:
+            # EIC aliases FULL spans onto reused SWA slots; skip reserved page + dedup.
+            swa_indices = torch.unique(swa_indices[swa_indices >= self.page_size])
+        else:
+            swa_indices = swa_indices[swa_indices > 0]
         self.swa_attn_allocator.free(swa_indices)
         self.full_to_swa_index_mapping[mapping_indices] = 0
 

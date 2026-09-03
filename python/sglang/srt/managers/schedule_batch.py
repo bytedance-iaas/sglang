@@ -969,6 +969,8 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
+        # Tokens the EIC admission gate loaded back into prefix_indices
+        self.eic_loaded_len = 0
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
         # Whether the prefill-time SWA tree lock has been released early
@@ -3298,7 +3300,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             skip_lock_node_ids=req.skip_lock_node_ids,
                         )
                         req.swa_prefix_lock_released = True
-                elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():
+                elif self.forward_mode.is_extend() and (
+                    self.tree_cache.is_chunk_cache()
+                    or getattr(  # EIC-only hook; other caches lack it.
+                        self.tree_cache, "eic_swa_extend_eviction", lambda: False
+                    )()
+                ):
                     pre_len = self.prefix_lens[idx]
                     if self.enable_overlap:
                         # In chunked prefill case, when the second extend batch is scheduling, the first extend batch is still running, so we cannot evict swa tokens

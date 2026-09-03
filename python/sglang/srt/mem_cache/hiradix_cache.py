@@ -123,6 +123,14 @@ class HiRadixCache(RadixCache):
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         self.enable_storage = server_args.hicache_storage_backend is not None
+        if server_args.hicache_storage_backend == "eic" and self.pp_size > 1:
+            logger.error(
+                "eic hicache_storage_backend with pipeline parallelism requires "
+                "the unified radix tree (SGLANG_ENABLE_UNIFIED_RADIX_TREE=1, "
+                "plus fcfs, no dp_attention, no SGLANG_REQ_WAITING_TIMEOUT); "
+                "disabling the storage tier"
+            )
+            self.enable_storage = False
         self.enable_storage_metrics = self.enable_storage and params.enable_metrics
         self.extra_metric_labels = server_args.extra_metric_labels
 
@@ -381,6 +389,13 @@ class HiRadixCache(RadixCache):
         requests to avoid races.
         """
         # Validate inputs first (no side effects).
+        if storage_backend == "eic" and self.pp_size > 1:
+            return (
+                False,
+                "eic storage under pipeline parallelism needs the unified radix "
+                "tree's cross-PP reconciliation (SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 "
+                "plus fcfs, no dp_attention, no SGLANG_REQ_WAITING_TIMEOUT).",
+            )
         if hicache_storage_prefetch_policy is not None:
             allowed = ["best_effort", "wait_complete", "timeout"]
             if hicache_storage_prefetch_policy not in allowed:

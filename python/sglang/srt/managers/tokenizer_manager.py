@@ -66,8 +66,11 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedGenerateReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
+    DisableEICReqInput,
+    EICSwitchOutput,
     ElasticScaleUpdateReq,
     EmbeddingReqInput,
+    EnableEICReqInput,
     FreezeGCReq,
     GenerateReqInput,
     HealthCheckOutput,
@@ -2184,6 +2187,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = real_time()
             self.soft_watchdog.feed()
+
+    async def enable_eic_cache(self) -> EICSwitchOutput:
+        return (await self.eic_switch_communicator(EnableEICReqInput()))[0]
+
+    async def disable_eic_cache(self) -> EICSwitchOutput:
+        return (await self.eic_switch_communicator(DisableEICReqInput()))[0]
 
     async def _handle_batch_output(
         self,
