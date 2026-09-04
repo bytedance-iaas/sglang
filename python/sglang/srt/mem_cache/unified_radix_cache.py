@@ -1022,8 +1022,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Skip if there is nothing to load, or if the Full-KV transfer is too
         # small / exceeds memory quota. Aux transfers should still run even
-        # when the Full-KV load is skipped by thresholding.
-        if (kv_tokens < self.load_back_threshold and not comp_xfers) or (
+        # when the Full-KV load is skipped by thresholding. max(1, ...): an
+        # entirely empty spec (e.g. foreign-pin rejection) must never report
+        # success, even at load_back_threshold <= 0.
+        if (kv_tokens < max(1, self.load_back_threshold) and not comp_xfers) or (
             mem_quota is not None and kv_tokens > mem_quota + result.delta
         ):
             self.dec_lock_ref(node_id, ancestor_lock_params)
@@ -1173,11 +1175,16 @@ class UnifiedRadixCache(BasePrefixCache):
         new_input_tokens: list[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[list[str]] = None,
+        extra_key: Optional[str] = None,
     ) -> None:
         if not self.enable_storage or self.cache_controller is None:
             return
 
-        extra_key = self.tree_core.prefetch_anchor_info(last_host_node_id)
+        anchor_extra_key = self.tree_core.prefetch_anchor_info(last_host_node_id)
+        assert anchor_extra_key is None or anchor_extra_key == extra_key, (
+            f"prefetch anchor namespace {anchor_extra_key!r} "
+            f"!= request namespace {extra_key!r}"
+        )
         prefetch_key = RadixKey(
             new_input_tokens,
             extra_key=extra_key,
@@ -1253,13 +1260,26 @@ class UnifiedRadixCache(BasePrefixCache):
             + len(operation.hash_value) * self.prefetch_timeout_per_page
         )
 
-    def can_terminate_prefetch(self, operation: PrefetchOperation) -> bool:
+    def _can_terminate_prefetch(self, operation: PrefetchOperation) -> bool:
         if self.prefetch_stop_policy == "best_effort":
             return True
         if self.prefetch_stop_policy == "wait_complete":
             return False
         elif self.prefetch_stop_policy == "timeout":
-            return self._prefetch_timeout_check_linear_func(operation)
+            # Wall-clock time may differ among ranks, all-reduce is needed to ensure
+            # all ranks reach the same final result. Otherwise PP/TP ranks will diverge.
+            #
+            # For TP, if any rank reaches the timeout, the final result is timeout.
+            #
+            # For PP, PP0 makes the decision and other ranks follow PP0's decision.
+            should_terminate = False
+            if self.pp_rank == 0:
+                should_terminate = self._prefetch_timeout_check_linear_func(operation)
+            should_terminate_tensor = torch.tensor(
+                int(should_terminate), dtype=torch.int, device="cpu"
+            )
+            self._all_reduce(should_terminate_tensor, torch.distributed.ReduceOp.MAX)
+            return should_terminate_tensor.item() == 1
         else:
             return True
 
@@ -1268,16 +1288,12 @@ class UnifiedRadixCache(BasePrefixCache):
             return True
 
         operation = self.ongoing_prefetch[req_id].operation
-        should_terminate = False
-        if self.pp_rank == 0:
-            should_terminate = operation.is_terminated() or self.can_terminate_prefetch(
-                operation
-            )
-        should_terminate_tensor = torch.tensor(
-            int(should_terminate), dtype=torch.int, device="cpu"
+        # Determine whether or not we should terminate this prefetch request.
+        should_terminate = operation.is_terminated() or self._can_terminate_prefetch(
+            operation
         )
-        self._all_reduce(should_terminate_tensor, torch.distributed.ReduceOp.MAX)
-        if should_terminate_tensor.item() != 1:
+
+        if not should_terminate:
             return False
 
         self.cache_controller.terminate_prefetch(operation)
@@ -1401,6 +1417,21 @@ class UnifiedRadixCache(BasePrefixCache):
             for transfer, count in zip(pool_transfers, pool_hit_pages)
         )
         if pool_transfers and not all_succeeded:
+            # Drop the KV beliefs from the first page any pool failed to serve;
+            # the next insert then re-writes that span through one FULL check,
+            # restoring the missing aux pages.
+            keep_pages = completed_tokens // self.page_size
+            for transfer, count in zip(pool_transfers, pool_hit_pages):
+                if transfer.keys is None:
+                    keep_pages = 0
+                elif count < len(transfer.keys):
+                    # Aux transfers key the chain's trailing pages.
+                    keep_pages = min(
+                        keep_pages, max(0, len(hash_value) - len(transfer.keys))
+                    )
+            self.storage_existence_cache.invalidate_beyond(
+                PoolName.KV, hash_value, keep_pages=keep_pages
+            )
             # The controller's prefetch IO thread already releases the untransferred
             # tail (host_indices[completed_tokens:])
             self.cache_controller.append_host_mem_release(
@@ -1412,10 +1443,12 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
             self.prefetch_loaded_tokens_by_reqid[req_id] = 0
             logger.warning(
-                "HiCache hybrid prefetch discarded req=%s completed=%d requested=%d",
+                "HiCache hybrid prefetch discarded req=%s completed=%d requested=%d "
+                "kv_beliefs_kept_pages=%d",
                 req_id,
                 completed_tokens,
                 expected_tokens,
+                keep_pages,
             )
             return False
         return True

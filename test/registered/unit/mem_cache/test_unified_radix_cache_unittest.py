@@ -330,6 +330,34 @@ class TestUnifiedTreeCoreLoadBackPending(CustomTestCase):
         self.assertTrue(UnifiedTreeCore._can_reclaim_full_host_duplicate(core, shared))
         core._update_duplicate_tracking.assert_called_once_with(shared)
 
+    def test_auxiliary_load_does_not_reuse_full_pending_pin(self):
+        core, shared, anchor_a, anchor_b = self._build_core(is_write_back=True)
+        core.components_by_type[ComponentType.SWA] = mock.Mock()
+
+        self._commit_load_back(core, anchor_a, shared)
+        self.assertEqual(shared.load_back_pending_id, anchor_a.id)
+
+        kv_transfer = PoolTransfer(
+            name=PoolName.KV,
+            host_indices=torch.tensor([1], dtype=torch.int64),
+            nodes_to_load=[anchor_b.id],
+        )
+        swa_transfer = PoolTransfer(
+            name=PoolName.SWA,
+            host_indices=torch.tensor([2], dtype=torch.int64),
+            nodes_to_load=[shared.id],
+        )
+        UnifiedTreeCore.commit_load_back(
+            core,
+            anchor_b.id,
+            torch.tensor([3], dtype=torch.int64),
+            kv_transfer,
+            {ComponentType.SWA: [swa_transfer]},
+        )
+
+        self.assertEqual(shared.load_back_pending_id, anchor_a.id)
+        self.assertEqual(anchor_b.load_back_pending_id, anchor_b.id)
+
 
 def _write_backup(cache, node, write_back: bool = False) -> int:
     """Back up one node's KV D->H via the tree's build+execute primitives."""
@@ -480,11 +508,13 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
         cache.enable_storage = True
         cache.prefetch_threshold = 1
         tokens = array("q", [1, 2, 3, 4, 5, 6, 7, 8, 9])
+        namespace = "tenant-a"
+        key = RadixKey(tokens, extra_key=namespace)
 
         value = allocator.alloc(len(tokens) - 1)
         self.assertIsNotNone(value)
-        cache.insert(InsertParams(key=RadixKey(tokens), value=value))
-        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
+        cache.insert(InsertParams(key=key, value=value))
+        match = cache.match_prefix(MatchPrefixParams(key=key))
         leaf = cache.resolve_node_handle(match.last_device_node)
         self.assertTrue(leaf.key.is_bigram)
         self.assertEqual(len(leaf.hash_value), 2)
@@ -522,10 +552,13 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
 
         controller = FakeCacheController()
         cache.cache_controller = controller
-        cache.prefetch_from_storage("req", cache.root_node.id, tokens)
+        cache.prefetch_from_storage(
+            "req", cache.root_node.id, tokens, extra_key=namespace
+        )
 
         _, storage_key, _, _, _ = controller.prefetch_args
         self.assertIsInstance(storage_key, RadixKey)
+        self.assertEqual(storage_key.extra_key, namespace)
         self.assertTrue(storage_key.is_bigram)
         self.assertEqual(len(storage_key), len(tokens) - 1)
 
@@ -4437,6 +4470,62 @@ class UnifiedRadixCacheSuite:
         chain = [n.id for n in chain]
         self.assertEqual(xfer.nodes_to_load, chain[-expected_pages:])
 
+    def test_hicache_swa_load_back_rejects_foreign_pinned_window(self):
+        """A second load-back must not claim nodes pinned by an in-flight one.
+
+        commit_load_back republishes Full device values before the DMA acks, so
+        a later anchor can claim just the still-host-only SWA window of a
+        pinned node and hit the commit pin assert. The spec build must degrade
+        to an empty spec instead (the caller recomputes).
+        """
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the chain construction simple")
+        if self.cfg.sliding_window_size <= self.cfg.page_size:
+            # A window within one page never reaches the pinned ancestor.
+            self.skipTest("window must span past the leaf to reach the pin")
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        # commit_load_back pins its source nodes only under write-back; run the
+        # scenario in that mode so the foreign-pin path is reachable.
+        cache.is_write_back = True
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain collapsed below the two-node suffix being tested")
+        self._simulate_backup_tree(cache)
+
+        # Host-only suffix a -> b under a device-resident ancestor.
+        a, b = chain[-2], chain[-1]
+        for n in (a, b):
+            cache.tree_core.set_component_device_value_raw(n, ComponentType.FULL, None)
+            cache.tree_core.set_component_device_value_raw(n, ComponentType.SWA, None)
+            if cache.tree_core.is_node_in_device_lru(n, ComponentType.SWA):
+                cache.tree_core.remove_node_from_device_lru(n, ComponentType.SWA)
+            cache.tree_core.insert_node_into_host_lru(n, ComponentType.SWA)
+
+        # Anchor `a`: a Full-only load whose SWA slice stays host-only.
+        kv_xfer, _comp_xfers = cache.tree_core.build_load_back_spec(a)
+        self.assertEqual(kv_xfer.nodes_to_load, [a])
+        device_indices = torch.arange(
+            int(kv_xfer.host_indices.numel()), dtype=torch.int64, device=cache.device
+        )
+        cache.tree_core.commit_load_back(a, device_indices, kv_xfer, {})
+        self.assertEqual(cache.tree_core.node_by_id(a).load_back_pending_id, a)
+
+        # Anchor `b` rejects its whole spec: its SWA window claims pinned `a`.
+        kv_xfer, comp_xfers = cache.tree_core.build_load_back_spec(b)
+        self.assertEqual(int(kv_xfer.host_indices.numel()), 0)
+        self.assertEqual(kv_xfer.nodes_to_load, [])
+        self.assertEqual(comp_xfers, {})
+
+        # After the ack unpins, the same spec builds fully.
+        cache.tree_core.finish_load_back(a)
+        self.assertIsNone(cache.tree_core.node_by_id(a).load_back_pending_id)
+        kv_xfer, comp_xfers = cache.tree_core.build_load_back_spec(b)
+        self.assertEqual(kv_xfer.nodes_to_load, [b])
+        self.assertEqual(comp_xfers[ComponentType.SWA][0].nodes_to_load, [a, b])
+
     def _swa_finalize_setup(self):
         """Build a SWA chain long enough to fill at least the window
         plus one extra page, and host-back every node so we can flip
@@ -6235,7 +6324,7 @@ class TestPrefetchCommitOrdering(CustomTestCase):
         cache._check_hybrid_prefetch_result.return_value = 8
         cache.cache_controller.prefetch_tokens_occupied = 100
         cache.prefetch_loaded_tokens_by_reqid = {}
-        cache.can_terminate_prefetch.return_value = True
+        cache._can_terminate_prefetch.return_value = True
         cache.pp_rank = 0
 
         order = mock.MagicMock()
@@ -6413,7 +6502,7 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         operation.hash_value = hashes
 
         with (
-            mock.patch.object(cache, "can_terminate_prefetch", return_value=True),
+            mock.patch.object(cache, "_can_terminate_prefetch", return_value=True),
             # Isolate the drop-release branch under test from the hybrid-sync
             # step: treat the whole fetched prefix as usable so the insert runs.
             mock.patch.object(
