@@ -978,6 +978,20 @@ class TestEICHiCacheRegression(unittest.TestCase):
         self.assertEqual(cache.writing_check.call_count, 2)  # bounded spins
         self.assertEqual(len(cache.ongoing_write_through), 51)  # never drained
 
+    def test_load_remote_threshold(self):
+        def th(cfg):
+            cache = object.__new__(EICPagedHiRadixCache)
+            cache.page_size = 16
+            with mock.patch.object(
+                EICPagedHiRadixCache.__bases__[0], "init_hyper_params", lambda *a: None
+            ):
+                EICPagedHiRadixCache.init_hyper_params(cache, cfg)
+            return cache.load_remote_threshold
+
+        self.assertEqual(th({}), 1 << 14)
+        self.assertEqual(th({"load_remote_threshold": 8192}), 8192)  # was floored
+        self.assertEqual(th({"load_remote_threshold": 4}), 16)
+
 
 if __name__ == "__main__":
     unittest.main()
