@@ -900,6 +900,13 @@ class SchedulerMetricsReporter:
             self.scheduler.tree_cache, "token_to_kv_pool_host", None
         ) or getattr(self.scheduler.tree_cache, "full_kv_pool_host", None)
         assert host_pool is not None, "Host pool not found"
+        group = getattr(host_pool, "host_pool_group", None)
+        if group is not None:
+            host_pool = next(
+                e.host_pool
+                for e in group.entry_map.values()
+                if e.is_primary_index_anchor
+            )
         self.stats.hicache_host_used_tokens = (
             host_pool.size - host_pool.available_size()
         )
