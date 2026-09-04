@@ -194,6 +194,7 @@ class TestUnifiedDeepSeekV4FlashEagleHiCacheL3(AccuracyTwoPassMixin, CustomTestC
     num_gsm8k_questions = 100
     gsm8k_parallel = 4
     mmlu_num_threads = 4
+    expected_storage_suffix = None
 
     @classmethod
     def setUpClass(cls):
@@ -300,6 +301,7 @@ class TestUnifiedDeepSeekV4FlashEagleHiCacheL3(AccuracyTwoPassMixin, CustomTestC
                     "temperature": 0,
                     "max_new_tokens": 1,
                 },
+                "return_logprob": True,
             },
             timeout=1200,
         )
@@ -310,7 +312,7 @@ class TestUnifiedDeepSeekV4FlashEagleHiCacheL3(AccuracyTwoPassMixin, CustomTestC
         )
         return response.json()
 
-    def test_eagle_l3_storage_cache_hit(self):
+    def test_l3_storage_cache_hit(self):
         self._flush_cache()
         initial_pages = self._count_file_storage_pages()
 
@@ -326,15 +328,37 @@ class TestUnifiedDeepSeekV4FlashEagleHiCacheL3(AccuracyTwoPassMixin, CustomTestC
         self.assertGreaterEqual(
             storage_cached_tokens,
             self.page_size,
-            f"Expected EAGLE request to load KV from HiCache file storage, got {cached_details=}",
+            "Expected request to load KV from HiCache file storage, "
+            f"got {cached_details=}",
         )
         self.assertEqual(cached_details.get("storage_backend"), "HiCacheFile")
+        self.assertEqual(first["output_ids"], second["output_ids"])
+        first_logprob = first["meta_info"]["output_token_logprobs"][0][0]
+        second_logprob = second["meta_info"]["output_token_logprobs"][0][0]
+        self.assertAlmostEqual(first_logprob, second_logprob, places=4)
+
+        if self.expected_storage_suffix is not None:
+            storage_files = [
+                filename
+                for filename in os.listdir(self.hicache_dir)
+                if filename.endswith(".bin")
+            ]
+            self.assertTrue(storage_files, "Expected HiCache file storage entries")
+            self.assertTrue(
+                all(
+                    filename[:-4].endswith(self.expected_storage_suffix)
+                    for filename in storage_files
+                ),
+                f"Unexpected HiCache file namespace: {storage_files=}",
+            )
 
 
 class TestUnifiedDeepSeekV4FlashDSparkHiCacheL3(
     TestUnifiedDeepSeekV4FlashEagleHiCacheL3
 ):
-    """DeepSeek V4 Flash DSpark + HiCache L3 should load from storage."""
+    """DeepSeek V4 Flash CP-v2 + DSpark + HiCache L3 storage replay."""
+
+    expected_storage_suffix = "_cpfull_4"
 
     @classmethod
     def setUpClass(cls):
@@ -349,6 +373,11 @@ class TestUnifiedDeepSeekV4FlashDSparkHiCacheL3(
                 "--trust-remote-code",
                 "--tp-size",
                 "4",
+                "--attn-cp-size",
+                "4",
+                "--enable-prefill-cp",
+                "--cp-strategy",
+                "interleave",
                 "--attention-backend",
                 "compressed",
                 "--page-size",
@@ -385,6 +414,7 @@ class TestUnifiedDeepSeekV4FlashDSparkHiCacheL3(
             ],
             env={
                 "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+                "SGLANG_ENABLE_CP_V2": "1",
                 "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.hicache_dir,
             },
         )

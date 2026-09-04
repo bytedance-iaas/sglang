@@ -1734,7 +1734,10 @@ class HiRadixCache(RadixCache):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        extra_key: Optional[str] = None,
     ):
+        # Signature parity with UnifiedRadixCache. The dense tree already
+        # carries the namespace on last_host_node.key.
         prefetch_key = RadixKey(
             new_input_tokens,
             extra_key=last_host_node.key.extra_key,
