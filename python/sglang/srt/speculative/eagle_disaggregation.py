@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.layers.attention.dsa.utils import (
     should_remap_pd_dsa_seed_to_local_slots,
+    should_seed_dsa_topk_from_draft_extend,
 )
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
@@ -58,7 +59,11 @@ def build_eagle_disagg_draft_input(
 
     dsa_topk_indices = None
     dsa_indices_list = [req.output_dsa_topk_indices for req in batch.reqs]
-    if dsa_indices_list and all(t is not None for t in dsa_indices_list):
+    if (
+        should_seed_dsa_topk_from_draft_extend()
+        and dsa_indices_list
+        and all(t is not None for t in dsa_indices_list)
+    ):
         dsa_topk_indices = torch.stack(dsa_indices_list, dim=0).to(batch.device)
         if should_remap_pd_dsa_seed_to_local_slots():
             # PD sends request-relative positions; fused TopK consumes

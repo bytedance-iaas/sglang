@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
@@ -200,6 +201,35 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
 
+    def test_pd_indexshare_gate_keeps_iteration_share_but_disables_seed(self):
+        worker = object.__new__(EagleDraftWorker)
+        worker.topk = 1
+        worker.draft_runner = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    index_share_for_mtp_iteration=True, index_topk=2048
+                )
+            )
+        )
+
+        for mode, gate, expected_seed in (
+            ("prefill", False, False),
+            ("decode", False, False),
+            ("prefill", True, True),
+            ("decode", True, True),
+            ("null", False, True),
+        ):
+            with self.subTest(mode=mode, gate=gate):
+                override = get_context().override_server_args(disaggregation_mode=mode)
+                override.install()
+                with envs.SGLANG_DSA_PD_INDEXSHARE_DRAFT_SEED.override(gate):
+                    worker._init_dsa_index_share_state()
+                override.restore()
+
+                self.assertTrue(worker.index_share_for_mtp_iteration)
+                self.assertEqual(worker.dsa_index_topk, 2048)
+                self.assertEqual(worker.seed_dsa_topk_from_draft_extend, expected_seed)
+
     def test_dp_attention_eager_vote_uses_resolved_seed_contract(self):
         worker = object.__new__(EAGLEWorkerV2)
 
@@ -310,12 +340,15 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                     seq_lens=torch.ones((1,), dtype=torch.int32, device=DEVICE),
                 )
 
-                with patch(
-                    "sglang.srt.speculative.eagle_worker_common.build_tree_kernel_efficient",
-                    return_value=tree_result,
-                ), patch(
-                    "sglang.srt.speculative.eagle_worker_v2.prepare_for_draft",
-                    return_value=(forward_batch, True),
+                with (
+                    patch(
+                        "sglang.srt.speculative.eagle_worker_common.build_tree_kernel_efficient",
+                        return_value=tree_result,
+                    ),
+                    patch(
+                        "sglang.srt.speculative.eagle_worker_v2.prepare_for_draft",
+                        return_value=(forward_batch, True),
+                    ),
                 ):
                     worker.draft(batch)
 

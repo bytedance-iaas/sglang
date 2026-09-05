@@ -1472,7 +1472,7 @@ class Envs:
     # may be remapped into allocator-local slots and consumed by fused TopK.
     # This narrower gate permits diagnosis without disabling fused TopK for
     # ordinary target decode/verify forwards.
-    SGLANG_DSA_PD_INDEXSHARE_FUSED_TOPK = EnvBool(True)
+    SGLANG_DSA_PD_INDEXSHARE_DRAFT_SEED = EnvBool(True)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(

@@ -33,12 +33,16 @@ from sglang.srt.disaggregation.mooncake.conn import (
 )
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
+    get_dsa_seed_metadata_dim,
     get_dsv4_c128_state_indices,
     poll_and_all_reduce_attn_cp_tp_group,
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
+from sglang.srt.layers.attention.dsa.utils import (
+    should_seed_dsa_topk_from_draft_extend,
+    should_use_dsa_fused_topk,
+)
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -471,12 +475,13 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             # positions are passed through unremapped.
             ("other", False, False, False, unremapped),
         ):
-            with self.subTest(platform=platform), envs.SGLANG_DSA_FUSE_TOPK.override(
-                True
-            ), patch(
-                "sglang.srt.layers.attention.dsa.utils.is_cuda", return_value=cuda
-            ), patch(
-                "sglang.srt.layers.attention.dsa.utils.is_hip", return_value=hip
+            with (
+                self.subTest(platform=platform),
+                envs.SGLANG_DSA_FUSE_TOPK.override(True),
+                patch(
+                    "sglang.srt.layers.attention.dsa.utils.is_cuda", return_value=cuda
+                ),
+                patch("sglang.srt.layers.attention.dsa.utils.is_hip", return_value=hip),
             ):
                 self.assertEqual(
                     should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend=True),
@@ -498,16 +503,50 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
 
         with (
             envs.SGLANG_DSA_FUSE_TOPK.override(True),
-            envs.SGLANG_DSA_PD_INDEXSHARE_FUSED_TOPK.override(False),
+            envs.SGLANG_DSA_PD_INDEXSHARE_DRAFT_SEED.override(False),
             patch("sglang.srt.layers.attention.dsa.utils.is_cuda", return_value=True),
             patch("sglang.srt.layers.attention.dsa.utils.is_hip", return_value=False),
         ):
             self.assertTrue(
                 should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend=False)
             )
+            self.assertFalse(should_seed_dsa_topk_from_draft_extend())
+            # The transfer layout is still model-defined and rank-uniform; the
+            # disabled producer writes its normal all-negative sentinel.
+            self.assertEqual(
+                get_dsa_seed_metadata_dim(
+                    SimpleNamespace(index_share_for_mtp_iteration=True, index_topk=2)
+                ),
+                2,
+            )
             self.assertFalse(
                 should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend=True)
             )
+
+            batch = SimpleNamespace(
+                reqs=[
+                    SimpleNamespace(
+                        output_topk_p=torch.tensor([1.0]),
+                        output_topk_index=torch.tensor([7]),
+                        hidden_states_tensor=torch.tensor([1.0, 2.0]),
+                        output_dsa_topk_indices=torch.tensor([0, 1]),
+                    )
+                ],
+                device="cpu",
+                enable_overlap=False,
+            )
+            draft_input = build_eagle_disagg_draft_input(
+                batch, torch.tensor([11], dtype=torch.int64), None
+            )
+            self.assertIsNone(draft_input.dsa_topk_indices)
+
+    def test_pd_indexshare_gate_does_not_change_non_pd_seed_behavior(self):
+        override = get_context().override_server_args(disaggregation_mode="null")
+        override.install()
+        self.addCleanup(override.restore)
+
+        with envs.SGLANG_DSA_PD_INDEXSHARE_DRAFT_SEED.override(False):
+            self.assertTrue(should_seed_dsa_topk_from_draft_extend())
 
     def test_future_map_initializes_seed_buffer_after_seedless_payload(self):
         future_map = object.__new__(FutureMap)

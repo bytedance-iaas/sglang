@@ -18,6 +18,9 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner i
 )
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
+from sglang.srt.layers.attention.dsa.utils import (
+    should_seed_dsa_topk_from_draft_extend,
+)
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
@@ -176,8 +179,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         else:
             ctx = empty_context()
         with (
-            ctx
-        ), draft_pp_context(), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), draft_model_build_scope():
+            ctx,
+            draft_pp_context(),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            draft_model_build_scope(),
+        ):
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -272,7 +279,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # (last verified token), not draft-decode step 0.
         self.dsa_index_topk = getattr(hf_config, "index_topk", None)
         self.seed_dsa_topk_from_draft_extend = (
-            self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
+            self.index_share_for_mtp_iteration
+            and self.dsa_index_topk is not None
+            and should_seed_dsa_topk_from_draft_extend()
         )
 
     def init_token_map(self):
@@ -1042,9 +1051,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         dsa_seed_topk_indices = None
         if self.seed_dsa_topk_from_draft_extend:
             if can_run_decode_cuda_graph:
-                dsa_extend_topk_capture = (
-                    self.cuda_graph_runner_for_draft_extend.buffers.dsa_seed_topk_capture
-                )
+                dsa_extend_topk_capture = self.cuda_graph_runner_for_draft_extend.buffers.dsa_seed_topk_capture
             else:
                 dsa_extend_topk_capture = forward_batch.spec_info.dsa_seed_topk_capture
             # Fancy indexing returns a fresh tensor (detached from the buffer).
@@ -1461,8 +1468,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
         bs = batch.seq_lens.shape[0]
         assert parent_list.shape == (bs, num_draft - 1), (
-            f"topology shape mismatch: {parent_list.shape} vs "
-            f"({bs}, {num_draft - 1})"
+            f"topology shape mismatch: {parent_list.shape} vs ({bs}, {num_draft - 1})"
         )
 
         attn_backend = self.target_worker.model_runner.attn_backend

@@ -75,12 +75,28 @@ def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int):
     return original_seq_lens.clamp(max=dsa_index_topk)
 
 
+def should_seed_dsa_topk_from_draft_extend() -> bool:
+    """Whether draft-extend may seed the next MTP iteration's DSA TopK.
+
+    The seed is an optional optimization. Under PD disaggregation its producer
+    and consumer must agree on the index domain, so the narrow gate disables the
+    complete seed lifecycle on that worker instead of selecting an unfused
+    consumer for request-relative indices. Non-PD execution keeps the
+    configured behavior. The PD wire width remains model-defined and
+    rank-uniform even when both roles disable seed production and consumption.
+    """
+    return (
+        get_disagg().disaggregation_mode == "null"
+        or envs.SGLANG_DSA_PD_INDEXSHARE_DRAFT_SEED.get()
+    )
+
+
 def should_remap_pd_dsa_seed_to_local_slots() -> bool:
     """Whether a PD seed should enter the allocator-local fused TopK domain."""
     return (
         (is_cuda() or is_hip())
         and envs.SGLANG_DSA_FUSE_TOPK.get()
-        and envs.SGLANG_DSA_PD_INDEXSHARE_FUSED_TOPK.get()
+        and should_seed_dsa_topk_from_draft_extend()
         and get_disagg().disaggregation_mode == "decode"
         and not get_memory().enable_hisparse
         and not get_parallel().dcp_enabled
@@ -270,9 +286,9 @@ def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
 
     if is_dsa_prefill_cp_round_robin_split():
         cur_cp_seq_len = seq_len // cp_size
-        assert (
-            seq_len % cp_size == 0
-        ), f"seq_len {seq_len} is not divisible by cp_size {cp_size} when dsa_prefill_cp_mode is round-robin-split"
+        assert seq_len % cp_size == 0, (
+            f"seq_len {seq_len} is not divisible by cp_size {cp_size} when dsa_prefill_cp_mode is round-robin-split"
+        )
     else:
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
         # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
