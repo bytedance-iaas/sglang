@@ -1468,10 +1468,10 @@ class Envs:
     SGLANG_DSA_FUSE_TOPK = EnvBoolWithAlias(
         True, deprecated_name="SGLANG_NSA_FUSE_TOPK"
     )
-    # Whether request-relative IndexShare seeds received by a PD Decode worker
-    # may be remapped into allocator-local slots and consumed by fused TopK.
-    # This narrower gate permits diagnosis without disabling fused TopK for
-    # ordinary target decode/verify forwards.
+    # Whether PD workers may produce or consume the cross-iteration
+    # draft-extend DSA TopK seed. Disabling this gate keeps ordinary fused
+    # TopK and same-iteration IndexShare enabled; draft step 0 computes TopK
+    # locally instead of consuming a request-relative seed from Prefill.
     SGLANG_DSA_PD_INDEXSHARE_DRAFT_SEED = EnvBool(True)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
