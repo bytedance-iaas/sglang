@@ -68,6 +68,13 @@ def initialize_linear_attn_config(
     _BACKENDS["decode"] = LinearAttnKernelBackend(decode)
     _BACKENDS["prefill"] = LinearAttnKernelBackend(prefill)
 
+    if server_args.enable_deterministic_inference and _BACKENDS["prefill"].is_flashinfer():
+        raise ValueError(
+            "FlashInfer GDN prefill is not supported with "
+            "--enable-deterministic-inference. Use "
+            "--linear-attn-prefill-backend triton."
+        )
+
     # Verify backend. Unset -> follow decode (flashinfer -> its recurrent kernel,
     # else triton), preserving historical behavior.
     verify = server_args.linear_attn_verify_backend
