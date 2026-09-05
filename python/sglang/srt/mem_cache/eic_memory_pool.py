@@ -387,14 +387,18 @@ class EICKVClient:
         logger.info(f"start write thread thread_id {threading.get_ident()}")
         while True:
             keys, values, copy_event = self.write_queue.get()
-            if copy_event is not None:
-                copy_event.synchronize()
-            self._async_set_impl(keys, values)
-            for value in values:
-                if self.kv_cache_write_mem_pool.check_data_ptr_allocated(
-                    value.data_ptr()
-                ):
-                    self.kv_cache_write_mem_pool.free_to_mempool(value.data_ptr())
+            try:
+                if copy_event is not None:
+                    copy_event.synchronize()
+                self._async_set_impl(keys, values)
+            except Exception:
+                logger.exception("eic async write failed, dropping %d keys", len(keys))
+            finally:
+                for value in values:
+                    if self.kv_cache_write_mem_pool.check_data_ptr_allocated(
+                        value.data_ptr()
+                    ):
+                        self.kv_cache_write_mem_pool.free_to_mempool(value.data_ptr())
 
     def async_batch_set(
         self,

@@ -1020,6 +1020,26 @@ class TestEICHiCacheRegression(unittest.TestCase):
         self.assertEqual(rep.stats.hicache_host_total_tokens, 32960)
         self.assertEqual(rep.stats.hicache_host_used_tokens, 2960)
 
+    def test_write_thread_frees_slots_when_mset_raises(self):
+        from sglang.srt.mem_cache.eic_memory_pool import EICKVClient
+
+        freed = []
+        c = object.__new__(EICKVClient)
+        c.write_queue = Queue()
+        c.kv_cache_write_mem_pool = SimpleNamespace(
+            check_data_ptr_allocated=lambda p: True,
+            free_to_mempool=freed.append,
+        )
+        c._async_set_impl = mock.Mock(side_effect=RuntimeError("backend down"))
+        values = [torch.zeros(2), torch.zeros(2)]
+        c.write_queue.put((["a", "b"], values, None))
+        c.write_queue.put(None)
+
+        with self.assertRaises(TypeError):
+            EICKVClient._write_thread(c)
+
+        self.assertEqual(freed, [v.data_ptr() for v in values])
+
 
 if __name__ == "__main__":
     unittest.main()
