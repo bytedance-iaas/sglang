@@ -80,6 +80,7 @@ def should_remap_pd_dsa_seed_to_local_slots() -> bool:
     return (
         (is_cuda() or is_hip())
         and envs.SGLANG_DSA_FUSE_TOPK.get()
+        and envs.SGLANG_DSA_PD_INDEXSHARE_FUSED_TOPK.get()
         and get_disagg().disaggregation_mode == "decode"
         and not get_memory().enable_hisparse
         and not get_parallel().dcp_enabled

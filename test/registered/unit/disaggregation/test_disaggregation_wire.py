@@ -488,6 +488,27 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
 
                 self.assertEqual(draft_input.dsa_topk_indices.tolist(), expected)
 
+    def test_pd_indexshare_fused_topk_gate_preserves_global_fusion(self):
+        override = get_context().override_server_args(
+            disaggregation_mode="decode",
+            enable_hisparse=False,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+        with (
+            envs.SGLANG_DSA_FUSE_TOPK.override(True),
+            envs.SGLANG_DSA_PD_INDEXSHARE_FUSED_TOPK.override(False),
+            patch("sglang.srt.layers.attention.dsa.utils.is_cuda", return_value=True),
+            patch("sglang.srt.layers.attention.dsa.utils.is_hip", return_value=False),
+        ):
+            self.assertTrue(
+                should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend=False)
+            )
+            self.assertFalse(
+                should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend=True)
+            )
+
     def test_future_map_initializes_seed_buffer_after_seedless_payload(self):
         future_map = object.__new__(FutureMap)
         future_map.dsa_topk_indices_buf = None
