@@ -96,10 +96,29 @@ def should_remap_pd_dsa_seed_to_local_slots() -> bool:
     return (
         (is_cuda() or is_hip())
         and envs.SGLANG_DSA_FUSE_TOPK.get()
+        and envs.SGLANG_DSA_PD_INDEXSHARE_FUSED_TOPK.get()
         and should_seed_dsa_topk_from_draft_extend()
         and get_disagg().disaggregation_mode == "decode"
         and not get_memory().enable_hisparse
         and not get_parallel().dcp_enabled
+    )
+
+
+def should_use_pd_dsa_seed_cuda_graph(
+    seed_dsa_topk_from_draft_extend: bool,
+) -> bool:
+    """Whether seed-bearing draft phases may use CUDA Graph.
+
+    The legacy PD contract carries request-relative positions into the unfused
+    consumer. Its dynamic request rows and allocator epoch are not represented
+    by the static graph seed buffers, so both draft decode and draft extend stay
+    eager while this legacy compatibility mode is selected. Target graphs
+    are independent and remain enabled.
+    """
+    return not (
+        get_disagg().disaggregation_mode != "null"
+        and seed_dsa_topk_from_draft_extend
+        and not envs.SGLANG_DSA_PD_INDEXSHARE_FUSED_TOPK.get()
     )
 
 
@@ -111,7 +130,10 @@ def should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend: bool) -> bool:
     - Draft extend: fused TopK disabled.
 
     PD Decode worker:
-    - Draft decode / target verify / draft extend: fused TopK enabled.
+    - Draft decode / target verify / draft extend: fused TopK enabled after the
+      request-relative seed is remapped to allocator-local slots.
+    - Legacy request-relative seed compatibility: seed-bearing draft phases use
+      unfused TopK; ordinary target TopK remains fused.
     """
     pd_index_share_seed = (
         get_disagg().disaggregation_mode != "null" and seed_dsa_topk_from_draft_extend

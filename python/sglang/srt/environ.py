@@ -1473,6 +1473,10 @@ class Envs:
     # TopK and same-iteration IndexShare enabled; draft step 0 computes TopK
     # locally instead of consuming a request-relative seed from Prefill.
     SGLANG_DSA_PD_INDEXSHARE_DRAFT_SEED = EnvBool(True)
+    # Keep the post-#31477 allocator-local/fused consumer by default. Turning
+    # this off selects the legacy request-relative/unfused seed contract and
+    # therefore also keeps the seed-bearing draft decode/extend phases eager.
+    SGLANG_DSA_PD_INDEXSHARE_FUSED_TOPK = EnvBool(True)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(

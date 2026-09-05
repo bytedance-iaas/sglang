@@ -20,6 +20,7 @@ from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGra
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.layers.attention.dsa.utils import (
     should_seed_dsa_topk_from_draft_extend,
+    should_use_pd_dsa_seed_cuda_graph,
 )
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
@@ -137,6 +138,31 @@ _is_xpu = is_xpu()
 
 
 logger = logging.getLogger(__name__)
+
+
+def _slice_draft_output_to_local_tokens(
+    next_token_logits: torch.Tensor,
+    hidden_states: Optional[torch.Tensor],
+    positions: torch.Tensor,
+    num_local_tokens: int,
+) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+    """Discard DP-attention padding rows before eager draft postprocessing."""
+    for name, tensor in (
+        ("next_token_logits", next_token_logits),
+        ("hidden_states", hidden_states),
+        ("positions", positions),
+    ):
+        if tensor is not None and tensor.shape[0] < num_local_tokens:
+            raise RuntimeError(
+                f"EAGLE draft {name} has {tensor.shape[0]} rows, "
+                f"but {num_local_tokens} local tokens need postprocessing"
+            )
+
+    return (
+        next_token_logits[:num_local_tokens],
+        hidden_states[:num_local_tokens] if hidden_states is not None else None,
+        positions[:num_local_tokens],
+    )
 
 
 class EagleDraftWorker(EagleDraftWorkerBase):
@@ -283,6 +309,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             and self.dsa_index_topk is not None
             and should_seed_dsa_topk_from_draft_extend()
         )
+        self.dsa_seed_cuda_graph_compatible = should_use_pd_dsa_seed_cuda_graph(
+            self.seed_dsa_topk_from_draft_extend
+        )
 
     def init_token_map(self):
         # Load hot token ids
@@ -399,7 +428,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # Capture draft
         decode_backend = get_exec().graph.cuda_graph_config.decode.backend
         capture_bs, _ = get_batch_sizes_to_capture(self.draft_runner)
-        if self.speculative_num_steps > 1:
+        if self.speculative_num_steps > 1 and self.dsa_seed_cuda_graph_compatible:
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             log_info_on_rank0(
@@ -495,6 +524,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # TODO: support draft extend cuda graph for more attention backends
         if (
             self.draft_extend_attn_backend
+            and self.dsa_seed_cuda_graph_compatible
             and not envs.SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH.get()
             and (
                 _is_npu
@@ -697,6 +727,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 if i == self.speculative_num_steps - 1:
                     break
 
+                # Eager DP attention can append peer-padding rows to model
+                # outputs. Preserve the rank-local row boundary before the
+                # forward so those rows never enter token selection or mutate
+                # the next step's positions.
+                num_local_tokens = input_ids.shape[0]
                 forward_batch.input_ids = input_ids
                 # Qwen3-MoE MTP uses a fused RoPE + KV-store path whose cache_loc
                 # argument must be contiguous.
@@ -724,50 +759,58 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     logits_output = self.draft_runner.forward(
                         forward_batch
                     ).logits_output
+                next_token_logits, next_hidden_states, local_positions = (
+                    _slice_draft_output_to_local_tokens(
+                        logits_output.next_token_logits,
+                        logits_output.hidden_states,
+                        forward_batch.positions,
+                        num_local_tokens,
+                    )
+                )
                 maybe_detect_nan(
-                    logits_output.next_token_logits, f"draft_forward step {i}"
+                    next_token_logits, f"draft_forward step {i}"
                 )
                 maybe_detect_inf(
-                    logits_output.next_token_logits, f"draft_forward step {i}"
+                    next_token_logits, f"draft_forward step {i}"
                 )
                 if get_spec().speculative_use_rejection_sampling:
                     probs, topk_p, topk_index = sample_draft_proposal(
-                        logits_output.next_token_logits,
+                        next_token_logits,
                         forward_batch.sampling_info.temperatures,
                     )
                     draft_probs_list.append(probs)
-                    forward_batch.positions.add_(1)
+                    local_positions.add_(1)
                 elif self.topk == 1 and not _is_hip:
                     if _is_cuda:
                         topk_p, topk_index = draft_topk1_postprocess(
-                            logits_output.next_token_logits,
-                            forward_batch.positions,
+                            next_token_logits,
+                            local_positions,
                             draft_tokens_topk1,
                             i + 1,
                         )
                     else:
                         topk_index = torch.argmax(
-                            logits_output.next_token_logits, dim=-1, keepdim=True
+                            next_token_logits, dim=-1, keepdim=True
                         )
                         topk_p = torch.ones_like(topk_index, dtype=torch.float32)
-                        forward_batch.positions.add_(1)
+                        local_positions.add_(1)
                 else:
                     probs = renorm_draft_probs(
-                        logits_output.next_token_logits,
+                        next_token_logits,
                         forward_batch.sampling_info,
                         get_spec().speculative_use_rejection_sampling,
                     )
                     topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-                    forward_batch.positions.add_(1)
+                    local_positions.add_(1)
                 maybe_detect_oob(
                     topk_index,
                     0,
-                    logits_output.next_token_logits.shape[-1],
-                    f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
+                    next_token_logits.shape[-1],
+                    f"draft_forward step {i}: topk_index OOB vs vocab_size={next_token_logits.shape[-1]}",
                 )
                 if self.hot_token_id is not None:
                     topk_index = self.hot_token_id[topk_index]
-                hidden_states = logits_output.hidden_states
+                hidden_states = next_hidden_states
 
         draft_probs = (
             torch.stack(draft_probs_list, dim=1)
@@ -1179,13 +1222,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
         return self._draft_worker.draft_runner
 
     def requires_dp_attention_eager_forward(self, batch: ScheduleBatch) -> bool:
-        """Keep seedless GLM MTP draft fallback consistent across DP ranks."""
+        """Keep GLM MTP draft fallback consistent across DP ranks."""
         # Non-last PP ranks do not host the draft model. Their permissive vote
         # is reduced with the last stage's actual seed availability.
         if self._draft_worker is None:
             return False
         if not self._draft_worker.seed_dsa_topk_from_draft_extend:
             return False
+        if not self._draft_worker.dsa_seed_cuda_graph_compatible:
+            return True
 
         draft_input = batch.spec_info
         if draft_input is None:

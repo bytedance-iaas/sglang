@@ -212,23 +212,33 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
             )
         )
 
-        for mode, gate, expected_seed in (
-            ("prefill", False, False),
-            ("decode", False, False),
-            ("prefill", True, True),
-            ("decode", True, True),
-            ("null", False, True),
+        for mode, seed_gate, fused_gate, expected_seed, expected_graph in (
+            ("prefill", False, True, False, True),
+            ("decode", False, True, False, True),
+            ("prefill", True, True, True, True),
+            ("decode", True, True, True, True),
+            ("prefill", True, False, True, False),
+            ("decode", True, False, True, False),
+            ("null", False, False, True, True),
         ):
-            with self.subTest(mode=mode, gate=gate):
+            with self.subTest(
+                mode=mode, seed_gate=seed_gate, fused_gate=fused_gate
+            ):
                 override = get_context().override_server_args(disaggregation_mode=mode)
                 override.install()
-                with envs.SGLANG_DSA_PD_INDEXSHARE_DRAFT_SEED.override(gate):
+                with (
+                    envs.SGLANG_DSA_PD_INDEXSHARE_DRAFT_SEED.override(seed_gate),
+                    envs.SGLANG_DSA_PD_INDEXSHARE_FUSED_TOPK.override(fused_gate),
+                ):
                     worker._init_dsa_index_share_state()
                 override.restore()
 
                 self.assertTrue(worker.index_share_for_mtp_iteration)
                 self.assertEqual(worker.dsa_index_topk, 2048)
                 self.assertEqual(worker.seed_dsa_topk_from_draft_extend, expected_seed)
+                self.assertEqual(
+                    worker.dsa_seed_cuda_graph_compatible, expected_graph
+                )
 
     def test_dp_attention_eager_vote_uses_resolved_seed_contract(self):
         worker = object.__new__(EAGLEWorkerV2)
@@ -240,7 +250,10 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
             )
         )
 
-        worker._draft_worker = SimpleNamespace(seed_dsa_topk_from_draft_extend=False)
+        worker._draft_worker = SimpleNamespace(
+            seed_dsa_topk_from_draft_extend=False,
+            dsa_seed_cuda_graph_compatible=True,
+        )
         self.assertFalse(
             worker.requires_dp_attention_eager_forward(
                 SimpleNamespace(spec_info=SimpleNamespace())
@@ -248,6 +261,14 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         )
 
         worker._draft_worker.seed_dsa_topk_from_draft_extend = True
+        worker._draft_worker.dsa_seed_cuda_graph_compatible = False
+        self.assertTrue(
+            worker.requires_dp_attention_eager_forward(
+                SimpleNamespace(spec_info=SimpleNamespace(dsa_topk_indices=object()))
+            )
+        )
+
+        worker._draft_worker.dsa_seed_cuda_graph_compatible = True
         for spec_info, expected in (
             (None, False),
             (SimpleNamespace(dsa_topk_indices=None, future_indices=None), True),
@@ -315,6 +336,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 worker.tree_mask_mode = None
                 worker.server_args = SimpleNamespace(pp_size=1)
                 worker.seed_dsa_topk_from_draft_extend = seed_enabled
+                worker.dsa_seed_cuda_graph_compatible = True
                 worker.index_share_for_mtp_iteration = True
                 forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
                 worker.draft_forward = MagicMock(return_value=graph_result)

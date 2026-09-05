@@ -41,6 +41,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import (
     should_seed_dsa_topk_from_draft_extend,
+    should_use_pd_dsa_seed_cuda_graph,
     should_use_dsa_fused_topk,
 )
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
@@ -543,6 +544,43 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
                 batch, torch.tensor([11], dtype=torch.int64), None
             )
             self.assertIsNone(draft_input.dsa_topk_indices)
+
+    def test_pd_indexshare_legacy_seed_stays_request_relative_and_eager(self):
+        override = get_context().override_server_args(
+            disaggregation_mode="decode",
+            enable_hisparse=False,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+        batch = SimpleNamespace(
+            reqs=[
+                SimpleNamespace(
+                    output_topk_p=torch.tensor([1.0]),
+                    output_topk_index=torch.tensor([7]),
+                    hidden_states_tensor=torch.tensor([1.0, 2.0]),
+                    output_dsa_topk_indices=torch.tensor([2, 0, -1]),
+                )
+            ],
+            device="cpu",
+            enable_overlap=False,
+        )
+        with (
+            envs.SGLANG_DSA_FUSE_TOPK.override(True),
+            envs.SGLANG_DSA_PD_INDEXSHARE_DRAFT_SEED.override(True),
+            envs.SGLANG_DSA_PD_INDEXSHARE_FUSED_TOPK.override(False),
+            patch("sglang.srt.layers.attention.dsa.utils.is_cuda", return_value=True),
+            patch("sglang.srt.layers.attention.dsa.utils.is_hip", return_value=False),
+        ):
+            self.assertFalse(
+                should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend=True)
+            )
+            self.assertFalse(should_use_pd_dsa_seed_cuda_graph(True))
+            draft_input = build_eagle_disagg_draft_input(
+                batch, torch.tensor([11], dtype=torch.int64), None
+            )
+
+        self.assertEqual(draft_input.dsa_topk_indices.tolist(), [[2, 0, -1]])
 
     def test_pd_indexshare_gate_does_not_change_non_pd_seed_behavior(self):
         override = get_context().override_server_args(disaggregation_mode="null")
