@@ -1528,11 +1528,11 @@ class EICPagedHiRadixCache(EICHiRadixCache):
 
     def init_hyper_params(self, config):
         super().init_hyper_params(config)
-        floor = 1 << 14  # 16K tokens
-        cfg_val = config.get("load_remote_threshold", floor)
-        self.load_remote_threshold = max(cfg_val, floor)
+        self.load_remote_threshold = max(
+            config.get("load_remote_threshold", 1 << 14), self.page_size
+        )
         logger.info(
-            f"EICPagedHiRadixCache load_remote_threshold set to {self.load_remote_threshold} (cfg_val={cfg_val}, floor={floor})"
+            f"EICPagedHiRadixCache load_remote_threshold set to {self.load_remote_threshold}"
         )
         self.eic_check_max_num = config.get("eic_check_max_num", -1)
         logger.info(

@@ -978,6 +978,68 @@ class TestEICHiCacheRegression(unittest.TestCase):
         self.assertEqual(cache.writing_check.call_count, 2)  # bounded spins
         self.assertEqual(len(cache.ongoing_write_through), 51)  # never drained
 
+    def test_load_remote_threshold(self):
+        def th(cfg):
+            cache = object.__new__(EICPagedHiRadixCache)
+            cache.page_size = 16
+            with mock.patch.object(
+                EICPagedHiRadixCache.__bases__[0], "init_hyper_params", lambda *a: None
+            ):
+                EICPagedHiRadixCache.init_hyper_params(cache, cfg)
+            return cache.load_remote_threshold
+
+        self.assertEqual(th({}), 1 << 14)
+        self.assertEqual(th({"load_remote_threshold": 8192}), 8192)  # was floored
+        self.assertEqual(th({"load_remote_threshold": 4}), 16)
+
+    def test_hicache_host_stats_use_the_anchor_pool(self):
+        from sglang.srt.managers.scheduler_components.metrics_reporter import (
+            SchedulerMetricsReporter,
+        )
+
+        anchor = SimpleNamespace(size=32960, available_size=lambda: 30000)
+        entries = {
+            "kv": SimpleNamespace(host_pool=anchor, is_primary_index_anchor=True),
+            "swa": SimpleNamespace(
+                host_pool=SimpleNamespace(size=1, available_size=lambda: 1),
+                is_primary_index_anchor=False,
+            ),
+        }
+        host = SimpleNamespace(
+            size=1054208,
+            available_size=lambda: 1054208,
+            host_pool_group=SimpleNamespace(entry_map=entries),
+        )
+        rep = object.__new__(SchedulerMetricsReporter)
+        rep.stats = SimpleNamespace()
+        rep.scheduler = SimpleNamespace(
+            enable_hierarchical_cache=True,
+            tree_cache=SimpleNamespace(token_to_kv_pool_host=host),
+        )
+        SchedulerMetricsReporter._log_hicache_stats(rep)
+        self.assertEqual(rep.stats.hicache_host_total_tokens, 32960)
+        self.assertEqual(rep.stats.hicache_host_used_tokens, 2960)
+
+    def test_write_thread_frees_slots_when_mset_raises(self):
+        from sglang.srt.mem_cache.eic_memory_pool import EICKVClient
+
+        freed = []
+        c = object.__new__(EICKVClient)
+        c.write_queue = Queue()
+        c.kv_cache_write_mem_pool = SimpleNamespace(
+            check_data_ptr_allocated=lambda p: True,
+            free_to_mempool=freed.append,
+        )
+        c._async_set_impl = mock.Mock(side_effect=RuntimeError("backend down"))
+        values = [torch.zeros(2), torch.zeros(2)]
+        c.write_queue.put((["a", "b"], values, None))
+        c.write_queue.put(None)
+
+        with self.assertRaises(TypeError):
+            EICKVClient._write_thread(c)
+
+        self.assertEqual(freed, [v.data_ptr() for v in values])
+
 
 if __name__ == "__main__":
     unittest.main()
