@@ -1409,12 +1409,45 @@ class EAGLEWorkerV2(BaseSpecWorker):
         batch.seq_lens = batch_output.new_seq_lens
 
     def _build_idle_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
-        return EagleVerifyInput.create_idle_input(
-            self.topk,
-            self.speculative_num_steps,
-            self.speculative_num_draft_tokens,
-            device=self.device,
+        # Under PP, only the last stage owns the draft model and the next tree
+        # arrives through the PP relay.  A local idle companion must therefore
+        # enter target verify directly.
+        if self._pp_enabled:
+            return EagleVerifyInput.create_idle_input(
+                self.topk,
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
+                device=self.device,
+            )
+
+        # Without PP, every EP rank owns a draft shard.  Even a rank with no
+        # local request must execute the zero-token draft forwards so MegaMoE
+        # observes the same collective sequence as active peers before target
+        # verify.  EagleDraftWorker._draft_forward_idle discards local outputs
+        # while retaining those collective calls.
+        capture_mode = (
+            CaptureHiddenMode.NULL
+            if self.speculative_algorithm.is_standalone()
+            else CaptureHiddenMode.LAST
         )
+        hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
+            self.draft_worker.draft_runner
+        )
+        batch.spec_info = EagleDraftInput.create_idle_input(
+            device=self.device,
+            hidden_size=hidden_size,
+            dtype=hidden_dtype,
+            topk=self.topk,
+            capture_hidden_mode=capture_mode,
+            vocab_size=self.target_worker.model_config.vocab_size,
+        )
+        with (
+            self.draft_worker.draft_tp_context(self.draft_worker.draft_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            spec_stage_span("draft"),
+        ):
+            return self.draft_worker.draft(batch)
 
     def _build_verify_input_from_pp_raw(self, batch: ScheduleBatch) -> EagleVerifyInput:
         raw: EaglePPVerifyInputRaw = batch.spec_info

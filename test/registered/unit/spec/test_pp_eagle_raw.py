@@ -199,6 +199,7 @@ class TestEaglePPLastRankDraftOwnership(unittest.TestCase):
     def test_pp_idle_build_does_not_call_draft_worker(self):
         draft_worker = SimpleNamespace(draft=MagicMock())
         worker = SimpleNamespace(
+            _pp_enabled=True,
             draft_worker=draft_worker,
             topk=1,
             speculative_num_steps=3,
@@ -208,6 +209,49 @@ class TestEaglePPLastRankDraftOwnership(unittest.TestCase):
         verify_input = EAGLEWorkerV2._build_idle_verify_input(worker, SimpleNamespace())
         draft_worker.draft.assert_not_called()
         self.assertTrue(verify_input.is_verify_input())
+
+    def test_non_pp_idle_build_runs_draft_collectives(self):
+        verify_input = object()
+        draft_runner = SimpleNamespace(tp_group=object())
+        draft_worker = SimpleNamespace(
+            draft_runner=draft_runner,
+            draft_tp_context=lambda _group: nullcontext(),
+            draft=MagicMock(return_value=verify_input),
+        )
+        worker = SimpleNamespace(
+            _pp_enabled=False,
+            draft_worker=draft_worker,
+            speculative_algorithm=SimpleNamespace(is_standalone=lambda: False),
+            target_worker=SimpleNamespace(model_config=SimpleNamespace(vocab_size=123)),
+            topk=1,
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            device="cpu",
+        )
+        batch = SimpleNamespace(spec_info=None)
+        idle_draft_input = object()
+
+        with patch(
+            "sglang.srt.speculative.eagle_worker_v2.get_draft_recurrent_hidden_state_spec",
+            return_value=(64, torch.float32),
+        ), patch(
+            "sglang.srt.speculative.eagle_worker_v2.EagleDraftInput.create_idle_input",
+            return_value=idle_draft_input,
+        ), patch(
+            "sglang.srt.speculative.eagle_worker_v2.speculative_moe_backend_context",
+            return_value=nullcontext(),
+        ), patch(
+            "sglang.srt.speculative.eagle_worker_v2.speculative_moe_a2a_backend_context",
+            return_value=nullcontext(),
+        ), patch(
+            "sglang.srt.speculative.eagle_worker_v2.spec_stage_span",
+            return_value=nullcontext(),
+        ):
+            result = EAGLEWorkerV2._build_idle_verify_input(worker, batch)
+
+        self.assertIs(result, verify_input)
+        self.assertIs(batch.spec_info, idle_draft_input)
+        draft_worker.draft.assert_called_once_with(batch)
 
     def test_prepare_next_draft_preserves_idle_companion_mode(self):
         next_draft_input = object()
