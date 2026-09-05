@@ -515,7 +515,11 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             # disabled producer writes its normal all-negative sentinel.
             self.assertEqual(
                 get_dsa_seed_metadata_dim(
-                    SimpleNamespace(index_share_for_mtp_iteration=True, index_topk=2)
+                    SimpleNamespace(
+                        architectures=["GlmMoeDsaForCausalLM"],
+                        index_share_for_mtp_iteration=True,
+                        index_topk=2,
+                    )
                 ),
                 2,
             )
