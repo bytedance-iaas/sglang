@@ -61,6 +61,7 @@ from sglang.srt.models.deepseek_common.utils import (
     enable_nextn_moe_bf16_cast_to_fp8,
     is_wint4afp8_or_wint4a16_config,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import bind_or_assign, get_bool_env_var, log_info_on_rank0
 
 if _use_aiter_gfx95:
@@ -287,14 +288,15 @@ class DeepseekV2WeightLoaderMixin:
                         if "shared_head.head" in name:
                             continue
 
-                        # A PP draft is constructed as a standalone model on the
-                        # last target stage.  That target stage has no embedding
-                        # to share, so retain the checkpoint embedding for the
-                        # draft.  In the non-PP case the target embedding remains
-                        # the single source of truth.
+                        # A PP draft is constructed under a temporary singleton
+                        # pp group, so self.pp_group cannot tell whether its target
+                        # has an embedding to share.  Use the published target
+                        # topology instead: the last target stage in PP>1 has no
+                        # embedding, and the standalone draft must load its own
+                        # checkpoint tensor.
                         is_embed = "embed_tokens" in name
                         if is_embed and (
-                            self.pp_group.world_size == 1
+                            get_parallel().pp_size == 1
                             or not self.pp_group.is_last_rank
                         ):
                             continue
