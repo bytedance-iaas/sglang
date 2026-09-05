@@ -556,7 +556,7 @@ class TestPPCPRankOffsets(unittest.TestCase):
             [call.kwargs["group"] for call in barrier.call_args_list],
             [fence_groups[phase] for phase in _PP_DISAGG_SCHEDULER_FENCE_PHASES],
         )
-        self.assertEqual(len(set(fence_groups.values())), 5)
+        self.assertEqual(len(set(fence_groups.values())), 4)
 
     def test_pp_scheduler_fence_specs_match_mode_and_stage(self):
         shifted_tp_ranks = list(range(24, 32))
@@ -570,19 +570,20 @@ class TestPPCPRankOffsets(unittest.TestCase):
             [
                 (phase, [28, 29, 30, 31])
                 for phase in _PP_DISAGG_SCHEDULER_FENCE_PHASES
-                if phase != "decode_result_commit_done"
             ],
         )
         self.assertEqual(
             _pp_disagg_scheduler_fence_specs("decode", ps, shifted_tp_ranks),
-            [("decode_result_commit_done", shifted_tp_ranks)],
+            [],
         )
         self.assertEqual(
             _pp_disagg_scheduler_fence_specs("null", ps, shifted_tp_ranks),
             [],
         )
 
-    def test_decode_forward_and_result_commit_finish_before_next_iteration(self):
+    def test_decode_control_phases_and_result_commit_finish_without_cross_dp_fence(
+        self,
+    ):
         source = inspect.getsource(SchedulerPPMixin.event_loop_pp_disagg_decode)
         commit_previous_proxy = source.index(
             "self._pp_commit_comm_work(self.send_proxy_work)"
@@ -591,15 +592,19 @@ class TestPPCPRankOffsets(unittest.TestCase):
         send_current_proxy = source.index(
             "self._pp_send_proxy(result.pp_hidden_states_proxy_tensors.tensors)"
         )
+        retract = source.index('phase="decode_retract_consensus"')
+        prealloc = source.index('phase="decode_prealloc_consensus"')
+        release = source.index('phase="decode_release_consensus"')
         process = source.index("self._pp_process_batch_result(")
-        fence = source.index('"decode_result_commit_done"')
         advance = source.index("self.pp_outputs = next_pp_outputs")
         self.assertLess(commit_previous_proxy, launch)
         self.assertLess(launch, send_current_proxy)
         self.assertLess(send_current_proxy, process)
-        self.assertLess(launch, process)
-        self.assertLess(process, fence)
-        self.assertLess(fence, advance)
+        self.assertLess(retract, prealloc)
+        self.assertLess(prealloc, release)
+        self.assertLess(release, process)
+        self.assertLess(process, advance)
+        self.assertNotIn("decode_result_commit_done", source)
 
     def test_request_receiver_uses_cp_size_for_pp_recv_rank(self):
         ps = _make_ps()

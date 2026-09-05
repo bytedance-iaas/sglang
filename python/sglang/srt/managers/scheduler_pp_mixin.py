@@ -60,10 +60,7 @@ _PP_PREFILL_DISAGG_SCHEDULER_FENCE_PHASES = (
     "bootstrap_done",
     "transfer_done",
 )
-_PP_DECODE_DISAGG_SCHEDULER_FENCE_PHASES = ("decode_result_commit_done",)
-_PP_DISAGG_SCHEDULER_FENCE_PHASES = (
-    _PP_PREFILL_DISAGG_SCHEDULER_FENCE_PHASES + _PP_DECODE_DISAGG_SCHEDULER_FENCE_PHASES
-)
+_PP_DISAGG_SCHEDULER_FENCE_PHASES = _PP_PREFILL_DISAGG_SCHEDULER_FENCE_PHASES
 PP_CONTROL_RING_MESSAGE_MARKER = "sglang_pp_control_ring_v1"
 
 if TYPE_CHECKING:
@@ -91,13 +88,13 @@ def _pp_disagg_scheduler_fence_specs(
             for phase in _PP_PREFILL_DISAGG_SCHEDULER_FENCE_PHASES
         ]
     if disagg_mode == "decode":
-        # Decode result processing is asymmetric across attention-DP ranks.
-        # Fence every scheduler in this PP stage before the next metadata
-        # collective, including ranks whose prior microbatch was idle.
-        return [
-            (phase, list(tp_ranks))
-            for phase in _PP_DECODE_DISAGG_SCHEDULER_FENCE_PHASES
-        ]
+        # Decode control-ring payloads and result processing are asymmetric
+        # across attention-DP ranks.  Do not fence the whole PP stage here:
+        # an idle rank can otherwise wait in the fence while the active rank
+        # is still consuming a preallocation/release payload whose pending
+        # device work needs that idle rank to enter the next DP collective.
+        # The next scheduler all-gather is the safe rendezvous.
+        return []
     return []
 
 
@@ -615,15 +612,6 @@ class SchedulerPPMixin:
                             next_batch_result,
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
-
-                # DP-attention ranks must not plan the next batch while the
-                # active rank is still committing the previous PP result.
-                # Fence on a control-only group spanning this whole PP stage
-                # so the next business collective starts in one scheduler
-                # phase.
-                _pp_fence_scheduler_phase(
-                    self.pp_disagg_scheduler_fence_groups["decode_result_commit_done"]
-                )
 
                 self.pp_outputs = next_pp_outputs
                 self.running_batch.batch_is_full = False
