@@ -50,12 +50,12 @@ from sglang.srt.disaggregation.utils import (
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
-    pack_state_types,
+    pack_state_component_types,
     resolve_dcp_dst_entry_indices,
-    resolve_state_component_dst_index,
+    resolve_state_component_dst_index_by_type,
     should_send_replicated_state,
     slice_dsa_tail_dst_ptrs_for_pp,
-    unpack_state_types,
+    unpack_state_component_types,
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
@@ -153,7 +153,7 @@ class KVArgsRegisterInfo:
     dst_state_dim_per_tensor: List[List[int]]
     dst_kv_layer_ids: List[int]
     dst_state_layer_ids: List[List[int]]
-    dst_state_types: List[StateType] = dataclasses.field(default_factory=list)
+    dst_state_component_types: List[StateType] = dataclasses.field(default_factory=list)
     dst_dcp_size: int = 1
     dst_dcp_rank: int = 0
     requires_dcp_relayout: bool = False
@@ -191,7 +191,9 @@ class KVArgsRegisterInfo:
                 if len(msg) > 13 and msg[13] != b""
                 else []
             ),
-            dst_state_types=unpack_state_types(msg[19]) if len(msg) > 19 else [],
+            dst_state_component_types=(
+                unpack_state_component_types(msg[19]) if len(msg) > 19 else []
+            ),
             staging_base_ptr=(
                 struct.unpack("Q", msg[14])[0]
                 if len(msg) > 14 and len(msg[14]) == 8
@@ -1532,9 +1534,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
             dst_component_index = i
             if target_rank_registration_info is not None:
-                dst_component_index = resolve_state_component_dst_index(
+                dst_component_index = resolve_state_component_dst_index_by_type(
                     state_types,
-                    target_rank_registration_info.dst_state_types,
+                    target_rank_registration_info.dst_state_component_types,
                     i,
                 )
                 dst_data_ptrs = (
@@ -1734,7 +1736,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
                         executor=executor,
                         state_type=st,
-<<<<<<< HEAD
                         # Two independent reasons to keep the flat layout.
                         # QSA's per-layer list must not be half-split into K/V;
                         # neither must a unified sub-pool's single region, which
@@ -1745,8 +1746,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             st in (StateType.QSA_PENDING, StateType.QSA_COMPRESSED)
                             or get_memory().enable_unified_memory
                         ),
-=======
->>>>>>> 3c82fe4f31 (fix(disagg): pack DSV4 draft SWA state)
                         src_layer_ids=src_state_layer_ids,
                         dst_layer_ids=dst_state_layer_ids,
                     )
@@ -2779,7 +2778,9 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
             packed_state_layer_ids = pack_int_lists(
                 self.kv_mgr.kv_args.state_layer_ids, "I"
             )
-            packed_state_types = pack_state_types(self.kv_mgr.kv_args.state_types)
+            packed_state_component_types = pack_state_component_types(
+                self.kv_mgr.kv_args.state_types
+            )
             packed_kv_layer_ids = b"".join(
                 struct.pack("I", layer_id)
                 for layer_id in self.kv_mgr.kv_args.kv_layer_ids
@@ -2838,7 +2839,7 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                             dst_dcp_size,
                             dst_dcp_rank,
                             packed_staging_slot_layer_ids,
-                            packed_state_types,
+                            packed_state_component_types,
                         ]
                     )
             except zmq.ZMQError:
