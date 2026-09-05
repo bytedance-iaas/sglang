@@ -1734,6 +1734,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
                         executor=executor,
                         state_type=st,
+<<<<<<< HEAD
                         # Two independent reasons to keep the flat layout.
                         # QSA's per-layer list must not be half-split into K/V;
                         # neither must a unified sub-pool's single region, which
@@ -1744,6 +1745,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             st in (StateType.QSA_PENDING, StateType.QSA_COMPRESSED)
                             or get_memory().enable_unified_memory
                         ),
+=======
+>>>>>>> 3c82fe4f31 (fix(disagg): pack DSV4 draft SWA state)
                         src_layer_ids=src_state_layer_ids,
                         dst_layer_ids=dst_state_layer_ids,
                     )
