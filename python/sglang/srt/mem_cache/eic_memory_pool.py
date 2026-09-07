@@ -982,20 +982,6 @@ class EICBaseTokenToKVPoolHost:
 
         return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize * 2
 
-    def exist_page(self, content_hashes):
-        """
-        for single prompt detect prefix key
-        """
-        keys = self._encode_key_shared(content_hashes)
-        ret = self.eic_client.exists_batch(keys)
-        res = []
-        for i, exist in enumerate(ret):
-            if exist:
-                res.append(content_hashes[i])
-            else:
-                break
-        return res
-
     def get_page_data_direct(self, keys, device_indices=None):
         bs = G_GDRBounceTensorCount
         masks = []
@@ -1845,15 +1831,6 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
             end = start + self.page_chunk_count
             page_exists.append(all(chunk_exists[start:end]))
         return page_exists
-
-    def exist_page(self, content_hashes):
-        page_exists = self.batch_exist_page(content_hashes)
-        ret = []
-        for i, exist in enumerate(page_exists):
-            if not exist:
-                break
-            ret.append(content_hashes[i])
-        return ret
 
     def device_backup(
         self, device_indices: torch.Tensor, dst_tensors: List[torch.Tensor]

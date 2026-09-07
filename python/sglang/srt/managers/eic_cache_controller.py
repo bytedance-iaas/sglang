@@ -477,16 +477,6 @@ class EICCacheController(HiCacheController):
         """
         return self.mem_pool_host.alloc(size)
 
-    def find_longest_prefix_in_eic(self, prompt, prev_hash=None):
-        """
-        Find the longest prefix in the EIC cache.
-        """
-        if len(prompt) == 0:
-            return [], []
-        content_hash = get_content_hash(prompt, self.page_size, prev_hash)
-        exist_result = self.mem_pool_host.exist_page(content_hash)
-        return exist_result, prompt[: len(exist_result) * self.page_size]
-
     def batch_find_longest_prefix_in_eic(self, prompts, prev_hashes):
         assert len(prompts) == len(
             prev_hashes
