@@ -236,12 +236,6 @@ class MambaAttnBackendBase(AttentionBackend):
                 # shape compatibility, but make their query ranges empty so
                 # recurrent kernels only consume the logical token prefix.
                 if _real_bs is not None and _real_bs < bs:
-                    if query_start_loc.shape[0] < _real_bs + 1:
-                        raise RuntimeError(
-                            "target-verify query_start_loc does not cover all real "
-                            f"requests: qsl_rows={query_start_loc.shape[0]}, "
-                            f"real_bs={_real_bs}, padded_bs={bs}"
-                        )
                     logical_end = query_start_loc[_real_bs]
                     padded_query_start_loc = torch.empty(
                         (bs + 1,),
