@@ -974,6 +974,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 mixed_qkv=mixed_qkv,
                 a=a,
                 b=b,
+                draft_token_num=draft_token_num,
                 conv_states=conv_states,
                 ssm_states=ssm_states,
                 intermediate_state_cache=intermediate_state_cache,
@@ -1388,6 +1389,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         mixed_qkv: torch.Tensor,
         a: torch.Tensor,
         b: torch.Tensor,
+        draft_token_num: int,
         conv_states: torch.Tensor,
         ssm_states: torch.Tensor,
         intermediate_state_cache: torch.Tensor,
@@ -1405,6 +1407,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
         )
 
         seq_len = mixed_qkv.shape[0]
+        batch_size = seq_len // draft_token_num
+        cache_indices = cache_indices[:batch_size]
+        query_start_loc = query_start_loc[: batch_size + 1]
+        intermediate_state_indices = intermediate_state_indices[:batch_size]
         h = layer.num_v_heads
         x_q, x_k, x_v = mixed_qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
         x_q = x_q.reshape(1, seq_len, h, layer.head_q_dim)
@@ -1433,7 +1439,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if apply_onorm:
             onorm_weight = fused_static[5]
             onorm_eps = fused_static[6]
-            onorm_gate = onorm_gate.reshape(1, seq_len, h, layer.head_v_dim)
+            onorm_gate = onorm_gate[:seq_len].reshape(1, seq_len, h, layer.head_v_dim)
         else:
             onorm_weight = None
             onorm_eps = None
