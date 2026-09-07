@@ -2600,9 +2600,11 @@ class Scheduler(
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
-            if tree_cache.is_backuped(req.last_host_node) or tree_cache.is_root(
+            can_prefetch = tree_cache.is_backuped(
                 req.last_host_node
-            ):
+            ) or tree_cache.is_root(req.last_host_node)
+            must_participate = getattr(tree_cache, "pp_file_l3_fail_closed", False)
+            if can_prefetch:
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 match_end = req._compute_max_prefix_len(
                     len(req.full_untruncated_fill_ids)
@@ -2620,6 +2622,14 @@ class Scheduler(
                     tree_cache.get_last_hash_value(req.last_host_node),
                     prefix_keys,
                     extra_key=req.extra_key,
+                )
+            elif must_participate:
+                tree_cache.prefetch_from_storage(
+                    req.rid,
+                    req.last_host_node,
+                    [],
+                    extra_key=req.extra_key,
+                    skip_reason="anchor_not_prefetchable",
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):

@@ -9,6 +9,7 @@ import unittest
 from array import array
 from collections import defaultdict
 from dataclasses import dataclass, replace
+from queue import Queue
 from typing import Optional
 from unittest import mock
 
@@ -22,6 +23,13 @@ from sglang.srt.disaggregation.kv_events import (
     StorageMedium,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.cache_controller import (
+    HiCacheController,
+    PrefetchAck,
+)
+from sglang.srt.managers.cache_controller import (
+    PrefetchOperation as BasePrefetchOperation,
+)
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
@@ -41,6 +49,9 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+)
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    PrefetchOperation as HybridPrefetchOperation,
 )
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
@@ -81,6 +92,7 @@ from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedTreeNode,
     _OngoingPrefetch,
     _OngoingWriteThrough,
+    _prefetch_identity_digests,
 )
 from sglang.srt.runtime_context import get_server_args, get_serving
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -6570,6 +6582,259 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         child = self._attach_host_child(cache, parent_id, start_token=1000)
         self.assertIsNotNone(child)
         cache.sanity_check()
+
+
+class TestPPFileL3FailClosed(CustomTestCase):
+    def _sync_with_peer(self, operation, local_hit_count, peer_state):
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.prefetch_hits_sync_groups = [object()]
+
+        def reduce_with_peer(tensor, _op, _groups):
+            tensor.copy_(torch.minimum(tensor, torch.tensor(peer_state)))
+
+        controller._all_reduce = reduce_with_peer
+        return controller._synchronize_prefetch_hit(operation, local_hit_count)
+
+    def _operation(self, *, request_digest=11, candidate_digest=22):
+        return BasePrefetchOperation(
+            "req",
+            list(range(8)),
+            fail_closed=True,
+            request_digest=request_digest,
+            candidate_digest=candidate_digest,
+            reserved_tokens=8,
+        )
+
+    def test_real_operation_and_sentinel_reduce_to_zero_hit(self):
+        operation = self._operation()
+        hit_count = self._sync_with_peer(
+            operation,
+            8,
+            [0, 11, -11, 22, -22],
+        )
+        self.assertEqual(hit_count, 0)
+        self.assertTrue(operation.hit_sync_completed)
+        self.assertFalse(operation.force_revoke)
+
+    def test_candidate_digest_mismatch_falls_back(self):
+        operation = self._operation()
+        hit_count = self._sync_with_peer(
+            operation,
+            8,
+            [8, 11, -11, 33, -33],
+        )
+        self.assertEqual(hit_count, 0)
+        self.assertTrue(operation.force_revoke)
+
+    def test_request_order_mismatch_falls_back(self):
+        operation = self._operation()
+        hit_count = self._sync_with_peer(
+            operation,
+            8,
+            [8, 44, -44, 22, -22],
+        )
+        self.assertEqual(hit_count, 0)
+        self.assertTrue(operation.force_revoke)
+
+    def test_candidate_digest_covers_namespace_hash_span_and_bigram_mode(self):
+        key = RadixKey(array("q", [1, 2, 3, 4]), extra_key="tenant")
+        same_request, candidate = _prefetch_identity_digests("req", key, "h0")
+        other_request, other_candidate = _prefetch_identity_digests("req", key, "h1")
+        namespaced_request, namespaced_candidate = _prefetch_identity_digests(
+            "req",
+            RadixKey(array("q", [1, 2, 3, 4]), extra_key="other"),
+            "h0",
+        )
+        _, bigram_candidate = _prefetch_identity_digests(
+            "req",
+            RadixKey(
+                array("q", [1, 2, 3, 4, 5]),
+                extra_key="tenant",
+                is_bigram=True,
+            ),
+            "h0",
+        )
+        _, list_candidate = _prefetch_identity_digests(
+            "req", RadixKey([1, 2, 3, 4], extra_key="tenant"), "h0"
+        )
+
+        self.assertEqual(same_request, other_request)
+        self.assertNotEqual(candidate, other_candidate)
+        self.assertNotEqual(same_request, namespaced_request)
+        self.assertNotEqual(candidate, namespaced_candidate)
+        self.assertNotEqual(candidate, bigram_candidate)
+        self.assertEqual(candidate, list_candidate)
+
+    def test_failed_allocation_emits_complete_zero_sequence(self):
+        transfer = PoolTransfer(name=PoolName.SWA)
+        operation = HybridPrefetchOperation(
+            "req",
+            list(range(8)),
+            pool_transfers=[transfer],
+            fail_closed=True,
+            request_digest=11,
+            candidate_digest=22,
+            reserved_tokens=8,
+        )
+        operation.hash_value = [f"h{i}" for i in range(129)]
+        operation.storage_hit_count = 129
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.prefetch_sync_queue = Queue()
+
+        controller.enqueue_failed_prefetch_completion(operation)
+
+        acks = list(controller.prefetch_sync_queue.queue)
+        self.assertEqual([ack.completed_tokens for ack in acks[:2]], [0, 0])
+        self.assertEqual(acks[2].pool_hits, {})
+        self.assertTrue(acks[3].completed_req)
+        self.assertEqual(len(acks), 4)
+        self.assertTrue(operation.force_revoke)
+
+    def test_peer_zero_completion_forces_global_recompute(self):
+        operation = self._operation()
+        operation.storage_hit_count = 8
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.prefetch_completion_sync_groups = [object()]
+        controller._all_reduce = lambda tensor, _op, _groups: tensor.fill_(0)
+        ack = PrefetchAck(rid="req", operation=operation, completed_tokens=8)
+
+        controller._reduce_prefetch_ack(ack)
+
+        self.assertEqual(ack.completed_tokens, 0)
+        self.assertTrue(operation.force_revoke)
+        self.assertEqual(operation.skip_reason, "peer_completion_failed")
+
+    def test_host_allocation_failure_does_not_use_local_shorter_prefix(self):
+        operation = HybridPrefetchOperation(
+            "req",
+            list(range(8)),
+            fail_closed=True,
+            request_digest=11,
+            candidate_digest=22,
+            reserved_tokens=8,
+        )
+        operation.hash_value = ["h0", "h1"]
+        operation.storage_hit_count = 8
+
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.page_size = 4
+        cache.prefetch_threshold = 1
+        cache.ongoing_prefetch = {
+            "req": _OngoingPrefetch(
+                0,
+                RadixKey(array("q", list(range(8)))),
+                None,
+                operation,
+                mock.Mock(),
+                {},
+            )
+        }
+        cache.evict_host = mock.MagicMock()
+        cache.cache_controller = mock.MagicMock()
+        controller = cache.cache_controller
+        controller.prefetch_hit_queue = Queue()
+        controller.prefetch_hit_queue.put(operation)
+        controller.ack_prefetch_queue = Queue()
+        controller.ack_backup_queue = Queue()
+        controller.host_mem_release_queue = Queue()
+        controller.extra_host_mem_release_queues = {}
+        controller.mem_pool_host.alloc.side_effect = [None, None]
+
+        cache._drain_storage_control_queues_impl(
+            n_storage_hit=None,
+            n_ack_prefetch=None,
+            n_backup=None,
+            n_release=None,
+            extra_release_counts={},
+            log_metrics=False,
+        )
+
+        self.assertIn("req", cache.ongoing_prefetch)
+        self.assertEqual(controller.mem_pool_host.alloc.call_count, 2)
+        controller.mem_pool_host.available_size.assert_not_called()
+        controller.enqueue_failed_prefetch_completion.assert_called_once_with(
+            operation, reason="host_pool_allocation_failed"
+        )
+
+    def test_fail_closed_abort_waits_for_synchronized_cleanup(self):
+        operation = HybridPrefetchOperation(
+            "req",
+            list(range(8)),
+            fail_closed=True,
+            request_digest=11,
+            candidate_digest=22,
+            reserved_tokens=8,
+        )
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.prefetch_loaded_tokens_by_reqid = {}
+        cache.ongoing_prefetch = {
+            "req": _OngoingPrefetch(
+                0,
+                RadixKey(array("q", list(range(8)))),
+                None,
+                operation,
+                None,
+                {},
+            )
+        }
+        cache.cache_controller = mock.MagicMock()
+        cache.cache_controller.terminate_prefetch.side_effect = (
+            lambda op: op.mark_terminate()
+        )
+
+        cache.release_aborted_request("req")
+
+        self.assertIn("req", cache.ongoing_prefetch)
+        self.assertTrue(operation.is_terminated())
+        self.assertTrue(operation.force_revoke)
+        self.assertFalse(cache.check_prefetch_progress("req"))
+
+    def test_sentinel_cleanup_has_no_host_or_anchor_ownership(self):
+        operation = HybridPrefetchOperation(
+            "req",
+            [],
+            fail_closed=True,
+            request_digest=11,
+            candidate_digest=22,
+            skip_reason="rate_limited",
+            reserved_tokens=0,
+        )
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.ongoing_prefetch = {
+            "req": _OngoingPrefetch(
+                0,
+                RadixKey(array("q")),
+                None,
+                operation,
+                None,
+                {},
+            )
+        }
+        cache.cache_controller = mock.MagicMock()
+        cache.cache_controller.prefetch_tokens_occupied = 0
+        cache.dec_host_lock_ref = mock.MagicMock()
+
+        cache._revoke_pending_prefetch("req")
+
+        self.assertNotIn("req", cache.ongoing_prefetch)
+        self.assertEqual(cache.cache_controller.prefetch_tokens_occupied, 0)
+        cache.dec_host_lock_ref.assert_not_called()
+        cache.cache_controller.append_host_mem_release.assert_called_once_with(
+            extra_pools=[]
+        )
+
+    def test_pp_file_l3_rejects_non_wait_complete_policy(self):
+        cache, _, _ = build_fixture(CacheConfig(page_size=4))
+        cache.pp_size = 2
+        server_args = ServerArgs(
+            model_path="dummy",
+            page_size=4,
+            hicache_storage_backend="file",
+            hicache_storage_prefetch_policy="timeout",
+        )
+
+        with self.assertRaisesRegex(ValueError, "supports only.*wait_complete"):
+            cache.init_hicache(server_args, cache.cache_init_params)
 
 
 if __name__ == "__main__":
