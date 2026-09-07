@@ -1703,9 +1703,9 @@ class EICPagedHiRadixCache(EICHiRadixCache):
             if len(lens) == len(fetches):
                 for (slot, *_), n in zip(fetches, lens):
                     len_tensor[slot] = n
-            # TP ranks share tree state, so an empty fetches list is rank-uniform
-            # and the reduce below would be a no-op on an all-zero tensor.
-            self._reduce_min(len_tensor)
+        # Unconditional: a lagging PP stage builds an empty fetches, and skipping
+        # the reduce would orphan PP0's isend onto the next round's num_ready recv.
+        self._reduce_min(len_tensor)
 
         for slot, last_node, compute_key, _ in fetches:
             eic_len = int(len_tensor[slot])

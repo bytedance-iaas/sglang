@@ -977,6 +977,103 @@ class TestEICHiCacheRegression(unittest.TestCase):
         self.assertEqual(cache.writing_check.call_count, 2)  # bounded spins
         self.assertEqual(len(cache.ongoing_write_through), 51)  # never drained
 
+    def _remote_cache(self, page_size=256, budget=2048, memoized=()):
+        cache = object.__new__(EICPagedHiRadixCache)
+        cache.match_req_set = dict.fromkeys(memoized)
+        cache.tp_size = 1
+        cache.pp_size = 1
+        cache.pp_group = None
+        cache.page_size = page_size
+        cache.eic_check_max_num = budget
+        cache.root_node = object()
+        cache._insert_remote_node = mock.Mock()
+        cache.cache_controller = mock.Mock()
+        return cache
+
+    def test_match_from_remote_probes_only_a_full_page_of_remainder(self):
+        cache = self._remote_cache()
+        node = SimpleNamespace(id=1, content_hash=None)
+        cache._match_for_remote_fetch = lambda root, key: (0, node)
+        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [256, 256]
+        reqs = [
+            mock.Mock(rid=r, origin_input_ids=list(range(n)), output_ids=[9], extra_key=None)
+            for r, n in (("under", 255), ("exact", 256), ("over", 257))
+        ]
+        with mock.patch(
+            "sglang.srt.mem_cache.eic_hiradix_cache._need_calculate_hash",
+            return_value=False,
+        ):
+            EICPagedHiRadixCache.match_from_remote(cache, reqs)
+
+        probed = cache.cache_controller.batch_find_longest_prefix_in_eic.call_args[0][0]
+        self.assertEqual([len(k) for k in probed], [256, 257])
+
+    def test_match_from_remote_retries_a_miss_then_memoizes_the_hit(self):
+        cache = self._remote_cache()
+        node = SimpleNamespace(id=1, content_hash=None)
+        cache._match_for_remote_fetch = lambda root, key: (512, node)
+        req = mock.Mock(
+            rid="R", origin_input_ids=list(range(4096)), output_ids=[9], extra_key=None
+        )
+        patch_hash = mock.patch(
+            "sglang.srt.mem_cache.eic_hiradix_cache._need_calculate_hash",
+            return_value=False,
+        )
+
+        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [0]
+        with patch_hash:
+            EICPagedHiRadixCache.match_from_remote(cache, [req])
+        cache._insert_remote_node.assert_not_called()
+        self.assertEqual(cache.match_req_set, {})
+
+        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [768]
+        with patch_hash:
+            EICPagedHiRadixCache.match_from_remote(cache, [req])
+        key = cache._insert_remote_node.call_args[0][1]
+        self.assertEqual(len(key), 768)
+        self.assertEqual(key.token_ids[0], 512)
+        self.assertIn("R", cache.match_req_set)
+
+        cache._match_for_remote_fetch = mock.Mock(
+            side_effect=AssertionError("memoized rid must be skipped")
+        )
+        with patch_hash:
+            EICPagedHiRadixCache.match_from_remote(cache, [req])
+        self.assertEqual(
+            cache.cache_controller.batch_find_longest_prefix_in_eic.call_count, 2
+        )
+
+    def test_match_from_remote_reduces_even_when_fetches_is_empty(self):
+        # A lagging PP stage has an empty fetches; skipping its reduce would
+        # orphan PP0's isend onto the next round's num_ready recv.
+        def reduce_shapes(memoized):
+            cache = self._remote_cache(memoized=memoized)
+            cache.pp_size = 2
+            cache.pp_group = object()
+            node = SimpleNamespace(id=1, content_hash=None)
+            cache._match_for_remote_fetch = lambda root, key: (0, node)
+            cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [256, 256]
+            shapes = []
+
+            def fake_reduce(t):
+                shapes.append(tuple(t.shape))
+                if t.dim() == 0:
+                    t.fill_(2)
+
+            cache._reduce_min = fake_reduce
+            reqs = [
+                mock.Mock(rid=r, origin_input_ids=list(range(4096)), output_ids=[9], extra_key=None)
+                for r in ("x", "y")
+            ]
+            with mock.patch(
+                "sglang.srt.mem_cache.eic_hiradix_cache._need_calculate_hash",
+                return_value=False,
+            ):
+                EICPagedHiRadixCache.match_from_remote(cache, reqs)
+            return shapes
+
+        self.assertEqual(reduce_shapes(()), reduce_shapes(("x", "y")))
+
     def test_eic_check_max_num_is_bounded_by_default(self):
         def probe_budget(cfg):
             cache = object.__new__(EICPagedHiRadixCache)
