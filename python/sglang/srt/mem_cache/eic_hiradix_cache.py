@@ -970,15 +970,6 @@ class EICHiRadixCache(RadixCache):
         # No SWA state in the EIC radix tree.
         return 0
 
-    def supports_swa(self) -> bool:
-        # EIC replaces the SWA-capable UnifiedRadixCache; re-declare SWA support
-        # or maybe_evict_swa is gated off and the SWA pool fills (prefill OOM).
-        return self.sliding_window_size is not None
-
-    def sanity_check(self):
-        # EIC frees SWA outside the radix tree; no tree invariant to assert.
-        pass
-
     @property
     def swa_evict_release_prefix(self) -> bool:
         # EIC lacks SWARadixCache.dec_swa_lock_only, so let maybe_evict_swa drop
