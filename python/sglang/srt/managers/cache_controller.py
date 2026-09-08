@@ -210,11 +210,25 @@ class PrefetchOperation(StorageOperation):
         token_ids: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        *,
+        fail_closed: bool = False,
+        request_digest: int = 0,
+        candidate_digest: int = 0,
+        skip_reason: Optional[str] = None,
+        reserved_tokens: int = 0,
     ):
         self.request_id = request_id
 
         self._lock = threading.Lock()
         self._terminated_flag = False
+        self.fail_closed = fail_closed
+        self.request_digest = request_digest
+        self.candidate_digest = candidate_digest
+        self.skip_reason = skip_reason
+        self.reserved_tokens = reserved_tokens
+        self.hit_sync_completed = False
+        self.force_revoke = False
+        self.completion_enqueued = False
         self.storage_hit_count = 0
         self.start_time = time.monotonic()
 
@@ -499,14 +513,10 @@ class HiCacheController:
 
         self.get_hash_str = get_hash_str
         self.storage_config = self._generate_storage_config(
-            model_name, storage_backend_extra_config
+            storage_backend, model_name, storage_backend_extra_config
         )
-        # for MLA models, only one rank needs to backup the KV cache
-        self.backup_skip = (
-            self.storage_config.is_mla_model
-            # todo: load balancing
-            and self.storage_config.tp_rank != 0
-        )
+        # Rank-replicated caches have one writer per storage namespace.
+        self.backup_skip = not self.storage_config.is_storage_owner
 
         # Use storage backend factory for dynamic backend creation
         from sglang.srt.mem_cache.storage import StorageBackendFactory
@@ -627,6 +637,7 @@ class HiCacheController:
 
     def _generate_storage_config(
         self,
+        storage_backend: str,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
     ):
@@ -670,6 +681,9 @@ class HiCacheController:
             )
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
+        use_shared_cp_storage = (
+            storage_backend == "file" and is_compressed_mla_model and attn_cp_size > 1
+        )
 
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
@@ -686,6 +700,7 @@ class HiCacheController:
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
+            use_shared_cp_storage=use_shared_cp_storage,
         )
 
     def reset(self):
@@ -968,12 +983,26 @@ class HiCacheController:
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        *,
+        fail_closed: bool = False,
+        request_digest: int = 0,
+        candidate_digest: int = 0,
+        skip_reason: Optional[str] = None,
+        reserved_tokens: int = 0,
     ) -> PrefetchOperation:
         """
         Prefetch KV caches from storage backend to host memory.
         """
         operation = PrefetchOperation(
-            request_id, new_input_tokens, last_hash, prefix_keys
+            request_id,
+            new_input_tokens,
+            last_hash,
+            prefix_keys,
+            fail_closed=fail_closed,
+            request_digest=request_digest,
+            candidate_digest=candidate_digest,
+            skip_reason=skip_reason,
+            reserved_tokens=reserved_tokens,
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -1046,6 +1075,9 @@ class HiCacheController:
             # cancellation so every rank executes identical collectives.
             if all_success and operation.is_terminated():
                 all_success = False
+                if operation.fail_closed:
+                    completed_pages = 0
+                    operation.force_revoke = True
             if all_success:
                 batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
                 batch_host_indices = operation.host_indices[
@@ -1069,6 +1101,10 @@ class HiCacheController:
                 if prefix_keys and len(prefix_keys) > 0:
                     prefix_keys += batch_hashes
                 completed_pages += hit_pages
+
+            if operation.fail_closed and operation.is_terminated():
+                completed_pages = 0
+                operation.force_revoke = True
 
             self.prefetch_sync_queue.put(
                 PrefetchAck(
@@ -1171,19 +1207,13 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                if operation.is_terminated():
+                if operation.is_terminated() or operation.skip_reason is not None:
                     hash_value, storage_hit_count = [], 0
                 else:
                     hash_value, storage_hit_count = self._storage_hit_query(operation)
-                storage_hit_count_tensor = torch.tensor(
-                    storage_hit_count, dtype=torch.int
+                storage_hit_count = self._synchronize_prefetch_hit(
+                    operation, storage_hit_count
                 )
-                self._all_reduce(
-                    storage_hit_count_tensor,
-                    torch.distributed.ReduceOp.MIN,
-                    self.prefetch_hits_sync_groups,
-                )
-                storage_hit_count = storage_hit_count_tensor.item()
 
                 operation.hash_value = hash_value[
                     : (storage_hit_count // self.page_size)
@@ -1193,6 +1223,86 @@ class HiCacheController:
 
             except Empty:
                 continue
+
+    def _synchronize_prefetch_hit(
+        self, operation: PrefetchOperation, storage_hit_count: int
+    ) -> int:
+        if not operation.fail_closed:
+            storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
+            self._all_reduce(
+                storage_hit_count_tensor,
+                torch.distributed.ReduceOp.MIN,
+                self.prefetch_hits_sync_groups,
+            )
+            return int(storage_hit_count_tensor.item())
+
+        sync_state = torch.tensor(
+            [
+                storage_hit_count,
+                operation.request_digest,
+                -operation.request_digest,
+                operation.candidate_digest,
+                -operation.candidate_digest,
+            ],
+            dtype=torch.int64,
+        )
+        self._all_reduce(
+            sync_state,
+            torch.distributed.ReduceOp.MIN,
+            self.prefetch_hits_sync_groups,
+        )
+        storage_hit_count = int(sync_state[0].item())
+        request_matches = int(sync_state[1].item()) == -int(sync_state[2].item())
+        candidate_matches = int(sync_state[3].item()) == -int(sync_state[4].item())
+        if not request_matches or not candidate_matches:
+            operation.force_revoke = True
+            storage_hit_count = 0
+            log = logger.error if not request_matches else logger.warning
+            log(
+                "HiCache PP file-L3 prefetch identity mismatch; "
+                "falling back to recompute req=%s request_match=%s "
+                "candidate_match=%s",
+                operation.request_id,
+                request_matches,
+                candidate_matches,
+            )
+        operation.hit_sync_completed = True
+        return storage_hit_count
+
+    def enqueue_failed_prefetch_completion(
+        self,
+        operation: PrefetchOperation,
+        reason: Optional[str] = None,
+    ) -> None:
+        """Publish the completion shape of a prefetch that cannot start locally."""
+        if operation.completion_enqueued:
+            return
+        operation.completion_enqueued = True
+        operation.force_revoke = True
+        operation.skip_reason = operation.skip_reason or reason
+        for _ in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
+            self.prefetch_sync_queue.put(
+                PrefetchAck(
+                    rid=operation.request_id,
+                    completed_tokens=0,
+                    operation=operation,
+                )
+            )
+        if operation.fail_closed or getattr(operation, "pool_transfers", None):
+            self.prefetch_sync_queue.put(
+                PrefetchAck(
+                    rid=operation.request_id,
+                    pool_hits={},
+                    operation=operation,
+                )
+            )
+        self.prefetch_sync_queue.put(
+            PrefetchAck(
+                rid=operation.request_id,
+                completed_req=True,
+                operation=operation,
+            )
+        )
 
     def write_storage(
         self,
@@ -1348,10 +1458,23 @@ class HiCacheController:
     def _reduce_prefetch_ack(self, ack: PrefetchAck) -> None:
         if ack.completed_tokens is None:
             return
-        completed_tokens = torch.tensor(ack.completed_tokens, dtype=torch.int)
+        if ack.operation.fail_closed and (
+            ack.operation.is_terminated() or ack.operation.force_revoke
+        ):
+            ack.completed_tokens = 0
+        completed_tokens = torch.tensor(ack.completed_tokens, dtype=torch.int64)
         self._all_reduce(
             completed_tokens,
             torch.distributed.ReduceOp.MIN,
             self.prefetch_completion_sync_groups,
         )
         ack.completed_tokens = completed_tokens.item()
+        if (
+            ack.operation.fail_closed
+            and ack.operation.storage_hit_count > 0
+            and ack.completed_tokens == 0
+        ):
+            ack.operation.force_revoke = True
+            ack.operation.skip_reason = (
+                ack.operation.skip_reason or "peer_completion_failed"
+            )

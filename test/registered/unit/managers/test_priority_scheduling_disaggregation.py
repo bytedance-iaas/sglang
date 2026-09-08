@@ -81,6 +81,33 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         req.time_stats.trace_ctx.abort.assert_called_once()
 
 
+class TestPPFileL3PrefetchParticipation(unittest.TestCase):
+    def test_unbacked_anchor_still_submits_sentinel(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_hicache_storage = True
+        scheduler.tree_cache = MagicMock()
+        scheduler.tree_cache.pp_file_l3_fail_closed = True
+        scheduler.tree_cache.is_backuped.return_value = False
+        scheduler.tree_cache.is_root.return_value = False
+        req = MagicMock()
+        req.rid = "req"
+        req.last_host_node = 7
+        req.extra_key = "tenant"
+
+        scheduler._prefetch_kvcache(req)
+
+        req.init_next_round_input.assert_called_once_with(
+            scheduler.tree_cache, cow_mamba=False
+        )
+        scheduler.tree_cache.prefetch_from_storage.assert_called_once_with(
+            "req",
+            7,
+            [],
+            extra_key="tenant",
+            skip_reason="anchor_not_prefetchable",
+        )
+
+
 class TestDecodePreallocQueuePriority(unittest.TestCase):
     def _new_decode_req(self, rid: str, priority: int, *, failed: bool = False):
         req = SimpleNamespace(

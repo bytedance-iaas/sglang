@@ -9,6 +9,7 @@ import unittest
 from array import array
 from collections import defaultdict
 from dataclasses import dataclass, replace
+from queue import Queue
 from typing import Optional
 from unittest import mock
 
@@ -22,6 +23,13 @@ from sglang.srt.disaggregation.kv_events import (
     StorageMedium,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.cache_controller import (
+    HiCacheController,
+    PrefetchAck,
+)
+from sglang.srt.managers.cache_controller import (
+    PrefetchOperation as BasePrefetchOperation,
+)
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
@@ -41,6 +49,9 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+)
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    PrefetchOperation as HybridPrefetchOperation,
 )
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
@@ -81,6 +92,7 @@ from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedTreeNode,
     _OngoingPrefetch,
     _OngoingWriteThrough,
+    _prefetch_identity_digests,
 )
 from sglang.srt.runtime_context import get_server_args, get_serving
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -330,6 +342,34 @@ class TestUnifiedTreeCoreLoadBackPending(CustomTestCase):
         self.assertTrue(UnifiedTreeCore._can_reclaim_full_host_duplicate(core, shared))
         core._update_duplicate_tracking.assert_called_once_with(shared)
 
+    def test_auxiliary_load_does_not_reuse_full_pending_pin(self):
+        core, shared, anchor_a, anchor_b = self._build_core(is_write_back=True)
+        core.components_by_type[ComponentType.SWA] = mock.Mock()
+
+        self._commit_load_back(core, anchor_a, shared)
+        self.assertEqual(shared.load_back_pending_id, anchor_a.id)
+
+        kv_transfer = PoolTransfer(
+            name=PoolName.KV,
+            host_indices=torch.tensor([1], dtype=torch.int64),
+            nodes_to_load=[anchor_b.id],
+        )
+        swa_transfer = PoolTransfer(
+            name=PoolName.SWA,
+            host_indices=torch.tensor([2], dtype=torch.int64),
+            nodes_to_load=[shared.id],
+        )
+        UnifiedTreeCore.commit_load_back(
+            core,
+            anchor_b.id,
+            torch.tensor([3], dtype=torch.int64),
+            kv_transfer,
+            {ComponentType.SWA: [swa_transfer]},
+        )
+
+        self.assertEqual(shared.load_back_pending_id, anchor_a.id)
+        self.assertEqual(anchor_b.load_back_pending_id, anchor_b.id)
+
 
 def _write_backup(cache, node, write_back: bool = False) -> int:
     """Back up one node's KV D->H via the tree's build+execute primitives."""
@@ -480,11 +520,13 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
         cache.enable_storage = True
         cache.prefetch_threshold = 1
         tokens = array("q", [1, 2, 3, 4, 5, 6, 7, 8, 9])
+        namespace = "tenant-a"
+        key = RadixKey(tokens, extra_key=namespace)
 
         value = allocator.alloc(len(tokens) - 1)
         self.assertIsNotNone(value)
-        cache.insert(InsertParams(key=RadixKey(tokens), value=value))
-        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
+        cache.insert(InsertParams(key=key, value=value))
+        match = cache.match_prefix(MatchPrefixParams(key=key))
         leaf = cache.resolve_node_handle(match.last_device_node)
         self.assertTrue(leaf.key.is_bigram)
         self.assertEqual(len(leaf.hash_value), 2)
@@ -522,10 +564,13 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
 
         controller = FakeCacheController()
         cache.cache_controller = controller
-        cache.prefetch_from_storage("req", cache.root_node.id, tokens)
+        cache.prefetch_from_storage(
+            "req", cache.root_node.id, tokens, extra_key=namespace
+        )
 
         _, storage_key, _, _, _ = controller.prefetch_args
         self.assertIsInstance(storage_key, RadixKey)
+        self.assertEqual(storage_key.extra_key, namespace)
         self.assertTrue(storage_key.is_bigram)
         self.assertEqual(len(storage_key), len(tokens) - 1)
 
@@ -4437,6 +4482,62 @@ class UnifiedRadixCacheSuite:
         chain = [n.id for n in chain]
         self.assertEqual(xfer.nodes_to_load, chain[-expected_pages:])
 
+    def test_hicache_swa_load_back_rejects_foreign_pinned_window(self):
+        """A second load-back must not claim nodes pinned by an in-flight one.
+
+        commit_load_back republishes Full device values before the DMA acks, so
+        a later anchor can claim just the still-host-only SWA window of a
+        pinned node and hit the commit pin assert. The spec build must degrade
+        to an empty spec instead (the caller recomputes).
+        """
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the chain construction simple")
+        if self.cfg.sliding_window_size <= self.cfg.page_size:
+            # A window within one page never reaches the pinned ancestor.
+            self.skipTest("window must span past the leaf to reach the pin")
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        # commit_load_back pins its source nodes only under write-back; run the
+        # scenario in that mode so the foreign-pin path is reachable.
+        cache.is_write_back = True
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain collapsed below the two-node suffix being tested")
+        self._simulate_backup_tree(cache)
+
+        # Host-only suffix a -> b under a device-resident ancestor.
+        a, b = chain[-2], chain[-1]
+        for n in (a, b):
+            cache.tree_core.set_component_device_value_raw(n, ComponentType.FULL, None)
+            cache.tree_core.set_component_device_value_raw(n, ComponentType.SWA, None)
+            if cache.tree_core.is_node_in_device_lru(n, ComponentType.SWA):
+                cache.tree_core.remove_node_from_device_lru(n, ComponentType.SWA)
+            cache.tree_core.insert_node_into_host_lru(n, ComponentType.SWA)
+
+        # Anchor `a`: a Full-only load whose SWA slice stays host-only.
+        kv_xfer, _comp_xfers = cache.tree_core.build_load_back_spec(a)
+        self.assertEqual(kv_xfer.nodes_to_load, [a])
+        device_indices = torch.arange(
+            int(kv_xfer.host_indices.numel()), dtype=torch.int64, device=cache.device
+        )
+        cache.tree_core.commit_load_back(a, device_indices, kv_xfer, {})
+        self.assertEqual(cache.tree_core.node_by_id(a).load_back_pending_id, a)
+
+        # Anchor `b` rejects its whole spec: its SWA window claims pinned `a`.
+        kv_xfer, comp_xfers = cache.tree_core.build_load_back_spec(b)
+        self.assertEqual(int(kv_xfer.host_indices.numel()), 0)
+        self.assertEqual(kv_xfer.nodes_to_load, [])
+        self.assertEqual(comp_xfers, {})
+
+        # After the ack unpins, the same spec builds fully.
+        cache.tree_core.finish_load_back(a)
+        self.assertIsNone(cache.tree_core.node_by_id(a).load_back_pending_id)
+        kv_xfer, comp_xfers = cache.tree_core.build_load_back_spec(b)
+        self.assertEqual(kv_xfer.nodes_to_load, [b])
+        self.assertEqual(comp_xfers[ComponentType.SWA][0].nodes_to_load, [a, b])
+
     def _swa_finalize_setup(self):
         """Build a SWA chain long enough to fill at least the window
         plus one extra page, and host-back every node so we can flip
@@ -6235,7 +6336,7 @@ class TestPrefetchCommitOrdering(CustomTestCase):
         cache._check_hybrid_prefetch_result.return_value = 8
         cache.cache_controller.prefetch_tokens_occupied = 100
         cache.prefetch_loaded_tokens_by_reqid = {}
-        cache.can_terminate_prefetch.return_value = True
+        cache._can_terminate_prefetch.return_value = True
         cache.pp_rank = 0
 
         order = mock.MagicMock()
@@ -6413,7 +6514,7 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         operation.hash_value = hashes
 
         with (
-            mock.patch.object(cache, "can_terminate_prefetch", return_value=True),
+            mock.patch.object(cache, "_can_terminate_prefetch", return_value=True),
             # Isolate the drop-release branch under test from the hybrid-sync
             # step: treat the whole fetched prefix as usable so the insert runs.
             mock.patch.object(
@@ -6481,6 +6582,259 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         child = self._attach_host_child(cache, parent_id, start_token=1000)
         self.assertIsNotNone(child)
         cache.sanity_check()
+
+
+class TestPPFileL3FailClosed(CustomTestCase):
+    def _sync_with_peer(self, operation, local_hit_count, peer_state):
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.prefetch_hits_sync_groups = [object()]
+
+        def reduce_with_peer(tensor, _op, _groups):
+            tensor.copy_(torch.minimum(tensor, torch.tensor(peer_state)))
+
+        controller._all_reduce = reduce_with_peer
+        return controller._synchronize_prefetch_hit(operation, local_hit_count)
+
+    def _operation(self, *, request_digest=11, candidate_digest=22):
+        return BasePrefetchOperation(
+            "req",
+            list(range(8)),
+            fail_closed=True,
+            request_digest=request_digest,
+            candidate_digest=candidate_digest,
+            reserved_tokens=8,
+        )
+
+    def test_real_operation_and_sentinel_reduce_to_zero_hit(self):
+        operation = self._operation()
+        hit_count = self._sync_with_peer(
+            operation,
+            8,
+            [0, 11, -11, 22, -22],
+        )
+        self.assertEqual(hit_count, 0)
+        self.assertTrue(operation.hit_sync_completed)
+        self.assertFalse(operation.force_revoke)
+
+    def test_candidate_digest_mismatch_falls_back(self):
+        operation = self._operation()
+        hit_count = self._sync_with_peer(
+            operation,
+            8,
+            [8, 11, -11, 33, -33],
+        )
+        self.assertEqual(hit_count, 0)
+        self.assertTrue(operation.force_revoke)
+
+    def test_request_order_mismatch_falls_back(self):
+        operation = self._operation()
+        hit_count = self._sync_with_peer(
+            operation,
+            8,
+            [8, 44, -44, 22, -22],
+        )
+        self.assertEqual(hit_count, 0)
+        self.assertTrue(operation.force_revoke)
+
+    def test_candidate_digest_covers_namespace_hash_span_and_bigram_mode(self):
+        key = RadixKey(array("q", [1, 2, 3, 4]), extra_key="tenant")
+        same_request, candidate = _prefetch_identity_digests("req", key, "h0")
+        other_request, other_candidate = _prefetch_identity_digests("req", key, "h1")
+        namespaced_request, namespaced_candidate = _prefetch_identity_digests(
+            "req",
+            RadixKey(array("q", [1, 2, 3, 4]), extra_key="other"),
+            "h0",
+        )
+        _, bigram_candidate = _prefetch_identity_digests(
+            "req",
+            RadixKey(
+                array("q", [1, 2, 3, 4, 5]),
+                extra_key="tenant",
+                is_bigram=True,
+            ),
+            "h0",
+        )
+        _, list_candidate = _prefetch_identity_digests(
+            "req", RadixKey([1, 2, 3, 4], extra_key="tenant"), "h0"
+        )
+
+        self.assertEqual(same_request, other_request)
+        self.assertNotEqual(candidate, other_candidate)
+        self.assertNotEqual(same_request, namespaced_request)
+        self.assertNotEqual(candidate, namespaced_candidate)
+        self.assertNotEqual(candidate, bigram_candidate)
+        self.assertEqual(candidate, list_candidate)
+
+    def test_failed_allocation_emits_complete_zero_sequence(self):
+        transfer = PoolTransfer(name=PoolName.SWA)
+        operation = HybridPrefetchOperation(
+            "req",
+            list(range(8)),
+            pool_transfers=[transfer],
+            fail_closed=True,
+            request_digest=11,
+            candidate_digest=22,
+            reserved_tokens=8,
+        )
+        operation.hash_value = [f"h{i}" for i in range(129)]
+        operation.storage_hit_count = 129
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.prefetch_sync_queue = Queue()
+
+        controller.enqueue_failed_prefetch_completion(operation)
+
+        acks = list(controller.prefetch_sync_queue.queue)
+        self.assertEqual([ack.completed_tokens for ack in acks[:2]], [0, 0])
+        self.assertEqual(acks[2].pool_hits, {})
+        self.assertTrue(acks[3].completed_req)
+        self.assertEqual(len(acks), 4)
+        self.assertTrue(operation.force_revoke)
+
+    def test_peer_zero_completion_forces_global_recompute(self):
+        operation = self._operation()
+        operation.storage_hit_count = 8
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.prefetch_completion_sync_groups = [object()]
+        controller._all_reduce = lambda tensor, _op, _groups: tensor.fill_(0)
+        ack = PrefetchAck(rid="req", operation=operation, completed_tokens=8)
+
+        controller._reduce_prefetch_ack(ack)
+
+        self.assertEqual(ack.completed_tokens, 0)
+        self.assertTrue(operation.force_revoke)
+        self.assertEqual(operation.skip_reason, "peer_completion_failed")
+
+    def test_host_allocation_failure_does_not_use_local_shorter_prefix(self):
+        operation = HybridPrefetchOperation(
+            "req",
+            list(range(8)),
+            fail_closed=True,
+            request_digest=11,
+            candidate_digest=22,
+            reserved_tokens=8,
+        )
+        operation.hash_value = ["h0", "h1"]
+        operation.storage_hit_count = 8
+
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.page_size = 4
+        cache.prefetch_threshold = 1
+        cache.ongoing_prefetch = {
+            "req": _OngoingPrefetch(
+                0,
+                RadixKey(array("q", list(range(8)))),
+                None,
+                operation,
+                mock.Mock(),
+                {},
+            )
+        }
+        cache.evict_host = mock.MagicMock()
+        cache.cache_controller = mock.MagicMock()
+        controller = cache.cache_controller
+        controller.prefetch_hit_queue = Queue()
+        controller.prefetch_hit_queue.put(operation)
+        controller.ack_prefetch_queue = Queue()
+        controller.ack_backup_queue = Queue()
+        controller.host_mem_release_queue = Queue()
+        controller.extra_host_mem_release_queues = {}
+        controller.mem_pool_host.alloc.side_effect = [None, None]
+
+        cache._drain_storage_control_queues_impl(
+            n_storage_hit=None,
+            n_ack_prefetch=None,
+            n_backup=None,
+            n_release=None,
+            extra_release_counts={},
+            log_metrics=False,
+        )
+
+        self.assertIn("req", cache.ongoing_prefetch)
+        self.assertEqual(controller.mem_pool_host.alloc.call_count, 2)
+        controller.mem_pool_host.available_size.assert_not_called()
+        controller.enqueue_failed_prefetch_completion.assert_called_once_with(
+            operation, reason="host_pool_allocation_failed"
+        )
+
+    def test_fail_closed_abort_waits_for_synchronized_cleanup(self):
+        operation = HybridPrefetchOperation(
+            "req",
+            list(range(8)),
+            fail_closed=True,
+            request_digest=11,
+            candidate_digest=22,
+            reserved_tokens=8,
+        )
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.prefetch_loaded_tokens_by_reqid = {}
+        cache.ongoing_prefetch = {
+            "req": _OngoingPrefetch(
+                0,
+                RadixKey(array("q", list(range(8)))),
+                None,
+                operation,
+                None,
+                {},
+            )
+        }
+        cache.cache_controller = mock.MagicMock()
+        cache.cache_controller.terminate_prefetch.side_effect = (
+            lambda op: op.mark_terminate()
+        )
+
+        cache.release_aborted_request("req")
+
+        self.assertIn("req", cache.ongoing_prefetch)
+        self.assertTrue(operation.is_terminated())
+        self.assertTrue(operation.force_revoke)
+        self.assertFalse(cache.check_prefetch_progress("req"))
+
+    def test_sentinel_cleanup_has_no_host_or_anchor_ownership(self):
+        operation = HybridPrefetchOperation(
+            "req",
+            [],
+            fail_closed=True,
+            request_digest=11,
+            candidate_digest=22,
+            skip_reason="rate_limited",
+            reserved_tokens=0,
+        )
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.ongoing_prefetch = {
+            "req": _OngoingPrefetch(
+                0,
+                RadixKey(array("q")),
+                None,
+                operation,
+                None,
+                {},
+            )
+        }
+        cache.cache_controller = mock.MagicMock()
+        cache.cache_controller.prefetch_tokens_occupied = 0
+        cache.dec_host_lock_ref = mock.MagicMock()
+
+        cache._revoke_pending_prefetch("req")
+
+        self.assertNotIn("req", cache.ongoing_prefetch)
+        self.assertEqual(cache.cache_controller.prefetch_tokens_occupied, 0)
+        cache.dec_host_lock_ref.assert_not_called()
+        cache.cache_controller.append_host_mem_release.assert_called_once_with(
+            extra_pools=[]
+        )
+
+    def test_pp_file_l3_rejects_non_wait_complete_policy(self):
+        cache, _, _ = build_fixture(CacheConfig(page_size=4))
+        cache.pp_size = 2
+        server_args = ServerArgs(
+            model_path="dummy",
+            page_size=4,
+            hicache_storage_backend="file",
+            hicache_storage_prefetch_policy="timeout",
+        )
+
+        with self.assertRaisesRegex(ValueError, "supports only.*wait_complete"):
+            cache.init_hicache(server_args, cache.cache_init_params)
 
 
 if __name__ == "__main__":

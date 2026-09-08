@@ -129,10 +129,24 @@ class PrefetchOperation(StorageOperation):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
+        *,
+        fail_closed: bool = False,
+        request_digest: int = 0,
+        candidate_digest: int = 0,
+        skip_reason: Optional[str] = None,
+        reserved_tokens: int = 0,
     ):
         self.request_id = request_id
         self._lock = threading.Lock()
         self._terminated_flag = False
+        self.fail_closed = fail_closed
+        self.request_digest = request_digest
+        self.candidate_digest = candidate_digest
+        self.skip_reason = skip_reason
+        self.reserved_tokens = reserved_tokens
+        self.hit_sync_completed = False
+        self.force_revoke = False
+        self.completion_enqueued = False
         self.storage_hit_count = 0
         self.start_time = time.monotonic()
         super().__init__(
@@ -602,6 +616,12 @@ class HybridCacheController(BaseHiCacheController):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        *,
+        fail_closed: bool = False,
+        request_digest: int = 0,
+        candidate_digest: int = 0,
+        skip_reason: Optional[str] = None,
+        reserved_tokens: int = 0,
     ) -> PrefetchOperation:
         operation = PrefetchOperation(
             request_id,
@@ -609,6 +629,11 @@ class HybridCacheController(BaseHiCacheController):
             last_hash,
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
+            fail_closed=fail_closed,
+            request_digest=request_digest,
+            candidate_digest=candidate_digest,
+            skip_reason=skip_reason,
+            reserved_tokens=reserved_tokens,
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -693,12 +718,15 @@ class HybridCacheController(BaseHiCacheController):
     def _page_transfer_sidecar(
         self, operation: PrefetchOperation, kv_completed_pages: int
     ) -> None:
-        if operation.pool_transfers is None:
+        if operation.pool_transfers is None and not operation.fail_closed:
             return
 
         pool_hits: dict[str, int] = {}
-        if not operation.is_terminated() and kv_completed_pages == len(
-            operation.hash_value
+        if (
+            operation.pool_transfers
+            and not operation.is_terminated()
+            and not operation.force_revoke
+            and kv_completed_pages == len(operation.hash_value)
         ):
             transfers_nonkv = [
                 transfer

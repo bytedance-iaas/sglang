@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import threading
 import time
+from array import array
 from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
@@ -114,10 +116,57 @@ class _OngoingPrefetch(NamedTuple):
 
     anchor_node_id: NodeId
     prefetch_key: RadixKey
-    host_indices: torch.Tensor
+    host_indices: Optional[torch.Tensor]
     operation: PrefetchOperation
-    anchor_lock_params: DecLockRefParams
+    anchor_lock_params: Optional[DecLockRefParams]
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
+
+
+def _stable_prefetch_digest(label: str, *parts: object) -> int:
+    """Return a deterministic positive int64 digest for PP identity checks."""
+    digest = hashlib.blake2b(digest_size=8)
+    digest.update(label.encode("utf-8"))
+    for part in parts:
+        if part is None:
+            data = b"N"
+        elif isinstance(part, bytes):
+            data = b"B" + part
+        else:
+            data = b"S" + str(part).encode("utf-8")
+        digest.update(len(data).to_bytes(8, byteorder="little", signed=False))
+        digest.update(data)
+    value = int.from_bytes(digest.digest(), byteorder="little") & ((1 << 63) - 1)
+    return value or 1
+
+
+def _prefetch_identity_digests(
+    req_id: str,
+    prefetch_key: RadixKey,
+    last_hash: Optional[str],
+) -> tuple[int, int]:
+    raw_token_ids = prefetch_key.raw_token_ids()
+    token_bytes = (
+        raw_token_ids.tobytes()
+        if isinstance(raw_token_ids, array)
+        else array("q", raw_token_ids).tobytes()
+    )
+    request_digest = _stable_prefetch_digest("request", req_id, prefetch_key.extra_key)
+    candidate_digest = _stable_prefetch_digest(
+        "candidate",
+        prefetch_key.extra_key,
+        last_hash,
+        len(prefetch_key),
+        int(prefetch_key.is_bigram),
+        token_bytes,
+    )
+    return request_digest, candidate_digest
+
+
+def _reserved_prefetch_tokens(
+    operation: PrefetchOperation, prefetch_key: RadixKey
+) -> int:
+    reserved_tokens = getattr(operation, "reserved_tokens", None)
+    return reserved_tokens if isinstance(reserved_tokens, int) else len(prefetch_key)
 
 
 class UnifiedRadixCache(BasePrefixCache):
@@ -211,6 +260,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_timeout_base = 1.0
         self.prefetch_timeout_per_page = 0.25
         self.hicache_storage_pass_prefix_keys = False
+        self.pp_file_l3_fail_closed = False
 
         self.reset()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
@@ -331,6 +381,16 @@ class UnifiedRadixCache(BasePrefixCache):
                 hicache_storage_pass_prefix_keys,
             ) = HybridCacheController.parse_storage_backend_extra_config(
                 server_args.hicache_storage_backend_extra_config
+            )
+
+        self.pp_file_l3_fail_closed = storage_backend == "file" and self.pp_size > 1
+        if (
+            self.pp_file_l3_fail_closed
+            and server_args.hicache_storage_prefetch_policy != "wait_complete"
+        ):
+            raise ValueError(
+                "UnifiedRadixCache file storage with PP>1 currently supports only "
+                "--hicache-storage-prefetch-policy wait_complete."
             )
 
         attach_hybrid_pool_to_unified_cache(
@@ -1022,8 +1082,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Skip if there is nothing to load, or if the Full-KV transfer is too
         # small / exceeds memory quota. Aux transfers should still run even
-        # when the Full-KV load is skipped by thresholding.
-        if (kv_tokens < self.load_back_threshold and not comp_xfers) or (
+        # when the Full-KV load is skipped by thresholding. max(1, ...): an
+        # entirely empty spec (e.g. foreign-pin rejection) must never report
+        # success, even at load_back_threshold <= 0.
+        if (kv_tokens < max(1, self.load_back_threshold) and not comp_xfers) or (
             mem_quota is not None and kv_tokens > mem_quota + result.delta
         ):
             self.dec_lock_ref(node_id, ancestor_lock_params)
@@ -1173,21 +1235,79 @@ class UnifiedRadixCache(BasePrefixCache):
         new_input_tokens: list[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[list[str]] = None,
+        extra_key: Optional[str] = None,
+        skip_reason: Optional[str] = None,
     ) -> None:
         if not self.enable_storage or self.cache_controller is None:
             return
 
-        extra_key = self.tree_core.prefetch_anchor_info(last_host_node_id)
         prefetch_key = RadixKey(
             new_input_tokens,
             extra_key=extra_key,
             is_bigram=self.tree_core.is_eagle,
         ).page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)
-        if (
-            prefetch_length < self.prefetch_threshold
-            or self.cache_controller.prefetch_rate_limited()
-        ):
+        request_digest, candidate_digest = _prefetch_identity_digests(
+            req_id, prefetch_key, last_hash
+        )
+
+        def _submit(
+            *,
+            local_skip_reason: Optional[str],
+            anchor_lock_params: Optional[DecLockRefParams] = None,
+            comp_xfers: Optional[dict[ComponentType, list[PoolTransfer]]] = None,
+            extra_pools: Optional[list[PoolTransfer]] = None,
+        ) -> None:
+            reserved_tokens = 0 if local_skip_reason is not None else prefetch_length
+            if self.pp_file_l3_fail_closed:
+                operation = self.cache_controller.prefetch(
+                    req_id,
+                    prefetch_key,
+                    last_hash,
+                    prefix_keys,
+                    extra_pools=extra_pools,
+                    fail_closed=True,
+                    request_digest=request_digest,
+                    candidate_digest=candidate_digest,
+                    skip_reason=local_skip_reason,
+                    reserved_tokens=reserved_tokens,
+                )
+            else:
+                operation = self.cache_controller.prefetch(
+                    req_id,
+                    prefetch_key,
+                    last_hash,
+                    prefix_keys,
+                    extra_pools=extra_pools,
+                )
+                operation.reserved_tokens = reserved_tokens
+            self.ongoing_prefetch[req_id] = _OngoingPrefetch(
+                last_host_node_id,
+                prefetch_key,
+                None,
+                operation,
+                anchor_lock_params,
+                comp_xfers or {},
+            )
+            self.cache_controller.prefetch_tokens_occupied += reserved_tokens
+
+        if skip_reason is not None:
+            if self.pp_file_l3_fail_closed:
+                _submit(local_skip_reason=skip_reason)
+            return
+
+        anchor_extra_key = self.tree_core.prefetch_anchor_info(last_host_node_id)
+        assert anchor_extra_key is None or anchor_extra_key == extra_key, (
+            f"prefetch anchor namespace {anchor_extra_key!r} "
+            f"!= request namespace {extra_key!r}"
+        )
+        if prefetch_length < self.prefetch_threshold:
+            if self.pp_file_l3_fail_closed:
+                _submit(local_skip_reason="below_threshold")
+            return
+        if self.cache_controller.prefetch_rate_limited():
+            if self.pp_file_l3_fail_closed:
+                _submit(local_skip_reason="rate_limited")
             return
 
         anchor_lock_params = self.inc_host_lock_ref(last_host_node_id).to_dec_params()
@@ -1225,26 +1345,18 @@ class UnifiedRadixCache(BasePrefixCache):
                 extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
             )
             self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
+            if self.pp_file_l3_fail_closed:
+                _submit(local_skip_reason="aux_pool_allocation_failed")
             return
 
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
-        operation = self.cache_controller.prefetch(
-            req_id,
-            prefetch_key,
-            last_hash,
-            prefix_keys,
+        _submit(
+            local_skip_reason=None,
+            anchor_lock_params=anchor_lock_params,
+            comp_xfers=comp_xfers,
             extra_pools=aux_xfers or None,
         )
-        self.ongoing_prefetch[req_id] = _OngoingPrefetch(
-            last_host_node_id,
-            prefetch_key,
-            None,
-            operation,
-            anchor_lock_params,
-            comp_xfers,
-        )
-        self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
 
     def _prefetch_timeout_check_linear_func(self, operation: PrefetchOperation) -> bool:
         return (
@@ -1253,13 +1365,26 @@ class UnifiedRadixCache(BasePrefixCache):
             + len(operation.hash_value) * self.prefetch_timeout_per_page
         )
 
-    def can_terminate_prefetch(self, operation: PrefetchOperation) -> bool:
+    def _can_terminate_prefetch(self, operation: PrefetchOperation) -> bool:
         if self.prefetch_stop_policy == "best_effort":
             return True
         if self.prefetch_stop_policy == "wait_complete":
             return False
         elif self.prefetch_stop_policy == "timeout":
-            return self._prefetch_timeout_check_linear_func(operation)
+            # Wall-clock time may differ among ranks, all-reduce is needed to ensure
+            # all ranks reach the same final result. Otherwise PP/TP ranks will diverge.
+            #
+            # For TP, if any rank reaches the timeout, the final result is timeout.
+            #
+            # For PP, PP0 makes the decision and other ranks follow PP0's decision.
+            should_terminate = False
+            if self.pp_rank == 0:
+                should_terminate = self._prefetch_timeout_check_linear_func(operation)
+            should_terminate_tensor = torch.tensor(
+                int(should_terminate), dtype=torch.int, device="cpu"
+            )
+            self._all_reduce(should_terminate_tensor, torch.distributed.ReduceOp.MAX)
+            return should_terminate_tensor.item() == 1
         else:
             return True
 
@@ -1268,16 +1393,17 @@ class UnifiedRadixCache(BasePrefixCache):
             return True
 
         operation = self.ongoing_prefetch[req_id].operation
-        should_terminate = False
-        if self.pp_rank == 0:
-            should_terminate = operation.is_terminated() or self.can_terminate_prefetch(
-                operation
-            )
-        should_terminate_tensor = torch.tensor(
-            int(should_terminate), dtype=torch.int, device="cpu"
+        if operation.fail_closed:
+            # The hit/completion queues own cleanup for PP file-L3. Returning
+            # early here would let one stage remove an operation while peers
+            # still have collectives to execute for it.
+            return False
+        # Determine whether or not we should terminate this prefetch request.
+        should_terminate = operation.is_terminated() or self._can_terminate_prefetch(
+            operation
         )
-        self._all_reduce(should_terminate_tensor, torch.distributed.ReduceOp.MAX)
-        if should_terminate_tensor.item() != 1:
+
+        if not should_terminate:
             return False
 
         self.cache_controller.terminate_prefetch(operation)
@@ -1300,6 +1426,8 @@ class UnifiedRadixCache(BasePrefixCache):
             anchor_lock_params,
             comp_xfers,
         ) = self.ongoing_prefetch[req_id]
+        assert host_indices is not None
+        assert anchor_lock_params is not None
 
         if not self._check_hybrid_prefetch_result(
             req_id,
@@ -1352,7 +1480,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
         self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
         del self.ongoing_prefetch[req_id]
-        self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
+        self.cache_controller.prefetch_tokens_occupied -= _reserved_prefetch_tokens(
+            operation, prefetch_key
+        )
 
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
         logger.info(
@@ -1401,6 +1531,21 @@ class UnifiedRadixCache(BasePrefixCache):
             for transfer, count in zip(pool_transfers, pool_hit_pages)
         )
         if pool_transfers and not all_succeeded:
+            # Drop the KV beliefs from the first page any pool failed to serve;
+            # the next insert then re-writes that span through one FULL check,
+            # restoring the missing aux pages.
+            keep_pages = completed_tokens // self.page_size
+            for transfer, count in zip(pool_transfers, pool_hit_pages):
+                if transfer.keys is None:
+                    keep_pages = 0
+                elif count < len(transfer.keys):
+                    # Aux transfers key the chain's trailing pages.
+                    keep_pages = min(
+                        keep_pages, max(0, len(hash_value) - len(transfer.keys))
+                    )
+            self.storage_existence_cache.invalidate_beyond(
+                PoolName.KV, hash_value, keep_pages=keep_pages
+            )
             # The controller's prefetch IO thread already releases the untransferred
             # tail (host_indices[completed_tokens:])
             self.cache_controller.append_host_mem_release(
@@ -1409,13 +1554,17 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
             del self.ongoing_prefetch[req_id]
-            self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
+            self.cache_controller.prefetch_tokens_occupied -= _reserved_prefetch_tokens(
+                operation, prefetch_key
+            )
             self.prefetch_loaded_tokens_by_reqid[req_id] = 0
             logger.warning(
-                "HiCache hybrid prefetch discarded req=%s completed=%d requested=%d",
+                "HiCache hybrid prefetch discarded req=%s completed=%d requested=%d "
+                "kv_beliefs_kept_pages=%d",
                 req_id,
                 completed_tokens,
                 expected_tokens,
+                keep_pages,
             )
             return False
         return True
@@ -1425,6 +1574,9 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         operation = self.ongoing_prefetch[req_id].operation
         operation.mark_terminate()
+        if operation.fail_closed:
+            operation.force_revoke = True
+            operation.skip_reason = operation.skip_reason or "request_terminated"
 
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
@@ -1442,12 +1594,18 @@ class UnifiedRadixCache(BasePrefixCache):
             anchor_lock_params,
             comp_xfers,
         ) = self.ongoing_prefetch[rid]
+        if operation.fail_closed:
+            operation.force_revoke = True
+            operation.skip_reason = operation.skip_reason or "request_aborted"
+            self.cache_controller.terminate_prefetch(operation)
+            return
         if operation.host_indices is None:
             self.cache_controller.terminate_prefetch(operation)
             self._revoke_pending_prefetch(rid)
             return
 
         completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
+        assert anchor_lock_params is not None
         self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
         del self.ongoing_prefetch[rid]
         pool_transfers = [x for xfers in comp_xfers.values() for x in xfers]
@@ -1473,9 +1631,37 @@ class UnifiedRadixCache(BasePrefixCache):
         cc.append_host_mem_release(
             extra_pools=[x for xfers in comp_xfers.values() for x in xfers]
         )
-        self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
+        if anchor_lock_params is not None:
+            self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
         cc.prefetch_tokens_occupied = max(
-            0, cc.prefetch_tokens_occupied - len(prefetch_key)
+            0,
+            cc.prefetch_tokens_occupied
+            - _reserved_prefetch_tokens(_operation, prefetch_key),
+        )
+
+    def _discard_completed_prefetch(self, operation: PrefetchOperation) -> None:
+        """Release all buffers after a globally failed fail-closed prefetch."""
+        req_id = operation.request_id
+        info = self.ongoing_prefetch.pop(req_id, None)
+        if info is None:
+            return
+        if info.anchor_lock_params is not None:
+            self.dec_host_lock_ref(info.anchor_node_id, info.anchor_lock_params)
+        self.cache_controller.prefetch_tokens_occupied = max(
+            0,
+            self.cache_controller.prefetch_tokens_occupied
+            - _reserved_prefetch_tokens(operation, info.prefetch_key),
+        )
+        self.cache_controller.append_host_mem_release(
+            host_indices=operation.host_indices,
+            extra_pools=operation.pool_transfers,
+        )
+        self.prefetch_loaded_tokens_by_reqid[req_id] = 0
+        logger.warning(
+            "HiCache PP file-L3 prefetch fell back to recompute req=%s "
+            "skip_reason=%s",
+            req_id,
+            operation.skip_reason,
         )
 
     def _drain_storage_control_queues_impl(
@@ -1504,14 +1690,24 @@ class UnifiedRadixCache(BasePrefixCache):
                 req_id = operation.request_id
                 info = self.ongoing_prefetch.get(req_id)
                 if info is None:
-                    # request already aborted/cleaned up, skip
-                    continue
-                if operation.is_terminated():
-                    # request was aborted while the storage query was in flight
-                    self._revoke_pending_prefetch(req_id)
+                    if (
+                        operation.fail_closed
+                        and operation.storage_hit_count >= self.prefetch_threshold
+                    ):
+                        cc.enqueue_failed_prefetch_completion(
+                            operation, reason="request_state_missing"
+                        )
                     continue
                 if operation.storage_hit_count < self.prefetch_threshold:
                     self._revoke_pending_prefetch(req_id)
+                    continue
+                if operation.is_terminated() or operation.force_revoke:
+                    if operation.fail_closed:
+                        cc.enqueue_failed_prefetch_completion(
+                            operation, reason="request_terminated"
+                        )
+                    else:
+                        self._revoke_pending_prefetch(req_id)
                     continue
 
                 alloc_len = operation.storage_hit_count
@@ -1519,7 +1715,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 if host_indices is None:
                     self.evict_host(alloc_len)
                     host_indices = cc.mem_pool_host.alloc(alloc_len)
-                if host_indices is None:
+                if host_indices is None and not operation.fail_closed:
                     # Memory-pressure fallback: a shorter page-aligned prefix.
                     available_size = cc.mem_pool_host.available_size()
                     alloc_len = min(
@@ -1529,7 +1725,12 @@ class UnifiedRadixCache(BasePrefixCache):
                     if alloc_len >= self.prefetch_threshold:
                         host_indices = cc.mem_pool_host.alloc(alloc_len)
                 if host_indices is None:
-                    self._revoke_pending_prefetch(req_id)
+                    if operation.fail_closed:
+                        cc.enqueue_failed_prefetch_completion(
+                            operation, reason="host_pool_allocation_failed"
+                        )
+                    else:
+                        self._revoke_pending_prefetch(req_id)
                     continue
 
                 operation.storage_hit_count = alloc_len
@@ -1537,6 +1738,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     : alloc_len // self.page_size
                 ]
                 operation.host_indices = host_indices
+                operation.completion_enqueued = True
                 self.ongoing_prefetch[req_id] = info._replace(host_indices=host_indices)
                 cc.prefetch_buffer.put(operation)
 
@@ -1545,8 +1747,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 operation = ack.operation
                 if ack.completed_tokens is not None:
                     if operation.request_id in self.ongoing_prefetch:
-                        assert operation.completed_tokens <= ack.completed_tokens
+                        if not operation.fail_closed:
+                            assert operation.completed_tokens <= ack.completed_tokens
                         operation.completed_tokens = ack.completed_tokens
+                        if (
+                            operation.fail_closed
+                            and operation.storage_hit_count > 0
+                            and ack.completed_tokens == 0
+                        ):
+                            operation.force_revoke = True
                 if ack.pool_hits is not None:
                     if operation.request_id in self.ongoing_prefetch:
                         operation.pool_storage_result.update_extra_pool_hit_pages(
@@ -1555,7 +1764,12 @@ class UnifiedRadixCache(BasePrefixCache):
                         operation.pool_transfers_done = True
                 if ack.completed_req:
                     if operation.request_id in self.ongoing_prefetch:
+                        if operation.force_revoke:
+                            self._discard_completed_prefetch(operation)
+                            continue
                         self._handle_prefetch_result(operation)
+                    if operation.host_indices is None:
+                        continue
                     cc.append_host_mem_release(
                         operation.host_indices[operation.completed_tokens :],
                         (
