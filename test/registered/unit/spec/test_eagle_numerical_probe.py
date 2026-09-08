@@ -27,6 +27,47 @@ class TestEagleNumericalProbe(unittest.TestCase):
             pod_uid="probe-pod-uid" if expected_rid else None,
         )
 
+    @staticmethod
+    def record_target_verify(probe, *, batch_size=1, draft_token_num=2):
+        rows = batch_size * draft_token_num
+        hidden = torch.arange(rows * 4, dtype=torch.bfloat16).reshape(rows, 4)
+        active = probe.record_target_verify_input(
+            rids=["probe-rid"],
+            draft_token=torch.arange(10, 10 + rows, dtype=torch.int64),
+            positions=torch.arange(100, 100 + rows, dtype=torch.int64),
+            retrieve_index=torch.arange(rows, dtype=torch.int64).reshape(
+                batch_size, draft_token_num
+            ),
+            retrieve_next_token=torch.full(
+                (batch_size, draft_token_num), -1, dtype=torch.int64
+            ),
+            retrieve_next_sibling=torch.full(
+                (batch_size, draft_token_num), -1, dtype=torch.int64
+            ),
+            batch_size=batch_size,
+            draft_token_num=draft_token_num,
+        )
+        probe.record_target_verify_output(
+            logits=torch.arange(rows * 6, dtype=torch.float32).reshape(rows, 6),
+            hidden_states=hidden,
+            logical_rows=rows,
+        )
+        probe.record_target_verify_sample(
+            predict=torch.arange(20, 20 + rows, dtype=torch.int32),
+            logical_rows=rows,
+        )
+        probe.record_target_verify_accept(
+            accept_lens=torch.ones(batch_size, dtype=torch.int32),
+            accept_index=torch.zeros((batch_size, 2), dtype=torch.int32),
+            batch_size=batch_size,
+        )
+        probe.record_target_verify_handoff(
+            predict=torch.arange(20, 20 + rows, dtype=torch.int32),
+            hidden_states=hidden,
+            logical_rows=rows,
+        )
+        return active
+
     def test_default_off_is_noop(self):
         probe = self.probe(None)
         batch = SimpleNamespace(reqs=[SimpleNamespace(rid="probe-rid")])
@@ -70,6 +111,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
                 "sglang.srt.speculative.eagle_numerical_probe", level="WARNING"
             ) as logs,
         ):
+            self.assertTrue(self.record_target_verify(probe))
             with probe.forward_scope(
                 forward_batch,
                 phase="decode",
@@ -104,7 +146,6 @@ class TestEagleNumericalProbe(unittest.TestCase):
 
         self.assertIsNone(forward_batch._eagle_numerical_probe_callback)
         self.assertIsNone(forward_batch._eagle_numerical_probe_phase)
-
         stage_payloads = [
             json.loads(line.split("EAGLE_NUMERICAL_PROBE_STAGE ", 1)[1])
             for line in logs.output
@@ -113,6 +154,11 @@ class TestEagleNumericalProbe(unittest.TestCase):
         self.assertEqual(
             [payload["stage"] for payload in stage_payloads],
             [
+                "target_verify_input",
+                "target_verify_output",
+                "target_verify_sample",
+                "target_verify_accept",
+                "target_verify_handoff",
                 "draft_extend_input",
                 "nextn_embed",
                 "nextn_decoder",
@@ -122,21 +168,15 @@ class TestEagleNumericalProbe(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            [payload["ordinal"] for payload in stage_payloads], list(range(1, 7))
+            [payload["ordinal"] for payload in stage_payloads], list(range(1, 12))
         )
-        self.assertEqual(stage_payloads[0]["rid"], "probe-rid")
-        self.assertEqual(stage_payloads[0]["phase"], "decode")
-        self.assertEqual(
-            stage_payloads[0]["rank"], {"world": 13, "pp": 1, "attn_dp": 5}
+        self.assertTrue(
+            all(
+                payload["capture"] == probe.capture
+                and payload["rank"] == {"world": 13, "pp": 1, "attn_dp": 5}
+                for payload in stage_payloads
+            )
         )
-        self.assertEqual(stage_payloads[0]["logical_rows"], 2)
-        self.assertEqual(stage_payloads[0]["row_domain"], "dense_request_major_prefix")
-        self.assertEqual(stage_payloads[-1]["row_domain"], "request_terminal")
-        self.assertEqual(
-            stage_payloads[0]["fingerprints"]["input_ids"]["values"],
-            [11, 12],
-        )
-
         payload = json.loads(
             logs.output[-1].split("EAGLE_NUMERICAL_PROBE_RESULT ", 1)[1]
         )
@@ -149,18 +189,17 @@ class TestEagleNumericalProbe(unittest.TestCase):
                 "pod_uid": "probe-pod-uid",
             },
         )
-        self.assertTrue(
-            all(
-                stage_payload["capture"] == payload["capture"]
-                for stage_payload in stage_payloads
-            )
-        )
         self.assertTrue(payload["natural_stop"])
         self.assertTrue(payload["normal_completion"])
         stages = payload["phases"]["decode"]
         self.assertEqual(
             set(stages),
             {
+                "target_verify_input",
+                "target_verify_output",
+                "target_verify_sample",
+                "target_verify_accept",
+                "target_verify_handoff",
                 "draft_extend_input",
                 "nextn_embed",
                 "nextn_decoder",
@@ -168,6 +207,18 @@ class TestEagleNumericalProbe(unittest.TestCase):
                 "nextn_logits",
                 "proposed_token",
             },
+        )
+        self.assertEqual(
+            stages["target_verify_input"]["tensors"]["draft_token"]["values"],
+            [10, 11],
+        )
+        self.assertEqual(
+            stages["target_verify_sample"]["tensors"]["predict"]["values"],
+            [20, 21],
+        )
+        self.assertEqual(
+            stages["target_verify_accept"]["tensors"]["accept_lens"]["values"],
+            [1],
         )
         self.assertEqual(
             stages["draft_extend_input"]["tensors"]["input_ids"]["values"],
@@ -178,7 +229,14 @@ class TestEagleNumericalProbe(unittest.TestCase):
             [3],
         )
         self.assertEqual(stages["draft_extend_input"]["logical_rows"], 2)
+        self.assertEqual(stages["target_verify_input"]["logical_rows"], 2)
+        self.assertEqual(stages["target_verify_accept"]["logical_rows"], 1)
         self.assertEqual(stages["proposed_token"]["logical_rows"], 1)
+        self.assertEqual(
+            stages["target_verify_input"]["row_domain"],
+            "target_verify_tree_node",
+        )
+        self.assertEqual(stages["target_verify_accept"]["row_domain"], "request")
         self.assertEqual(
             stages["draft_extend_input"]["row_domain"],
             "dense_request_major_prefix",
@@ -216,15 +274,9 @@ class TestEagleNumericalProbe(unittest.TestCase):
         streams["cuda:0"].synchronize.assert_called_once_with()
         streams["cuda:1"].synchronize.assert_called_once_with()
 
-    def test_completed_stage_prefix_survives_cuda_runtime_error(self):
+    def test_target_verify_prefix_survives_cuda_runtime_error(self):
         probe = self.probe()
-        forward_batch = SimpleNamespace(
-            rids=["probe-rid"],
-            _eagle_numerical_probe_callback=None,
-            _eagle_numerical_probe_phase=None,
-        )
-        tensor = torch.ones((1, 2))
-
+        tensor = torch.ones((2, 2))
         with (
             mock.patch(
                 "sglang.srt.speculative.eagle_numerical_probe._synchronize_cuda_tensors",
@@ -235,21 +287,26 @@ class TestEagleNumericalProbe(unittest.TestCase):
             ) as logs,
             self.assertRaisesRegex(RuntimeError, "CUDA illegal memory access"),
         ):
-            with probe.forward_scope(
-                forward_batch,
-                phase="decode",
-                logical_rows=1,
-                using_cuda_graph=False,
-                input_ids=torch.ones(1, dtype=torch.int64),
-                target_hidden_states=tensor,
-                positions=torch.ones(1, dtype=torch.int64),
-            ):
-                maybe_record_eagle_numerical_stage(
-                    forward_batch, "nextn_embed", hidden_states=tensor
+            self.assertTrue(
+                probe.record_target_verify_input(
+                    rids=["probe-rid"],
+                    draft_token=torch.tensor([10, 11]),
+                    positions=torch.tensor([20, 21]),
+                    retrieve_index=torch.tensor([[0, 1]]),
+                    retrieve_next_token=torch.tensor([[1, -1]]),
+                    retrieve_next_sibling=torch.tensor([[-1, -1]]),
+                    batch_size=1,
+                    draft_token_num=2,
                 )
-                maybe_record_eagle_numerical_stage(
-                    forward_batch, "nextn_decoder", hidden_states=tensor
-                )
+            )
+            probe.record_target_verify_output(
+                logits=torch.ones((2, 3)),
+                hidden_states=tensor,
+                logical_rows=2,
+            )
+            probe.record_target_verify_sample(
+                predict=torch.tensor([7, 8]), logical_rows=2
+            )
 
         events = [
             (
@@ -266,102 +323,67 @@ class TestEagleNumericalProbe(unittest.TestCase):
         self.assertEqual(
             [(kind, payload["stage"]) for kind, payload in events],
             [
-                ("stage", "draft_extend_input"),
-                ("stage", "nextn_embed"),
-                ("error", "nextn_decoder"),
+                ("stage", "target_verify_input"),
+                ("stage", "target_verify_output"),
+                ("error", "target_verify_sample"),
             ],
         )
         self.assertEqual(events[-1][1]["ordinal"], 3)
-        self.assertEqual(events[-1][1]["error_type"], "RuntimeError")
-        self.assertTrue(
-            all(
-                payload["capture"]
-                == {
-                    "id": "capture-test-generation",
-                    "pod_name": "probe-pod",
-                    "pod_uid": "probe-pod-uid",
-                }
-                for _, payload in events
-            )
-        )
+        self.assertEqual(events[-1][1]["capture"], probe.capture)
         self.assertFalse(probe.can_probe)
-        self.assertIsNone(forward_batch._eagle_numerical_probe_callback)
 
     def test_default_off_and_unmatched_rid_emit_no_stage_events(self):
-        tensor = torch.ones((1, 2))
         for expected_rid in (None, "probe-rid"):
             probe = self.probe(expected_rid)
-            forward_batch = SimpleNamespace(
-                rids=["other-rid"],
-                _eagle_numerical_probe_callback=None,
-                _eagle_numerical_probe_phase=None,
-            )
             with self.assertNoLogs(
                 "sglang.srt.speculative.eagle_numerical_probe",
                 level="WARNING",
             ):
-                with probe.forward_scope(
-                    forward_batch,
-                    phase="decode",
-                    logical_rows=1,
-                    using_cuda_graph=False,
-                    input_ids=torch.ones(1, dtype=torch.int64),
-                    target_hidden_states=tensor,
+                active = probe.record_target_verify_input(
+                    rids=["other-rid"],
+                    draft_token=torch.ones(1, dtype=torch.int64),
                     positions=torch.ones(1, dtype=torch.int64),
-                ) as active:
-                    self.assertFalse(active)
+                    retrieve_index=torch.zeros((1, 1), dtype=torch.int64),
+                    retrieve_next_token=torch.full((1, 1), -1, dtype=torch.int64),
+                    retrieve_next_sibling=torch.full((1, 1), -1, dtype=torch.int64),
+                    batch_size=1,
+                    draft_token_num=1,
+                )
+            self.assertFalse(active)
 
     def test_duplicate_stage_still_fails_closed(self):
         probe = self.probe()
-        forward_batch = SimpleNamespace(
-            rids=["probe-rid"],
-            _eagle_numerical_probe_callback=None,
-            _eagle_numerical_probe_phase=None,
-        )
-        tensor = torch.ones((1, 2))
-        with self.assertLogs(
-            "sglang.srt.speculative.eagle_numerical_probe", level="WARNING"
-        ):
-            with probe.forward_scope(
-                forward_batch,
-                phase="decode",
-                logical_rows=1,
-                using_cuda_graph=False,
-                input_ids=torch.ones(1, dtype=torch.int64),
-                target_hidden_states=tensor,
+        self.assertTrue(
+            probe.record_target_verify_input(
+                rids=["probe-rid"],
+                draft_token=torch.ones(1, dtype=torch.int64),
                 positions=torch.ones(1, dtype=torch.int64),
-            ):
-                maybe_record_eagle_numerical_stage(
-                    forward_batch, "nextn_embed", hidden_states=tensor
-                )
-                maybe_record_eagle_numerical_stage(
-                    forward_batch, "nextn_embed", hidden_states=tensor
-                )
+                retrieve_index=torch.zeros((1, 1), dtype=torch.int64),
+                retrieve_next_token=torch.full((1, 1), -1, dtype=torch.int64),
+                retrieve_next_sibling=torch.full((1, 1), -1, dtype=torch.int64),
+                batch_size=1,
+                draft_token_num=1,
+            )
+        )
+        probe.record_target_verify_output(
+            logits=torch.ones((1, 2)),
+            hidden_states=torch.ones((1, 2)),
+            logical_rows=1,
+        )
+        probe.record_target_verify_output(
+            logits=torch.ones((1, 2)),
+            hidden_states=torch.ones((1, 2)),
+            logical_rows=1,
+        )
         self.assertFalse(probe.can_probe)
 
     def test_out_of_order_stage_still_fails_closed(self):
         probe = self.probe()
-        forward_batch = SimpleNamespace(
-            rids=["probe-rid"],
-            _eagle_numerical_probe_callback=None,
-            _eagle_numerical_probe_phase=None,
+        probe.record_target_verify_accept(
+            accept_lens=torch.ones(1, dtype=torch.int32),
+            accept_index=torch.zeros((1, 2), dtype=torch.int32),
+            batch_size=1,
         )
-        tensor = torch.ones((1, 2))
-        with self.assertLogs(
-            "sglang.srt.speculative.eagle_numerical_probe", level="WARNING"
-        ):
-            with probe.forward_scope(
-                forward_batch,
-                phase="decode",
-                logical_rows=1,
-                using_cuda_graph=False,
-                input_ids=torch.ones(1, dtype=torch.int64),
-                target_hidden_states=tensor,
-                positions=torch.ones(1, dtype=torch.int64),
-            ):
-                maybe_record_eagle_numerical_stage(
-                    forward_batch, "nextn_decoder", hidden_states=tensor
-                )
         self.assertFalse(probe.can_probe)
 
     def test_co_batched_rid_defers_without_forcing_eager_or_rejecting(self):
@@ -373,6 +395,12 @@ class TestEagleNumericalProbe(unittest.TestCase):
         self.assertTrue(probe.can_probe)
 
         sole_batch = SimpleNamespace(reqs=[SimpleNamespace(rid="probe-rid")])
+        self.assertTrue(probe.needs_eager_for_schedule_batch(sole_batch))
+
+        # Starting target verify must not release the eager vote: the same
+        # iteration's downstream draft-extend still has to remain outside its
+        # CUDA graph before the capture is complete.
+        self.assertTrue(self.record_target_verify(probe))
         self.assertTrue(probe.needs_eager_for_schedule_batch(sole_batch))
 
     def test_wrong_rid_and_second_decode_do_not_capture(self):
@@ -394,7 +422,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
         ) as active:
             self.assertFalse(active)
 
-        probe._records["decode"] = {}
+        self.assertTrue(self.record_target_verify(probe))
         matching = SimpleNamespace(
             rids=["probe-rid"],
             _eagle_numerical_probe_callback=None,
@@ -409,10 +437,63 @@ class TestEagleNumericalProbe(unittest.TestCase):
             target_hidden_states=tensor,
             positions=torch.ones(1, dtype=torch.int64),
         ) as active:
+            self.assertTrue(active)
+        with probe.forward_scope(
+            matching,
+            phase="decode",
+            logical_rows=1,
+            using_cuda_graph=False,
+            input_ids=torch.ones(1, dtype=torch.int64),
+            target_hidden_states=tensor,
+            positions=torch.ones(1, dtype=torch.int64),
+        ) as active:
             self.assertFalse(active)
 
     def test_missing_required_tensor_fails_closed(self):
         probe = self.probe()
+        self.assertTrue(
+            probe.record_target_verify_input(
+                rids=["probe-rid"],
+                draft_token=torch.ones(1, dtype=torch.int64),
+                positions=torch.ones(1, dtype=torch.int64),
+                retrieve_index=torch.zeros((1, 1), dtype=torch.int64),
+                retrieve_next_token=torch.full((1, 1), -1, dtype=torch.int64),
+                retrieve_next_sibling=torch.full((1, 1), -1, dtype=torch.int64),
+                batch_size=1,
+                draft_token_num=1,
+            )
+        )
+        probe.record_target_verify_output(
+            logits=torch.ones((1, 2)), hidden_states=None, logical_rows=1
+        )
+        self.assertFalse(probe.can_probe)
+
+    def test_out_of_order_target_verify_stage_fails_closed(self):
+        probe = self.probe()
+        probe.record_target_verify_sample(
+            predict=torch.ones(1, dtype=torch.int32), logical_rows=1
+        )
+        self.assertFalse(probe.can_probe)
+
+    def test_wrong_rid_does_not_start_target_verify_capture(self):
+        probe = self.probe()
+        self.assertFalse(
+            probe.record_target_verify_input(
+                rids=["other-rid"],
+                draft_token=torch.ones(1, dtype=torch.int64),
+                positions=torch.ones(1, dtype=torch.int64),
+                retrieve_index=torch.zeros((1, 1), dtype=torch.int64),
+                retrieve_next_token=torch.full((1, 1), -1, dtype=torch.int64),
+                retrieve_next_sibling=torch.full((1, 1), -1, dtype=torch.int64),
+                batch_size=1,
+                draft_token_num=1,
+            )
+        )
+        self.assertTrue(probe.can_probe)
+
+    def test_missing_later_required_tensor_fails_closed(self):
+        probe = self.probe()
+        self.assertTrue(self.record_target_verify(probe))
         forward_batch = SimpleNamespace(
             rids=["probe-rid"],
             _eagle_numerical_probe_callback=None,
@@ -428,14 +509,6 @@ class TestEagleNumericalProbe(unittest.TestCase):
             target_hidden_states=tensor,
             positions=torch.ones(1, dtype=torch.int64),
         ):
-            for stage, value in (
-                ("nextn_embed", tensor),
-                ("nextn_decoder", tensor),
-                ("nextn_norm", tensor),
-            ):
-                maybe_record_eagle_numerical_stage(
-                    forward_batch, stage, hidden_states=value
-                )
             maybe_record_eagle_numerical_stage(
                 forward_batch, "nextn_logits", logits=None
             )
@@ -443,6 +516,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
 
     def test_proposal_row_domain_mismatch_fails_closed(self):
         probe = self.probe()
+        self.assertTrue(self.record_target_verify(probe))
         forward_batch = SimpleNamespace(
             rids=["probe-rid"],
             _eagle_numerical_probe_callback=None,
@@ -480,6 +554,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
             logs.output[-1].split("EAGLE_NUMERICAL_PROBE_RESULT ", 1)[1]
         )
         self.assertEqual(payload["status"], "rejected")
+        self.assertEqual(payload["capture"], self.probe().capture)
         self.assertIn("phase decode missing stages", payload["rejection"])
 
     def test_abnormal_completion_fails_closed_and_preserves_stop_reason(self):

@@ -79,6 +79,7 @@ jobs:
             python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py \
             python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py \
             python/sglang/srt/speculative/eagle_numerical_probe.py \
+            python/sglang/srt/speculative/eagle_worker_common.py \
             python/sglang/srt/speculative/eagle_worker_v2.py)"
           test "$runtime_diff" = "$allowed_runtime_diff"
           source_commit="$(git rev-parse HEAD)"

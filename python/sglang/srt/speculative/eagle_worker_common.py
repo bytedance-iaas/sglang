@@ -480,6 +480,7 @@ def run_eagle_verify(
     finalize_tree_path: bool,
     grammar_barrier=None,
     pp_proxy_tensors=None,
+    numerical_probe=None,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -492,6 +493,10 @@ def run_eagle_verify(
     - ``finalize_tree_path``: single-layer compacts the accepted tree path to
       the front of each per-req block for topk > 1; multi-layer has never run
       this compaction.
+
+    ``numerical_probe`` is a default-off exact-RID observer. It is evaluated
+    only on the PP last rank for output/sample stages; non-last PP ranks still
+    run their target shard without emitting an incomplete trace.
     """
     fwd_stream = torch.get_device_module(device).current_stream()
     verify_input: EagleVerifyInput = batch.spec_info
@@ -540,6 +545,26 @@ def run_eagle_verify(
             ),
         )
 
+    # The verify tree is produced on plan_stream and update_verify_buffers above
+    # may finalize its backend-owned metadata. Fingerprint only after that
+    # producer/consumer boundary, immediately before the target verify launch.
+    # Only the PP last rank owns sampling and the downstream draft worker, so
+    # other ranks must not start a trace they cannot complete.
+    numerical_probe_active = bool(
+        numerical_probe is not None
+        and (get_parallel().pp_size == 1 or target_worker.pp_group.is_last_rank)
+        and numerical_probe.record_target_verify_input(
+            rids=verify_forward_batch.rids,
+            draft_token=verify_input.draft_token,
+            positions=verify_input.positions,
+            retrieve_index=verify_input.retrieve_index,
+            retrieve_next_token=verify_input.retrieve_next_token,
+            retrieve_next_sibling=verify_input.retrieve_next_sibling,
+            batch_size=bs,
+            draft_token_num=verify_input.draft_token_num,
+        )
+    )
+
     # Must stay ahead of the target verify launch below.
     grammar_tree = (
         GrammarTree.from_device(
@@ -582,6 +607,13 @@ def run_eagle_verify(
     if pp_enabled and not pp_is_last_rank:
         return forward_batch_output
 
+    if numerical_probe_active:
+        numerical_probe.record_target_verify_output(
+            logits=logits_output.next_token_logits,
+            hidden_states=logits_output.hidden_states,
+            logical_rows=bs * verify_input.draft_token_num,
+        )
+
     # Generate vocab mask for constrained decoding
     grammar_mask = None
     if batch.has_grammar:
@@ -601,6 +633,16 @@ def run_eagle_verify(
         accept_lens,
         accept_index,
     ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
+    if numerical_probe_active:
+        numerical_probe.record_target_verify_sample(
+            predict=predict,
+            logical_rows=bs * verify_input.draft_token_num,
+        )
+        numerical_probe.record_target_verify_accept(
+            accept_lens=accept_lens,
+            accept_index=accept_index,
+            batch_size=bs,
+        )
     new_seq_lens = batch.seq_lens + accept_lens
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),
@@ -654,6 +696,13 @@ def run_eagle_verify(
             bs,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             num_draft_tokens=num_draft_tokens,
+        )
+
+    if numerical_probe_active:
+        numerical_probe.record_target_verify_handoff(
+            predict=predict,
+            hidden_states=logits_output.hidden_states,
+            logical_rows=bs * verify_input.draft_token_num,
         )
 
     next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)

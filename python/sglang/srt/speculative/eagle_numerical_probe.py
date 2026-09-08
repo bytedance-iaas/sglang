@@ -1,9 +1,9 @@
-"""Exact-request numerical fingerprints for EAGLE NextN localization.
+"""Exact-request numerical fingerprints for EAGLE verify/NextN localization.
 
 The probe is diagnostic-only and default-off.  It records the first matching
-decode draft-extend forward.  Every selected stage synchronizes its current
-CUDA stream and emits a fingerprint immediately, so a later device fault does
-not erase the completed stage prefix.
+decode target-verify and draft-extend sequence.  Every selected stage
+synchronizes its current CUDA stream and emits a fingerprint immediately, so a
+later device fault does not erase the completed stage prefix.
 """
 
 from __future__ import annotations
@@ -21,6 +21,11 @@ from sglang.srt.runtime_context import get_parallel
 logger = logging.getLogger(__name__)
 
 _REQUIRED_STAGES = (
+    "target_verify_input",
+    "target_verify_output",
+    "target_verify_sample",
+    "target_verify_accept",
+    "target_verify_handoff",
     "draft_extend_input",
     "nextn_embed",
     "nextn_decoder",
@@ -30,6 +35,19 @@ _REQUIRED_STAGES = (
 )
 _REQUIRED_STAGE_SET = frozenset(_REQUIRED_STAGES)
 _REQUIRED_TENSORS = {
+    "target_verify_input": frozenset(
+        {
+            "draft_token",
+            "positions",
+            "retrieve_index",
+            "retrieve_next_token",
+            "retrieve_next_sibling",
+        }
+    ),
+    "target_verify_output": frozenset({"logits", "hidden_states"}),
+    "target_verify_sample": frozenset({"predict"}),
+    "target_verify_accept": frozenset({"accept_lens", "accept_index"}),
+    "target_verify_handoff": frozenset({"predict", "hidden_states"}),
     "draft_extend_input": frozenset({"input_ids", "positions", "target_hidden_states"}),
     "nextn_embed": frozenset({"hidden_states"}),
     "nextn_decoder": frozenset({"hidden_states"}),
@@ -39,6 +57,8 @@ _REQUIRED_TENSORS = {
 }
 _DENSE_ROW_DOMAIN = "dense_request_major_prefix"
 _PROPOSAL_ROW_DOMAIN = "request_terminal"
+_TARGET_TREE_ROW_DOMAIN = "target_verify_tree_node"
+_REQUEST_ROW_DOMAIN = "request"
 
 
 def _rank_payload() -> Optional[dict[str, int]]:
@@ -105,7 +125,7 @@ def _tensor_fingerprint(tensor: torch.Tensor, logical_rows: int) -> dict:
 
 
 class EagleNumericalProbe:
-    """Capture one complete numerical fingerprint per draft-extend phase."""
+    """Capture one complete target-verify through draft-extend fingerprint."""
 
     def __init__(
         self,
@@ -157,7 +177,9 @@ class EagleNumericalProbe:
         return self.matches_rids([req.rid for req in batch.reqs])
 
     def needs_eager_for_schedule_batch(self, batch) -> bool:
-        return self.matches_schedule_batch(batch) and "decode" not in self._records
+        return self.matches_schedule_batch(batch) and "draft_extend_input" not in (
+            self._records.get("decode", {})
+        )
 
     def _reject(self, reason: str) -> None:
         if self._rejection is None:
@@ -284,6 +306,106 @@ class EagleNumericalProbe:
             ):
                 raise
 
+    def _record_explicit(
+        self,
+        stage: str,
+        tensors: dict[str, Optional[torch.Tensor]],
+        *,
+        logical_rows: int,
+        row_domain: str,
+    ) -> None:
+        previous_phase = self._active_phase
+        previous_rows = self._active_rows
+        self._active_phase = "decode"
+        self._active_rows = logical_rows
+        try:
+            self._record(stage, tensors, row_domain=row_domain)
+        finally:
+            self._active_phase = previous_phase
+            self._active_rows = previous_rows
+
+    def record_target_verify_input(
+        self,
+        *,
+        rids: Optional[list[str]],
+        draft_token: torch.Tensor,
+        positions: torch.Tensor,
+        retrieve_index: torch.Tensor,
+        retrieve_next_token: torch.Tensor,
+        retrieve_next_sibling: torch.Tensor,
+        batch_size: int,
+        draft_token_num: int,
+    ) -> bool:
+        """Start the one-shot capture at the target-verify input tree."""
+        if not self.matches_rids(rids):
+            return False
+        self._seen = True
+        if "decode" in self._records:
+            return False
+        logical_rows = batch_size * draft_token_num
+        self._proposal_rows["decode"] = batch_size
+        self._record_explicit(
+            "target_verify_input",
+            {
+                "draft_token": draft_token,
+                "positions": positions,
+                "retrieve_index": retrieve_index.reshape(-1),
+                "retrieve_next_token": retrieve_next_token.reshape(-1),
+                "retrieve_next_sibling": retrieve_next_sibling.reshape(-1),
+            },
+            logical_rows=logical_rows,
+            row_domain=_TARGET_TREE_ROW_DOMAIN,
+        )
+        return self.can_probe
+
+    def record_target_verify_output(
+        self,
+        *,
+        logits: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
+        logical_rows: int,
+    ) -> None:
+        self._record_explicit(
+            "target_verify_output",
+            {"logits": logits, "hidden_states": hidden_states},
+            logical_rows=logical_rows,
+            row_domain=_TARGET_TREE_ROW_DOMAIN,
+        )
+
+    def record_target_verify_sample(
+        self, *, predict: torch.Tensor, logical_rows: int
+    ) -> None:
+        self._record_explicit(
+            "target_verify_sample",
+            {"predict": predict},
+            logical_rows=logical_rows,
+            row_domain=_TARGET_TREE_ROW_DOMAIN,
+        )
+
+    def record_target_verify_accept(
+        self, *, accept_lens: torch.Tensor, accept_index: torch.Tensor, batch_size: int
+    ) -> None:
+        self._record_explicit(
+            "target_verify_accept",
+            {"accept_lens": accept_lens, "accept_index": accept_index},
+            logical_rows=batch_size,
+            row_domain=_REQUEST_ROW_DOMAIN,
+        )
+
+    def record_target_verify_handoff(
+        self,
+        *,
+        predict: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
+        logical_rows: int,
+    ) -> None:
+        self._record_explicit(
+            "target_verify_handoff",
+            {"predict": predict, "hidden_states": hidden_states},
+            logical_rows=logical_rows,
+            row_domain=_TARGET_TREE_ROW_DOMAIN,
+        )
+
     @contextlib.contextmanager
     def forward_scope(
         self,
@@ -301,7 +423,7 @@ class EagleNumericalProbe:
             return
 
         self._seen = True
-        if not self.can_probe or phase in self._records:
+        if not self.can_probe or "draft_extend_input" in self._records.get(phase, {}):
             yield False
             return
         if phase != "decode":
