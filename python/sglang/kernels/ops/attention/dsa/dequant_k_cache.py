@@ -9,6 +9,35 @@ def dequantize_k_cache(quant_k_cache):
     return _dequantize_k_cache_fast_wrapped(quant_k_cache)
 
 
+def dequantize_sparse_nope_cache(
+    quant_k_cache: torch.Tensor, indices: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Read 528-byte FP8 KV with four FP32 scales, preserving sparse masks.
+
+    Materialize the smaller of the physical pool and the selected-token table.
+    The gathered form may duplicate shared tokens, but bounds BF16 workspace by
+    ``min(physical_tokens, indices.numel()) * 1024`` bytes without a host sync
+    or data-dependent unique operation. Returned indices address this workspace.
+    """
+    if (
+        quant_k_cache.ndim != 3
+        or quant_k_cache.shape[1:] != (1, 528)
+        or quant_k_cache.dtype != torch.float8_e4m3fn
+    ):
+        raise ValueError("expected [physical tokens, 1, 528] group-scaled FP8 NoPE KV")
+    if indices.numel() >= quant_k_cache.shape[0]:
+        return dequantize_k_cache(quant_k_cache), indices
+    valid = (indices >= 0) & (indices < quant_k_cache.shape[0])
+    # The existing paged reader requires in-bounds physical indices. Invalid
+    # entries gather a safe row but retain -1 in the new table, so even a
+    # poisoned row 0 cannot become an attention contribution.
+    safe_indices = torch.where(valid, indices, 0).flatten()
+    kv = dequantize_k_cache_paged(quant_k_cache, safe_indices)
+    remapped = torch.arange(indices.numel(), device=indices.device, dtype=indices.dtype)
+    remapped = torch.where(valid, remapped.view_as(indices), -1)
+    return kv, remapped
+
+
 def _dequantize_k_cache_ref(
     quant_k_cache: torch.Tensor,  # (num_blocks, block_size, 1, bytes_per_token)
     dv: int = 512,

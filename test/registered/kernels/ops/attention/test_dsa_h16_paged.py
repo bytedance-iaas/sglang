@@ -15,7 +15,9 @@ pytestmark = pytest.mark.skipif(not is_sm90_supported(), reason="requires SM90")
 
 
 @pytest.mark.parametrize("fp8", [False, True])
-def test_h16_real_pool_write_move_and_graph(fp8):
+@pytest.mark.parametrize("pool_size", [128, 32768])
+@pytest.mark.parametrize("phase", ["prefill", "decode", "verify"])
+def test_nope_real_pool_write_move_and_graph(fp8, pool_size, phase):
     from sglang.kernels.ops.attention.dsa.dequant_k_cache import dequantize_k_cache
     from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
     from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
@@ -26,7 +28,7 @@ def test_h16_real_pool_write_move_and_graph(fp8):
     publish(ServerArgs(model_path="dummy"), role="tokenizer")
     try:
         pool = MLATokenToKVPool(
-            size=128,
+            size=pool_size,
             page_size=1,
             dtype=torch.float8_e4m3fn if fp8 else torch.bfloat16,
             kv_lora_rank=512,
@@ -37,10 +39,11 @@ def test_h16_real_pool_write_move_and_graph(fp8):
             use_dsa=True,
             override_kv_cache_dim=528 if fp8 else None,
         )
+        heads = 16 if phase == "prefill" else 64
         layer = SimpleNamespace(
             layer_id=0,
             is_cross_attention=False,
-            tp_q_head_num=16,
+            tp_q_head_num=heads,
             v_head_dim=512,
             head_dim=512,
             scaling=512**-0.5,
@@ -53,12 +56,12 @@ def test_h16_real_pool_write_move_and_graph(fp8):
         keys = keys.bfloat16()
         locs = torch.randperm(100, device="cuda", generator=generator)[:32] + 1
         pool.set_mla_kv_buffer(layer, locs, keys, None)
-        q = torch.randn(4, 16, 512, device="cuda", generator=generator).bfloat16()
+        q = torch.randn(4, heads, 512, device="cuda", generator=generator).bfloat16()
         # Prefix slots are non-contiguous, and live tails follow masked holes.
         indices = torch.full((4, 2051), -1, device="cuda", dtype=torch.int32)
         indices[1:, :10] = locs[:10].int()
         indices[2:, 2048:] = locs[10:13].int()
-        indices[1, 20] = 129
+        indices[1, 20] = pool_size + 1
         pool.kv_buffer[0][0].fill_(255 if fp8 else float("nan"))
 
         backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
@@ -72,10 +75,18 @@ def test_h16_real_pool_write_move_and_graph(fp8):
         backend.token_to_kv_pool = pool
         backend.hisparse_coordinator = None
         backend.forward_metadata = SimpleNamespace()
-        batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+        mode = {
+            "prefill": ForwardMode.EXTEND,
+            "decode": ForwardMode.DECODE,
+            "verify": ForwardMode.TARGET_VERIFY,
+        }[phase]
+        batch = SimpleNamespace(forward_mode=mode)
 
         def run():
-            return backend.forward_extend(
+            forward = (
+                backend.forward_decode if phase == "decode" else backend.forward_extend
+            )
+            return forward(
                 q,
                 None,
                 None,
@@ -86,11 +97,12 @@ def test_h16_real_pool_write_move_and_graph(fp8):
             )
 
         def check(actual):
+            actual = actual.view_as(q)
             cache = pool.get_key_buffer(0)
             decoded = dequantize_k_cache(cache) if fp8 else cache
             ids = indices.long()
             valid = (ids >= 0) & (ids < cache.shape[0])
-            selected = decoded[ids.clamp(1, 128), 0].float()
+            selected = decoded[ids.clamp(1, pool_size), 0].float()
             selected = torch.where(valid[:, :, None], selected, 0)
             scores = torch.einsum("qhd,qkd->qhk", q.float(), selected) * layer.scaling
             probs = (

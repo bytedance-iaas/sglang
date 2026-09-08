@@ -12,11 +12,13 @@ def sparse_mla_h16_paged_fwd(
 ) -> torch.Tensor:
     """Read BF16 or 528-byte group-scaled NoPE KV at physical token indices.
 
-    FP8 conversion materializes one BF16 cache workspace (1024 bytes per
-    physical token). It is part of this path's latency and peak-memory cost.
+    FP8 conversion materializes the smaller of the physical cache and selected
+    tokens in BF16. It is part of this path's latency and peak-memory cost.
     Invalid indices, including holes before KPool tail tokens, remain masked.
     """
-    from sglang.kernels.ops.attention.dsa.dequant_k_cache import dequantize_k_cache
+    from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
+        dequantize_sparse_nope_cache,
+    )
     from sglang.kernels.ops.attention.sparse_mla_h16_sm90 import sparse_mla_h16_fwd
 
     if q.dtype != torch.bfloat16 or q.ndim != 3 or q.shape[1:] != (16, 512):
@@ -24,7 +26,7 @@ def sparse_mla_h16_paged_fwd(
     if kv_cache.ndim != 3 or kv_cache.shape[1] != 1:
         raise ValueError("KV cache must have shape [physical tokens, 1, cache dim]")
     if kv_cache.dtype == torch.float8_e4m3fn and kv_cache.shape[-1] == 528:
-        kv_cache = dequantize_k_cache(kv_cache)
+        kv_cache, indices = dequantize_sparse_nope_cache(kv_cache, indices)
     elif kv_cache.dtype != torch.bfloat16 or kv_cache.shape[-1] != 512:
         raise ValueError("H16 prefill requires BF16 NoPE or 528-byte group-scaled KV")
 
