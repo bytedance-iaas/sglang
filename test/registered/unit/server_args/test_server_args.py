@@ -228,6 +228,234 @@ class TestSidpServerArgs(CustomTestCase):
             ["--model-path", "dummy", "--sidp-enable-peak-shifting"]
         )
         self.assertTrue(parsed.sidp_enable_peak_shifting)
+        self.assertEqual(parsed.sidp_peak_sync_strategy, "none")
+
+    def test_sidp_default_policy_and_backend_resolution(self):
+        args = self._make_sidp_args()
+        with patch.dict(
+            os.environ,
+            {"PYTORCH_CUDA_ALLOC_CONF": "", "PYTORCH_ALLOC_CONF": ""},
+        ):
+            args._handle_sidp()
+        self.assertEqual(args.sidp_prefetch_policy, "compute")
+        self.assertEqual(args.sidp_copy_backend, "dma")
+        self.assertEqual(args.sidp_slot_sync, "flag")
+        self.assertEqual(args.sidp_dma_slices, 1)
+        self.assertEqual(args.sidp_dma_slice_groups, 1)
+        self.assertEqual(args.sidp_dynamic_claim_order, "rotating")
+        self.assertFalse(args.sidp_sm_use_event_sync)
+        self.assertEqual(args.sidp_sm_copy_ctas, 0)
+        self.assertFalse(args.sidp_enable_peak_shifting)
+
+    def test_sidp_legacy_peak_maps_to_static_peak_dma(self):
+        args = self._make_sidp_args(sidp_enable_peak_shifting=True)
+        with patch.dict(
+            os.environ,
+            {"PYTORCH_CUDA_ALLOC_CONF": "", "PYTORCH_ALLOC_CONF": ""},
+        ):
+            args._handle_sidp()
+        self.assertEqual(args.sidp_prefetch_policy, "static_peak")
+        self.assertEqual(args.sidp_copy_backend, "dma")
+        self.assertEqual(args.sidp_slot_sync, "event")
+        self.assertTrue(args.sidp_enable_peak_shifting)
+
+    def test_sidp_dynamic_auto_selects_sm(self):
+        args = self._make_sidp_args(
+            sidp_prefetch_policy="dynamic_owner",
+            sidp_dynamic_claim_order="compute_priority",
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"PYTORCH_CUDA_ALLOC_CONF": "", "PYTORCH_ALLOC_CONF": ""},
+            ),
+            self.assertLogs(server_args_module.logger, level="WARNING") as logs,
+        ):
+            args._handle_sidp()
+        self.assertEqual(args.sidp_prefetch_policy, "dynamic_owner")
+        self.assertEqual(args.sidp_copy_backend, "sm")
+        self.assertEqual(args.sidp_slot_sync, "flag")
+        self.assertEqual(args.sidp_dynamic_claim_order, "compute_priority")
+        self.assertIn("experimental", "\n".join(logs.output))
+
+    def test_sidp_compute_sm_control_mode(self):
+        args = self._make_sidp_args(
+            sidp_prefetch_policy="compute",
+            sidp_copy_backend="sm",
+            sidp_sm_copy_ctas=32,
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"PYTORCH_CUDA_ALLOC_CONF": "", "PYTORCH_ALLOC_CONF": ""},
+            ),
+            self.assertLogs(server_args_module.logger, level="WARNING"),
+        ):
+            args._handle_sidp()
+        self.assertEqual(args.sidp_prefetch_policy, "compute")
+        self.assertEqual(args.sidp_copy_backend, "sm")
+        self.assertEqual(args.sidp_slot_sync, "flag")
+        self.assertEqual(args.sidp_sm_copy_ctas, 32)
+
+    def test_sidp_compute_sm_event_validation_mode(self):
+        args = self._make_sidp_args(
+            sidp_prefetch_policy="compute",
+            sidp_copy_backend="sm",
+            sidp_sm_use_event_sync=True,
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"PYTORCH_CUDA_ALLOC_CONF": "", "PYTORCH_ALLOC_CONF": ""},
+            ),
+            self.assertLogs(server_args_module.logger, level="WARNING") as logs,
+        ):
+            args._handle_sidp()
+        self.assertTrue(args.sidp_sm_use_event_sync)
+        self.assertEqual(args.sidp_slot_sync, "event")
+        self.assertIn("validation-only", "\n".join(logs.output))
+
+    def test_sidp_explicit_slot_sync_modes(self):
+        for slot_sync in ("event", "flag"):
+            with self.subTest(slot_sync=slot_sync):
+                args = self._make_sidp_args(sidp_slot_sync=slot_sync)
+                with patch.dict(
+                    os.environ,
+                    {"PYTORCH_CUDA_ALLOC_CONF": "", "PYTORCH_ALLOC_CONF": ""},
+                ):
+                    args._handle_sidp()
+                self.assertEqual(args.sidp_prefetch_policy, "compute")
+                self.assertEqual(args.sidp_copy_backend, "dma")
+                self.assertEqual(args.sidp_slot_sync, slot_sync)
+
+    def test_sidp_fixed_dma_arbitrary_slice_count(self):
+        for slot_sync in ("flag", "event"):
+            with self.subTest(slot_sync=slot_sync):
+                args = self._make_sidp_args(
+                    sidp_slot_sync=slot_sync,
+                    sidp_dma_slices=3,
+                    sidp_dma_slice_groups=2,
+                )
+                with patch.dict(
+                    os.environ,
+                    {"PYTORCH_CUDA_ALLOC_CONF": "", "PYTORCH_ALLOC_CONF": ""},
+                ):
+                    args._handle_sidp()
+                self.assertEqual(args.sidp_prefetch_policy, "compute")
+                self.assertEqual(args.sidp_copy_backend, "dma")
+                self.assertEqual(args.sidp_slot_sync, slot_sync)
+                self.assertEqual(args.sidp_dma_slices, 3)
+                self.assertEqual(args.sidp_dma_slice_groups, 2)
+
+    def test_sidp_invalid_policy_backend_combinations(self):
+        cases = [
+            (
+                {
+                    "sidp_prefetch_policy": "dynamic_owner",
+                    "sidp_copy_backend": "dma",
+                    "sidp_slot_sync": "event",
+                },
+                "dynamic_owner requires --sidp-slot-sync flag",
+            ),
+            (
+                {
+                    "sidp_prefetch_policy": "dynamic_owner",
+                    "sidp_peak_sync_strategy": "force_sync",
+                },
+                "only valid for static_peak",
+            ),
+            (
+                {
+                    "sidp_prefetch_policy": "dynamic_owner",
+                    "sidp_k": 8,
+                },
+                "requires remote weights",
+            ),
+            (
+                {"sidp_copy_backend": "sm", "enable_torch_compile": True},
+                "does not support --enable-torch-compile",
+            ),
+            (
+                {"sidp_copy_backend": "sm", "sidp_k": 8},
+                "SM copy requires remote weights",
+            ),
+            (
+                {
+                    "sidp_prefetch_policy": "dynamic_owner",
+                    "sidp_sm_use_event_sync": True,
+                },
+                r"dynamic_owner requires --sidp-slot-sync flag",
+            ),
+            (
+                {
+                    "sidp_prefetch_policy": "compute",
+                    "sidp_copy_backend": "dma",
+                    "sidp_sm_use_event_sync": True,
+                },
+                r"validation-only mode.*requires compute \+ sm",
+            ),
+            (
+                {"sidp_sm_copy_ctas": -1},
+                "sidp_sm_copy_ctas must be non-negative",
+            ),
+            (
+                {"sidp_sm_copy_ctas": 32},
+                "only valid with.*sidp-copy-backend sm",
+            ),
+            (
+                {"sidp_slot_sync": "invalid"},
+                "sidp_slot_sync must be one of",
+            ),
+            (
+                {"sidp_dma_slices": 0},
+                "sidp_dma_slices must be positive",
+            ),
+            (
+                {"sidp_dma_slice_groups": 2},
+                "only applies when.*sidp-dma-slices",
+            ),
+            (
+                {
+                    "sidp_dma_slices": 3,
+                    "sidp_prefetch_policy": "static_peak",
+                    "sidp_slot_sync": "event",
+                },
+                "DMA slicing requires.*compute.*dma",
+            ),
+            (
+                {"sidp_dma_slices": 3, "sidp_copy_backend": "sm"},
+                "DMA slicing requires.*compute.*dma",
+            ),
+            (
+                {"sidp_dma_slices": 3, "sidp_k": 8},
+                "DMA slicing requires remote weights",
+            ),
+            (
+                {
+                    "sidp_prefetch_policy": "compute",
+                    "sidp_dynamic_claim_order": "compute_priority",
+                },
+                "only valid with.*dynamic_owner",
+            ),
+            (
+                {
+                    "sidp_enable_peak_shifting": True,
+                    "sidp_prefetch_policy": "compute",
+                },
+                "conflicts",
+            ),
+        ]
+        for overrides, message in cases:
+            with self.subTest(overrides=overrides):
+                args = self._make_sidp_args(**overrides)
+                with (
+                    patch.dict(
+                        os.environ,
+                        {"PYTORCH_CUDA_ALLOC_CONF": "", "PYTORCH_ALLOC_CONF": ""},
+                    ),
+                    self.assertRaisesRegex(AssertionError, message),
+                ):
+                    args._handle_sidp()
 
     def test_graph_profiling_parameters(self):
         args = self._make_sidp_args(
@@ -244,7 +472,6 @@ class TestSidpServerArgs(CustomTestCase):
 
     def test_invalid_graph_profiling_parameters(self):
         cases = [
-            ({"disable_cuda_graph": True}, "requires CUDA Graph"),
             ({"sidp_profile_sample_interval": 0}, "must be at least 1"),
             ({"sidp_profile_warmup_replays": -1}, "cannot be negative"),
             ({"sidp_profile_output_dir": ""}, "cannot be empty"),
@@ -262,6 +489,21 @@ class TestSidpServerArgs(CustomTestCase):
                     self.assertRaisesRegex(AssertionError, message),
                 ):
                     args._handle_sidp()
+
+        # Effective per-phase Graph mode is resolved after _handle_sidp, so
+        # this gate belongs to the final graph-config validation stage.
+        args = self._make_sidp_args(
+            sidp_enable_graph_profiling=True,
+            disable_cuda_graph=True,
+        )
+        with patch.dict(
+            os.environ,
+            {"PYTORCH_CUDA_ALLOC_CONF": "", "PYTORCH_ALLOC_CONF": ""},
+        ):
+            args._handle_sidp()
+        args._parse_cuda_graph_config()
+        with self.assertRaisesRegex(ValueError, "profiling requires"):
+            args._validate_sidp_graph_config()
 
     def test_dummy_compute_requires_profiling_and_remote_weights(self):
         cases = [
@@ -309,11 +551,18 @@ class TestSidpServerArgs(CustomTestCase):
             sidp_enable_peak_shifting=True,
             sidp_peak_sync_strategy="force_sync",
         )
-        with patch.dict(
-            os.environ,
-            {"PYTORCH_CUDA_ALLOC_CONF": "", "PYTORCH_ALLOC_CONF": ""},
+        with (
+            patch.dict(
+                os.environ,
+                {"PYTORCH_CUDA_ALLOC_CONF": "", "PYTORCH_ALLOC_CONF": ""},
+            ),
+            self.assertLogs(server_args_module.logger, level="WARNING") as logs,
         ):
             args._handle_sidp()
+        warning = "\n".join(logs.output)
+        self.assertIn("experimental reference strategy", warning)
+        self.assertIn("MUST NOT be used in production", warning)
+        self.assertIn("--sidp-peak-sync-strategy none", warning)
 
     def test_invalid_peak_sync_parameters(self):
         cases = [
