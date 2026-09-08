@@ -208,6 +208,28 @@ def _init_parallel_groups(
     )
     rank = rank_offset + tp_size * pp_rank + tp_rank
 
+    # A singleton TP/PP process group does not need a network rendezvous.  In
+    # particular, normal DP launches create one independent TP=1 group per DP
+    # rank.  The controller has to release its temporary port reservation
+    # before the scheduler can create TCPStore, leaving a check-then-bind race
+    # with unrelated sockets.  Use a process-local Store for the automatically
+    # configured singleton case and remove that port race entirely.
+    #
+    # Preserve TCP rendezvous when the user supplied an address/override or
+    # when elastic/joiner/NIXL/Mooncake semantics require a network-visible
+    # store.
+    use_in_process_store = (
+        world_size == 1
+        and rank == 0
+        and not is_ep_joiner
+        and not is_scale_joiner
+        and not server_args.dist_init_addr
+        and not envs.SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE.get()
+        and server_args.moe_a2a_backend != "nixl"
+        and backend != "mooncake"
+        and (server_args.max_ep_size is None or server_args.max_ep_size <= 1)
+    )
+
     init_distributed_environment(
         backend=backend,
         world_size=world_size,
@@ -218,6 +240,7 @@ def _init_parallel_groups(
         moe_a2a_backend=server_args.moe_a2a_backend,
         recovered_rank=is_ep_joiner,
         max_world_size=server_args.max_ep_size,
+        use_in_process_store=use_in_process_store,
     )
     initialize_model_parallel(
         tensor_model_parallel_size=tp_size,

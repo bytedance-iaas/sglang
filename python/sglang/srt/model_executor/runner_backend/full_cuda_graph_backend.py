@@ -60,6 +60,16 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
         self._tp_group = cuda_graph_runner.model_runner.tp_group
+        self._sidp_manager = getattr(
+            cuda_graph_runner.model_runner, "sidp_manager", None
+        )
+        self._inline_sidp_dma = bool(
+            self._sidp_manager is not None and self._sidp_manager._uses_conditional_dma
+        )
+        if self._inline_sidp_dma and enable_memory_saver:
+            raise ValueError(
+                "SiDP conditional DMA model Graph does not support memory saver"
+            )
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -93,7 +103,20 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
-        graph = torch.cuda.CUDAGraph()
+        # Conditional nodes are inserted directly into this graph during
+        # capture. Keep PyTorch's pool/stream lifecycle; only C retains the raw
+        # graph and explicitly instantiates before serving the first request.
+        graph = (
+            torch.cuda.CUDAGraph(keep_graph=True)
+            if self._inline_sidp_dma
+            else torch.cuda.CUDAGraph()
+        )
+        sidp_debug = self._inline_sidp_dma and self._sidp_manager.enable_debug_logging
+        if sidp_debug:
+            import time
+
+            graph.enable_debug_mode()
+            capture_started = time.monotonic()
 
         graph_ctx: Callable[..., AbstractContextManager]
         if (
@@ -109,6 +132,30 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
 
         with graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream):
             out = forward_fn()
+
+        if self._inline_sidp_dma:
+            graph.instantiate()
+        if sidp_debug:
+            import logging
+            import os
+            from pathlib import Path
+
+            capture_seconds = time.monotonic() - capture_started
+            dump_dir = (
+                Path(self._sidp_manager.config.profile_output_dir) / "cuda_graphs"
+            )
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            dump_path = dump_dir / (
+                f"sidp_dma_rank{self._sidp_manager.dp_rank}_pid{os.getpid()}"
+                f"_shape{len(self._graphs)}.dot"
+            )
+            graph.debug_dump(str(dump_path))
+            logging.getLogger(__name__).info(
+                "SiDP conditional DMA capture+instantiate: shape=%s, %.3fs, dump=%s",
+                shape_key,
+                capture_seconds,
+                dump_path,
+            )
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
@@ -130,6 +177,8 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
+        if self._inline_sidp_dma and self._graphs:
+            self._device_module.synchronize()
         self._graphs.clear()
         self._outputs.clear()
         self._pool = None

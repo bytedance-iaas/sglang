@@ -1156,6 +1156,20 @@ class ModelRunner:
         if getattr(self.server_args, "sidp_size", 0) <= 0:
             return
 
+        self.server_args._validate_sidp_graph_config()
+
+        from sglang.srt.models.gemma4_causal import Gemma4ForCausalLM
+        from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
+
+        if not isinstance(
+            self.model, (Gemma4ForCausalLM, Gemma4ForConditionalGeneration)
+        ):
+            raise RuntimeError(
+                "SiDP currently supports only Gemma4 causal or multimodal "
+                "models that use the Gemma4DecoderLayer hooks; "
+                f"loaded model type is {type(self.model).__name__}"
+            )
+
         from sglang.srt.layers.sidp import (
             SidpConfig,
             SidpManager,
@@ -1171,18 +1185,70 @@ class ModelRunner:
                 num_layers = getattr(text_config, "num_hidden_layers", 0)
             else:
                 num_layers = 0
+
+        external_mode = getattr(self.server_args, "sidp_external_mode", False)
+        if external_mode:
+            # Direction A coordinated_static: this process is one independent
+            # dp_size=1 service, so ps.dp_rank is always 0 and cannot identify
+            # the SiDP member. Take the SiDP world identity from the explicit
+            # member_rank/world_size instead. The downstream owner/IPC/rendezvous
+            # logic keys off SidpConfig.dp_rank/dp_size and is otherwise unchanged.
+            sidp_dp_rank = self.server_args.sidp_member_rank
+            sidp_dp_size = self.server_args.sidp_world_size
+        else:
+            sidp_dp_rank = dp_rank
+            sidp_dp_size = self.server_args.sidp_size
+
         config = SidpConfig(
-            dp_size=self.server_args.sidp_size,
-            dp_rank=dp_rank,
+            dp_size=sidp_dp_size,
+            dp_rank=sidp_dp_rank,
+            external_mode=external_mode,
+            coord_mode=getattr(self.server_args, "sidp_coord_mode", False),
+            barrier_interval_cycles=getattr(
+                self.server_args, "sidp_barrier_interval_cycles", 4
+            ),
+            barrier_nptr=getattr(self.server_args, "sidp_barrier_nptr", 0),
+            coord_dynamic_nptr=getattr(
+                self.server_args, "sidp_coord_dynamic_nptr", False
+            ),
+            coord_observe=getattr(self.server_args, "sidp_coord_observe", False),
+            coord_observe_dir=getattr(
+                self.server_args, "sidp_coord_observe_dir",
+                "check_logs/sidp_sched_trace",
+            ),
+            coord_unified_schedule=getattr(
+                self.server_args, "sidp_coord_unified_schedule", False
+            ),
+            coord_prefill_low_watermark=getattr(
+                self.server_args, "sidp_coord_prefill_low_watermark", 0.15
+            ),
+            coord_disable_device_barrier=getattr(
+                self.server_args, "sidp_coord_disable_device_barrier", False
+            ),
             k=self.server_args.sidp_k,
             cache_cycles=self.server_args.sidp_cache_cycles,
             rdzv_port=self.server_args.sidp_rdzv_port,
-            # SiDP is currently single-node; do not reuse the HTTP bind host
-            # (which may be 0.0.0.0 and is not a stable client destination).
-            rdzv_host="127.0.0.1",
+            # Native single-service DP is single-node; do not reuse the HTTP bind
+            # host (which may be 0.0.0.0 and is not a stable client destination).
+            # External-worker mode uses the explicit shared rendezvous host.
+            rdzv_host=(
+                self.server_args.sidp_rdzv_host if external_mode else "127.0.0.1"
+            ),
             num_layers=num_layers,
             enable_cycle_overlap=True,
+            prefetch_policy=self.server_args.sidp_prefetch_policy,
+            copy_backend=self.server_args.sidp_copy_backend,
+            slot_sync=self.server_args.sidp_slot_sync,
+            dma_slices=self.server_args.sidp_dma_slices,
+            dma_slice_groups=self.server_args.sidp_dma_slice_groups,
+            dynamic_claim_order=self.server_args.sidp_dynamic_claim_order,
+            disable_cuda_graph=(
+                self.server_args.cuda_graph_config.decode.backend == "disabled"
+            ),
+            sm_use_event_sync=self.server_args.sidp_sm_use_event_sync,
+            sm_copy_ctas=self.server_args.sidp_sm_copy_ctas,
             enable_peak_shifting=self.server_args.sidp_enable_peak_shifting,
+            enable_debug_logging=self.server_args.sidp_enable_debug_logging,
             enable_graph_profiling=self.server_args.sidp_enable_graph_profiling,
             profile_dummy_compute=self.server_args.sidp_profile_dummy_compute,
             peak_sync_strategy=self.server_args.sidp_peak_sync_strategy,

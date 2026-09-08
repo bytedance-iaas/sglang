@@ -1099,10 +1099,96 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = 2
+    sidp_prefetch_policy: A[
+        str,
+        Arg(
+            help="SiDP remote-weight scheduling policy. 'compute' and "
+            "'static_peak' use a graph-static order; 'dynamic_owner' chooses "
+            "a currently free owner on device at runtime. 'auto' preserves "
+            "the legacy --sidp-enable-peak-shifting mapping.",
+            choices=["auto", "compute", "static_peak", "dynamic_owner"],
+        ),
+        NS("parallel"),
+    ] = "auto"
+    sidp_copy_backend: A[
+        str,
+        Arg(
+            help="SiDP encoded-weight copy backend. 'dma' uses the CUDA copy "
+            "engine; 'sm' uses a CUDA kernel. dynamic_owner + dma supports "
+            "eager or full decode CUDA Graph with eager prefill. "
+            "'auto' selects SM only for dynamic_owner.",
+            choices=["auto", "dma", "sm"],
+        ),
+        NS("parallel"),
+    ] = "auto"
+    sidp_slot_sync: A[
+        str,
+        Arg(
+            help="SiDP two-cycle slot RAW/WAR protocol. 'flag' uses device "
+            "generation wait/publish kernels; 'event' retains the legacy "
+            "per-slot CUDA Event path. 'auto' selects flag for the default "
+            "compute + DMA path and preserves Event for static_peak + DMA.",
+            choices=["auto", "event", "flag"],
+        ),
+        NS("parallel"),
+    ] = "auto"
+    sidp_dma_slices: A[
+        int,
+        Arg(
+            help="Number of contiguous byte slices per encoded component for "
+            "fixed compute-order DMA. Any positive integer is accepted; 1 "
+            "keeps whole-component copies. Event and flag slot sync are "
+            "supported.",
+        ),
+        NS("parallel"),
+    ] = 1
+    sidp_dma_slice_groups: A[
+        int,
+        Arg(
+            help="Number of contiguous owner groups per cycle for fixed DMA "
+            "slice-major submission. Only applies when --sidp-dma-slices > 1.",
+        ),
+        NS("parallel"),
+    ] = 1
+    sidp_dynamic_claim_order: A[
+        str,
+        Arg(
+            help="Candidate priority for SiDP dynamic_owner. 'rotating' keeps "
+            "the original cross-cycle probe cursor; 'compute_priority' starts "
+            "each claim from the earliest unfinished layer and then scans "
+            "later eligible owners. Only valid with dynamic_owner.",
+            choices=["rotating", "compute_priority"],
+        ),
+        NS("parallel"),
+    ] = "rotating"
+    sidp_sm_use_event_sync: A[
+        bool,
+        "Validation-only: use fixed-order SM copies while retaining the "
+        "legacy per-slot CUDA Event RAW/WAR synchronization. This isolates "
+        "SM-copy cost from generation-flag cost and is only valid with "
+        "--sidp-prefetch-policy compute --sidp-copy-backend sm.",
+        NS("parallel"),
+    ] = False
+    sidp_sm_copy_ctas: A[
+        int,
+        Arg(
+            help="Total CTAs for each SiDP SM-copy kernel. 0 keeps the "
+            "bandwidth-oriented default (4x the device SM count); a positive "
+            "value throttles SM-copy concurrency to reduce interference with "
+            "model kernels. Only valid with the SM copy backend.",
+        ),
+        NS("parallel"),
+    ] = 0
     sidp_enable_peak_shifting: A[
         bool,
-        "Enable SiDP peak-shifting: reorder each cycle's remote prefetches into "
-        "permutation waves. Disabled by default for compute-order A/B comparison.",
+        "Deprecated compatibility alias for "
+        "--sidp-prefetch-policy static_peak.",
+        NS("parallel"),
+    ] = False
+    sidp_enable_debug_logging: A[
+        bool,
+        "Enable SiDP setup/debug logs and diagnostic HBM before/after sampling. "
+        "Disabled by default and independent of graph profiling.",
         NS("parallel"),
     ] = False
     sidp_enable_graph_profiling: A[
@@ -1125,14 +1211,14 @@ class ServerArgs:
         str,
         Arg(
             help="Cross-rank CUDA Graph launch synchronization for SiDP "
-            "peak-shifting. 'force_sync' aligns every launch after all ranks "
-            "reach the configured bulk batch; 'none' preserves unsynchronized "
-            "behavior for A/B comparison. The strategy is ignored when "
-            "peak-shifting is disabled.",
+            "peak-shifting. 'none' is the supported default. 'force_sync' is "
+            "an experimental reference that blindly waits for every DP rank "
+            "and must not be used in production. The strategy is ignored "
+            "when peak-shifting is disabled.",
             choices=["none", "force_sync"],
         ),
         NS("parallel"),
-    ] = "force_sync"
+    ] = "none"
     sidp_peak_sync_min_raw_bs: A[
         int,
         Arg(
@@ -1181,6 +1267,135 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = 0
+    sidp_external_mode: A[
+        bool,
+        Arg(
+            help="Enable SiDP external-worker mode (Direction A coordinated_static "
+            "topology): N independent dp_size=1 services are grouped into one SiDP "
+            "world instead of a single --data-parallel-size service. Requires "
+            "--sidp-member-rank / --sidp-world-size / --sidp-rdzv-host and a shared "
+            "--sidp-rdzv-port. Default False preserves the native single-service "
+            "DP topology.",
+        ),
+        NS("parallel"),
+    ] = False
+    sidp_member_rank: A[
+        int,
+        Arg(
+            help="This service's SiDP member rank in external-worker mode "
+            "(0-based). Ignored unless --sidp-external-mode is set.",
+        ),
+        NS("parallel"),
+    ] = 0
+    sidp_world_size: A[
+        int,
+        Arg(
+            help="Total number of SiDP members (independent services) in "
+            "external-worker mode. Ignored unless --sidp-external-mode is set.",
+        ),
+        NS("parallel"),
+    ] = 0
+    sidp_rdzv_host: A[
+        str,
+        Arg(
+            help="SiDP TCPStore rendezvous host. In external-worker mode every "
+            "member must share the same rdzv host/port; the member with rank 0 is "
+            "the TCPStore master.",
+        ),
+        NS("parallel"),
+    ] = "127.0.0.1"
+    sidp_coord_mode: A[
+        bool,
+        Arg(
+            help="Enable SiDP Direction A coordinated_static GPU data plane: "
+            "insert a cross-member device barrier every "
+            "--sidp-barrier-interval-cycles prefetch cycles to correct launch-skew "
+            "phase drift. Requires --sidp-external-mode. Default False keeps the "
+            "unchanged (Phase 1) GPU runner.",
+        ),
+        NS("parallel"),
+    ] = False
+    sidp_barrier_interval_cycles: A[
+        int,
+        Arg(
+            help="Number of prefetch cycles between SiDP coordinated device "
+            "barriers (K). Only used when --sidp-coord-mode is set.",
+        ),
+        NS("parallel"),
+    ] = 4
+    sidp_barrier_nptr: A[
+        int,
+        Arg(
+            help="Number of members expected at each SiDP coordinated device "
+            "barrier. 0 (default) means all members (sidp_world_size). A smaller "
+            "M runs the barrier over a fixed subset while the rest stay idle; the "
+            "idle members must not receive decode requests. Only used with "
+            "--sidp-coord-mode.",
+        ),
+        NS("parallel"),
+    ] = 0
+    sidp_coord_dynamic_nptr: A[
+        bool,
+        Arg(
+            help="Enable SiDP dynamic nptr: a per-forward host rendezvous decides "
+            "the live barrier participant count (members vote decode/idle each "
+            "forward), so members can exit at EOS / join later without deadlock. "
+            "Requires --sidp-coord-mode; overrides --sidp-barrier-nptr.",
+        ),
+        NS("parallel"),
+    ] = False
+    sidp_coord_observe: A[
+        bool,
+        Arg(
+            help="Enable SiDP schedule-consistency observation (read-only). Each "
+            "member appends one jsonl row per rendezvous round recording its "
+            "prefill/decode/idle decision plus running/waiting/kv state, keyed by "
+            "the globally-aligned round id, for offline divergence analysis. Does "
+            "not change scheduling or barrier behavior.",
+        ),
+        NS("parallel"),
+    ] = False
+    sidp_coord_observe_dir: A[
+        str,
+        Arg(
+            help="Directory for SiDP schedule-observation jsonl files (one per "
+            "member rank). Default check_logs/sidp_sched_trace.",
+        ),
+        NS("parallel"),
+    ] = "check_logs/sidp_sched_trace"
+    sidp_coord_unified_schedule: A[
+        bool,
+        Arg(
+            help="Enable SiDP unified scheduling: all members agree on a single "
+            "forward mode (all-decode or all-prefill) each round via the "
+            "rendezvous, so prefill/decode never mix across ranks (which stalls "
+            "fast decoders at the host round barrier). decode-wins: defer prefill "
+            "while any rank has running to decode; force a prefill window when a "
+            "rank has no running left or drops below the low watermark. Requires "
+            "--sidp-coord-mode + --sidp-coord-dynamic-nptr.",
+        ),
+        NS("parallel"),
+    ] = False
+    sidp_coord_prefill_low_watermark: A[
+        float,
+        Arg(
+            help="running low-watermark (fraction of --max-running-requests) below "
+            "which a rank wanting prefill forces a group prefill window (soft "
+            "anti-starvation). 0 forces prefill only when running is fully "
+            "drained. Only used with --sidp-coord-unified-schedule.",
+        ),
+        NS("parallel"),
+    ] = 0.15
+    sidp_coord_disable_device_barrier: A[
+        bool,
+        Arg(
+            help="Ablation: keep the SiDP coordinated host rendezvous (per-forward "
+            "vote + peak-shifting phase alignment) but SKIP launching the "
+            "cross-member device barrier. Measures whether host-only sync is "
+            "enough. Requires --sidp-coord-mode. Default False (barrier on).",
+        ),
+        NS("parallel"),
+    ] = False
     dcp_comm_backend: A[
         str,
         Arg(
@@ -3745,6 +3960,7 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
+        self._validate_sidp_graph_config()
 
     def _handle_return_hidden_states_mode(self):
         if self.return_hidden_states_mode not in (None, "last", "full"):
@@ -6544,10 +6760,169 @@ class ServerArgs:
         if self.sidp_size <= 0:
             return
 
+        assert self.sidp_prefetch_policy in (
+            "auto",
+            "compute",
+            "static_peak",
+            "dynamic_owner",
+        ), "sidp_prefetch_policy must be one of: auto, compute, static_peak, dynamic_owner"
+        assert self.sidp_copy_backend in (
+            "auto",
+            "dma",
+            "sm",
+        ), "sidp_copy_backend must be one of: auto, dma, sm"
+        assert self.sidp_slot_sync in (
+            "auto",
+            "event",
+            "flag",
+        ), "sidp_slot_sync must be one of: auto, event, flag"
+        assert self.sidp_dynamic_claim_order in (
+            "rotating",
+            "compute_priority",
+        ), "sidp_dynamic_claim_order must be one of: rotating, compute_priority"
+
+        if self.sidp_prefetch_policy == "auto":
+            self.sidp_prefetch_policy = (
+                "static_peak" if self.sidp_enable_peak_shifting else "compute"
+            )
+        elif self.sidp_enable_peak_shifting:
+            assert self.sidp_prefetch_policy == "static_peak", (
+                "--sidp-enable-peak-shifting conflicts with "
+                f"--sidp-prefetch-policy {self.sidp_prefetch_policy}"
+            )
+
+        if self.sidp_copy_backend == "auto":
+            self.sidp_copy_backend = (
+                "sm" if self.sidp_prefetch_policy == "dynamic_owner" else "dma"
+            )
+        if self.sidp_sm_use_event_sync:
+            assert self.sidp_slot_sync in ("auto", "event"), (
+                "--sidp-sm-use-event-sync conflicts with --sidp-slot-sync flag"
+            )
+            self.sidp_slot_sync = "event"
+        elif self.sidp_slot_sync == "auto":
+            # Keep the old static-peak DMA behavior while switching the normal
+            # fixed compute-order DMA path to the validated generation protocol.
+            self.sidp_slot_sync = (
+                "event"
+                if self.sidp_prefetch_policy == "static_peak"
+                and self.sidp_copy_backend == "dma"
+                else "flag"
+            )
+        assert self.sidp_dma_slices >= 1, "sidp_dma_slices must be positive"
+        assert self.sidp_dma_slice_groups >= 1, (
+            "sidp_dma_slice_groups must be positive"
+        )
+        if self.sidp_dma_slices == 1:
+            assert self.sidp_dma_slice_groups == 1, (
+                "--sidp-dma-slice-groups only applies when "
+                "--sidp-dma-slices > 1"
+            )
+        else:
+            assert (
+                self.sidp_prefetch_policy == "compute"
+                and self.sidp_copy_backend == "dma"
+            ), (
+                "SiDP DMA slicing requires --sidp-prefetch-policy compute "
+                "and --sidp-copy-backend dma; both Event and flag slot sync "
+                "are supported"
+            )
+        if (
+            self.sidp_prefetch_policy == "dynamic_owner"
+            and self.sidp_copy_backend == "dma"
+        ):
+            assert not self.enable_torch_compile, (
+                "SiDP dynamic_owner + dma does not support --enable-torch-compile"
+            )
+            logger.warning(
+                "SiDP dynamic_owner + DMA is experimental: eager or full "
+                "decode Graph, conditional DMA per cycle, flag RAW/WAR, "
+                "no DP barriers. Requires CUDA Toolkit/driver 12.8+ for SWITCH."
+            )
+        if self.sidp_prefetch_policy == "dynamic_owner":
+            assert self.sidp_slot_sync == "flag", (
+                "SiDP dynamic_owner requires --sidp-slot-sync flag"
+            )
+        if self.sidp_copy_backend == "sm" and self.sidp_slot_sync == "event":
+            assert self.sidp_prefetch_policy == "compute", (
+                "SiDP SM + Event synchronization is only valid with "
+                "--sidp-prefetch-policy compute"
+            )
+        if self.sidp_dynamic_claim_order != "rotating":
+            assert self.sidp_prefetch_policy == "dynamic_owner", (
+                "--sidp-dynamic-claim-order compute_priority is only valid with "
+                "--sidp-prefetch-policy dynamic_owner"
+            )
+        if self.sidp_sm_use_event_sync:
+            assert (
+                self.sidp_prefetch_policy == "compute"
+                and self.sidp_copy_backend == "sm"
+            ), (
+                "--sidp-sm-use-event-sync is a validation-only mode and "
+                "requires compute + sm"
+            )
+        assert self.sidp_sm_copy_ctas >= 0, (
+            "sidp_sm_copy_ctas must be non-negative (0 means auto=4xSM)"
+        )
+        if self.sidp_sm_copy_ctas > 0:
+            assert self.sidp_copy_backend == "sm", (
+                "--sidp-sm-copy-ctas is only valid with "
+                "--sidp-copy-backend sm"
+            )
+
+        # Keep the legacy field coherent for launch-sync and older diagnostic
+        # callers. Dynamic owner scheduling intentionally does not use it.
+        self.sidp_enable_peak_shifting = (
+            self.sidp_prefetch_policy == "static_peak"
+        )
+
         assert self.sidp_size >= 2, "SiDP requires sidp_size >= 2"
-        assert (
-            self.sidp_size == self.dp_size
-        ), f"sidp_size ({self.sidp_size}) must equal dp_size ({self.dp_size})"
+        if self.sidp_external_mode:
+            # Direction A coordinated_static: N independent dp_size=1 services
+            # form one SiDP world. The service's SiDP identity comes from
+            # sidp_member_rank/sidp_world_size, not from the local DP topology.
+            assert self.dp_size == 1, (
+                "SiDP external-worker mode requires --data-parallel-size 1 "
+                f"(got dp_size={self.dp_size}); each service is an independent "
+                "member of the SiDP group"
+            )
+            assert self.sidp_world_size >= 2, (
+                "SiDP external-worker mode requires --sidp-world-size >= 2 "
+                f"(got {self.sidp_world_size})"
+            )
+            assert self.sidp_size == self.sidp_world_size, (
+                f"sidp_size ({self.sidp_size}) must equal sidp_world_size "
+                f"({self.sidp_world_size}) in external-worker mode"
+            )
+            assert 0 <= self.sidp_member_rank < self.sidp_world_size, (
+                f"sidp_member_rank ({self.sidp_member_rank}) must be in "
+                f"[0, sidp_world_size ({self.sidp_world_size}))"
+            )
+            # Each service binds exactly one contiguous GPU equal to its member
+            # rank so member k -> CUDA ordinal k, which cross-process CUDA IPC
+            # requires (the default SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=False
+            # keeps current_device == base_gpu_id).
+            assert self.base_gpu_id == self.sidp_member_rank, (
+                f"SiDP external-worker mode requires base_gpu_id "
+                f"({self.base_gpu_id}) == sidp_member_rank "
+                f"({self.sidp_member_rank})"
+            )
+            assert self.gpu_id_step == 1, (
+                "SiDP external-worker mode requires gpu_id_step=1"
+            )
+            assert self.sidp_rdzv_port != 0, (
+                "SiDP external-worker mode requires an explicit shared "
+                "--sidp-rdzv-port (auto-allocation is not valid across "
+                "independent services)"
+            )
+        else:
+            assert (
+                self.sidp_size == self.dp_size
+            ), f"sidp_size ({self.sidp_size}) must equal dp_size ({self.dp_size})"
+            assert self.base_gpu_id == 0 and self.gpu_id_step == 1, (
+                "SiDP currently requires contiguous CUDA devices starting at GPU 0 "
+                "(base_gpu_id=0, gpu_id_step=1)"
+            )
         assert (
             1 <= self.sidp_k <= self.sidp_size
         ), f"sidp_k ({self.sidp_k}) must be in [1, sidp_size ({self.sidp_size})]"
@@ -6560,10 +6935,42 @@ class ServerArgs:
         assert self.pp_size == 1, "SiDP requires pp_size=1"
         assert self.nnodes == 1, "SiDP currently supports single-node execution only"
         assert self.device == "cuda", "SiDP currently requires CUDA"
-        assert self.base_gpu_id == 0 and self.gpu_id_step == 1, (
-            "SiDP currently requires contiguous CUDA devices starting at GPU 0 "
-            "(base_gpu_id=0, gpu_id_step=1)"
-        )
+        if self.sidp_coord_mode:
+            assert self.sidp_external_mode, (
+                "SiDP coordinated_static mode (--sidp-coord-mode) requires "
+                "--sidp-external-mode"
+            )
+            assert self.sidp_barrier_interval_cycles >= 1, (
+                "sidp_barrier_interval_cycles (K) must be >= 1 "
+                f"(got {self.sidp_barrier_interval_cycles})"
+            )
+            assert 0 <= self.sidp_barrier_nptr <= self.sidp_world_size, (
+                f"sidp_barrier_nptr ({self.sidp_barrier_nptr}) must be in "
+                f"[0, sidp_world_size ({self.sidp_world_size})]; 0 means all"
+            )
+            if self.sidp_coord_unified_schedule:
+                assert self.sidp_coord_dynamic_nptr, (
+                    "SiDP unified scheduling (--sidp-coord-unified-schedule) "
+                    "requires --sidp-coord-dynamic-nptr (it reuses the per-forward "
+                    "rendezvous channel to agree on the group forward mode)"
+                )
+                assert 0.0 <= self.sidp_coord_prefill_low_watermark < 1.0, (
+                    "sidp_coord_prefill_low_watermark "
+                    f"({self.sidp_coord_prefill_low_watermark}) must be in [0, 1)"
+                )
+        else:
+            assert not self.sidp_coord_dynamic_nptr, (
+                "SiDP dynamic nptr (--sidp-coord-dynamic-nptr) requires "
+                "--sidp-coord-mode"
+            )
+            assert not self.sidp_coord_unified_schedule, (
+                "SiDP unified scheduling (--sidp-coord-unified-schedule) requires "
+                "--sidp-coord-mode"
+            )
+            assert not self.sidp_coord_disable_device_barrier, (
+                "--sidp-coord-disable-device-barrier requires --sidp-coord-mode "
+                "(it ablates the barrier within coordinated mode)"
+            )
         assert (
             0 <= self.sidp_rdzv_port <= 65535
         ), f"sidp_rdzv_port ({self.sidp_rdzv_port}) must be in [0, 65535]"
@@ -6572,10 +6979,8 @@ class ServerArgs:
             f"the HTTP server port ({self.port})"
         )
         if self.sidp_enable_graph_profiling:
-            assert not self.disable_cuda_graph, (
-                "SiDP graph profiling requires CUDA Graph; remove "
-                "--disable-cuda-graph"
-            )
+            # Final per-phase settings are validated after resolution: explicit
+            # JSON can override the legacy disable_cuda_graph flag.
             assert (
                 self.sidp_profile_sample_interval >= 1
             ), "sidp_profile_sample_interval must be at least 1"
@@ -6593,6 +6998,10 @@ class ServerArgs:
                 "SiDP dummy compute requires remote weight communication "
                 "(sidp_k < sidp_size)"
             )
+        if self.sidp_dma_slices > 1:
+            assert self.sidp_k < self.sidp_size, (
+                "SiDP DMA slicing requires remote weights (sidp_k < sidp_size)"
+            )
         assert self.sidp_peak_sync_strategy in ("none", "force_sync"), (
             "sidp_peak_sync_strategy must be one of: none, force_sync"
         )
@@ -6605,6 +7014,60 @@ class ServerArgs:
         assert self.sidp_peak_sync_timeout_s > 0, (
             "sidp_peak_sync_timeout_s must be positive"
         )
+        if self.sidp_peak_sync_strategy != "none":
+            assert (
+                self.sidp_prefetch_policy == "static_peak"
+                and self.sidp_copy_backend == "dma"
+            ), (
+                "SiDP peak synchronization is only valid for "
+                "static_peak + dma"
+            )
+        if self.sidp_prefetch_policy == "dynamic_owner":
+            assert self.sidp_k < self.sidp_size, (
+                "SiDP dynamic_owner requires remote weights (sidp_k < sidp_size)"
+            )
+        if self.sidp_copy_backend == "sm":
+            assert self.sidp_k < self.sidp_size, (
+                "SiDP SM copy requires remote weights (sidp_k < sidp_size)"
+            )
+            assert not self.enable_torch_compile, (
+                "SiDP SM copy uses graph-stable indirect pointer descriptors "
+                "and does not support --enable-torch-compile yet"
+            )
+            logger.warning(
+                "SiDP SM copy is an experimental backend. It is CUDA Graph "
+                "compatible, but may contend with model GEMMs for SM resources. "
+                "SM-copy CTAs=%s.",
+                (
+                    str(self.sidp_sm_copy_ctas)
+                    if self.sidp_sm_copy_ctas
+                    else "auto(4xSM)"
+                ),
+            )
+        if self.sidp_sm_use_event_sync:
+            logger.warning(
+                "SiDP SM + Event synchronization is a validation-only A/B "
+                "mode. It keeps fixed compute order and legacy CUDA Event "
+                "RAW/WAR dependencies so only the copy backend changes."
+            )
+        if self.sidp_prefetch_policy == "dynamic_owner":
+            logger.warning(
+                "SiDP dynamic_owner is experimental. It uses system-scope "
+                "peer atomics and runtime owner arbitration; hardware support "
+                "will be checked during SiDP setup."
+            )
+        if (
+            self.sidp_enable_peak_shifting
+            and self.sidp_peak_sync_strategy == "force_sync"
+        ):
+            logger.warning(
+                "SiDP force_sync is an experimental reference strategy and "
+                "MUST NOT be used in production. It performs blind all-DP-rank "
+                "barriers and can time out when warmup, health checks, or "
+                "dynamic load imbalance leave any rank without a decode Graph. "
+                "Use compute-order (disable peak-shifting) or peak-shifting "
+                "with --sidp-peak-sync-strategy none."
+            )
 
         # CUDA IPC cannot export allocations backed by expandable segments.
         for var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
@@ -6632,14 +7095,54 @@ class ServerArgs:
 
         # SiDP does not force-disable CUDA Graph. Eager and captured forwards
         # use the same cross-forward cycle pipeline.
-        logger.info(
-            f"SiDP enabled: sidp_size={self.sidp_size}, k={self.sidp_k}, "
-            f"cache_cycles={self.sidp_cache_cycles}, "
-            f"peak_shifting={self.sidp_enable_peak_shifting}, "
-            f"peak_sync_strategy={self.sidp_peak_sync_strategy}, "
-            f"graph_profiling={self.sidp_enable_graph_profiling}, "
-            f"rdzv_port={self.sidp_rdzv_port}"
-        )
+        if self.sidp_enable_debug_logging:
+            logger.info(
+                f"SiDP enabled: sidp_size={self.sidp_size}, k={self.sidp_k}, "
+                f"cache_cycles={self.sidp_cache_cycles}, "
+                f"prefetch_policy={self.sidp_prefetch_policy}, "
+                f"copy_backend={self.sidp_copy_backend}, "
+                f"slot_sync={self.sidp_slot_sync}, "
+                f"dma_slices={self.sidp_dma_slices}, "
+                f"dma_slice_groups={self.sidp_dma_slice_groups}, "
+                f"peak_sync_strategy={self.sidp_peak_sync_strategy}, "
+                f"graph_profiling={self.sidp_enable_graph_profiling}, "
+                f"rdzv_port={self.sidp_rdzv_port}"
+            )
+
+    def _validate_sidp_graph_config(self):
+        """SiDP checks that need final (not legacy bool) Graph configuration."""
+        if self.sidp_size <= 0:
+            return
+        cfg = self.cuda_graph_config
+        if self.sidp_enable_graph_profiling and cfg.decode.backend == Backend.DISABLED:
+            raise ValueError("SiDP graph profiling requires decode CUDA Graph")
+        if not (
+            self.sidp_prefetch_policy == "dynamic_owner"
+            and self.sidp_copy_backend == "dma"
+        ):
+            return
+        if (
+            cfg.decode.backend not in (Backend.FULL, Backend.DISABLED)
+            or cfg.prefill.backend != Backend.DISABLED
+        ):
+            raise ValueError(
+                "SiDP dynamic_owner + dma supports only full decode CUDA Graph "
+                "with eager prefill, or fully eager. Use --cuda-graph-config "
+                '\'{"decode":{"backend":"full"},"prefill":{"backend":"disabled"}}\' '
+                "or disable both phases."
+            )
+        if self.enable_torch_compile:
+            raise ValueError(
+                "SiDP dynamic_owner + dma does not support --enable-torch-compile"
+            )
+        if self.enable_pdmux:
+            raise ValueError(
+                "SiDP dynamic_owner + dma requires serial model forwards; PDMux is unsupported"
+            )
+        if cfg.decode.backend == Backend.FULL and self.enable_memory_saver:
+            raise ValueError(
+                "SiDP conditional DMA model Graph does not support --enable-memory-saver yet"
+            )
 
     def _handle_data_parallelism(self):
         # The dp_size==1 resets moved to the resolution pipeline

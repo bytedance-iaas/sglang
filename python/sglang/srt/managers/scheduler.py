@@ -1678,6 +1678,118 @@ class Scheduler(
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
 
+    def _sidp_coord_rendezvous(self, batch) -> None:
+        """SiDP Direction A dynamic nptr: per-forward decode/idle consensus.
+
+        Called once per scheduler iteration (both event loops) after the batch is
+        decided and before run_batch. Every member votes decode(1)/idle(0) and
+        waits for all; the live participant count is written to the device barrier
+        so members that hit EOS (batch=None -> vote 0) drop out without deadlock.
+        No-op unless SiDP coordinated dynamic-nptr mode is active.
+        """
+        mgr = self._sidp_coord_manager()
+        if mgr is None:
+            return
+        # In unified-schedule mode the group forward mode was already decided by a
+        # SEPARATE rendezvous inside the prefill decision (coord_unified_decide).
+        # This plain rendezvous still runs here to set the barrier nptr from the
+        # REAL decode set: it votes on the finalized batch.forward_mode, so live
+        # equals the members that actually launch the barrier this round (a member
+        # that intended decode but finalized an empty batch votes 0 here). The two
+        # rendezvous use different key namespaces + independent round counters, so
+        # they do not interfere.
+        wants_forward = (
+            batch is not None and batch.forward_mode.is_decode()
+        )
+        participate, live = mgr.coord_rendezvous_before_forward(wants_forward)
+        # Read-only schedule-consistency observation (no behavior change). Records
+        # this member's decision for this globally-aligned round so an offline
+        # tool can find prefill/decode divergence across members.
+        if mgr.observe_enabled:
+            self._sidp_observe_round(mgr, batch, participate, live)
+
+    def _sidp_observe_round(self, mgr, batch, participate: bool, live: int) -> None:
+        """Gather cheap, already-computed scheduling state and hand it to the SiDP
+        observer. Everything here is a read of existing state at the rendezvous
+        point; it never mutates scheduling or barrier behavior."""
+        try:
+            if batch is None:
+                mode = "idle"
+                batch_size = 0
+            elif batch.forward_mode.is_decode():
+                mode = "decode"
+                batch_size = batch.batch_size()
+            else:
+                mode = "prefill"
+                batch_size = batch.batch_size()
+            running = self.running_batch.batch_size() if self.running_batch else 0
+            waiting = len(self.waiting_queue)
+            kv_used_frac = 0.0
+            try:
+                alloc = self.token_to_kv_pool_allocator
+                total = alloc.size
+                if total:
+                    kv_used_frac = 1.0 - (alloc.available_size() / total)
+            except Exception:
+                pass
+            mgr.observe_round(
+                mode=mode,
+                running=running,
+                waiting=waiting,
+                batch_size=batch_size,
+                kv_used_frac=kv_used_frac,
+                retracted=int(getattr(self.metrics_reporter, "num_retracted_reqs", 0) or 0),
+                eos_prev=-1,  # derived offline from running deltas (see tool)
+                participate=participate,
+                live_nptr=live,
+            )
+        except Exception:
+            # Observation must never break the scheduler loop.
+            pass
+
+    def _sidp_coord_manager(self):
+        """Return the SiDP manager iff coordinated dynamic-nptr rendezvous is on.
+
+        Resolved lazily and cached: the manager is created during model load,
+        after the scheduler __init__. Returns None (fast path) in every non-SiDP
+        or non-dynamic configuration so the hot loop is unaffected.
+        """
+        cached = getattr(self, "_sidp_coord_manager_cached", None)
+        if cached is not None:
+            return cached
+        try:
+            from sglang.srt.layers.sidp import get_global_sidp_manager
+
+            mgr = get_global_sidp_manager()
+            if mgr is not None and mgr.coord_rendezvous_enabled:
+                # Cache only a positive resolution; a premature None (manager not
+                # yet built) is re-checked next call rather than cached.
+                self._sidp_coord_manager_cached = mgr
+                return mgr
+        except Exception:
+            return None
+        return None
+
+    def _sidp_unified_manager(self):
+        """Return the SiDP manager iff unified scheduling is on, else None.
+
+        Fast path for the prefill decision: the mode rendezvous (which replaces
+        the plain decode/idle vote) only runs when unified scheduling is active.
+        """
+        cached = getattr(self, "_sidp_unified_manager_cached", None)
+        if cached is not None:
+            return cached
+        try:
+            from sglang.srt.layers.sidp import get_global_sidp_manager
+
+            mgr = get_global_sidp_manager()
+            if mgr is not None and getattr(mgr, "unified_enabled", False):
+                self._sidp_unified_manager_cached = mgr
+                return mgr
+        except Exception:
+            return None
+        return None
+
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
@@ -1698,6 +1810,10 @@ class Scheduler(
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
+
+            # SiDP dynamic nptr: agree on the live barrier participant count
+            # before launching (idle members vote 0 and drop out cleanly).
+            self._sidp_coord_rendezvous(batch)
 
             # Launch the current batch
             if batch:
@@ -1744,6 +1860,10 @@ class Scheduler(
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(
                 batch, last_batch=self.last_batch
             )
+
+            # SiDP dynamic nptr: agree on the live barrier participant count
+            # before launching (idle members vote 0 and drop out cleanly).
+            self._sidp_coord_rendezvous(batch)
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
@@ -3037,8 +3157,16 @@ class Scheduler(
         else:
             # Run decode (skip for prefill-only batches)
             if not running_batch.is_empty() and not running_batch.is_prefill_only:
-                running_batch = self.update_running_batch(running_batch)
-                ret = running_batch if not running_batch.is_empty() else None
+                # SiDP unified scheduling: if the group agreed on a PREFILL (or
+                # IDLE) round, a rank with running but no prefill work must NOT
+                # decode -- that would mix modes (and its decode forward would
+                # launch a device barrier no one else arrives at). Idle instead.
+                umgr = self._sidp_unified_manager()
+                if umgr is not None and umgr.last_unified_mode in ("p", "i"):
+                    ret = None
+                else:
+                    running_batch = self.update_running_batch(running_batch)
+                    ret = running_batch if not running_batch.is_empty() else None
             else:
                 ret = None
 
@@ -3108,22 +3236,37 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             running_batch.batch_is_full = False
 
+        # SiDP unified scheduling: instead of each early-return immediately
+        # forcing this rank into decode, collect the "won't prefill" outcome into
+        # ``want_prefill`` and let ALL ranks agree on ONE group mode before any KV
+        # is allocated (design §2). ``umgr`` is None (fast path) in every
+        # non-unified config; then each check returns immediately, byte-for-byte
+        # identical to the original.
+        umgr = self._sidp_unified_manager()
+        want_prefill = True
+        chunked_must = self.chunked_req is not None
+
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
-            return None, running_batch
+            if umgr is None:
+                return None, running_batch
+            want_prefill = False
 
         running_bs = len(running_batch.reqs)
         # Skipped during a chunked prefill: that pass must proceed regardless.
         if (
-            self.min_free_slots_delayer is not None
+            want_prefill
+            and self.min_free_slots_delayer is not None
             and self.chunked_req is None
             and self.min_free_slots_delayer.should_delay(
                 running_bs=running_bs,
                 num_allocatable_reqs=self.get_num_allocatable_reqs(running_bs),
             )
         ):
-            return None, running_batch
+            if umgr is None:
+                return None, running_batch
+            want_prefill = False
 
         # Ignore the check if self.chunked_req is not None.
         # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
@@ -3131,12 +3274,43 @@ class Scheduler(
         # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
         if (
-            self.get_num_allocatable_reqs(running_bs) <= 0
+            want_prefill
+            and self.get_num_allocatable_reqs(running_bs) <= 0
             and self.chunked_req is None
             and not self.enable_priority_preemption
         ):
             running_batch.batch_is_full = True
-            return None, running_batch
+            if umgr is None:
+                return None, running_batch
+            want_prefill = False
+
+        # Unified decision point: this rank's intent (want_prefill / chunked_must)
+        # is now known from the real predicates above WITHOUT any KV allocation.
+        # Agree on one group mode M, then gate. Replaces the plain decode/idle
+        # rendezvous when unified is on (do not also call the other one).
+        if umgr is not None:
+            has_running = (
+                not running_batch.is_empty() and not running_batch.is_prefill_only
+            )
+            lw = umgr.coord_prefill_low_watermark
+            below_wm = bool(
+                lw > 0
+                and self.max_running_requests
+                and running_bs < lw * self.max_running_requests
+            )
+            m = umgr.coord_unified_decide(
+                want_prefill=want_prefill,
+                has_running=bool(has_running),
+                chunked_must=chunked_must,
+                below_watermark=below_wm,
+            )
+            # A chunked-prefill rank must finish its prefill regardless of M.
+            # Otherwise M!="p" (group decodes/idles) or this rank has nothing to
+            # prefill -> do not build prefill here. The outer branch then runs
+            # decode (M=="d") or idles (M=="p"/"i", gated in get_next_batch_to_run),
+            # so ranks never mix modes.
+            if not chunked_must and (m != "p" or not want_prefill):
+                return None, running_batch
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, running_batch)
@@ -3144,7 +3318,7 @@ class Scheduler(
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
             # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
-            # in the waiting queue.
+            # in the waiting queue. (test-only; not folded into the unified vote.)
             return None, running_batch
 
         # Determine chunked_prefill_size for this batch

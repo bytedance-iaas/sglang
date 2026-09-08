@@ -2106,6 +2106,7 @@ def init_distributed_environment(
     moe_a2a_backend: Optional[str] = None,
     recovered_rank: bool = False,
     max_world_size: Optional[int] = None,
+    use_in_process_store: bool = False,
 ):
     logger.debug(
         "world_size=%d rank=%d local_rank=%d " "distributed_init_method=%s backend=%s",
@@ -2144,15 +2145,26 @@ def init_distributed_environment(
         else:
             pg_options = get_torch_distributed_pg_options()
 
-        # this backend is used for WORLD
-        torch.distributed.init_process_group(
+        # This backend is used for WORLD. An automatically configured
+        # singleton group can use HashStore and avoid opening a TCP listener;
+        # callers deliberately opt in so explicit rendezvous configuration is
+        # never ignored.
+        process_group_kwargs = dict(
             backend=backend,
-            init_method=distributed_init_method,
             world_size=world_size,
             rank=rank,
             timeout=timeout,
             pg_options=pg_options,
         )
+        if use_in_process_store:
+            if world_size != 1 or rank != 0:
+                raise ValueError(
+                    "use_in_process_store requires world_size=1 and rank=0"
+                )
+            process_group_kwargs["store"] = torch.distributed.HashStore()
+        else:
+            process_group_kwargs["init_method"] = distributed_init_method
+        torch.distributed.init_process_group(**process_group_kwargs)
 
         # Create a global TCPStore for coordination (used by NIXL)
         if moe_a2a_backend == "nixl":

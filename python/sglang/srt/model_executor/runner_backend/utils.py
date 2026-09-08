@@ -61,6 +61,14 @@ def resolve_decode_backend(
     cfg = model_runner.server_args.cuda_graph_config
     backend_name = cfg.decode.backend if cfg is not None else Backend.FULL
 
+    sidp_manager = getattr(model_runner, "sidp_manager", None)
+    if sidp_manager is not None and sidp_manager._uses_conditional_dma:
+        model_runner.server_args._validate_sidp_graph_config()
+        if backend_name != Backend.FULL:
+            raise ValueError(
+                "SiDP conditional DMA capture requires the Full decode backend"
+            )
+
     enable_memory_saver = model_runner.server_args.enable_memory_saver
 
     if model_runner.device == "npu":
@@ -108,6 +116,9 @@ def resolve_prefill_backend(
     model_runner = cuda_graph_runner.model_runner
     cfg = model_runner.server_args.cuda_graph_config
     backend_name = cfg.prefill.backend if cfg is not None else Backend.TC_PIECEWISE
+    sidp_manager = getattr(model_runner, "sidp_manager", None)
+    if sidp_manager is not None and sidp_manager._uses_conditional_dma:
+        raise ValueError("SiDP conditional DMA currently requires eager prefill")
 
     if backend_name == Backend.BREAKABLE:
         return BreakableCudaGraphBackend(
