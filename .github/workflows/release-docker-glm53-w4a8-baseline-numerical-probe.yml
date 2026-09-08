@@ -199,8 +199,12 @@ jobs:
               /glm52/sglang/test/registered/unit/spec/test_eagle_numerical_probe.py \
               /glm52/sglang/test/registered/unit/managers/test_spec_worker_finish_flags.py \
               /glm52/sglang/test/registered/unit/managers/scheduler_components/test_dp_attn_draft_graph_vote.py \
+              /glm52/sglang/test/registered/unit/managers/test_symmetric_moe_spec_idle_padding.py \
               /glm52/sglang/test/registered/unit/spec/test_eagle_draft_cuda_graph_probe_gate.py \
+              /glm52/sglang/test/registered/unit/spec/test_eagle_worker_v2_topk1_fastpath.py::TestEagleWorkerV2Topk1FastPath::test_pp_idle_handoff_materializes_before_dsa_metadata \
               /glm52/sglang/test/registered/unit/spec/test_eagle_worker_v2_topk1_fastpath.py::TestEagleWorkerV2BackendFallback::test_dp_attention_eager_vote_for_exact_numerical_probe_rid \
               /glm52/sglang/test/registered/unit/spec/test_eagle_worker_v2_topk1_fastpath.py::TestEagleWorkerV2BackendFallback::test_dp_attention_eager_vote_is_permissive_without_draft_worker \
-              /glm52/sglang/test/registered/unit/spec/test_eagle_worker_v2_topk1_fastpath.py::TestEagleWorkerV2BackendFallback::test_note_request_finished_delegates_to_numerical_probe
+              /glm52/sglang/test/registered/unit/spec/test_eagle_worker_v2_topk1_fastpath.py::TestEagleWorkerV2BackendFallback::test_note_request_finished_delegates_to_numerical_probe \
+              /glm52/sglang/test/registered/unit/spec/test_pp_eagle_raw.py::TestEaglePPLastRankDraftOwnership::test_prepare_next_draft_preserves_idle_companion_mode \
+              /glm52/sglang/test/registered/unit/spec/test_pp_eagle_raw.py::TestEaglePPLastRankDraftOwnership::test_prepare_next_draft_promotes_active_batch_to_decode
           ' -- "$SOURCE_COMMIT" "$SOURCE_TREE" "$SGL_DEEP_GEMM_COMMIT" "$SOURCE_ARCHIVE_SHA256" "$SGLANG_KERNEL_VERSION"

@@ -966,9 +966,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         numerical_probe_requested = (
             self.eagle_numerical_probe.needs_eager_for_schedule_batch(batch)
         )
-        numerical_probe_rows = (
-            len(batch.seq_lens) * self.speculative_num_draft_tokens
-        )
+        numerical_probe_rows = len(batch.seq_lens) * self.speculative_num_draft_tokens
         # Batch 2: Draft extend
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
@@ -1446,11 +1444,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
                 # PP last rank: produce next-iter draft raw for cross-rank relay.
                 if self._pp_enabled and self._pp_is_last_rank:
-                    batch.forward_mode = ForwardMode.DECODE
-                    batch.spec_info = batch_output.next_draft_input
-                    # Use post-accept seq_lens so draft/draft_extend write KV
-                    # at the correct slots.
-                    batch.seq_lens = batch_output.new_seq_lens
+                    self._prepare_pp_next_draft_batch(batch, batch_output)
                     pp_draft_tokens, pp_parent_list, pp_top_scores_index = (
                         self.draft_worker.draft(batch)
                     )
@@ -1473,6 +1467,20 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
         return batch_output
+
+    @staticmethod
+    def _prepare_pp_next_draft_batch(
+        batch: ScheduleBatch, batch_output: GenerationBatchResult
+    ) -> None:
+        # Active requests draft the next decode tree. An IDLE DP companion
+        # must retain its mode so EagleDraftWorker takes its idle compatibility
+        # path before any DSA metadata is planned for a nonexistent request.
+        if not batch.forward_mode.is_idle():
+            batch.forward_mode = ForwardMode.DECODE
+        batch.spec_info = batch_output.next_draft_input
+        # Use post-accept seq_lens so draft/draft_extend write KV at the correct
+        # slots for active requests; an idle companion keeps the empty tensor.
+        batch.seq_lens = batch_output.new_seq_lens
 
     def _build_idle_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
         # PP non-last ranks intentionally have no draft model. They only need

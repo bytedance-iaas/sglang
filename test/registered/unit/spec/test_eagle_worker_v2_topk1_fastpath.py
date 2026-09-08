@@ -134,6 +134,74 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         with self.assertRaises(AssertionError):
             worker._rebuild_topk1_chain_buffers()
 
+    def test_pp_idle_handoff_materializes_before_dsa_metadata(self):
+        worker = object.__new__(EagleDraftWorker)
+        worker.req_to_token_pool = None
+        worker.cuda_graph_runner = None
+        worker.draft_runner = SimpleNamespace(canary_manager=None)
+        worker.topk = 1
+        worker.speculative_num_steps = 3
+        worker.speculative_num_draft_tokens = 4
+        worker.server_args = SimpleNamespace(pp_size=2)
+        worker.seed_dsa_topk_from_draft_extend = True
+        worker.draft_forward = MagicMock(return_value=(None, None, None, None))
+
+        draft_input = SimpleNamespace(dsa_topk_indices=None)
+        schedule_batch = SimpleNamespace(
+            forward_mode=ForwardMode.IDLE, spec_info=None, seq_lens=None
+        )
+        EAGLEWorkerV2._prepare_pp_next_draft_batch(
+            schedule_batch,
+            SimpleNamespace(
+                next_draft_input=draft_input,
+                new_seq_lens=torch.empty((0,), dtype=torch.int64),
+            ),
+        )
+
+        forward_batch = SimpleNamespace(
+            forward_mode=schedule_batch.forward_mode,
+            original_global_num_tokens_cpu=[1, 0],
+            spec_algorithm=SimpleNamespace(is_eagle=lambda: True),
+            spec_info=draft_input,
+            is_extend_in_batch=False,
+            batch_size=0,
+            out_cache_loc=torch.empty((0,), dtype=torch.int64),
+            num_token_non_padded=torch.tensor(0),
+            num_token_non_padded_cpu=0,
+        )
+
+        def materialize(_runner, _num_tokens, _batch_size):
+            forward_batch.seq_lens_cpu = torch.tensor([1], dtype=torch.int64)
+
+        forward_batch._pad_inputs_to_size = materialize
+        metadata_seq_lens = []
+
+        def init_forward_metadata(batch):
+            # Mirror the failing DSA reduction: this raises on an empty tensor.
+            metadata_seq_lens.append(int(batch.seq_lens_cpu.max().item()))
+
+        worker.draft_attn_backend = SimpleNamespace(
+            init_forward_metadata=init_forward_metadata
+        )
+
+        with (
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.prepare_for_draft",
+                return_value=(forward_batch, False),
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2._should_force_symmetric_spec_moe_padding",
+                return_value=True,
+            ),
+        ):
+            draft_tokens, parent_list, top_scores_index = worker.draft(schedule_batch)
+
+        self.assertEqual(schedule_batch.forward_mode, ForwardMode.IDLE)
+        self.assertEqual(metadata_seq_lens, [1])
+        self.assertEqual(tuple(draft_tokens.shape), (0, 4))
+        self.assertEqual(tuple(parent_list.shape), (0, 3))
+        self.assertEqual(tuple(top_scores_index.shape), (0, 3))
+
 
 class TestEagleWorkerV2BackendFallback(CustomTestCase):
     def setUp(self):

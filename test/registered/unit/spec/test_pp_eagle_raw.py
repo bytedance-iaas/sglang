@@ -10,6 +10,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 from sglang.srt.layers.attention.verify_mask import VerifyMask
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.eagle_info import EaglePPVerifyInputRaw, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import TreeMaskMode
 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
@@ -177,6 +178,43 @@ class TestEaglePPVerifyRebuild(unittest.TestCase):
 
 
 class TestEaglePPLastRankDraftOwnership(unittest.TestCase):
+    def test_prepare_next_draft_preserves_idle_companion_mode(self):
+        next_draft_input = object()
+        new_seq_lens = torch.empty((0,), dtype=torch.int64)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.IDLE, spec_info=None, seq_lens=None
+        )
+
+        EAGLEWorkerV2._prepare_pp_next_draft_batch(
+            batch,
+            SimpleNamespace(
+                next_draft_input=next_draft_input, new_seq_lens=new_seq_lens
+            ),
+        )
+
+        self.assertEqual(batch.forward_mode, ForwardMode.IDLE)
+        self.assertIs(batch.spec_info, next_draft_input)
+        self.assertIs(batch.seq_lens, new_seq_lens)
+        self.assertEqual(batch.seq_lens.numel(), 0)
+
+    def test_prepare_next_draft_promotes_active_batch_to_decode(self):
+        next_draft_input = object()
+        new_seq_lens = torch.tensor([17], dtype=torch.int64)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND, spec_info=None, seq_lens=None
+        )
+
+        EAGLEWorkerV2._prepare_pp_next_draft_batch(
+            batch,
+            SimpleNamespace(
+                next_draft_input=next_draft_input, new_seq_lens=new_seq_lens
+            ),
+        )
+
+        self.assertEqual(batch.forward_mode, ForwardMode.DECODE)
+        self.assertIs(batch.spec_info, next_draft_input)
+        self.assertIs(batch.seq_lens, new_seq_lens)
+
     @staticmethod
     def _server_args():
         return SimpleNamespace(
