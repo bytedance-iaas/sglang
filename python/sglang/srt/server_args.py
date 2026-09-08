@@ -474,6 +474,7 @@ class ServerArgs:
             choices=[
                 "flashmla_sparse",
                 "flashmla_sparse_q8",
+                "cutedsl_h16",
                 "flashmla_kv",
                 "flashmla_auto",
                 "flashinfer_sparse_mla",

@@ -302,6 +302,7 @@ _DSA_IMPL_T: TypeAlias = Literal[
     "flashinfer_sparse_mla",
     "fa3",
     "tilelang",
+    "cutedsl_h16",
     "trtllm",
     "intel_xpu",
 ]
@@ -449,6 +450,21 @@ class DeepseekSparseAttnBackend(
             self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+
+        if self.dsa_prefill_impl == "cutedsl_h16":
+            if (
+                self.device_capability != (9, 0)
+                or self.num_q_heads != 16
+                or self.kv_lora_rank != 512
+                or self.qk_rope_head_dim != 0
+                or model_runner.model_config.dtype != torch.bfloat16
+                or self.kv_cache_dtype not in (torch.bfloat16, torch.float8_e4m3fn)
+                or self.kv_cache_dim != (528 if self.dsa_kv_cache_store_fp8 else 512)
+            ):
+                raise ValueError(
+                    "cutedsl_h16 prefill requires SM90, 16 local Q heads, BF16 Q, "
+                    "latent dimension 512, no RoPE, and BF16 or group-scaled FP8 KV"
+                )
 
         # `flashmla_sparse_q8` = the native FP8 SM90 sparse-prefill kernel. It always
         # runs FP8 (requires fp8_e4m3 KV) and is SM90-only, so validate both at
@@ -1993,9 +2009,9 @@ class DeepseekSparseAttnBackend(
             )
             else self.dsa_prefill_impl
         )
-        if attn_sink is not None and dsa_impl != "flashmla_sparse":
+        if attn_sink is not None and dsa_impl not in ("flashmla_sparse", "cutedsl_h16"):
             raise RuntimeError(
-                f"Learnable attention sinks require flashmla_sparse, got {dsa_impl}"
+                f"Learnable attention sinks require flashmla_sparse or cutedsl_h16, got {dsa_impl}"
             )
 
         phase = (
@@ -2120,6 +2136,19 @@ class DeepseekSparseAttnBackend(
             page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
                 page_table_1
             ).to(torch.int32)
+
+        if dsa_impl == "cutedsl_h16":
+            from sglang.kernels.ops.attention.dsa.sparse_mla_h16 import (
+                sparse_mla_h16_paged_fwd,
+            )
+
+            return sparse_mla_h16_paged_fwd(
+                q=q_nope,
+                kv_cache=kv_cache,
+                indices=page_table_1,
+                sm_scale=layer.scaling,
+                attn_sink=attn_sink,
+            )
 
         if dsa_impl == "tilelang":
             if q_rope is not None:
