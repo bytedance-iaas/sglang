@@ -174,6 +174,7 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
             forward_batch.seq_lens_cpu = torch.tensor([1], dtype=torch.int64)
 
         forward_batch._pad_inputs_to_size = materialize
+        forward_batch.mark_forward_metadata_ready = lambda: None
         metadata_seq_lens = []
 
         def init_forward_metadata(batch):
