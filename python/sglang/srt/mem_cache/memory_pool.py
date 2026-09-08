@@ -3838,6 +3838,8 @@ class HybridLinearKVPool(KVCache):
         else:
             # Mirror the MHA branch: `full_loc` is the unified pool's
             # pre-translated (dense) loc; None for a static pool.
+            # Keep the logical owner mask because ownership cannot be derived
+            # from this compact physical location.
             write_loc = full_loc if full_loc is not None else loc
             with self._transfer_id_context(layer):
                 self.full_kv_pool.set_kv_buffer(
@@ -3845,6 +3847,7 @@ class HybridLinearKVPool(KVCache):
                     write_loc,
                     cache_k,
                     cache_v,
+                    dcp_kv_mask=dcp_kv_mask,
                 )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
@@ -4022,15 +4025,24 @@ class MLATokenToKVPool(KVCache):
         loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
         layer_id = layer.layer_id
         assert not self.dsa_kv_cache_store_fp8
-        parallel = get_parallel()
-        if parallel.dcp_enabled:
-            valid_mask = loc % parallel.attn_dcp_size == parallel.attn_dcp_rank
-            if not valid_mask.all():
+        if dcp_kv_mask is not None:
+            # The caller has already translated loc to the physical DCP shard.
+            loc = loc[dcp_kv_mask]
+            cache_k = cache_k[dcp_kv_mask]
+        else:
+            parallel = get_parallel()
+            valid_mask = (
+                loc % parallel.attn_dcp_size == parallel.attn_dcp_rank
+                if parallel.dcp_enabled
+                else None
+            )
+            if valid_mask is not None and not valid_mask.all():
                 loc = loc[valid_mask]
                 cache_k = cache_k[valid_mask]
         if cache_k.dtype != self.dtype:
@@ -4244,12 +4256,16 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
         # loc_info may be a KVWriteLoc; MLA pools have no SWA target.
         loc, _, _ = unwrap_write_loc(loc_info)
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA-FP4)")
         layer_id = layer.layer_id
         assert not self.dsa_kv_cache_store_fp8
+        if dcp_kv_mask is not None:
+            loc = loc[dcp_kv_mask]
+            cache_k = cache_k[dcp_kv_mask]
         if cache_k.dtype != self.dtype:
             from sglang.srt.layers.quantization.kvfp4_tensor import (
                 FP4MXBlock16KVQuantizeUtil,
