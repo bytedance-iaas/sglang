@@ -362,6 +362,7 @@ class EICKVClient:
             )
 
         self.write_queue = queue.Queue()
+        self._write_drop_ct = 0
         self._write_thread_num = 1
         self._write_thread_pool = [
             threading.Thread(target=self._write_thread, args=())
@@ -455,7 +456,7 @@ class EICKVClient:
             # benign L2/L3 cache miss (recomputed later). Rank-safe: assign_page_data
             # returns False without blocking, so every TP rank still reaches the
             # write_operation_shared all_reduce, which reconciles the failed result.
-            self._write_drop_ct = getattr(self, "_write_drop_ct", 0) + 1
+            self._write_drop_ct += 1
             if self._write_drop_ct == 1 or self._write_drop_ct % 128 == 0:
                 logger.warning(
                     "eic async write pool exhausted, dropping %d keys "
@@ -690,9 +691,12 @@ class EICKVClient:
         status_code, set_outcome = self.connection.mset(keys_vec, vals_vec, set_option)
 
         # Free slots before any early exit: the write mempool never refills, so an
-        # mset-error bail leaks them permanently.
-        if registered:
-            for item in objs:
+        # mset-error bail leaks them permanently. Test each item rather than the
+        # `registered` flag -- the loops above reassign it per key, so it carries
+        # only the last key's state and a single reshape fallback would strand the
+        # whole batch.
+        for item in objs:
+            if self.kv_cache_write_mem_pool.check_data_ptr_allocated(item.data_ptr()):
                 self.kv_cache_write_mem_pool.free_to_mempool(item.data_ptr())
 
         if status_code != eic.StatusCode.SUCCESS:
@@ -787,6 +791,10 @@ class EICBaseTokenToKVPoolHost:
         else:
             self.size = int(device_pool.size * host_to_device_ratio)
         self.size = self.size - (self.size % self.page_size)
+        # The metrics reporter reads logical_size off whatever host pool the tree
+        # cache exposes. EIC pools are flat -- no anchor entry to proxy -- so the
+        # logical size is just size.
+        self.logical_size = self.size
 
         # Initialize memory states and tracking structures.
         self.mem_state = torch.zeros(
@@ -1604,14 +1612,8 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
             params=params,
             server_args=server_args,
             kvcache=device_pool,
-            page_size=page_size,
-            tp_group=params.tp_cache_group,
             load_cache_event=load_cache_event,
-            attn_cp_group=params.attn_cp_cache_group,
-            attn_tp_group=params.attn_tp_cache_group,
             storage_backend=None,
-            pp_rank=params.pp_rank,
-            pp_size=params.pp_size,
             # EIC host pages are device-indexed; see _deepseek_v4_num_host_pages.
             device_indexed=True,
         )

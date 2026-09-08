@@ -171,6 +171,10 @@ class EICChunkCache(ChunkCache):
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
     ):
+        # ep_main's cache_finished_req has no is_decode, and release_kv_cache
+        # consumes it for the EICHiRadixCache branch instead of forwarding it.
+        # Gate on the decode-role flag alone rather than backing up every
+        # finished request, which is what dropping the term would do.
         save_cache = is_insert and self.save_decode_cache
         self.write_backup(req, save_decode_cache=save_cache)
         self.req_to_token_pool.free(req.req_pool_idx)

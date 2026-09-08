@@ -1,3 +1,4 @@
+import os
 import sys
 import unittest
 from queue import Queue
@@ -425,7 +426,7 @@ class TestEICHiCacheRegression(unittest.TestCase):
         cache.pp_group = object() if pp_size > 1 else None
         cache.tp_size, cache.rank, cache.tp_group = 1, 0, None
         cache.load_back_threshold = 10
-        cache._load_back_reserve = 16384
+        cache.load_back_reserve = 16384
         cache.evictable_size_ = 0
         cache.root_node = FakeTreeNode(0, True, None)
         cache.ongoing_load_admit = {}
@@ -718,6 +719,62 @@ class TestEICHiCacheRegression(unittest.TestCase):
             (device_full * 2, device_swa * 2),
         )
 
+    def test_eic_calls_the_assembler_with_its_current_signature(self):
+        # The port left six kwargs (page_size, tp_group, attn_cp_group,
+        # attn_tp_group, pp_rank, pp_size) on the call that ep_main had folded
+        # into `params`, so --enable-eic-cache died with TypeError at startup on
+        # the first DSV4 launch. Bind the call against the real signature.
+        import ast
+        import inspect
+
+        from sglang.srt.mem_cache import eic_memory_pool
+        from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
+
+        sig = inspect.signature(hybrid_pool_assembler.build_deepseek_v4_hicache_stack)
+        calls = [
+            n
+            for n in ast.walk(ast.parse(inspect.getsource(eic_memory_pool)))
+            if isinstance(n, ast.Call)
+            and getattr(n.func, "id", None) == "build_deepseek_v4_hicache_stack"
+        ]
+        self.assertTrue(calls)
+        for call in calls:
+            sig.bind_partial(**{kw.arg: None for kw in call.keywords})
+
+    def test_swa_evict_release_prefix_reaches_free_swa(self):
+        # EIC's swa_evict_release_prefix property is only honored if _evict_swa
+        # forwards it; without the kwarg it defaults False, the loaded-prefix
+        # branch never fires, and out-of-window prefix SWA leaks.
+        import ast
+        import inspect
+
+        from sglang.srt.managers import schedule_batch
+
+        src = inspect.getsource(schedule_batch.ScheduleBatch._evict_swa)
+        call = next(
+            n
+            for n in ast.walk(ast.parse(src.strip()))
+            if isinstance(n, ast.Call)
+            and getattr(n.func, "id", None) == "free_swa_out_of_window_slots"
+        )
+        self.assertIn("release_cache_protected_prefix", [k.arg for k in call.keywords])
+
+    def test_chunk_cache_does_not_back_up_every_finished_req(self):
+        # Dropping the is_decode term during the port flipped save_cache from
+        # always-False to always-True, so a prefill-only chunk-cache request
+        # would write its whole KV to EIC on finish.
+        seen = []
+        cache = EICChunkCache.__new__(EICChunkCache)
+        cache.save_decode_cache = False
+        cache.write_backup = lambda req, save_decode_cache: seen.append(
+            save_decode_cache
+        )
+        cache.req_to_token_pool = SimpleNamespace(free=lambda idx: None)
+        cache.cache_finished_req(
+            SimpleNamespace(req_pool_idx=0), is_insert=True, kv_len_to_handle=0
+        )
+        self.assertEqual(seen, [False])
+
     def test_finalize_asserts_on_verdict_before_ack(self):
         # I5 enforcement: a FINAL verdict may never land before the local ack
         # when a load was kicked -- silent free of in-flight DMA otherwise.
@@ -843,9 +900,7 @@ class TestEICHiCacheRegression(unittest.TestCase):
         import torch as _torch
 
         cache = self._make_writing_check_cache("write_back")
-        with mock.patch.object(
-            _torch.distributed, "get_world_size", return_value=1
-        ):
+        with mock.patch.object(_torch.distributed, "get_world_size", return_value=1):
             EICPagedHiRadixCache.writing_check(cache)  # no explicit flag
         cache.dec_lock_ref.assert_not_called()
         self.assertEqual(cache.ongoing_write_through, {})
@@ -855,9 +910,7 @@ class TestEICHiCacheRegression(unittest.TestCase):
         import torch as _torch
 
         cache = self._make_writing_check_cache("write_through")
-        with mock.patch.object(
-            _torch.distributed, "get_world_size", return_value=1
-        ):
+        with mock.patch.object(_torch.distributed, "get_world_size", return_value=1):
             EICPagedHiRadixCache.writing_check(cache)
         cache.dec_lock_ref.assert_called_once()
         self.assertEqual(cache.ongoing_write_through, {})
@@ -865,22 +918,25 @@ class TestEICHiCacheRegression(unittest.TestCase):
     def test_writing_check_no_barrier_when_not_blocking(self):
         # The forward-loop hazard: under write_back the per-loop call sites must NOT
         # spin waiting for every ack (a hung EIC write thread would freeze forward_ct
-        # until the watchdog SIGQUITs the server). With ongoing != acked and no
-        # blocking, writing_check must return promptly instead of looping forever.
+        # until the watchdog SIGQUITs the server). Assert on the spin itself -- the
+        # barrier's own 30s timeout means a missing `and blocking` still returns, so
+        # only the sleep count distinguishes "never entered" from "entered and bailed".
         import torch as _torch
 
         cache = self._make_writing_check_cache("write_back")
         cache.ongoing_write_through = {7: SimpleNamespace(id=7, host_value=object())}
-        ackq = Queue()  # deliberately EMPTY: qsize(0) != ongoing(1)
-        cache.cache_controller.ack_write_queue = ackq
-        with mock.patch.object(_torch.distributed, "get_world_size", return_value=1):
+        cache.cache_controller.ack_write_queue = Queue()  # qsize(0) != ongoing(1)
+        with mock.patch.object(
+            _torch.distributed, "get_world_size", return_value=1
+        ), mock.patch("sglang.srt.mem_cache.eic_hiradix_cache.time.sleep") as slept:
             EICPagedHiRadixCache.writing_check(cache)  # blocking defaults False
-        # Returned without hanging; the un-acked node is left for the next pass.
-        self.assertEqual(cache.ongoing_write_through, {7: cache.ongoing_write_through[7]})
+        slept.assert_not_called()
+        self.assertIn(7, cache.ongoing_write_through)
 
     def test_writing_check_barrier_times_out(self):
         # evict's blocking barrier must be bounded: if acks never arrive it breaks
-        # after the timeout instead of hanging the scheduler indefinitely.
+        # after the timeout instead of hanging the scheduler indefinitely. Without
+        # the deadline the loop spins forever, so a bounded sleep count is the claim.
         import torch as _torch
 
         cache = self._make_writing_check_cache("write_back")
@@ -894,10 +950,9 @@ class TestEICHiCacheRegression(unittest.TestCase):
             side_effect=[0.0, 5.0, 40.0, 40.1],
         ), mock.patch(
             "sglang.srt.mem_cache.eic_hiradix_cache.time.sleep"
-        ):
+        ) as slept:
             EICPagedHiRadixCache.writing_check(cache, write_back=True, blocking=True)
-        # Broke out of the barrier (did not hang) and drained the 0 available acks.
-        self.assertTrue(True)
+        self.assertEqual(slept.call_count, 1)
 
     def test_async_batch_set_drops_when_write_pool_exhausted(self):
         # Backend-failure OOM guard: when the async write pool is exhausted (the
@@ -909,6 +964,7 @@ class TestEICHiCacheRegression(unittest.TestCase):
         c = object.__new__(EICKVClient)
         c.kv_cache_write_mem_pool = SimpleNamespace(left_count=lambda: 0)
         c.write_queue = Queue()
+        c._write_drop_ct = 0
         copied = []
         ret = EICKVClient.async_batch_set(
             c,
@@ -998,9 +1054,14 @@ class TestEICHiCacheRegression(unittest.TestCase):
         cache = self._remote_cache()
         node = SimpleNamespace(id=1, content_hash=None)
         cache._match_for_remote_fetch = lambda root, key: (0, node)
-        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [256, 256]
+        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [
+            256,
+            256,
+        ]
         reqs = [
-            mock.Mock(rid=r, origin_input_ids=list(range(n)), output_ids=[9], extra_key=None)
+            mock.Mock(
+                rid=r, origin_input_ids=list(range(n)), output_ids=[9], extra_key=None
+            )
             for r, n in (("under", 255), ("exact", 256), ("over", 257))
         ]
         with mock.patch(
@@ -1056,7 +1117,10 @@ class TestEICHiCacheRegression(unittest.TestCase):
             cache.pp_group = object()
             node = SimpleNamespace(id=1, content_hash=None)
             cache._match_for_remote_fetch = lambda root, key: (0, node)
-            cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [256, 256]
+            cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [
+                256,
+                256,
+            ]
             shapes = []
 
             def fake_reduce(t):
@@ -1066,7 +1130,12 @@ class TestEICHiCacheRegression(unittest.TestCase):
 
             cache._reduce_min = fake_reduce
             reqs = [
-                mock.Mock(rid=r, origin_input_ids=list(range(4096)), output_ids=[9], extra_key=None)
+                mock.Mock(
+                    rid=r,
+                    origin_input_ids=list(range(4096)),
+                    output_ids=[9],
+                    extra_key=None,
+                )
                 for r in ("x", "y")
             ]
             with mock.patch(
@@ -1092,36 +1161,19 @@ class TestEICHiCacheRegression(unittest.TestCase):
         self.assertEqual(probe_budget({"eic_check_max_num": 512}), 512)
         self.assertEqual(probe_budget({"eic_check_max_num": -1}), -1)
 
-    def test_match_from_remote_admits_a_short_eic_hit(self):
-        cache = object.__new__(EICPagedHiRadixCache)
-        cache.match_req_set = {}
-        cache.tp_size = 1
-        cache.pp_size = 1
-        cache.pp_group = None
-        cache.page_size = 256
-        cache.eic_check_max_num = 2048
-        cache.root_node = object()
-        cache._insert_remote_node = mock.Mock()
-        node = SimpleNamespace(id=1, content_hash=None)
-        cache._match_for_remote_fetch = lambda root, key: (0, node)
-        cache.cache_controller = mock.Mock()
-        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [512]
+    def test_real_tree_node_carries_content_hash(self):
+        # Every EIC hash path (_need_calculate_hash, _split_node, write_backup)
+        # reads node.content_hash off nodes built by RadixCache._insert_helper,
+        # not just EIC-created ones. The suite's SimpleNamespace fakes invent the
+        # field, so only a real TreeNode catches it going missing -- without it
+        # the first non-EIC-inserted node raises AttributeError.
+        from sglang.srt.mem_cache.eic_hiradix_cache import _need_calculate_hash
+        from sglang.srt.mem_cache.radix_cache import RadixKey, TreeNode
 
-        req = mock.Mock(
-            rid="short-hit",
-            origin_input_ids=list(range(4096)),
-            output_ids=[9],
-            extra_key=None,
-        )
-        with mock.patch(
-            "sglang.srt.mem_cache.eic_hiradix_cache._need_calculate_hash",
-            return_value=False,
-        ):
-            EICPagedHiRadixCache.match_from_remote(cache, [req])
-
-        cache._insert_remote_node.assert_called_once()
-        self.assertEqual(len(cache._insert_remote_node.call_args[0][1]), 512)
-        self.assertIn("short-hit", cache.match_req_set)
+        node = TreeNode()
+        self.assertIsNone(node.content_hash)
+        node.key = RadixKey(list(range(512)), None)
+        self.assertTrue(_need_calculate_hash(node, 256))
 
     def test_match_from_remote_probe_budget_caps_a_long_queue(self):
         cache = object.__new__(EICPagedHiRadixCache)
@@ -1157,32 +1209,38 @@ class TestEICHiCacheRegression(unittest.TestCase):
         self.assertEqual(len(probed), 2)
         self.assertEqual(len(cache.match_req_set), 0)
 
-    def test_hicache_host_stats_use_the_anchor_pool(self):
+    def test_hicache_host_stats_read_a_real_eic_host_pool(self):
+        # _log_hicache_stats reads logical_size off tree_cache.token_to_kv_pool_host,
+        # which for EIC is a flat EIC*TokenToKVPoolHost, not a HostPoolGroup with an
+        # anchor to proxy from. Build the pool through its real __init__: a
+        # hand-rolled SimpleNamespace would invent the attribute and hide that EIC
+        # forces enable_hierarchical_cache while the reporter has no try/except, so
+        # a missing logical_size is an AttributeError on every prefill report.
         from sglang.srt.managers.scheduler_components.metrics_reporter import (
             SchedulerMetricsReporter,
         )
+        from sglang.srt.mem_cache.eic_memory_pool import EICBaseTokenToKVPoolHost
 
-        anchor = SimpleNamespace(
-            size=32960, logical_size=32960, available_size=lambda: 30000
-        )
-        entries = {
-            "kv": SimpleNamespace(host_pool=anchor, is_primary_index_anchor=True),
-            "swa": SimpleNamespace(
-                host_pool=SimpleNamespace(
-                    size=1, logical_size=1, available_size=lambda: 1
-                ),
-                is_primary_index_anchor=False,
-            ),
-        }
-        # HostPoolGroup proxies size/logical_size/available_size from the anchor
-        # entry (memory_pool_host.py), so the group reports the anchor's numbers
-        # rather than the sum across pools.
-        host = SimpleNamespace(
-            size=anchor.size,
-            logical_size=anchor.logical_size,
-            available_size=anchor.available_size,
-            host_pool_group=SimpleNamespace(entry_map=entries),
-        )
+        device_pool = SimpleNamespace(store_dtype=torch.bfloat16, size=8192)
+        host = EICBaseTokenToKVPoolHost.__new__(EICBaseTokenToKVPoolHost)
+        host.get_size_per_token = lambda: 1024
+        with mock.patch(
+            "sglang.srt.mem_cache.eic_memory_pool.get_attention_tp_size", return_value=1
+        ), mock.patch(
+            "sglang.srt.mem_cache.eic_memory_pool.get_attention_tp_rank", return_value=0
+        ), mock.patch.dict(
+            os.environ, {"MY_HOST_IP": "10.0.0.1"}
+        ):
+            EICBaseTokenToKVPoolHost.__init__(
+                host,
+                device_pool,
+                host_to_device_ratio=2.0,
+                host_size=0,
+                page_size=256,
+                extra_info={},
+            )
+        host.free_slots = host.free_slots[:-2960]
+
         rep = object.__new__(SchedulerMetricsReporter)
         rep.stats = SimpleNamespace()
         rep.scheduler = SimpleNamespace(
@@ -1190,7 +1248,7 @@ class TestEICHiCacheRegression(unittest.TestCase):
             tree_cache=SimpleNamespace(token_to_kv_pool_host=host),
         )
         SchedulerMetricsReporter._log_hicache_stats(rep)
-        self.assertEqual(rep.stats.hicache_host_total_tokens, 32960)
+        self.assertEqual(rep.stats.hicache_host_total_tokens, 16384)
         self.assertEqual(rep.stats.hicache_host_used_tokens, 2960)
 
     def test_write_thread_frees_slots_when_mset_raises(self):

@@ -288,6 +288,13 @@ class EICHiRadixCache(RadixCache):
             1 if server_args.hicache_write_policy == "write_through" else 3
         )
         self.load_back_threshold = 10
+        # Headroom a load-back must leave for the next chunked-prefill extend;
+        # both inputs are frozen for this object's lifetime.
+        self.load_back_reserve = (
+            server_args.chunked_prefill_size
+            if server_args.chunked_prefill_size and server_args.chunked_prefill_size > 0
+            else self.page_size
+        )
         if self.pp_size > 1:
             # The verdict protocol assumes lockstep candidate iteration and
             # lockstep releases. These knobs break that: cache-aware policies
@@ -812,12 +819,7 @@ class EICHiRadixCache(RadixCache):
         # with #running-req: 0 and evictable_size 0 -- an unrecoverable prefill OOM
         # (the baseline's init_load_back sits inside that budget and self-bounds).
         # A refused load degrades to a device-only admit below, not a deadlock.
-        reserve = getattr(self, "_load_back_reserve", None)
-        if reserve is None:
-            from sglang.srt.server_args import get_global_server_args
-
-            cps = get_global_server_args().chunked_prefill_size or 0
-            reserve = self._load_back_reserve = cps if cps > 0 else self.page_size
+        reserve = self.load_back_reserve
         alloc = self.cache_controller.mem_pool_device_allocator
         return alloc.available_size() + self.evictable_size_ >= quota + reserve
 
