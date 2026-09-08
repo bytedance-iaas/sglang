@@ -76,7 +76,6 @@ class TestEICHiCacheRegression(unittest.TestCase):
         cache.pp_size = 1
         cache.pp_group = None
         cache.page_size = 1
-        cache.load_remote_threshold = 1
         cache.eic_check_max_num = 0
         cache.root_node = object()
         cache._insert_remote_node = mock.Mock()
@@ -85,7 +84,7 @@ class TestEICHiCacheRegression(unittest.TestCase):
         # Fetch only the middle req; the others' prefix already covers the key.
         def match(root, key):
             match.i += 1
-            return (0, 0, node) if match.i == 2 else (len(key), 0, node)
+            return (0, node) if match.i == 2 else (len(key), node)
 
         match.i = 0
         cache._match_for_remote_fetch = match
@@ -977,6 +976,230 @@ class TestEICHiCacheRegression(unittest.TestCase):
         self.assertIs(ctx.exception, escaped)  # reached the body, i.e. broke out
         self.assertEqual(cache.writing_check.call_count, 2)  # bounded spins
         self.assertEqual(len(cache.ongoing_write_through), 51)  # never drained
+
+    def _remote_cache(self, page_size=256, budget=2048, memoized=()):
+        cache = object.__new__(EICPagedHiRadixCache)
+        cache.match_req_set = dict.fromkeys(memoized)
+        cache.tp_size = 1
+        cache.pp_size = 1
+        cache.pp_group = None
+        cache.page_size = page_size
+        cache.eic_check_max_num = budget
+        cache.root_node = object()
+        cache._insert_remote_node = mock.Mock()
+        cache.cache_controller = mock.Mock()
+        return cache
+
+    def test_match_from_remote_probes_only_a_full_page_of_remainder(self):
+        cache = self._remote_cache()
+        node = SimpleNamespace(id=1, content_hash=None)
+        cache._match_for_remote_fetch = lambda root, key: (0, node)
+        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [256, 256]
+        reqs = [
+            mock.Mock(rid=r, origin_input_ids=list(range(n)), output_ids=[9], extra_key=None)
+            for r, n in (("under", 255), ("exact", 256), ("over", 257))
+        ]
+        with mock.patch(
+            "sglang.srt.mem_cache.eic_hiradix_cache._need_calculate_hash",
+            return_value=False,
+        ):
+            EICPagedHiRadixCache.match_from_remote(cache, reqs)
+
+        probed = cache.cache_controller.batch_find_longest_prefix_in_eic.call_args[0][0]
+        self.assertEqual([len(k) for k in probed], [256, 257])
+
+    def test_match_from_remote_retries_a_miss_then_memoizes_the_hit(self):
+        cache = self._remote_cache()
+        node = SimpleNamespace(id=1, content_hash=None)
+        cache._match_for_remote_fetch = lambda root, key: (512, node)
+        req = mock.Mock(
+            rid="R", origin_input_ids=list(range(4096)), output_ids=[9], extra_key=None
+        )
+        patch_hash = mock.patch(
+            "sglang.srt.mem_cache.eic_hiradix_cache._need_calculate_hash",
+            return_value=False,
+        )
+
+        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [0]
+        with patch_hash:
+            EICPagedHiRadixCache.match_from_remote(cache, [req])
+        cache._insert_remote_node.assert_not_called()
+        self.assertEqual(cache.match_req_set, {})
+
+        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [768]
+        with patch_hash:
+            EICPagedHiRadixCache.match_from_remote(cache, [req])
+        key = cache._insert_remote_node.call_args[0][1]
+        self.assertEqual(len(key), 768)
+        self.assertEqual(key.token_ids[0], 512)
+        self.assertIn("R", cache.match_req_set)
+
+        cache._match_for_remote_fetch = mock.Mock(
+            side_effect=AssertionError("memoized rid must be skipped")
+        )
+        with patch_hash:
+            EICPagedHiRadixCache.match_from_remote(cache, [req])
+        self.assertEqual(
+            cache.cache_controller.batch_find_longest_prefix_in_eic.call_count, 2
+        )
+
+    def test_match_from_remote_reduces_even_when_fetches_is_empty(self):
+        # A lagging PP stage has an empty fetches; skipping its reduce would
+        # orphan PP0's isend onto the next round's num_ready recv.
+        def reduce_shapes(memoized):
+            cache = self._remote_cache(memoized=memoized)
+            cache.pp_size = 2
+            cache.pp_group = object()
+            node = SimpleNamespace(id=1, content_hash=None)
+            cache._match_for_remote_fetch = lambda root, key: (0, node)
+            cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [256, 256]
+            shapes = []
+
+            def fake_reduce(t):
+                shapes.append(tuple(t.shape))
+                if t.dim() == 0:
+                    t.fill_(2)
+
+            cache._reduce_min = fake_reduce
+            reqs = [
+                mock.Mock(rid=r, origin_input_ids=list(range(4096)), output_ids=[9], extra_key=None)
+                for r in ("x", "y")
+            ]
+            with mock.patch(
+                "sglang.srt.mem_cache.eic_hiradix_cache._need_calculate_hash",
+                return_value=False,
+            ):
+                EICPagedHiRadixCache.match_from_remote(cache, reqs)
+            return shapes
+
+        self.assertEqual(reduce_shapes(()), reduce_shapes(("x", "y")))
+
+    def test_eic_check_max_num_is_bounded_by_default(self):
+        def probe_budget(cfg):
+            cache = object.__new__(EICPagedHiRadixCache)
+            cache.page_size = 256
+            with mock.patch.object(
+                EICPagedHiRadixCache.__bases__[0], "init_hyper_params", lambda *a: None
+            ):
+                EICPagedHiRadixCache.init_hyper_params(cache, cfg)
+            return cache.eic_check_max_num
+
+        self.assertEqual(probe_budget({}), 2048)
+        self.assertEqual(probe_budget({"eic_check_max_num": 512}), 512)
+        self.assertEqual(probe_budget({"eic_check_max_num": -1}), -1)
+
+    def test_match_from_remote_admits_a_short_eic_hit(self):
+        cache = object.__new__(EICPagedHiRadixCache)
+        cache.match_req_set = {}
+        cache.tp_size = 1
+        cache.pp_size = 1
+        cache.pp_group = None
+        cache.page_size = 256
+        cache.eic_check_max_num = 2048
+        cache.root_node = object()
+        cache._insert_remote_node = mock.Mock()
+        node = SimpleNamespace(id=1, content_hash=None)
+        cache._match_for_remote_fetch = lambda root, key: (0, node)
+        cache.cache_controller = mock.Mock()
+        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [512]
+
+        req = mock.Mock(
+            rid="short-hit",
+            origin_input_ids=list(range(4096)),
+            output_ids=[9],
+            extra_key=None,
+        )
+        with mock.patch(
+            "sglang.srt.mem_cache.eic_hiradix_cache._need_calculate_hash",
+            return_value=False,
+        ):
+            EICPagedHiRadixCache.match_from_remote(cache, [req])
+
+        cache._insert_remote_node.assert_called_once()
+        self.assertEqual(len(cache._insert_remote_node.call_args[0][1]), 512)
+        self.assertIn("short-hit", cache.match_req_set)
+
+    def test_match_from_remote_probe_budget_caps_a_long_queue(self):
+        cache = object.__new__(EICPagedHiRadixCache)
+        cache.match_req_set = {}
+        cache.tp_size = 1
+        cache.pp_size = 1
+        cache.pp_group = None
+        cache.page_size = 256
+        cache.eic_check_max_num = 5  # each req below is 4 pages
+        cache.root_node = object()
+        cache._insert_remote_node = mock.Mock()
+        node = SimpleNamespace(id=1, content_hash=None)
+        cache._match_for_remote_fetch = lambda root, key: (0, node)
+        cache.cache_controller = mock.Mock()
+        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [0, 0]
+
+        reqs = [
+            mock.Mock(
+                rid=r,
+                origin_input_ids=list(range(1024)),
+                output_ids=[9],
+                extra_key=None,
+            )
+            for r in ("a", "b", "c")
+        ]
+        with mock.patch(
+            "sglang.srt.mem_cache.eic_hiradix_cache._need_calculate_hash",
+            return_value=False,
+        ):
+            EICPagedHiRadixCache.match_from_remote(cache, reqs)
+
+        probed = cache.cache_controller.batch_find_longest_prefix_in_eic.call_args[0][0]
+        self.assertEqual(len(probed), 2)
+        self.assertEqual(len(cache.match_req_set), 0)
+
+    def test_hicache_host_stats_use_the_anchor_pool(self):
+        from sglang.srt.managers.scheduler_components.metrics_reporter import (
+            SchedulerMetricsReporter,
+        )
+
+        anchor = SimpleNamespace(size=32960, available_size=lambda: 30000)
+        entries = {
+            "kv": SimpleNamespace(host_pool=anchor, is_primary_index_anchor=True),
+            "swa": SimpleNamespace(
+                host_pool=SimpleNamespace(size=1, available_size=lambda: 1),
+                is_primary_index_anchor=False,
+            ),
+        }
+        host = SimpleNamespace(
+            size=1054208,
+            available_size=lambda: 1054208,
+            host_pool_group=SimpleNamespace(entry_map=entries),
+        )
+        rep = object.__new__(SchedulerMetricsReporter)
+        rep.stats = SimpleNamespace()
+        rep.scheduler = SimpleNamespace(
+            enable_hierarchical_cache=True,
+            tree_cache=SimpleNamespace(token_to_kv_pool_host=host),
+        )
+        SchedulerMetricsReporter._log_hicache_stats(rep)
+        self.assertEqual(rep.stats.hicache_host_total_tokens, 32960)
+        self.assertEqual(rep.stats.hicache_host_used_tokens, 2960)
+
+    def test_write_thread_frees_slots_when_mset_raises(self):
+        from sglang.srt.mem_cache.eic_memory_pool import EICKVClient
+
+        freed = []
+        c = object.__new__(EICKVClient)
+        c.write_queue = Queue()
+        c.kv_cache_write_mem_pool = SimpleNamespace(
+            check_data_ptr_allocated=lambda p: True,
+            free_to_mempool=freed.append,
+        )
+        c._async_set_impl = mock.Mock(side_effect=RuntimeError("backend down"))
+        values = [torch.zeros(2), torch.zeros(2)]
+        c.write_queue.put((["a", "b"], values, None))
+        c.write_queue.put(None)
+
+        with self.assertRaises(TypeError):
+            EICKVClient._write_thread(c)
+
+        self.assertEqual(freed, [v.data_ptr() for v in values])
 
 
 if __name__ == "__main__":

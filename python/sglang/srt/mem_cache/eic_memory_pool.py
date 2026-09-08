@@ -387,14 +387,18 @@ class EICKVClient:
         logger.info(f"start write thread thread_id {threading.get_ident()}")
         while True:
             keys, values, copy_event = self.write_queue.get()
-            if copy_event is not None:
-                copy_event.synchronize()
-            self._async_set_impl(keys, values)
-            for value in values:
-                if self.kv_cache_write_mem_pool.check_data_ptr_allocated(
-                    value.data_ptr()
-                ):
-                    self.kv_cache_write_mem_pool.free_to_mempool(value.data_ptr())
+            try:
+                if copy_event is not None:
+                    copy_event.synchronize()
+                self._async_set_impl(keys, values)
+            except Exception:
+                logger.exception("eic async write failed, dropping %d keys", len(keys))
+            finally:
+                for value in values:
+                    if self.kv_cache_write_mem_pool.check_data_ptr_allocated(
+                        value.data_ptr()
+                    ):
+                        self.kv_cache_write_mem_pool.free_to_mempool(value.data_ptr())
 
     def async_batch_set(
         self,
@@ -977,20 +981,6 @@ class EICBaseTokenToKVPoolHost:
         self.layer_num = self.device_pool.layer_num
 
         return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize * 2
-
-    def exist_page(self, content_hashes):
-        """
-        for single prompt detect prefix key
-        """
-        keys = self._encode_key_shared(content_hashes)
-        ret = self.eic_client.exists_batch(keys)
-        res = []
-        for i, exist in enumerate(ret):
-            if exist:
-                res.append(content_hashes[i])
-            else:
-                break
-        return res
 
     def get_page_data_direct(self, keys, device_indices=None):
         bs = G_GDRBounceTensorCount
@@ -1841,15 +1831,6 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
             end = start + self.page_chunk_count
             page_exists.append(all(chunk_exists[start:end]))
         return page_exists
-
-    def exist_page(self, content_hashes):
-        page_exists = self.batch_exist_page(content_hashes)
-        ret = []
-        for i, exist in enumerate(page_exists):
-            if not exist:
-                break
-            ret.append(content_hashes[i])
-        return ret
 
     def device_backup(
         self, device_indices: torch.Tensor, dst_tensors: List[torch.Tensor]
