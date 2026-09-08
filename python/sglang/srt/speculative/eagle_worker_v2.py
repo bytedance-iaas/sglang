@@ -2118,6 +2118,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
             finalize_tree_path=True,
             grammar_barrier=grammar_barrier,
             pp_proxy_tensors=pp_proxy_tensors,
+            numerical_probe=(
+                self._draft_worker.eagle_numerical_probe
+                if self._draft_worker is not None
+                else None
+            ),
         )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
