@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "working_directory": "sglang",
+  "benchmark": "benchmark/kernels/sidp/bench_dma_compute_pipeline.py",
+  "output_dir": "../check_logs/sidp_nsight_pipeline_smoke",
+  "artifact_dir": "/tmp/sidp_nsight_pipeline_smoke",
+  "baseline_case": "compute_only_k4",
+  "common": {
+    "num_gpus": 8,
+    "cycles": 6,
+    "component_bytes": [33554432, 16777216],
+    "gemm_m": 256,
+    "gemm_n": 4096,
+    "gemm_k": 4096,
+    "gemm_repeats": 1,
+    "random_delay_max_us": 1000,
+    "warmup": 1,
+    "iterations": 1,
+    "seed": 20260904,
+    "lead_ms": 20
+  },
+  "cases": [
+    {
+      "name": "compute_only_k4",
+      "mode": "compute_only",
+      "k": 4
+    },
+    {
+      "name": "fixed_dma_flag_k4",
+      "mode": "compute_dma_flag",
+      "k": 4
+    }
+  ],
+  "collection": {
+    "nsys": {
+      "enabled": true,
+      "path": "/usr/local/bin/nsys",
+      "timeout_s": 900,
+      "trace": "cuda,nvtx,osrt",
+      "cuda_graph_trace": "node:host-only:nvtx-precapture"
+    },
+    "ncu": {
+      "enabled": true,
+      "required": false,
+      "path": "/usr/local/cuda/bin/ncu",
+      "timeout_s": 1800,
+      "node_enabled": true,
+      "workload_enabled": true,
+      "hotspot_time_ratio": 0.05,
+      "min_kernel_num": 1,
+      "max_kernel_num": 1,
+      "launch_count": 1,
+      "sections": [
+        "SpeedOfLight",
+        "SpeedOfLight_RooflineChart",
+        "SpeedOfLight_HierarchicalTensorRooflineChart",
+        "ComputeWorkloadAnalysis",
+        "MemoryWorkloadAnalysis",
+        "LaunchStats",
+        "Occupancy",
+        "SchedulerStats"
+      ]
+    }
+  }
+}
