@@ -340,19 +340,22 @@ class Glm5NextLinearAttention(nn.Module):
         # A global quant_config does not mean these six projections are
         # quantized: GLM-5.3-Flash ships FP8 experts with BF16 attention. Ask
         # per prefix, since the fused modules can only eat unquantized weights.
-        self.do_fuse_qkvbfg = are_linear_prefixes_unquantized(
-            quant_config,
-            [
-                f"{prefix}.{name}"
-                for name in (
-                    "qkv_proj",
-                    "f_a_proj",
-                    "f_b_proj",
-                    "b_proj",
-                    "g_a_proj",
-                    "g_b_proj",
-                )
-            ],
+        self.do_fuse_qkvbfg = (
+            not envs.SGLANG_DISABLE_KDA_PROJECTION_FUSION.get()
+            and are_linear_prefixes_unquantized(
+                quant_config,
+                [
+                    f"{prefix}.{name}"
+                    for name in (
+                        "qkv_proj",
+                        "f_a_proj",
+                        "f_b_proj",
+                        "b_proj",
+                        "g_a_proj",
+                        "g_b_proj",
+                    )
+                ],
+            )
         )
         if self.do_fuse_qkvbfg:
             self.qkvb_sizes = [

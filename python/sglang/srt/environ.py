@@ -1253,6 +1253,7 @@ class Envs:
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # SM90 T2 chain verify: retain accepted SSM checkpoints in request scratch.
     SGLANG_OPT_KDA_ACCEPTED_STATE = EnvBool(False)
+    SGLANG_DISABLE_KDA_PROJECTION_FUSION = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")

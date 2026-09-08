@@ -85,10 +85,12 @@ def test_glm_kda_projection_loading_and_outputs(
             )
         assert fused.do_fuse_qkvbfg
         # Build the public unfused modules to compare equivalent loaded weights.
-        with monkeypatch.context() as m:
-            m.setattr(glm, "are_linear_prefixes_unquantized", lambda *a: False)
+        with glm.envs.SGLANG_DISABLE_KDA_PROJECTION_FUSION.override(True):
             with torch.device("cuda"):
-                unfused = glm.Glm5NextLinearAttention(0, 256, config, prefix=PREFIX)
+                unfused = glm.Glm5NextLinearAttention(
+                    0, 256, config, quant_config=qc, prefix=PREFIX
+                )
+        assert not unfused.do_fuse_qkvbfg
         generator = torch.Generator(device="cuda").manual_seed(5381)
         sizes = [8192, 8192, 8192, 64, 128, 128]
         mapping = [
