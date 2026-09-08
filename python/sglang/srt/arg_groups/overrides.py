@@ -683,17 +683,20 @@ def _check_tilelang_dsa_fp8_kv(
     decode_backend: Optional[str],
     *,
     hip: bool,
+    nope_group_scaled: bool = False,
 ) -> None:
-    """tilelang's fp8 KV path is ROCm-only; the CUDA kernel hardcodes bfloat16.
-    Reject here instead of crashing at decode CUDA-graph capture."""
+    """CUDA supports group-scaled NoPE via bounded BF16 conversion.
+    Keep rejecting other FP8 layouts before CUDA-graph capture.
+    """
     if (
         not hip
+        and not nope_group_scaled
         and kv_cache_dtype == "fp8_e4m3"
         and "tilelang" in {prefill_backend, decode_backend}
     ):
         raise ValueError(
-            "The tilelang DSA prefill/decode kernels only support an fp8_e4m3 KV "
-            "cache on ROCm/HIP; on CUDA they require a bfloat16 KV cache. Use "
+            "CUDA tilelang FP8 KV requires BF16 queries with latent512/RoPE0 "
+            "group-scaled NoPE cache; other CUDA layouts require BF16 KV. Use "
             "--kv-cache-dtype bfloat16 with the tilelang backend, or keep "
             "--kv-cache-dtype fp8_e4m3 and pick an fp8-capable DSA backend "
             "(flashmla_kv on Hopper, trtllm on Blackwell)."
@@ -817,7 +820,15 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
     _check_tilelang_dsa_fp8_kv(
-        kv_cache_dtype, prefill, decode, hip=get_platform().is_hip
+        kv_cache_dtype,
+        prefill,
+        decode,
+        hip=get_platform().is_hip,
+        nope_group_scaled=(
+            model_config_of(view).kv_lora_rank == 512
+            and model_config_of(view).qk_rope_head_dim == 0
+            and model_config_of(view).dtype == torch.bfloat16
+        ),
     )
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "
