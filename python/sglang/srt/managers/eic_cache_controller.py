@@ -189,12 +189,14 @@ class EICCacheController(HiCacheController):
 
         def safe_empty_cache():
             self.write_wait_event.set()
-            write_stream = self.write_stream
-            write_event = torch.cuda.Event()
-            write_event.record(write_stream)
-            write_event.synchronize()
-            original_empty_cache()
-            self.write_wait_event.clear()
+            try:
+                write_stream = self.write_stream
+                write_event = torch.cuda.Event()
+                write_event.record(write_stream)
+                write_event.synchronize()
+                original_empty_cache()
+            finally:
+                self.write_wait_event.clear()
 
         torch.cuda.empty_cache = safe_empty_cache
 
@@ -208,10 +210,11 @@ class EICCacheController(HiCacheController):
 
         def synced_forward(*args, **kwargs):
             self.write_wait_event.set()
-            self.write_stream.synchronize()
-            result = original_forward(*args, **kwargs)
-            self.write_wait_event.clear()
-            return result
+            try:
+                self.write_stream.synchronize()
+                return original_forward(*args, **kwargs)
+            finally:
+                self.write_wait_event.clear()
 
         ModelRunner.forward = synced_forward
         logger.info("Hooked model forward with synchronized write stream.")
@@ -458,8 +461,10 @@ class EICCacheController(HiCacheController):
                 try:
                     operation = self.load_queue.get(block=True, timeout=1)
                     self.load_wait_event.set()
-                    self.load_from_eic(operation)
-                    self.load_wait_event.clear()
+                    try:
+                        self.load_from_eic(operation)
+                    finally:
+                        self.load_wait_event.clear()
                 except Empty:
                     continue
                 except Exception as e:
@@ -475,16 +480,6 @@ class EICCacheController(HiCacheController):
         Allocate memory on the host.
         """
         return self.mem_pool_host.alloc(size)
-
-    def find_longest_prefix_in_eic(self, prompt, prev_hash=None):
-        """
-        Find the longest prefix in the EIC cache.
-        """
-        if len(prompt) == 0:
-            return [], []
-        content_hash = get_content_hash(prompt, self.page_size, prev_hash)
-        exist_result = self.mem_pool_host.exist_page(content_hash)
-        return exist_result, prompt[: len(exist_result) * self.page_size]
 
     def batch_find_longest_prefix_in_eic(self, prompts, prev_hashes):
         assert len(prompts) == len(

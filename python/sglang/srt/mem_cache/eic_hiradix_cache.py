@@ -1511,6 +1511,9 @@ class EICHiRadixCache(RadixCache):
         return ret_list
 
 
+DEFAULT_EIC_CHECK_MAX_NUM = 2048
+
+
 def _need_calculate_hash(node: TreeNode, page_size: int):
     if node is None or node.key is None or len(node.key) == 0:
         return False
@@ -1526,20 +1529,15 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         server_args: ServerArgs,
     ):
         self.calculate_hash_fn = get_content_hash
-        self.load_remote_threshold = 100
         self.match_req_set = {}  # rid -> None, insertion-ordered for FIFO trim
-        self.eic_check_max_num = -1
+        self.eic_check_max_num = DEFAULT_EIC_CHECK_MAX_NUM
         super().__init__(params, server_args)
 
     def init_hyper_params(self, config):
         super().init_hyper_params(config)
-        floor = 1 << 14  # 16K tokens
-        cfg_val = config.get("load_remote_threshold", floor)
-        self.load_remote_threshold = max(cfg_val, floor)
-        logger.info(
-            f"EICPagedHiRadixCache load_remote_threshold set to {self.load_remote_threshold} (cfg_val={cfg_val}, floor={floor})"
+        self.eic_check_max_num = config.get(
+            "eic_check_max_num", DEFAULT_EIC_CHECK_MAX_NUM
         )
-        self.eic_check_max_num = config.get("eic_check_max_num", -1)
         logger.info(
             f"EICPagedHiRadixCache eic_check_max_num set to {self.eic_check_max_num}"
         )
@@ -1587,62 +1585,6 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         new_node.parent.children[key.child_key(self.page_size)] = new_node
         return new_node
 
-    def match_prefix_extend(self, key: RadixKey, last_node):
-        cache_prefix_len = 0
-        temp_node = last_node
-        while temp_node:
-            cache_prefix_len += len(temp_node.key)
-            temp_node = temp_node.parent
-
-        # if the cache prefix is too long, or the remaining key is too short, we can skip loading from eic
-        if (len(key) - cache_prefix_len) < self.load_remote_threshold:
-            return last_node
-
-        logger.debug(
-            f"few cache in radix, try load from eic, cache len {cache_prefix_len}, total len {len(key)}"
-        )
-        if _need_calculate_hash(last_node, self.page_size):
-            self._calculate_content_hash(last_node)
-        last_prev_hash = None
-        if last_node.content_hash is not None and len(last_node.content_hash) > 0:
-            last_prev_hash = last_node.content_hash[-1]
-        need_compute_key = key[cache_prefix_len:]
-        eic_hash, eic_key = self.cache_controller.find_longest_prefix_in_eic(
-            need_compute_key, last_prev_hash
-        )
-        if self.tp_size > 1:
-            eic_hash_len_tensor = torch.tensor(
-                [len(eic_hash)], dtype=torch.int64, device="cpu"
-            )
-            torch.distributed.all_reduce(
-                eic_hash_len_tensor,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
-            )
-            eic_hash_len = eic_hash_len_tensor.item()
-            eic_hash = eic_hash[:eic_hash_len]
-            eic_key = eic_key[: eic_hash_len * self.page_size]
-        if len(eic_key) < self.load_remote_threshold:
-            logger.debug(
-                f"eic key is too short, skip loading from eic, eic cache len {len(eic_key)}, need compute key len {len(need_compute_key)}"
-            )
-            return last_node
-        load_node = TreeNode()
-        load_node.key = eic_key
-        load_node.content_hash = eic_hash
-        load_node.host_value = torch.arange(
-            len(eic_key), dtype=torch.int32, device="cpu"
-        )
-        assert (
-            last_node.children.get(eic_key.child_key(self.page_size)) is None
-        ), f"eic key {eic_key} already exists in radix cache"
-        logger.debug(
-            f"load token from eic: {len(eic_key)}, node {load_node.id}, parent {last_node.id}"
-        )
-        last_node.children[eic_key.child_key(self.page_size)] = load_node
-        load_node.parent = last_node
-        return load_node
-
     def _match_for_remote_fetch(self, node: TreeNode, key: RadixKey):
         key, _ = key.maybe_to_bigram_view(self.is_eagle)
         node.last_access_time = time.monotonic()
@@ -1664,17 +1606,7 @@ class EICPagedHiRadixCache(EICHiRadixCache):
 
                 if len(key):
                     child_key = key.child_key(self.page_size)
-        temp_node = node
-        local_evict_len = 0
-        while temp_node.evicted:
-            while not temp_node.backuped and temp_node.parent is not None:
-                temp_node = temp_node.parent
-                local_evict_len = 0
-            if not temp_node.evicted:
-                break
-            local_evict_len += len(temp_node.host_value)
-            temp_node = temp_node.parent
-        return local_prefix_len, local_evict_len, node
+        return local_prefix_len, node
 
     def _insert_remote_node(self, node: TreeNode, key: RadixKey):
         node.last_access_time = time.monotonic()
@@ -1741,7 +1673,7 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         if len(self.match_req_set) > 1000:
             self.match_req_set = dict(list(self.match_req_set.items())[500:])
 
-        fetches = []  # (slot, last_node, evict_len, compute_key, prev_hash)
+        fetches = []  # (slot, last_node, compute_key, prev_hash)
         eic_keys = 0
         for slot in range(local_n):
             req = waiting_queue[slot]
@@ -1752,17 +1684,15 @@ class EICPagedHiRadixCache(EICHiRadixCache):
             if len(req_tokens) == 0:
                 continue
             req_key = RadixKey(req_tokens, req.extra_key)
-            prefix_len, evict_len, last_node = self._match_for_remote_fetch(
+            prefix_len, last_node = self._match_for_remote_fetch(
                 self.root_node, req_key
             )
-            if len(req_key) - prefix_len + evict_len < self.load_remote_threshold:
+            if len(req_key) - prefix_len < self.page_size:
                 continue
             if _need_calculate_hash(last_node, self.page_size):
                 self._calculate_content_hash(last_node)
             prev_hash = last_node.content_hash[-1] if last_node.content_hash else None
-            fetches.append(
-                (slot, last_node, evict_len, req_key[prefix_len:], prev_hash)
-            )
+            fetches.append((slot, last_node, req_key[prefix_len:], prev_hash))
             eic_keys += (len(req_key) - prefix_len) // self.page_size
             if 0 < self.eic_check_max_num <= eic_keys:
                 break
@@ -1773,18 +1703,18 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         len_tensor = torch.zeros(num_ready, dtype=torch.int64, device="cpu")
         if fetches:
             lens = self.cache_controller.batch_find_longest_prefix_in_eic(
-                [f[3] for f in fetches], [f[4] for f in fetches]
+                [f[2] for f in fetches], [f[3] for f in fetches]
             )
             if len(lens) == len(fetches):
                 for (slot, *_), n in zip(fetches, lens):
                     len_tensor[slot] = n
-            # TP ranks share tree state, so an empty fetches list is rank-uniform
-            # and the reduce below would be a no-op on an all-zero tensor.
-            self._reduce_min(len_tensor)
+        # Unconditional: a lagging PP stage builds an empty fetches, and skipping
+        # the reduce would orphan PP0's isend onto the next round's num_ready recv.
+        self._reduce_min(len_tensor)
 
-        for slot, last_node, evict_len, compute_key, _ in fetches:
+        for slot, last_node, compute_key, _ in fetches:
             eic_len = int(len_tensor[slot])
-            if eic_len + evict_len >= self.load_remote_threshold:
+            if eic_len > 0:
                 self._insert_remote_node(last_node, compute_key[:eic_len])
                 # Only mark as matched when we actually admitted a remote prefix.
                 # A miss (eic_len == 0) must be retried: the async write may not
@@ -1816,7 +1746,6 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         else:
             value = empty_value
 
-        # last_node = self.match_prefix_extend(key, last_node)
         host_hit_length = 0
         last_host_node = last_node
         while last_node.evicted:
