@@ -1162,17 +1162,25 @@ class TestEICHiCacheRegression(unittest.TestCase):
             SchedulerMetricsReporter,
         )
 
-        anchor = SimpleNamespace(size=32960, available_size=lambda: 30000)
+        anchor = SimpleNamespace(
+            size=32960, logical_size=32960, available_size=lambda: 30000
+        )
         entries = {
             "kv": SimpleNamespace(host_pool=anchor, is_primary_index_anchor=True),
             "swa": SimpleNamespace(
-                host_pool=SimpleNamespace(size=1, available_size=lambda: 1),
+                host_pool=SimpleNamespace(
+                    size=1, logical_size=1, available_size=lambda: 1
+                ),
                 is_primary_index_anchor=False,
             ),
         }
+        # HostPoolGroup proxies size/logical_size/available_size from the anchor
+        # entry (memory_pool_host.py), so the group reports the anchor's numbers
+        # rather than the sum across pools.
         host = SimpleNamespace(
-            size=1054208,
-            available_size=lambda: 1054208,
+            size=anchor.size,
+            logical_size=anchor.logical_size,
+            available_size=anchor.available_size,
             host_pool_group=SimpleNamespace(entry_map=entries),
         )
         rep = object.__new__(SchedulerMetricsReporter)
