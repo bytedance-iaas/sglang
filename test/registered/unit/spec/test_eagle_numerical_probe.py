@@ -18,15 +18,30 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestEagleNumericalProbe(unittest.TestCase):
+    @staticmethod
+    def probe(expected_rid="probe-rid"):
+        return EagleNumericalProbe(
+            expected_rid,
+            capture_id="capture-test-generation" if expected_rid else None,
+            pod_name="probe-pod" if expected_rid else None,
+            pod_uid="probe-pod-uid" if expected_rid else None,
+        )
+
     def test_default_off_is_noop(self):
-        probe = EagleNumericalProbe(None)
+        probe = self.probe(None)
         batch = SimpleNamespace(reqs=[SimpleNamespace(rid="probe-rid")])
 
         self.assertFalse(probe.can_probe)
         self.assertFalse(probe.matches_schedule_batch(batch))
 
+    def test_capture_identity_is_required_exactly_when_probe_is_armed(self):
+        with self.assertRaisesRegex(ValueError, "requires capture id"):
+            EagleNumericalProbe("probe-rid")
+        with self.assertRaisesRegex(ValueError, "requires an exact request id"):
+            EagleNumericalProbe(None, capture_id="capture-only")
+
     def test_exact_rid_records_complete_decode_fingerprint(self):
-        probe = EagleNumericalProbe("probe-rid")
+        probe = self.probe()
         forward_batch = SimpleNamespace(
             rids=["probe-rid"],
             _eagle_numerical_probe_callback=None,
@@ -116,6 +131,14 @@ class TestEagleNumericalProbe(unittest.TestCase):
             logs.output[-1].split("EAGLE_NUMERICAL_PROBE_RESULT ", 1)[1]
         )
         self.assertEqual(payload["status"], "complete")
+        self.assertEqual(
+            payload["capture"],
+            {
+                "id": "capture-test-generation",
+                "pod_name": "probe-pod",
+                "pod_uid": "probe-pod-uid",
+            },
+        )
         self.assertTrue(payload["natural_stop"])
         self.assertTrue(payload["normal_completion"])
         stages = payload["phases"]["decode"]
@@ -178,7 +201,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
         streams["cuda:1"].synchronize.assert_called_once_with()
 
     def test_completed_stage_prefix_survives_cuda_runtime_error(self):
-        probe = EagleNumericalProbe("probe-rid")
+        probe = self.probe()
         forward_batch = SimpleNamespace(
             rids=["probe-rid"],
             _eagle_numerical_probe_callback=None,
@@ -234,13 +257,24 @@ class TestEagleNumericalProbe(unittest.TestCase):
         )
         self.assertEqual(events[-1][1]["ordinal"], 3)
         self.assertEqual(events[-1][1]["error_type"], "RuntimeError")
+        self.assertTrue(
+            all(
+                payload["capture"]
+                == {
+                    "id": "capture-test-generation",
+                    "pod_name": "probe-pod",
+                    "pod_uid": "probe-pod-uid",
+                }
+                for _, payload in events
+            )
+        )
         self.assertFalse(probe.can_probe)
         self.assertIsNone(forward_batch._eagle_numerical_probe_callback)
 
     def test_default_off_and_unmatched_rid_emit_no_stage_events(self):
         tensor = torch.ones((1, 2))
         for expected_rid in (None, "probe-rid"):
-            probe = EagleNumericalProbe(expected_rid)
+            probe = self.probe(expected_rid)
             forward_batch = SimpleNamespace(
                 rids=["other-rid"],
                 _eagle_numerical_probe_callback=None,
@@ -262,7 +296,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
                     self.assertFalse(active)
 
     def test_duplicate_stage_still_fails_closed(self):
-        probe = EagleNumericalProbe("probe-rid")
+        probe = self.probe()
         forward_batch = SimpleNamespace(
             rids=["probe-rid"],
             _eagle_numerical_probe_callback=None,
@@ -290,7 +324,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
         self.assertFalse(probe.can_probe)
 
     def test_out_of_order_stage_still_fails_closed(self):
-        probe = EagleNumericalProbe("probe-rid")
+        probe = self.probe()
         forward_batch = SimpleNamespace(
             rids=["probe-rid"],
             _eagle_numerical_probe_callback=None,
@@ -315,7 +349,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
         self.assertFalse(probe.can_probe)
 
     def test_co_batched_rid_defers_without_forcing_eager_or_rejecting(self):
-        probe = EagleNumericalProbe("probe-rid")
+        probe = self.probe()
         co_batch = SimpleNamespace(
             reqs=[SimpleNamespace(rid="probe-rid"), SimpleNamespace(rid="other")]
         )
@@ -326,7 +360,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
         self.assertTrue(probe.needs_eager_for_schedule_batch(sole_batch))
 
     def test_wrong_rid_and_second_decode_do_not_capture(self):
-        probe = EagleNumericalProbe("probe-rid")
+        probe = self.probe()
         wrong = SimpleNamespace(
             rids=["other-rid"],
             _eagle_numerical_probe_callback=None,
@@ -362,7 +396,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
             self.assertFalse(active)
 
     def test_missing_required_tensor_fails_closed(self):
-        probe = EagleNumericalProbe("probe-rid")
+        probe = self.probe()
         forward_batch = SimpleNamespace(
             rids=["probe-rid"],
             _eagle_numerical_probe_callback=None,
@@ -392,7 +426,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
         self.assertFalse(probe.can_probe)
 
     def test_proposal_row_domain_mismatch_fails_closed(self):
-        probe = EagleNumericalProbe("probe-rid")
+        probe = self.probe()
         forward_batch = SimpleNamespace(
             rids=["probe-rid"],
             _eagle_numerical_probe_callback=None,
@@ -418,7 +452,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
         self.assertFalse(probe.can_probe)
 
     def test_missing_stage_fails_closed(self):
-        probe = EagleNumericalProbe("probe-rid")
+        probe = self.probe()
         probe._seen = True
 
         with self.assertLogs(
@@ -433,7 +467,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
         self.assertIn("phase decode missing stages", payload["rejection"])
 
     def test_abnormal_completion_fails_closed_and_preserves_stop_reason(self):
-        probe = EagleNumericalProbe("probe-rid")
+        probe = self.probe()
         probe._seen = True
 
         with self.assertLogs(

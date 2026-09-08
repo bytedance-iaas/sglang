@@ -292,7 +292,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
         )
         self.eagle_numerical_probe = EagleNumericalProbe(
-            envs.SGLANG_EAGLE_NUMERICAL_PROBE_RID.get()
+            envs.SGLANG_EAGLE_NUMERICAL_PROBE_RID.get(),
+            capture_id=envs.SGLANG_EAGLE_NUMERICAL_PROBE_CAPTURE_ID.get(),
+            pod_name=envs.SGLANG_EAGLE_NUMERICAL_PROBE_POD_NAME.get(),
+            pod_uid=envs.SGLANG_EAGLE_NUMERICAL_PROBE_POD_UID.get(),
         )
 
     def init_token_map(self):

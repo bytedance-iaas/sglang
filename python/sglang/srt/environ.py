@@ -769,6 +769,9 @@ class Envs:
     # Diagnostic-only exact request id for one eager decode draft-extend
     # numerical fingerprint. Empty disables the probe.
     SGLANG_EAGLE_NUMERICAL_PROBE_RID = EnvStr(None)
+    SGLANG_EAGLE_NUMERICAL_PROBE_CAPTURE_ID = EnvStr(None)
+    SGLANG_EAGLE_NUMERICAL_PROBE_POD_NAME = EnvStr(None)
+    SGLANG_EAGLE_NUMERICAL_PROBE_POD_UID = EnvStr(None)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(
