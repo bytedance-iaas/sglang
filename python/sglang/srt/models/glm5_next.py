@@ -342,6 +342,10 @@ class Glm5NextLinearAttention(nn.Module):
         # per prefix, since the fused modules can only eat unquantized weights.
         self.do_fuse_qkvbfg = (
             not envs.SGLANG_DISABLE_KDA_PROJECTION_FUSION.get()
+            and (
+                quant_config is None
+                or envs.SGLANG_ENABLE_KDA_MIXED_PRECISION_FUSION.get()
+            )
             and are_linear_prefixes_unquantized(
                 quant_config,
                 [

@@ -79,13 +79,25 @@ def test_glm_kda_projection_loading_and_outputs(
             if expert_quantized
             else None
         )
-        with torch.device("cuda"):
+        monkeypatch.delenv("SGLANG_ENABLE_KDA_MIXED_PRECISION_FUSION", raising=False)
+        assert not glm.envs.SGLANG_ENABLE_KDA_MIXED_PRECISION_FUSION.get()
+        with (
+            glm.envs.SGLANG_ENABLE_KDA_MIXED_PRECISION_FUSION.override(
+                expert_quantized
+            ),
+            glm.envs.SGLANG_DISABLE_KDA_PROJECTION_FUSION.override(False),
+            torch.device("cuda"),
+        ):
             fused = glm.Glm5NextLinearAttention(
                 0, 256, config, quant_config=qc, prefix=PREFIX
             )
         assert fused.do_fuse_qkvbfg
         # Build the public unfused modules to compare equivalent loaded weights.
-        with glm.envs.SGLANG_DISABLE_KDA_PROJECTION_FUSION.override(True):
+        # Mixed-precision defaults to separate projections; BF16 keeps its
+        # existing default fusion and still honors the explicit rollback.
+        with glm.envs.SGLANG_DISABLE_KDA_PROJECTION_FUSION.override(
+            not expert_quantized
+        ):
             with torch.device("cuda"):
                 unfused = glm.Glm5NextLinearAttention(
                     0, 256, config, quant_config=qc, prefix=PREFIX
