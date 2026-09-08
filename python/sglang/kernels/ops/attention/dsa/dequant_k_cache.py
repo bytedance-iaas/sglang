@@ -63,7 +63,7 @@ def _dequantize_k_cache_fast_wrapped(
         quant_k_cache = quant_k_cache.unsqueeze(1)
     num_blocks, block_size, _, dim_quant = quant_k_cache.shape
     assert dv == 512
-    assert dim_quant == 656
+    assert dim_quant in (528, 656), "expected NoPE or 64-RoPE group-scaled FP8 KV"
     assert tile_size == 128
     quant_k_cache = quant_k_cache.view((-1, dim_quant))
 
@@ -80,9 +80,9 @@ def _dequantize_k_cache_fast(quant_k_cache, group_size: int = 128):
 
     assert quant_k_cache.dtype == torch.float8_e4m3fn
     dim_nope = 512
-    dim_rope = 64
+    dim_rope = (dim_quant - dim_nope - (dim_nope // group_size) * 4) // 2
     num_tiles = dim_nope // group_size
-    assert dim_quant == 656
+    assert dim_quant in (528, 656)
 
     output = torch.empty(
         (num_tokens, dim_nope + dim_rope),
@@ -91,7 +91,7 @@ def _dequantize_k_cache_fast(quant_k_cache, group_size: int = 128):
     )
 
     num_blocks_per_token = triton.cdiv(dim_nope + dim_rope, group_size)
-    assert num_blocks_per_token == 5
+    assert num_blocks_per_token in (4, 5)
 
     assert dim_nope % group_size == 0
 
@@ -181,8 +181,8 @@ def dequantize_k_cache_paged(
         output: [num_tokens, 1, dim_nope + dim_rope], the de-quantized k-cache
     """
     dim_quant = quant_k_cache.shape[-1]
-    assert dim_quant == 656, (
-        f"dim_quant: {dim_quant} != 656 detected in dequantize_k_cache_paged"
+    assert dim_quant in (528, 656), (
+        f"expected NoPE or 64-RoPE group-scaled FP8 KV, got width {dim_quant}"
     )
     quant_k_cache = quant_k_cache.view((-1, dim_quant))
 
@@ -191,7 +191,7 @@ def dequantize_k_cache_paged(
     num_tokens = page_table_1_flattened.shape[0]
     assert quant_k_cache.dtype == torch.float8_e4m3fn
     dim_nope = 512
-    dim_rope = 64
+    dim_rope = (dim_quant - dim_nope - (dim_nope // group_size) * 4) // 2
     num_tiles = dim_nope // group_size  # 512 // 128 = 4
 
     output = torch.empty(
@@ -202,7 +202,7 @@ def dequantize_k_cache_paged(
 
     # cdiv(512 + 64, 128) = 5
     num_blocks_per_token = triton.cdiv(dim_nope + dim_rope, group_size)
-    assert num_blocks_per_token == 5
+    assert num_blocks_per_token in (4, 5)
 
     assert dim_nope % group_size == 0
 
