@@ -1498,6 +1498,13 @@ class Envs:
     # captures logical rows at the NextN input/embed/decoder/norm/logits/token
     # boundaries and is never eligible for performance conclusions.
     SGLANG_EAGLE_NUMERICAL_PROBE_RID = EnvStr(None)
+    # Generation-scoped capture identity for the numerical probe. The Pod name
+    # and UID come from the Kubernetes Downward API. All three are required
+    # whenever the exact-RID probe is armed so copied events cannot be rebound
+    # to a different generation or serving Pod.
+    SGLANG_EAGLE_NUMERICAL_PROBE_CAPTURE_ID = EnvStr(None)
+    SGLANG_EAGLE_NUMERICAL_PROBE_POD_NAME = EnvStr(None)
+    SGLANG_EAGLE_NUMERICAL_PROBE_POD_UID = EnvStr(None)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(

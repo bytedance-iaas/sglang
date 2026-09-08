@@ -338,7 +338,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             seed_enabled=self.seed_dsa_topk_from_draft_extend,
         )
         self.eagle_numerical_probe = EagleNumericalProbe(
-            envs.SGLANG_EAGLE_NUMERICAL_PROBE_RID.get()
+            envs.SGLANG_EAGLE_NUMERICAL_PROBE_RID.get(),
+            capture_id=envs.SGLANG_EAGLE_NUMERICAL_PROBE_CAPTURE_ID.get(),
+            pod_name=envs.SGLANG_EAGLE_NUMERICAL_PROBE_POD_NAME.get(),
+            pod_uid=envs.SGLANG_EAGLE_NUMERICAL_PROBE_POD_UID.get(),
         )
         # Eager draft-extend seed buffer (graph paths use their own static ones).
         self.dsa_extend_topk_buf: Optional[torch.Tensor] = None

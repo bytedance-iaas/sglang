@@ -81,8 +81,29 @@ def _tensor_fingerprint(tensor: torch.Tensor, logical_rows: int) -> dict:
 class EagleNumericalProbe:
     """Capture one complete numerical fingerprint per draft-extend phase."""
 
-    def __init__(self, expected_rid: Optional[str]) -> None:
+    def __init__(
+        self,
+        expected_rid: Optional[str],
+        *,
+        capture_id: Optional[str] = None,
+        pod_name: Optional[str] = None,
+        pod_uid: Optional[str] = None,
+    ) -> None:
         self.expected_rid = expected_rid or None
+        capture_values = (capture_id, pod_name, pod_uid)
+        if self.expected_rid is None and any(capture_values):
+            raise ValueError(
+                "numerical probe capture identity requires an exact request id"
+            )
+        if self.expected_rid is not None and not all(capture_values):
+            raise ValueError(
+                "numerical probe requires capture id and Downward API Pod name/UID"
+            )
+        self.capture = (
+            {"id": capture_id, "pod_name": pod_name, "pod_uid": pod_uid}
+            if self.expected_rid is not None
+            else None
+        )
         self._rejection: Optional[str] = None
         self._sealed = False
         self._seen = False
@@ -260,6 +281,7 @@ class EagleNumericalProbe:
                     break
         payload = {
             "rid": rid,
+            "capture": self.capture,
             "natural_stop": natural_stop,
             "normal_completion": normal_completion,
             "status": "rejected" if self._rejection else "complete",
