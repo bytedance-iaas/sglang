@@ -175,6 +175,7 @@ ATTENTION_BACKEND_CHOICES = [
     "flex_attention",
     "dsa",
     "nsa",  # Deprecated alias for "dsa"
+    "qsa",
     "dsv4",
     "compressed",  # Deprecated alias for "dsv4"
     # NVIDIA specific
@@ -3095,6 +3096,17 @@ class ServerArgs:
         int, "Steps to prefetch in offloading.", NS("exec.offload")
     ] = 1
     offload_mode: A[str, "Mode of offloading.", NS("exec.offload")] = "cpu"
+    ple_offload_embedding: A[
+        Optional[bool],
+        Arg(
+            help="Offload Qwen4 PLE n-gram embedding weights to CPU pinned "
+            "memory. Enabled by default for BF16 Qwen4-Exp on CUDA; use "
+            "--no-ple-offload-embedding to disable.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
+        ),
+        NS("exec.offload"),
+    ] = None
 
     # -------------------------------------------------------------------------
     # LMCache
