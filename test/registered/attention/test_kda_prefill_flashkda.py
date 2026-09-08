@@ -80,7 +80,7 @@ def _chunk_kda_ref(d, lower_bound):
     """Triton chunk_kda reference. chunk_kda mutates g/v and the state in place,
     so feed clones; returns (output, updated_state_slots)."""
     st = d["pool"].clone()
-    out, _ = chunk_kda(
+    out = chunk_kda(
         q=d["q"].clone(),
         k=d["k"].clone(),
         v=d["v"].clone(),
@@ -105,7 +105,7 @@ def test_flashkda_matches_triton_safe_gate(seq_lens):
     ref_out, ref_state = _chunk_kda_ref(d, LOWER_BOUND)
 
     st_fk = d["pool"].clone()
-    out, h = FlashKDAKernel().extend(
+    out = FlashKDAKernel().extend(
         d["q"].clone(),
         d["k"].clone(),
         d["v"].clone(),
@@ -121,7 +121,8 @@ def test_flashkda_matches_triton_safe_gate(seq_lens):
     )
     torch.cuda.synchronize()
 
-    assert h is None
+    assert isinstance(out, torch.Tensor)
+    assert out.shape == d["v"].shape
     assert torch.isfinite(out).all(), "FlashKDA output has non-finite values"
     assert torch.isfinite(st_fk).all(), "FlashKDA final state has non-finite values"
     # bf16 cross-implementation noise (chunk=16 CUTLASS vs chunk=64 Triton);
@@ -141,7 +142,7 @@ def test_flashkda_falls_back_without_lower_bound():
     ref_out, _ = _chunk_kda_ref(d, None)
 
     st_fk = d["pool"].clone()
-    out, _ = FlashKDAKernel().extend(
+    out = FlashKDAKernel().extend(
         d["q"].clone(),
         d["k"].clone(),
         d["v"].clone(),
@@ -171,7 +172,7 @@ def test_flashkda_spec_verify_falls_back():
     ref_out, _ = _chunk_kda_ref(d, LOWER_BOUND)
 
     st_fk = d["pool"].clone()
-    out, _ = FlashKDAKernel().extend(
+    out = FlashKDAKernel().extend(
         d["q"].clone(),
         d["k"].clone(),
         d["v"].clone(),
@@ -194,6 +195,52 @@ def test_flashkda_spec_verify_falls_back():
     assert _cos(ref_out, out) > 0.999, (
         f"spec-decode did not fall back: {_cos(ref_out, out):.4f}"
     )
+
+
+def test_flashkda_checkpoint_fallback_preserves_states(monkeypatch):
+    """Tracked prefill must return real chunk checkpoints for prefix restore."""
+    d = _make_inputs([128, 256])
+    reference_pool = d["pool"].clone()
+    expected, expected_h = chunk_kda(
+        q=d["q"].clone(),
+        k=d["k"].clone(),
+        v=d["v"].clone(),
+        g=d["g"].clone(),
+        beta=d["beta"].clone(),
+        initial_state=reference_pool,
+        initial_state_indices=d["idx"],
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=d["cu"],
+        A_log=d["A_log"],
+        dt_bias=d["dt_bias"],
+        lower_bound=LOWER_BOUND,
+        output_intermediate_states=True,
+    )
+    kernel = FlashKDAKernel()
+
+    def unexpected_flash(*args, **kwargs):
+        pytest.fail("FlashKDA cannot produce intermediate checkpoints")
+
+    monkeypatch.setattr(kernel, "_flashkda_extend", unexpected_flash)
+    actual_pool = d["pool"].clone()
+    actual, actual_h = kernel.extend(
+        d["q"].clone(),
+        d["k"].clone(),
+        d["v"].clone(),
+        d["g"].clone(),
+        d["beta"].clone(),
+        ssm_states=actual_pool,
+        cache_indices=d["idx"],
+        query_start_loc=d["cu"],
+        A_log=d["A_log"],
+        dt_bias=d["dt_bias"],
+        lower_bound=LOWER_BOUND,
+        extend_seq_lens_cpu=[128, 256],
+        return_intermediate_states=True,
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual_h, expected_h, rtol=0, atol=0)
+    torch.testing.assert_close(actual_pool, reference_pool, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
