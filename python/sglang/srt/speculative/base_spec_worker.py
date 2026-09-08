@@ -125,6 +125,10 @@ class BaseSpecWorker(ABC):
         # ngram has no draft worker at all (returns None via its override).
         return self._draft_worker
 
+    def requires_dp_attention_eager_forward(self, batch) -> bool:
+        """Whether this rank requires eager speculative draft execution."""
+        return False
+
     @property
     def graph_memory_usage(self) -> dict[str, float]:
         if self.draft_worker is None:
@@ -224,11 +228,14 @@ class BaseSpecWorker(ABC):
         """
         pass
 
-    def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
+    def note_request_finished(
+        self, *, rid: str, natural_stop: bool, normal_completion: bool
+    ) -> None:
         """Hook called by the batch-result processor when a request finishes.
 
-        Default no-op. DSpark overrides this to settle / censor its
-        block-accept estimator state for the finished request.
+        Default no-op. ``natural_stop`` preserves DSpark's matched-token/EOS
+        semantics; ``normal_completion`` distinguishes success (including a
+        length cap) from abort for request-scoped observers.
         """
         pass
 

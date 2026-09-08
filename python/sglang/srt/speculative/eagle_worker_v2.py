@@ -74,6 +74,7 @@ from sglang.srt.speculative.eagle_info import (
     EaglePPVerifyInputRaw,
     EagleVerifyInput,
 )
+from sglang.srt.speculative.eagle_numerical_probe import EagleNumericalProbe
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     _eagle_prefill_tail_tokens,
@@ -289,6 +290,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.dsa_index_topk = getattr(hf_config, "index_topk", None)
         self.seed_dsa_topk_from_draft_extend = (
             self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
+        )
+        self.eagle_numerical_probe = EagleNumericalProbe(
+            envs.SGLANG_EAGLE_NUMERICAL_PROBE_RID.get()
         )
 
     def init_token_map(self):
@@ -959,6 +963,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def _draft_extend_for_decode(
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
+        numerical_probe_requested = (
+            self.eagle_numerical_probe.needs_eager_for_schedule_batch(batch)
+        )
+        numerical_probe_rows = (
+            len(batch.seq_lens) * self.speculative_num_draft_tokens
+        )
         # Batch 2: Draft extend
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
@@ -993,7 +1003,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 next_token_ids,
                 self.speculative_num_draft_tokens,
                 self.draft_runner,
-                self.cuda_graph_runner_for_draft_extend,
+                (
+                    None
+                    if numerical_probe_requested
+                    else self.cuda_graph_runner_for_draft_extend
+                ),
                 return_hidden_states_before_norm=False,
             )
 
@@ -1007,6 +1021,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.cuda_graph_runner_for_draft_extend
             and self.cuda_graph_runner_for_draft_extend.can_run_graph(forward_batch)
         )
+        if numerical_probe_requested:
+            can_run_decode_cuda_graph = False
 
         # Eager path publishes the indexer top-k into a worker buffer (the graph
         # path uses the runner's static buffer). Gathered at select_index below.
@@ -1026,7 +1042,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if (c := self.draft_runner.canary_manager) is not None
             else contextlib.nullcontext()
         )
-        with canary_ctx:
+        with (
+            canary_ctx,
+            self.eagle_numerical_probe.forward_scope(
+                forward_batch,
+                phase="decode",
+                logical_rows=numerical_probe_rows,
+                using_cuda_graph=can_run_decode_cuda_graph,
+                input_ids=forward_batch.input_ids,
+                target_hidden_states=forward_batch.spec_info.hidden_states,
+                positions=forward_batch.positions,
+            ),
+        ):
             if can_run_decode_cuda_graph:
                 draft_logits_output = self.cuda_graph_runner_for_draft_extend.execute(
                     forward_batch
@@ -1089,6 +1116,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
             ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
             ret_draft_probs = None
+        self.eagle_numerical_probe.record_proposal(
+            phase="decode",
+            logical_rows=ret_topk_index.shape[0],
+            topk_index=ret_topk_index,
+            topk_probability=ret_topk_p,
+        )
         ret_hidden_states = draft_logits_output.hidden_states
 
         # Construct the return values
@@ -1187,6 +1220,25 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if self._draft_worker is None:
             return self._target_worker.model_runner
         return self._draft_worker.draft_runner
+
+    def requires_dp_attention_eager_forward(self, batch: ScheduleBatch) -> bool:
+        """Vote eager for the exact singleton selected by the probe."""
+        if self._draft_worker is None:
+            return False
+        return self._draft_worker.eagle_numerical_probe.needs_eager_for_schedule_batch(
+            batch
+        )
+
+    def note_request_finished(
+        self, *, rid: str, natural_stop: bool, normal_completion: bool
+    ) -> None:
+        if self._draft_worker is None:
+            return
+        self._draft_worker.eagle_numerical_probe.finish(
+            rid=rid,
+            natural_stop=natural_stop,
+            normal_completion=normal_completion,
+        )
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
