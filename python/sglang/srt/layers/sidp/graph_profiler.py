@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 import torch
@@ -30,7 +30,7 @@ def _timing_event() -> torch.cuda.Event:
 class SidpGraphProfiler:
     """Own the timing events shared by all captured decode graph shapes."""
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(
         self,
@@ -43,6 +43,8 @@ class SidpGraphProfiler:
         warmup_replays: int,
         output_dir: str,
         peak_shifting: bool,
+        prefetch_policy: str = "compute",
+        copy_backend: str = "dma",
         dummy_compute: bool = False,
         sync_strategy: str = "none",
         weight_codec: str = "identity",
@@ -59,10 +61,12 @@ class SidpGraphProfiler:
         self.dummy_compute = dummy_compute
         self.sync_strategy = sync_strategy
         self.weight_codec = weight_codec
+        self.prefetch_policy = prefetch_policy
+        self.copy_backend = copy_backend
         self.order = (
             "resident"
             if not self.has_communication
-            else ("peak-shifting" if peak_shifting else "compute")
+            else f"{prefetch_policy}-{copy_backend}"
         )
         self.replay_index = 0
 
@@ -82,6 +86,12 @@ class SidpGraphProfiler:
         ]
         self.copy_start = {layer_id: _timing_event() for layer_id in non_local_layers}
         self.copy_end = {layer_id: _timing_event() for layer_id in non_local_layers}
+        self.claim_start = (
+            {layer_id: _timing_event() for layer_id in non_local_layers}
+            if prefetch_policy == "dynamic_owner" and copy_backend == "dma"
+            else {}
+        )
+        self._dma_cycle_events: dict[tuple[int, ...], torch.Tensor] = {}
         # Cycle 0 is resident at graph entry and therefore has no in-forward RAW
         # wait.  Its copy events describe the tail refill for the next forward.
         waited_layers = [
@@ -113,6 +123,8 @@ class SidpGraphProfiler:
                 "dummy_compute": self.dummy_compute,
                 "sync_strategy": self.sync_strategy,
                 "weight_codec": self.weight_codec,
+                "prefetch_policy": self.prefetch_policy,
+                "copy_backend": self.copy_backend,
             }
         )
 
@@ -150,6 +162,32 @@ class SidpGraphProfiler:
     def record_copy_end(self, layer_id: int, stream: torch.cuda.Stream) -> None:
         self.copy_end[layer_id].record(stream)
 
+    def prepare_dma_cycle_events(
+        self, layers: tuple[int, ...], nbytes: list[int], stream: torch.cuda.Stream
+    ) -> torch.Tensor:
+        """Setup-only native event handles, retained for every referencing graph.
+
+        Conditional bodies cannot contain EventRecord. The native builder
+        inserts these three markers in the parent: before claim, after claim,
+        and after the SWITCH (all components + release + publish).
+        """
+        if layers not in self._dma_cycle_events:
+            handles = []
+            for layer, size in zip(layers, nbytes):
+                self.copy_nbytes[layer] = size
+                events = (
+                    self.claim_start[layer],
+                    self.copy_start[layer],
+                    self.copy_end[layer],
+                )
+                for event in events:
+                    event.record(stream)  # materialize lazy CUDA handles before capture
+                handles.append([event.cuda_event for event in events])
+            self._dma_cycle_events[layers] = torch.tensor(
+                handles, dtype=torch.uint64, device="cpu"
+            )
+        return self._dma_cycle_events[layers]
+
     def record_wait_start(self, layer_id: int, stream: torch.cuda.Stream) -> None:
         self.wait_start[layer_id].record(stream)
 
@@ -170,20 +208,35 @@ class SidpGraphProfiler:
         records = []
         for schedule_index, layer_id in enumerate(layer_ids):
             cycle = layer_id // self.dp_size
+            duration_ms = self._duration_ms(
+                self.copy_start[layer_id], self.copy_end[layer_id]
+            )
+            nbytes = self.copy_nbytes[layer_id]
             records.append(
                 {
                     "layer": layer_id,
                     "cycle": cycle,
                     "owner": owner_of(layer_id, self.dp_size),
                     "schedule_index": schedule_index,
-                    "nbytes": self.copy_nbytes[layer_id],
+                    "nbytes": nbytes,
                     "start_ms": self._offset_ms(self.copy_start[layer_id]),
                     "end_ms": self._offset_ms(self.copy_end[layer_id]),
-                    "duration_ms": self._duration_ms(
-                        self.copy_start[layer_id], self.copy_end[layer_id]
+                    "duration_ms": duration_ms,
+                    "effective_gbps": (
+                        self._round_ms(nbytes / duration_ms / 1_000_000)
+                        if duration_ms > 0
+                        else None
                     ),
                 }
             )
+            if layer_id in self.claim_start:
+                records[-1].update(
+                    claim_start_ms=self._offset_ms(self.claim_start[layer_id]),
+                    claim_duration_ms=self._duration_ms(
+                        self.claim_start[layer_id], self.copy_start[layer_id]
+                    ),
+                    timing_scope="trace+setter+conditional_dma+release+publish",
+                )
         return records
 
     def collect_after_graph_replay(
@@ -192,6 +245,7 @@ class SidpGraphProfiler:
         raw_batch_size: int,
         graph_batch_size: int,
         launch_profile: dict | None = None,
+        trace_provider: Callable[[], dict | None] | None = None,
     ) -> None:
         """Synchronize and emit one sampled replay.
 
@@ -212,6 +266,7 @@ class SidpGraphProfiler:
         anchor_host_ns = time.monotonic_ns()
 
         anchor_offset_ms = self._offset_ms(self.anchor)
+        sm_trace = trace_provider() if trace_provider is not None else None
         cycles = []
         copies = []
         waits = []
@@ -251,8 +306,39 @@ class SidpGraphProfiler:
                     copy["target_forward_offset"] = 0
             copies.extend(cycle_copies)
 
+        # Copy Event markers have a fixed graph-step identity while dynamic_owner
+        # chooses the actual layer on device. Join the device trace back onto
+        # the timing records before computing per-layer ready margins.
+        if sm_trace is not None:
+            trace_by_step = {
+                (step["cycle"], step["step"]): step
+                for step in sm_trace.get("steps", [])
+            }
+            for copy in copies:
+                step = trace_by_step.get(
+                    (copy["cycle"], copy["schedule_index"])
+                )
+                if step is None:
+                    continue
+                copy["scheduled_layer"] = copy["layer"]
+                copy["scheduled_owner"] = copy["owner"]
+                copy["layer"] = step["layer"]
+                copy["owner"] = step["owner"]
+                copy["claim_spins"] = step["claim_spins"]
+                copy["claim_collisions"] = step["claim_collisions"]
+                if "nbytes" in step:
+                    copy["nbytes"] = step["nbytes"]
+                    copy["effective_gbps"] = (
+                        self._round_ms(step["nbytes"] / copy["duration_ms"] / 1_000_000)
+                        if copy["duration_ms"] > 0
+                        else None
+                    )
+
+        copy_by_actual_layer = {copy["layer"]: copy for copy in copies}
+
         for layer_id in sorted(self.wait_start):
-            copy_end_ms = self._offset_ms(self.copy_end[layer_id])
+            copy_record = copy_by_actual_layer[layer_id]
+            copy_end_ms = copy_record["end_ms"]
             wait_start_ms = self._offset_ms(self.wait_start[layer_id])
             waits.append(
                 {
@@ -297,5 +383,6 @@ class SidpGraphProfiler:
             "cycles": cycles,
             "copies": copies,
             "waits": waits,
+            "sm_trace": sm_trace,
         }
         self._write(record)
