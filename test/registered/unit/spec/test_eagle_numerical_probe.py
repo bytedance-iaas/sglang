@@ -3,11 +3,13 @@
 import json
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
 from sglang.srt.speculative.eagle_numerical_probe import (
     EagleNumericalProbe,
+    _synchronize_cuda_tensors,
     maybe_record_eagle_numerical_stage,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -35,7 +37,15 @@ class TestEagleNumericalProbe(unittest.TestCase):
         target_hidden = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
 
         with (
-            probe.forward_scope(
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.get_parallel",
+                return_value=SimpleNamespace(world_rank=13, pp_rank=1, attn_dp_rank=5),
+            ),
+            self.assertLogs(
+                "sglang.srt.speculative.eagle_numerical_probe", level="WARNING"
+            ) as logs,
+        ):
+            with probe.forward_scope(
                 forward_batch,
                 phase="decode",
                 logical_rows=2,
@@ -43,36 +53,64 @@ class TestEagleNumericalProbe(unittest.TestCase):
                 input_ids=input_ids,
                 target_hidden_states=target_hidden,
                 positions=positions,
-            ) as active,
-        ):
-            self.assertTrue(active)
-            for stage, tensor in (
-                ("nextn_embed", target_hidden + 1),
-                ("nextn_decoder", target_hidden + 2),
-                ("nextn_norm", target_hidden + 3),
-            ):
+            ) as active:
+                self.assertTrue(active)
+                for stage, tensor in (
+                    ("nextn_embed", target_hidden + 1),
+                    ("nextn_decoder", target_hidden + 2),
+                    ("nextn_norm", target_hidden + 3),
+                ):
+                    maybe_record_eagle_numerical_stage(
+                        forward_batch, stage, hidden_states=tensor
+                    )
                 maybe_record_eagle_numerical_stage(
-                    forward_batch, stage, hidden_states=tensor
+                    forward_batch,
+                    "nextn_logits",
+                    logits=torch.arange(18).reshape(3, 6).float(),
                 )
-            maybe_record_eagle_numerical_stage(
-                forward_batch,
-                "nextn_logits",
-                logits=torch.arange(18).reshape(3, 6).float(),
-            )
 
-        probe.record_proposal(
-            phase="decode",
-            logical_rows=1,
-            topk_index=torch.tensor([[3], [4], [5]]),
-            topk_probability=torch.tensor([[0.7], [0.8], [0.9]]),
-        )
+            probe.record_proposal(
+                phase="decode",
+                logical_rows=1,
+                topk_index=torch.tensor([[3], [4], [5]]),
+                topk_probability=torch.tensor([[0.7], [0.8], [0.9]]),
+            )
+            probe.finish(rid="probe-rid", natural_stop=True, normal_completion=True)
+
         self.assertIsNone(forward_batch._eagle_numerical_probe_callback)
         self.assertIsNone(forward_batch._eagle_numerical_probe_phase)
 
-        with self.assertLogs(
-            "sglang.srt.speculative.eagle_numerical_probe", level="WARNING"
-        ) as logs:
-            probe.finish(rid="probe-rid", natural_stop=True, normal_completion=True)
+        stage_payloads = [
+            json.loads(line.split("EAGLE_NUMERICAL_PROBE_STAGE ", 1)[1])
+            for line in logs.output
+            if "EAGLE_NUMERICAL_PROBE_STAGE " in line
+        ]
+        self.assertEqual(
+            [payload["stage"] for payload in stage_payloads],
+            [
+                "draft_extend_input",
+                "nextn_embed",
+                "nextn_decoder",
+                "nextn_norm",
+                "nextn_logits",
+                "proposed_token",
+            ],
+        )
+        self.assertEqual(
+            [payload["ordinal"] for payload in stage_payloads], list(range(1, 7))
+        )
+        self.assertEqual(stage_payloads[0]["rid"], "probe-rid")
+        self.assertEqual(stage_payloads[0]["phase"], "decode")
+        self.assertEqual(
+            stage_payloads[0]["rank"], {"world": 13, "pp": 1, "attn_dp": 5}
+        )
+        self.assertEqual(stage_payloads[0]["logical_rows"], 2)
+        self.assertEqual(stage_payloads[0]["row_domain"], "dense_request_major_prefix")
+        self.assertEqual(stage_payloads[-1]["row_domain"], "request_terminal")
+        self.assertEqual(
+            stage_payloads[0]["fingerprints"]["input_ids"]["values"],
+            [11, 12],
+        )
 
         payload = json.loads(
             logs.output[-1].split("EAGLE_NUMERICAL_PROBE_RESULT ", 1)[1]
@@ -115,6 +153,166 @@ class TestEagleNumericalProbe(unittest.TestCase):
             len(stages["nextn_embed"]["tensors"]["hidden_states"]["sha256"]),
             64,
         )
+        self.assertEqual(payload["rank"], {"world": 13, "pp": 1, "attn_dp": 5})
+
+    def test_cuda_stage_syncs_each_distinct_tensor_device(self):
+        tensors = {
+            "a": SimpleNamespace(is_cuda=True, device=torch.device("cuda:1")),
+            "b": SimpleNamespace(is_cuda=True, device=torch.device("cuda:0")),
+            "same_as_a": SimpleNamespace(is_cuda=True, device=torch.device("cuda:1")),
+            "cpu": SimpleNamespace(is_cuda=False, device=torch.device("cpu")),
+            "missing": None,
+        }
+        streams = {}
+
+        def current_stream(*, device):
+            stream = mock.Mock()
+            streams[str(device)] = stream
+            return stream
+
+        with mock.patch("torch.cuda.current_stream", side_effect=current_stream):
+            _synchronize_cuda_tensors(tensors)
+
+        self.assertEqual(list(streams), ["cuda:0", "cuda:1"])
+        streams["cuda:0"].synchronize.assert_called_once_with()
+        streams["cuda:1"].synchronize.assert_called_once_with()
+
+    def test_completed_stage_prefix_survives_cuda_runtime_error(self):
+        probe = EagleNumericalProbe("probe-rid")
+        forward_batch = SimpleNamespace(
+            rids=["probe-rid"],
+            _eagle_numerical_probe_callback=None,
+            _eagle_numerical_probe_phase=None,
+        )
+        tensor = torch.ones((1, 2))
+
+        with (
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe._synchronize_cuda_tensors",
+                side_effect=[None, None, RuntimeError("CUDA illegal memory access")],
+            ),
+            self.assertLogs(
+                "sglang.srt.speculative.eagle_numerical_probe", level="WARNING"
+            ) as logs,
+            self.assertRaisesRegex(RuntimeError, "CUDA illegal memory access"),
+        ):
+            with probe.forward_scope(
+                forward_batch,
+                phase="decode",
+                logical_rows=1,
+                using_cuda_graph=False,
+                input_ids=torch.ones(1, dtype=torch.int64),
+                target_hidden_states=tensor,
+                positions=torch.ones(1, dtype=torch.int64),
+            ):
+                maybe_record_eagle_numerical_stage(
+                    forward_batch, "nextn_embed", hidden_states=tensor
+                )
+                maybe_record_eagle_numerical_stage(
+                    forward_batch, "nextn_decoder", hidden_states=tensor
+                )
+
+        events = [
+            (
+                "error" if "EAGLE_NUMERICAL_PROBE_STAGE_ERROR " in line else "stage",
+                json.loads(
+                    line.split("EAGLE_NUMERICAL_PROBE_STAGE_ERROR ", 1)[1]
+                    if "EAGLE_NUMERICAL_PROBE_STAGE_ERROR " in line
+                    else line.split("EAGLE_NUMERICAL_PROBE_STAGE ", 1)[1]
+                ),
+            )
+            for line in logs.output
+            if "EAGLE_NUMERICAL_PROBE_STAGE" in line
+        ]
+        self.assertEqual(
+            [(kind, payload["stage"]) for kind, payload in events],
+            [
+                ("stage", "draft_extend_input"),
+                ("stage", "nextn_embed"),
+                ("error", "nextn_decoder"),
+            ],
+        )
+        self.assertEqual(events[-1][1]["ordinal"], 3)
+        self.assertEqual(events[-1][1]["error_type"], "RuntimeError")
+        self.assertFalse(probe.can_probe)
+        self.assertIsNone(forward_batch._eagle_numerical_probe_callback)
+
+    def test_default_off_and_unmatched_rid_emit_no_stage_events(self):
+        tensor = torch.ones((1, 2))
+        for expected_rid in (None, "probe-rid"):
+            probe = EagleNumericalProbe(expected_rid)
+            forward_batch = SimpleNamespace(
+                rids=["other-rid"],
+                _eagle_numerical_probe_callback=None,
+                _eagle_numerical_probe_phase=None,
+            )
+            with self.assertNoLogs(
+                "sglang.srt.speculative.eagle_numerical_probe",
+                level="WARNING",
+            ):
+                with probe.forward_scope(
+                    forward_batch,
+                    phase="decode",
+                    logical_rows=1,
+                    using_cuda_graph=False,
+                    input_ids=torch.ones(1, dtype=torch.int64),
+                    target_hidden_states=tensor,
+                    positions=torch.ones(1, dtype=torch.int64),
+                ) as active:
+                    self.assertFalse(active)
+
+    def test_duplicate_stage_still_fails_closed(self):
+        probe = EagleNumericalProbe("probe-rid")
+        forward_batch = SimpleNamespace(
+            rids=["probe-rid"],
+            _eagle_numerical_probe_callback=None,
+            _eagle_numerical_probe_phase=None,
+        )
+        tensor = torch.ones((1, 2))
+        with self.assertLogs(
+            "sglang.srt.speculative.eagle_numerical_probe", level="WARNING"
+        ):
+            with probe.forward_scope(
+                forward_batch,
+                phase="decode",
+                logical_rows=1,
+                using_cuda_graph=False,
+                input_ids=torch.ones(1, dtype=torch.int64),
+                target_hidden_states=tensor,
+                positions=torch.ones(1, dtype=torch.int64),
+            ):
+                maybe_record_eagle_numerical_stage(
+                    forward_batch, "nextn_embed", hidden_states=tensor
+                )
+                maybe_record_eagle_numerical_stage(
+                    forward_batch, "nextn_embed", hidden_states=tensor
+                )
+        self.assertFalse(probe.can_probe)
+
+    def test_out_of_order_stage_still_fails_closed(self):
+        probe = EagleNumericalProbe("probe-rid")
+        forward_batch = SimpleNamespace(
+            rids=["probe-rid"],
+            _eagle_numerical_probe_callback=None,
+            _eagle_numerical_probe_phase=None,
+        )
+        tensor = torch.ones((1, 2))
+        with self.assertLogs(
+            "sglang.srt.speculative.eagle_numerical_probe", level="WARNING"
+        ):
+            with probe.forward_scope(
+                forward_batch,
+                phase="decode",
+                logical_rows=1,
+                using_cuda_graph=False,
+                input_ids=torch.ones(1, dtype=torch.int64),
+                target_hidden_states=tensor,
+                positions=torch.ones(1, dtype=torch.int64),
+            ):
+                maybe_record_eagle_numerical_stage(
+                    forward_batch, "nextn_decoder", hidden_states=tensor
+                )
+        self.assertFalse(probe.can_probe)
 
     def test_co_batched_rid_defers_without_forcing_eager_or_rejecting(self):
         probe = EagleNumericalProbe("probe-rid")
@@ -180,6 +378,14 @@ class TestEagleNumericalProbe(unittest.TestCase):
             target_hidden_states=tensor,
             positions=torch.ones(1, dtype=torch.int64),
         ):
+            for stage, value in (
+                ("nextn_embed", tensor),
+                ("nextn_decoder", tensor),
+                ("nextn_norm", tensor),
+            ):
+                maybe_record_eagle_numerical_stage(
+                    forward_batch, stage, hidden_states=value
+                )
             maybe_record_eagle_numerical_stage(
                 forward_batch, "nextn_logits", logits=None
             )

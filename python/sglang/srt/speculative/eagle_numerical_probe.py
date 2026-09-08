@@ -1,8 +1,9 @@
 """Exact-request numerical fingerprints for EAGLE NextN localization.
 
 The probe is diagnostic-only and default-off.  It records the first matching
-decode draft-extend forward, synchronizing only that forward to move logical
-tensor rows to CPU for byte-exact fingerprints.
+decode draft-extend forward.  Every selected stage synchronizes its current
+CUDA stream and emits a fingerprint immediately, so a later device fault does
+not erase the completed stage prefix.
 """
 
 from __future__ import annotations
@@ -19,16 +20,15 @@ from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 
-_REQUIRED_STAGES = frozenset(
-    {
-        "draft_extend_input",
-        "nextn_embed",
-        "nextn_decoder",
-        "nextn_norm",
-        "nextn_logits",
-        "proposed_token",
-    }
+_REQUIRED_STAGES = (
+    "draft_extend_input",
+    "nextn_embed",
+    "nextn_decoder",
+    "nextn_norm",
+    "nextn_logits",
+    "proposed_token",
 )
+_REQUIRED_STAGE_SET = frozenset(_REQUIRED_STAGES)
 _REQUIRED_TENSORS = {
     "draft_extend_input": frozenset({"input_ids", "positions", "target_hidden_states"}),
     "nextn_embed": frozenset({"hidden_states"}),
@@ -39,6 +39,32 @@ _REQUIRED_TENSORS = {
 }
 _DENSE_ROW_DOMAIN = "dense_request_major_prefix"
 _PROPOSAL_ROW_DOMAIN = "request_terminal"
+
+
+def _rank_payload() -> Optional[dict[str, int]]:
+    try:
+        parallel = get_parallel()
+        return {
+            "world": parallel.world_rank,
+            "pp": parallel.pp_rank,
+            "attn_dp": parallel.attn_dp_rank,
+        }
+    except (AssertionError, AttributeError, RuntimeError):
+        return None
+
+
+def _synchronize_cuda_tensors(
+    tensors: dict[str, Optional[torch.Tensor]],
+) -> None:
+    """Expose asynchronous device faults at the owning stage boundary."""
+
+    devices = {
+        tensor.device
+        for tensor in tensors.values()
+        if tensor is not None and tensor.is_cuda
+    }
+    for device in sorted(devices, key=str):
+        torch.cuda.current_stream(device=device).synchronize()
 
 
 def _tensor_fingerprint(tensor: torch.Tensor, logical_rows: int) -> dict:
@@ -90,6 +116,7 @@ class EagleNumericalProbe:
         self._active_rows = 0
         self._records: dict[str, dict[str, dict]] = {}
         self._proposal_rows: dict[str, int] = {}
+        self._next_ordinal = 1
 
     @property
     def can_probe(self) -> bool:
@@ -120,6 +147,57 @@ class EagleNumericalProbe:
                 reason,
             )
 
+    def _emit_stage_event(
+        self,
+        *,
+        prefix: str,
+        phase: str,
+        stage: str,
+        row_domain: str,
+        fingerprints: dict[str, dict],
+        error: Optional[BaseException] = None,
+    ) -> None:
+        payload = {
+            "rid": self.expected_rid,
+            "phase": phase,
+            "stage": stage,
+            "ordinal": self._next_ordinal,
+            "row_domain": row_domain,
+            "logical_rows": self._active_rows,
+            "fingerprints": fingerprints,
+            "rank": _rank_payload(),
+        }
+        if error is not None:
+            payload.update(
+                {
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                }
+            )
+        logger.warning(
+            "%s %s",
+            prefix,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
+
+    def _handle_stage_error(
+        self,
+        *,
+        phase: str,
+        stage: str,
+        row_domain: str,
+        error: BaseException,
+    ) -> None:
+        self._emit_stage_event(
+            prefix="EAGLE_NUMERICAL_PROBE_STAGE_ERROR",
+            phase=phase,
+            stage=stage,
+            row_domain=row_domain,
+            fingerprints={},
+            error=error,
+        )
+        self._reject(f"failed to synchronize/fingerprint {phase}.{stage}: {error}")
+
     def _record(
         self,
         stage: str,
@@ -138,10 +216,24 @@ class EagleNumericalProbe:
         if required is None:
             self._reject(f"unexpected stage {phase}.{stage}")
             return
+        expected_stage = _REQUIRED_STAGES[len(bucket)]
+        if stage != expected_stage:
+            self._reject(
+                f"out-of-order stage {phase}.{stage}, expected {expected_stage}"
+            )
+            return
         missing = sorted(name for name in required if tensors.get(name) is None)
         if missing:
             self._reject(f"stage {phase}.{stage} missing tensors {missing}")
             return
+        try:
+            _synchronize_cuda_tensors(tensors)
+        except RuntimeError as exc:
+            self._handle_stage_error(
+                phase=phase, stage=stage, row_domain=row_domain, error=exc
+            )
+            raise
+
         try:
             fingerprints = {
                 name: _tensor_fingerprint(tensor, self._active_rows)
@@ -153,8 +245,22 @@ class EagleNumericalProbe:
                 "logical_rows": self._active_rows,
                 "tensors": fingerprints,
             }
+            self._emit_stage_event(
+                prefix="EAGLE_NUMERICAL_PROBE_STAGE",
+                phase=phase,
+                stage=stage,
+                row_domain=row_domain,
+                fingerprints=fingerprints,
+            )
+            self._next_ordinal += 1
         except (RuntimeError, TypeError, ValueError) as exc:
-            self._reject(f"failed to fingerprint {phase}.{stage}: {exc}")
+            self._handle_stage_error(
+                phase=phase, stage=stage, row_domain=row_domain, error=exc
+            )
+            if isinstance(exc, RuntimeError) and any(
+                tensor is not None and tensor.is_cuda for tensor in tensors.values()
+            ):
+                raise
 
     @contextlib.contextmanager
     def forward_scope(
@@ -254,7 +360,7 @@ class EagleNumericalProbe:
             self._rejection = "request did not complete normally"
         if self._rejection is None:
             for phase in ("decode",):
-                missing = _REQUIRED_STAGES - self._records.get(phase, {}).keys()
+                missing = _REQUIRED_STAGE_SET - self._records.get(phase, {}).keys()
                 if missing:
                     self._rejection = f"phase {phase} missing stages {sorted(missing)}"
                     break
@@ -267,15 +373,9 @@ class EagleNumericalProbe:
             "seen": self._seen,
             "phases": self._records,
         }
-        try:
-            parallel = get_parallel()
-            payload["rank"] = {
-                "world": parallel.world_rank,
-                "pp": parallel.pp_rank,
-                "attn_dp": parallel.attn_dp_rank,
-            }
-        except (AssertionError, AttributeError, RuntimeError):
-            pass
+        rank = _rank_payload()
+        if rank is not None:
+            payload["rank"] = rank
         logger.warning(
             "EAGLE_NUMERICAL_PROBE_RESULT %s",
             json.dumps(payload, sort_keys=True, separators=(",", ":")),
