@@ -33,10 +33,20 @@ class TestEagleNumericalProbe(unittest.TestCase):
         self.assertFalse(probe.matches_schedule_batch(batch))
 
     def test_capture_identity_is_required_exactly_when_probe_is_armed(self):
-        with self.assertRaisesRegex(ValueError, "requires capture id"):
-            EagleNumericalProbe("probe-rid")
-        with self.assertRaisesRegex(ValueError, "requires an exact request id"):
-            EagleNumericalProbe(None, capture_id="capture-only")
+        identity = {
+            "capture_id": "capture-test-generation",
+            "pod_name": "probe-pod",
+            "pod_uid": "probe-pod-uid",
+        }
+        for key in identity:
+            for replacement in (None, ""):
+                with self.subTest(armed_missing=key, replacement=replacement):
+                    incomplete = identity | {key: replacement}
+                    with self.assertRaisesRegex(ValueError, "requires capture id"):
+                        EagleNumericalProbe("probe-rid", **incomplete)
+            with self.subTest(disarmed_with=key):
+                with self.assertRaisesRegex(ValueError, "requires an exact request id"):
+                    EagleNumericalProbe(None, **{key: identity[key]})
 
     def test_exact_rid_records_complete_decode_fingerprint(self):
         probe = self.probe()
@@ -247,6 +257,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
             logs.output[-1].split("EAGLE_NUMERICAL_PROBE_RESULT ", 1)[1]
         )
         self.assertEqual(payload["status"], "rejected")
+        self.assertEqual(payload["capture"], self.probe().capture)
         self.assertIn("phase decode missing stages", payload["rejection"])
 
     def test_abnormal_completion_fails_closed_and_preserves_stop_reason(self):
