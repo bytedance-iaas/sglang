@@ -230,8 +230,13 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
         self.post_init()
 
     @torch.no_grad()
-    def forward(self, *args, **kwargs):
-        out = super().forward(*args, **kwargs)
+    def forward(self, *args, pp_proxy_tensors=None, **kwargs):
+        # Name pp_proxy_tensors explicitly (even though it is just forwarded) so
+        # ModelRunner.support_pp -- which inspects this forward's signature -- sees
+        # it and enables pipeline parallelism. Without it this *args/**kwargs
+        # wrapper hides the parameter that the base Gemma4ForConditionalGeneration
+        # forward declares, and PP is rejected for the unified model.
+        out = super().forward(*args, pp_proxy_tensors=pp_proxy_tensors, **kwargs)
         if (
             self._suppress_idx.numel() > 0
             and isinstance(out, LogitsProcessorOutput)

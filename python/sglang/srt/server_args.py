@@ -1304,6 +1304,37 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = "127.0.0.1"
+    sidp_cross_pp: A[
+        bool,
+        Arg(
+            help="Enable SiDP cross-PP mode: G independent --pipeline-parallel-size "
+            "services are grouped so that same-stage GPUs (one per PP group) form a "
+            "per-stage SiDP subworld sharing that stage's dense-FFN weights over "
+            "NVLink. This service's PP group index comes from --sidp-pp-group-id and "
+            "the group count from --sidp-num-pp-groups (= --sidp-size); the SiDP "
+            "member axis is the PP group, the stage axis is this process's pp_rank. "
+            "Requires a shared --sidp-rdzv-host / --sidp-rdzv-port. Single node only; "
+            "mutually exclusive with --sidp-external-mode. Default False.",
+        ),
+        NS("parallel"),
+    ] = False
+    sidp_pp_group_id: A[
+        int,
+        Arg(
+            help="This service's PP group index in cross-PP mode (0-based), i.e. its "
+            "SiDP member rank. Ignored unless --sidp-cross-pp is set.",
+        ),
+        NS("parallel"),
+    ] = 0
+    sidp_num_pp_groups: A[
+        int,
+        Arg(
+            help="Total number of PP groups (independent services) forming the "
+            "cross-PP SiDP group; equals the per-stage subworld size G and must equal "
+            "--sidp-size. Ignored unless --sidp-cross-pp is set.",
+        ),
+        NS("parallel"),
+    ] = 1
     sidp_coord_mode: A[
         bool,
         Arg(
@@ -6877,7 +6908,63 @@ class ServerArgs:
         )
 
         assert self.sidp_size >= 2, "SiDP requires sidp_size >= 2"
-        if self.sidp_external_mode:
+        assert not (self.sidp_external_mode and self.sidp_cross_pp), (
+            "SiDP external-worker mode and cross-PP mode are mutually exclusive"
+        )
+        if self.sidp_cross_pp:
+            # Cross-PP: G independent --pipeline-parallel-size services. The SiDP
+            # member axis is the PP group (sidp_pp_group_id); the per-stage
+            # subworld is formed by same-stage GPUs across groups. The manager
+            # keys owner/IPC/rendezvous off the PP group index + this process's
+            # pp_rank, so the local DP topology stays dp_size=1.
+            assert self.pp_size >= 2, (
+                f"SiDP cross-PP mode requires --pipeline-parallel-size >= 2 "
+                f"(got pp_size={self.pp_size})"
+            )
+            assert self.dp_size == 1, (
+                "SiDP cross-PP mode requires --data-parallel-size 1 "
+                f"(got dp_size={self.dp_size}); each PP group is an independent "
+                "service"
+            )
+            assert self.sidp_num_pp_groups >= 2, (
+                "SiDP cross-PP mode requires --sidp-num-pp-groups >= 2 "
+                f"(got {self.sidp_num_pp_groups})"
+            )
+            assert self.sidp_size == self.sidp_num_pp_groups, (
+                f"sidp_size ({self.sidp_size}) must equal sidp_num_pp_groups "
+                f"({self.sidp_num_pp_groups}) in cross-PP mode (both = per-stage "
+                "subworld size G)"
+            )
+            assert 0 <= self.sidp_pp_group_id < self.sidp_num_pp_groups, (
+                f"sidp_pp_group_id ({self.sidp_pp_group_id}) must be in "
+                f"[0, sidp_num_pp_groups ({self.sidp_num_pp_groups}))"
+            )
+            # Group g occupies contiguous ordinals [g*pp_size, (g+1)*pp_size), so
+            # stage s of group g lands on ordinal g*pp_size + s. Same-stage GPUs
+            # across groups share weights over intra-node NVLink; requiring
+            # base_gpu_id == g*pp_size (with the default
+            # SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=False) keeps
+            # current_device == gpu_id so cross-process CUDA IPC targets the right
+            # physical card. The member->ordinal map is exchanged at setup, so the
+            # SiDP manager never assumes member rank == ordinal.
+            assert self.base_gpu_id == self.sidp_pp_group_id * self.pp_size, (
+                f"SiDP cross-PP mode requires base_gpu_id ({self.base_gpu_id}) == "
+                f"sidp_pp_group_id * pp_size "
+                f"({self.sidp_pp_group_id} * {self.pp_size} = "
+                f"{self.sidp_pp_group_id * self.pp_size})"
+            )
+            assert self.gpu_id_step == 1, (
+                "SiDP cross-PP mode requires gpu_id_step=1"
+            )
+            assert self.sidp_rdzv_port != 0, (
+                "SiDP cross-PP mode requires an explicit shared --sidp-rdzv-port "
+                "(each PP stage subworld uses rdzv_port + pp_rank)"
+            )
+            assert not self.sidp_coord_mode, (
+                "SiDP cross-PP first version does not support coordinated_static "
+                "(--sidp-coord-mode); each service runs independently"
+            )
+        elif self.sidp_external_mode:
             # Direction A coordinated_static: N independent dp_size=1 services
             # form one SiDP world. The service's SiDP identity comes from
             # sidp_member_rank/sidp_world_size, not from the local DP topology.
@@ -6932,7 +7019,8 @@ class ServerArgs:
         )
         assert self.tp_size == 1, "SiDP requires tp_size=1 (classic DP mode)"
         assert self.dwdp_size <= 1, "SiDP and DWDP are mutually exclusive"
-        assert self.pp_size == 1, "SiDP requires pp_size=1"
+        if not self.sidp_cross_pp:
+            assert self.pp_size == 1, "SiDP requires pp_size=1"
         assert self.nnodes == 1, "SiDP currently supports single-node execution only"
         assert self.device == "cuda", "SiDP currently requires CUDA"
         if self.sidp_coord_mode:

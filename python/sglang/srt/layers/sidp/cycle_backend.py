@@ -211,7 +211,7 @@ class SidpCycleBackend:
             layers = tuple(manager._cycle_layers.get(cycle, ()))
             if not layers:
                 continue
-            owners = [owner_of(layer_id, manager.dp_size) for layer_id in layers]
+            owners = [manager.owner_of_layer(layer_id) for layer_id in layers]
             if any(
                 manager._layers_ref[layer_id] is None
                 or layer_id not in manager.peer_views
@@ -339,7 +339,7 @@ class SidpCycleBackend:
         )
 
     def wait_layer(self, layer_id: int) -> None:
-        cycle = layer_id // self.manager.dp_size
+        cycle = self.manager.cycle_of_layer(layer_id)
         if cycle == 0:
             return
         wait_generation(
@@ -352,7 +352,7 @@ class SidpCycleBackend:
         )
 
     def record_consumed(self, layer_id: int) -> None:
-        cycle = layer_id // self.manager.dp_size
+        cycle = self.manager.cycle_of_layer(layer_id)
         publish_generation(
             self.comp_gen,
             self.manager._layer_to_slot[layer_id],
@@ -382,7 +382,7 @@ class SidpCycleBackend:
                         "candidate_index": candidate_index,
                         "layer": layer_id,
                         "owner": (
-                            owner_of(layer_id, self.manager.dp_size)
+                            self.manager.owner_of_layer(layer_id)
                             if layer_id >= 0
                             else -1
                         ),

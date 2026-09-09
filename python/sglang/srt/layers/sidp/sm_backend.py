@@ -105,7 +105,7 @@ class SidpSmBackend(SidpCycleBackend):
         A setup-initialized one-element selection descriptor avoids adding a
         runtime selector kernel, so Event-vs-DMA differs only in copy backend.
         """
-        cycle = layer_id // self.manager.dp_size
+        cycle = self.manager.cycle_of_layer(layer_id)
         plan = self._plans[cycle]
         try:
             step = plan.layers.index(layer_id)

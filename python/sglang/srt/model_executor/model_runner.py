@@ -1187,7 +1187,19 @@ class ModelRunner:
                 num_layers = 0
 
         external_mode = getattr(self.server_args, "sidp_external_mode", False)
-        if external_mode:
+        cross_pp = getattr(self.server_args, "sidp_cross_pp", False)
+        if cross_pp:
+            # Cross-PP: this service is one PP group; the SiDP member axis is the
+            # PP group index and the world size is the number of groups (== the
+            # per-stage subworld size G). ps.dp_rank is always 0 here (dp_size=1),
+            # so take the SiDP identity from the explicit group id / group count,
+            # and the stage from this process's pp_rank. The manager keys
+            # owner/IPC/rendezvous off SidpConfig.dp_rank/dp_size + pp_stage and
+            # applies the per-stage layer offset internally.
+            sidp_dp_rank = self.server_args.sidp_pp_group_id
+            sidp_dp_size = self.server_args.sidp_num_pp_groups
+            pp_stage = self.ps.pp_rank
+        elif external_mode:
             # Direction A coordinated_static: this process is one independent
             # dp_size=1 service, so ps.dp_rank is always 0 and cannot identify
             # the SiDP member. Take the SiDP world identity from the explicit
@@ -1195,14 +1207,18 @@ class ModelRunner:
             # logic keys off SidpConfig.dp_rank/dp_size and is otherwise unchanged.
             sidp_dp_rank = self.server_args.sidp_member_rank
             sidp_dp_size = self.server_args.sidp_world_size
+            pp_stage = 0
         else:
             sidp_dp_rank = dp_rank
             sidp_dp_size = self.server_args.sidp_size
+            pp_stage = 0
 
         config = SidpConfig(
             dp_size=sidp_dp_size,
             dp_rank=sidp_dp_rank,
             external_mode=external_mode,
+            cross_pp=cross_pp,
+            pp_stage=pp_stage,
             coord_mode=getattr(self.server_args, "sidp_coord_mode", False),
             barrier_interval_cycles=getattr(
                 self.server_args, "sidp_barrier_interval_cycles", 4
@@ -1230,9 +1246,12 @@ class ModelRunner:
             rdzv_port=self.server_args.sidp_rdzv_port,
             # Native single-service DP is single-node; do not reuse the HTTP bind
             # host (which may be 0.0.0.0 and is not a stable client destination).
-            # External-worker mode uses the explicit shared rendezvous host.
+            # External-worker and cross-PP modes span independent processes, so
+            # they use the explicit shared rendezvous host.
             rdzv_host=(
-                self.server_args.sidp_rdzv_host if external_mode else "127.0.0.1"
+                self.server_args.sidp_rdzv_host
+                if (external_mode or cross_pp)
+                else "127.0.0.1"
             ),
             num_layers=num_layers,
             enable_cycle_overlap=True,

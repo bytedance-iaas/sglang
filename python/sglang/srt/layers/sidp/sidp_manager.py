@@ -67,6 +67,21 @@ class SidpManager:
         self.dp_size = config.dp_size
         self.dp_rank = config.dp_rank
         self.external_mode = config.external_mode
+        # Cross-PP: this member is one PP group; owner/cycle math runs on the
+        # per-stage layer segment (offset by ``layer_offset``, resolved at setup)
+        # and IPC targets a peer's physical CUDA ordinal via ``member_ordinals``
+        # (member rank no longer equals the ordinal). ``pp_stage`` selects this
+        # process's per-stage rendezvous namespace.
+        self.cross_pp = getattr(config, "cross_pp", False)
+        self.pp_stage = getattr(config, "pp_stage", 0)
+        # Physical CUDA ordinal of this process (cross-PP only; native/external
+        # keep rank == ordinal). ``member_ordinals`` maps member rank -> ordinal,
+        # exchanged over the per-stage TCPStore at setup. ``layer_offset`` is the
+        # global id of this stage's first decoder layer, so local-layer id
+        # ``lid - layer_offset`` drives owner/cycle/slot math within the segment.
+        self._my_ordinal = 0
+        self.member_ordinals: Dict[int, int] = {}
+        self.layer_offset = 0
         self.coord_mode = config.coord_mode
         self.barrier_interval_cycles = config.barrier_interval_cycles
         # 0 means "all members"; otherwise a fixed subset of M members runs the
@@ -297,22 +312,46 @@ class SidpManager:
                     "device reindexing."
                 )
 
+        # Cross-PP: member rank (PP group) does NOT equal the physical ordinal
+        # (e.g. stage 1 of group 1 sits on ordinal pp_size + 1). Record this
+        # process's ordinal and exchange the member -> ordinal map over the
+        # per-stage TCPStore below, instead of assuming rank == ordinal.
+        if self.cross_pp:
+            self._my_ordinal = torch.cuda.current_device()
+
         # D2: Create TCPStore now (all ranks have finished load_model at this point).
         # Rank 0 is master. Non-master ranks retry connection for up to 300s.
+        # Cross-PP forms one independent subworld per PP stage, so each stage uses
+        # its own store port (base rdzv_port + pp_stage); the group-0 process is
+        # master within every stage subworld.
+        store_port = self._rdzv_port + (self.pp_stage if self.cross_pp else 0)
         if self.enable_debug_logging:
             logger.info(
                 f"[SiDP rank{self.dp_rank}] creating TCPStore "
-                f"(host={self._rdzv_host}, port={self._rdzv_port})..."
+                f"(host={self._rdzv_host}, port={store_port})..."
             )
         self.store = torch.distributed.TCPStore(
             host_name=self._rdzv_host,
-            port=self._rdzv_port,
+            port=store_port,
             world_size=self.dp_size,
             is_master=(self.dp_rank == 0),
             wait_for_workers=False,
         )
         if self.enable_debug_logging:
             logger.info(f"[SiDP rank{self.dp_rank}] TCPStore connected")
+
+        # Cross-PP: publish this member's physical ordinal, then read every
+        # member's so owner/IPC/peer-access can target the right physical card.
+        # Keyed by stage so distinct stage subworlds never collide on the store.
+        if self.cross_pp:
+            self.member_ordinals = self._exchange_member_ordinals()
+            if self.enable_debug_logging:
+                logger.info(
+                    f"[SiDP rank{self.dp_rank}] stage {self.pp_stage} "
+                    f"member->ordinal map: {self.member_ordinals}"
+                )
+        else:
+            self.member_ordinals = {r: r for r in range(self.dp_size)}
         self._launch_sync_strategy = build_peak_sync_strategy(
             self.peak_sync_strategy,
             enabled=self.enable_peak_shifting,
@@ -341,17 +380,34 @@ class SidpManager:
             return
 
         self.num_layers = max(layers.keys()) + 1
+        # Cross-PP: this process only holds its PP stage's decoder layers, e.g.
+        # global ids [start_layer, end_layer). Owner/cycle/slot math must run on
+        # the LOCAL layer id (``lid - layer_offset``) within a segment of length
+        # ``seg_len``, using the per-stage subworld size G (== dp_size). Native /
+        # external-worker single-stage services hold [0, num_layers) so
+        # layer_offset stays 0 and seg_len == num_layers (unchanged behavior).
+        self.layer_offset = min(layers.keys()) if self.cross_pp else 0
+        self._max_lid = max(layers.keys())
+        self._seg_len = self._max_lid - self.layer_offset + 1
         if self.enable_debug_logging:
             logger.info(
                 f"[SiDP rank{self.dp_rank}] setup: {len(layers)} layers, "
                 f"num_layers={self.num_layers}, dp_size={self.dp_size}, k={self.k}"
+                + (
+                    f", stage={self.pp_stage}, layer_offset={self.layer_offset}, "
+                    f"seg_len={self._seg_len}"
+                    if self.cross_pp
+                    else ""
+                )
             )
 
-        # Identify local vs non-local layers
+        # Identify local vs non-local layers (owner math on the local segment id)
         local_layers = []
         non_local_layers = []
         for lid in sorted(layers.keys()):
-            if is_local_layer(lid, self.dp_rank, self.dp_size, self.k):
+            if is_local_layer(
+                lid - self.layer_offset, self.dp_rank, self.dp_size, self.k
+            ):
                 local_layers.append(lid)
             else:
                 non_local_layers.append(lid)
@@ -433,7 +489,7 @@ class SidpManager:
                 f"(weight_codec={self.weight_codec.name})..."
             )
         for lid, encoded_params in self._local_encoded_weights.items():
-            if owner_of(lid, self.dp_size) != self.dp_rank:
+            if owner_of(lid - self.layer_offset, self.dp_size) != self.dp_rank:
                 continue
             for pname, encoded in encoded_params.items():
                 tensor_reduction = _reduce_tensor(encoded.tensor)
@@ -474,7 +530,8 @@ class SidpManager:
             published_layers = sum(
                 1
                 for layer_id in local_layers
-                if owner_of(layer_id, self.dp_size) == self.dp_rank
+                if owner_of(layer_id - self.layer_offset, self.dp_size)
+                == self.dp_rank
             )
             logger.info(
                 f"[SiDP rank{self.dp_rank}] published handles for "
@@ -485,7 +542,13 @@ class SidpManager:
         if self.enable_debug_logging:
             logger.info(f"[SiDP rank{self.dp_rank}] fetching peer handles...")
         for lid in non_local_layers:
-            src = owner_of(lid, self.dp_size)
+            # ``src`` is the owner's SiDP member rank (the IPC key namespace, set
+            # by the publisher using its own dp_rank). ``src_ordinal`` is that
+            # owner's physical CUDA ordinal, which cross-process IPC rebuild needs
+            # -- in cross-PP it differs from the member rank (member->ordinal map);
+            # native/external keep them equal.
+            src = owner_of(lid - self.layer_offset, self.dp_size)
+            src_ordinal = self.member_ordinals[src]
             self.peer_views[lid] = {}
             self._peer_sm_ipc[lid] = {}
             for pname, _ in self._get_ffn_params(layers[lid]):
@@ -539,9 +602,9 @@ class SidpManager:
                             f"actual={sorted(sm_ipc)}"
                         )
                     self._peer_sm_ipc[lid][pname] = sm_ipc
-                peer_view = _rebuild_tensor(reduced_tensor, src_device=src)
+                peer_view = _rebuild_tensor(reduced_tensor, src_device=src_ordinal)
                 extra_views = {
-                    name: _rebuild_tensor(reduced, src_device=src)
+                    name: _rebuild_tensor(reduced, src_device=src_ordinal)
                     for name, reduced in reduced_extras.items()
                 }
                 encoded_view = EncodedWeight(
@@ -621,14 +684,16 @@ class SidpManager:
         # pool therefore absorbs the freed HBM directly, leaving activation slack
         # untouched — total device usage stays close to baseline, only KV grows.
 
-        # D6: Enable peer access + prime P2P routes
+        # D6: Enable peer access + prime P2P routes. Enable access to every other
+        # member's physical ordinal (in cross-PP the peers are the same-stage
+        # cards of the other PP groups, not ordinals [0, dp_size)).
         if self.enable_debug_logging:
             logger.info(
                 f"[SiDP rank{self.dp_rank}] enabling peer access + priming routes..."
             )
-        for dev in range(self.dp_size):
-            if dev != self.dp_rank:
-                self.memcpy.enable_peer_access(dev)
+        for ordinal in self.member_ordinals.values():
+            if ordinal != self.member_ordinals[self.dp_rank]:
+                self.memcpy.enable_peer_access(ordinal)
         self._prime_routes(non_local_layers)
 
         if self._uses_conditional_dma:
@@ -663,8 +728,13 @@ class SidpManager:
         for lid, layer in layers.items():
             layer._sidp_bound = lid in self.peer_views
             layer._sidp_mgr = self
-            layer._sidp_begin_forward = lid == 0
-            layer._sidp_end_forward = lid == self.num_layers - 1
+            # Bind begin/end to this stage's segment boundaries, not the global
+            # layer 0 / num_layers-1. Under cross-PP a non-first/last stage holds
+            # neither, so keying off globals would leave the cycle pipeline
+            # uninitialized on those stages. layer_offset/_max_lid collapse to
+            # 0/num_layers-1 in native + external single-stage mode (unchanged).
+            layer._sidp_begin_forward = lid == self.layer_offset
+            layer._sidp_end_forward = lid == self._max_lid
             layer._sidp_profile_enabled = self._graph_profiler is not None
             layer._sidp_dummy_compute = self.profile_dummy_compute
 
@@ -983,7 +1053,7 @@ class SidpManager:
         compute_stream = torch.cuda.current_stream()
 
         if self.enable_cycle_overlap and self.k < self.dp_size:
-            if layer_id // self.dp_size == 0:
+            if (layer_id - self.layer_offset) // self.dp_size == 0:
                 # The previous forward's tail (or setup for the first forward)
                 # established the cycle-0-resident invariant.
                 self._decode_weight_before_compute(layer_id, slot, compute_stream)
@@ -1024,7 +1094,7 @@ class SidpManager:
         else:
             self._consume_events[slot].record(torch.cuda.current_stream())
 
-        cycle = layer_id // self.dp_size
+        cycle = (layer_id - self.layer_offset) // self.dp_size
         if self._last_non_local_in_cycle.get(cycle) == layer_id:
             next_cycle = cycle + self._cycle_cache_depth
             if next_cycle < self._num_cycles:
@@ -1045,7 +1115,10 @@ class SidpManager:
         current compute-stream point and enqueue the next cycle normally.
         """
         compute_stream = torch.cuda.current_stream()
-        if self._graph_profiler is not None and layer_id // self.dp_size > 0:
+        if (
+            self._graph_profiler is not None
+            and (layer_id - self.layer_offset) // self.dp_size > 0
+        ):
             self._graph_profiler.record_wait_start(layer_id, compute_stream)
             self._graph_profiler.record_wait_end(layer_id, compute_stream)
         self.record_compute_and_prefetch_next(layer_id)
@@ -1094,22 +1167,24 @@ class SidpManager:
 
     def record_cycle_compute_start(self, layer_id: int):
         """Mark the start of a full decoder cycle for diagnostic captures."""
-        if self._graph_profiler is None or layer_id % self.dp_size != 0:
+        local_lid = layer_id - self.layer_offset
+        if self._graph_profiler is None or local_lid % self.dp_size != 0:
             return
         self._graph_profiler.record_cycle_compute_start(
-            layer_id // self.dp_size, torch.cuda.current_stream()
+            local_lid // self.dp_size, torch.cuda.current_stream()
         )
 
     def record_cycle_compute_end(self, layer_id: int):
         """Mark the end of a full decoder cycle for diagnostic captures."""
+        local_lid = layer_id - self.layer_offset
         is_cycle_end = (
-            layer_id % self.dp_size == self.dp_size - 1
-            or layer_id == self.num_layers - 1
+            local_lid % self.dp_size == self.dp_size - 1
+            or layer_id == self._max_lid
         )
         if self._graph_profiler is None or not is_cycle_end:
             return
         self._graph_profiler.record_cycle_compute_end(
-            layer_id // self.dp_size, torch.cuda.current_stream()
+            local_lid // self.dp_size, torch.cuda.current_stream()
         )
 
     def profile_after_cuda_graph_replay(
@@ -1422,8 +1497,17 @@ class SidpManager:
             self._cycle_backend.debug_validate_cycle(0)
 
     def _build_cycle_schedule(self):
-        """Build compute-order cycle membership and stable slot identities."""
-        self._num_cycles = (self.num_layers + self.dp_size - 1) // self.dp_size
+        """Build compute-order cycle membership and stable slot identities.
+
+        Owner/cycle math runs on this stage's LOCAL layer segment: the scheduler
+        helpers work in local ids ``[0, seg_len)`` with the per-stage subworld
+        size ``dp_size`` (== G), and every emitted local id is shifted by
+        ``layer_offset`` back to a global decoder-layer id. Native + external
+        single-stage services have layer_offset=0 and seg_len=num_layers, so this
+        is byte-for-byte identical to the previous full-model schedule.
+        """
+        seg_len = self._seg_len
+        self._num_cycles = (seg_len + self.dp_size - 1) // self.dp_size
         self._cycle_cache_depth = min(self.cache_cycles, self._num_cycles)
         if self.enable_cycle_overlap and self.k < self.dp_size:
             if self._cycle_cache_depth != 2:
@@ -1438,6 +1522,7 @@ class SidpManager:
                 # computes. This intentionally uses compute order (and may
                 # incast) for only the tail cycle. Current Gemma4 has 6 cycles,
                 # so leave this branch explicit but unimplemented for now.
+                # (Part B / P4 replaces this with a resident-tail fix.)
                 raise NotImplementedError(
                     "SiDP cross-forward cycle overlap currently requires an even "
                     "number of cycles; odd-cycle tail refill is reserved"
@@ -1450,18 +1535,23 @@ class SidpManager:
         self._remote_position_to_index = {
             pos: index for index, pos in enumerate(self._remote_positions)
         }
-        self._fetch_schedule = prefetch_order(
-            self.dp_rank,
-            self.dp_size,
-            self.k,
-            self.num_layers,
-            peak_shifting=(
-                self.prefetch_policy == SidpPrefetchPolicy.STATIC_PEAK.value
-            ),
-        )
+        # prefetch_order works in the local segment id space; shift each emitted
+        # id by layer_offset to name the global decoder layer it prefetches.
+        self._fetch_schedule = [
+            local_lid + self.layer_offset
+            for local_lid in prefetch_order(
+                self.dp_rank,
+                self.dp_size,
+                self.k,
+                seg_len,
+                peak_shifting=(
+                    self.prefetch_policy == SidpPrefetchPolicy.STATIC_PEAK.value
+                ),
+            )
+        ]
         self._cycle_layers = {}
         for layer_id in self._fetch_schedule:
-            cycle = layer_id // self.dp_size
+            cycle = (layer_id - self.layer_offset) // self.dp_size
             self._cycle_layers.setdefault(cycle, []).append(layer_id)
         self._last_non_local_in_cycle = {
             cycle: max(layer_ids) for cycle, layer_ids in self._cycle_layers.items()
@@ -1490,8 +1580,9 @@ class SidpManager:
         if self.enable_cycle_overlap:
             remote_count = len(self._remote_positions)
             for lid in non_local_layers:
-                cycle = lid // self.dp_size
-                position = lid % self.dp_size
+                local_lid = lid - self.layer_offset
+                cycle = local_lid // self.dp_size
+                position = local_lid % self.dp_size
                 cycle_slot = cycle % self._cycle_cache_depth
                 position_slot = self._remote_position_to_index[position]
                 self._layer_to_slot[lid] = cycle_slot * remote_count + position_slot
@@ -1572,7 +1663,9 @@ class SidpManager:
         device = torch.cuda.current_device()
         primed_devices = set()
         for lid in non_local_layers:
-            src_dev = owner_of(lid, self.dp_size)
+            # Dedup by the owner member (one physical peer ordinal each); owner
+            # math runs on the local segment id.
+            src_dev = owner_of(lid - self.layer_offset, self.dp_size)
             if src_dev in primed_devices:
                 continue
             # One small copy from this peer's view to trigger page mapping
@@ -1584,6 +1677,47 @@ class SidpManager:
                 break  # one param per device is enough
             primed_devices.add(src_dev)
         torch.cuda.synchronize()
+
+    def cycle_of_layer(self, layer_id: int) -> int:
+        """Cycle index of a global decoder layer within this stage's segment.
+
+        Owner/cycle/slot math uses segment-local ids so a cross-PP stage that
+        holds a non-zero global layer range still cycles from 0. layer_offset is
+        0 for native + external single-stage services (identity there).
+        """
+        return (layer_id - self.layer_offset) // self.dp_size
+
+    def owner_of_layer(self, layer_id: int) -> int:
+        """SiDP member rank that owns a global decoder layer (segment-local)."""
+        return owner_of(layer_id - self.layer_offset, self.dp_size)
+
+    def _exchange_member_ordinals(self) -> Dict[int, int]:
+        """Cross-PP: exchange each member's physical CUDA ordinal over the store.
+
+        In cross-PP the SiDP member rank is the PP group index, which does NOT
+        equal the physical CUDA ordinal (member g of stage s sits on ordinal
+        g*pp_size + s). Owner/IPC/peer-access must target the physical ordinal, so
+        every member publishes its own and reads all of them. Keys are namespaced
+        by pp_stage so the independent per-stage subworlds never collide on the
+        shared TCPStore (each stage subworld has its own member 0..G-1).
+        """
+        key = f"sidp/xpp/{self.pp_stage}/ord/{self.dp_rank}"
+        self.store.set(key, str(self._my_ordinal))
+        all_keys = [
+            f"sidp/xpp/{self.pp_stage}/ord/{r}" for r in range(self.dp_size)
+        ]
+        try:
+            self.store.wait(all_keys)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"SiDP cross-PP ordinal exchange failed at member {self.dp_rank} "
+                f"(stage {self.pp_stage}) waiting for all {self.dp_size} members"
+            ) from exc
+        ordinals: Dict[int, int] = {}
+        for r in range(self.dp_size):
+            raw = self.store.get(f"sidp/xpp/{self.pp_stage}/ord/{r}")
+            ordinals[r] = int(raw.decode() if isinstance(raw, bytes) else raw)
+        return ordinals
 
     def _collect_decoder_layers(self, model) -> Dict[int, Any]:
         """Find all decoder layers that have .mlp and .layer_id."""

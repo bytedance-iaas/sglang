@@ -62,7 +62,7 @@ class SidpFixedDmaFlagBackend(SidpFixedDmaSlicePlan):
         )
 
     def wait_layer(self, layer_id: int) -> None:
-        cycle = layer_id // self.manager.dp_size
+        cycle = self.manager.cycle_of_layer(layer_id)
         if cycle == 0:
             return
         wait_generation(
@@ -75,7 +75,7 @@ class SidpFixedDmaFlagBackend(SidpFixedDmaSlicePlan):
         )
 
     def record_consumed(self, layer_id: int) -> None:
-        cycle = layer_id // self.manager.dp_size
+        cycle = self.manager.cycle_of_layer(layer_id)
         publish_generation(
             self.comp_gen,
             self.manager._layer_to_slot[layer_id],

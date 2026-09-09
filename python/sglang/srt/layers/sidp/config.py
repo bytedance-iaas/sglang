@@ -48,6 +48,16 @@ class SidpConfig:
     # coordinated_static topology). Only affects rendezvous master election and
     # setup-time validation; the fetch/copy data path is unchanged.
     external_mode: bool = False
+    # Cross-PP mode: this service is one PP group of G independent
+    # --pipeline-parallel-size services. The SiDP member axis is the PP group
+    # (dp_rank == pp_group_id, dp_size == G); the per-stage subworld is formed by
+    # same-stage GPUs across groups. ``pp_stage`` is this process's pp_rank. The
+    # manager applies a per-stage layer offset (owner/cycle math run on the layer
+    # segment this stage holds) and exchanges a member->CUDA-ordinal map at setup
+    # (member rank no longer equals the physical ordinal). Like external_mode, the
+    # fetch/copy data path is otherwise unchanged.
+    cross_pp: bool = False
+    pp_stage: int = 0
     # Direction A Phase 2: coordinated_static GPU data plane. When True, a
     # cross-member device barrier (sense-reversing, host-free) is inserted every
     # ``barrier_interval_cycles`` prefetch cycles on the comm stream to correct
