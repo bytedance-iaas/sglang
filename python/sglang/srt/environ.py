@@ -980,6 +980,13 @@ class Envs:
     # mamba pool ratio accordingly. Frees one resident slot per running request,
     # raising max_running_requests. Off = original locking + ratio (escape hatch).
     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
+    # GDN decode fusion: unpack the projected QKVZ/BA and apply the indexed
+    # causal Conv1D state update in one Triton kernel (Qwen3.5/3.8 hybrids).
+    # On in prod; set False to fall back to split + causal_conv1d_update.
+    # Names follow upstream sgl-project so future syncs stay diff-clean.
+    SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
+    SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS = EnvBool(False)
+    SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS = EnvBool(False)
     # Unified Radix Tree
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
     # Registered TreeCore backend serving the unified radix cache.

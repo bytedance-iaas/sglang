@@ -67,6 +67,7 @@ if _use_aiter:
 class Bf16GemmBackend(Enum):
     AUTO = "auto"
     CUTEDSL = "cutedsl"
+    GEMV = "gemv"
     TORCH = "torch"
 
     def is_auto(self) -> bool:
@@ -75,14 +76,20 @@ class Bf16GemmBackend(Enum):
     def is_cutedsl(self) -> bool:
         return self == Bf16GemmBackend.CUTEDSL
 
+    def is_gemv(self) -> bool:
+        return self == Bf16GemmBackend.GEMV
+
 
 _BF16_GEMM_BACKEND: Optional[Bf16GemmBackend] = None
 _cutedsl_bf16_gemm = None
 _use_cutedsl_bf16_gemm = None
+_hopper_bf16_gemv = None
+_use_hopper_bf16_gemv = None
 
 
 def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
     global _BF16_GEMM_BACKEND, _cutedsl_bf16_gemm, _use_cutedsl_bf16_gemm
+    global _hopper_bf16_gemv, _use_hopper_bf16_gemv
 
     from sglang.srt.utils import is_sm100_supported
 
@@ -105,6 +112,17 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
 
         _cutedsl_bf16_gemm = cutedsl_bf16_gemm
         _use_cutedsl_bf16_gemm = use_cutedsl_bf16_gemm
+    elif backend.is_gemv():
+        if torch.cuda.get_device_capability()[0] != 9:
+            raise ValueError("--bf16-gemm-backend gemv requires SM90 (Hopper)")
+
+        from sglang.kernels.ops.gemm.hopper_bf16_gemv import (
+            hopper_bf16_gemv,
+            use_hopper_bf16_gemv,
+        )
+
+        _hopper_bf16_gemv = hopper_bf16_gemv
+        _use_hopper_bf16_gemv = use_hopper_bf16_gemv
 
     _BF16_GEMM_BACKEND = backend
 
@@ -119,6 +137,10 @@ def _bf16_gemm_dispatch_fake(
 def bf16_gemm_dispatch(
     x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
 ) -> torch.Tensor:
+    if _use_hopper_bf16_gemv is not None and _use_hopper_bf16_gemv(
+        x.numel() // x.shape[-1], weight.shape[0], weight.shape[1]
+    ):
+        return _hopper_bf16_gemv(x.view(-1, x.shape[-1]), weight)
     if _use_cutedsl_bf16_gemm is not None and _use_cutedsl_bf16_gemm(
         x.numel() // x.shape[-1], weight.shape[0], weight.shape[1]
     ):
