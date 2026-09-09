@@ -82,6 +82,13 @@ class SidpManager:
         self._my_ordinal = 0
         self.member_ordinals: Dict[int, int] = {}
         self.layer_offset = 0
+        # Resident-tail split (non-divisible / odd-cycle fix). ``_pipeline_layers``
+        # = number of leading local ids that ride the SiDP cycle pipeline (an even
+        # count of full cycles); ``_tail_local_ids`` = the leftover local ids kept
+        # full-resident. Both resolved in setup; tail empty for divisible+even
+        # segments (native DP8, 2xPP4, ... => unchanged behavior).
+        self._pipeline_layers = 0
+        self._tail_local_ids: set[int] = set()
         self.coord_mode = config.coord_mode
         self.barrier_interval_cycles = config.barrier_interval_cycles
         # 0 means "all members"; otherwise a fixed subset of M members runs the
@@ -389,6 +396,20 @@ class SidpManager:
         self.layer_offset = min(layers.keys()) if self.cross_pp else 0
         self._max_lid = max(layers.keys())
         self._seg_len = self._max_lid - self.layer_offset + 1
+
+        # Non-divisible / odd-cycle fix (resident tail). The cross-forward cycle
+        # pipeline (enable_cycle_overlap + k<G, depth-2 rolling cache) requires an
+        # EVEN number of full cycles. When seg_len is not a multiple of G, or the
+        # full-cycle count is odd, the leftover layers cannot ride the pipeline.
+        # Instead of failing, those layers become the "resident tail": kept fully
+        # local (never encoded/published/fetched/released) and computed in place
+        # after the last pipeline cycle. Only the first ``pipeline_layers`` local
+        # ids (an even number of complete cycles) run the SiDP pipeline.
+        #
+        # ``pipeline_layers == seg_len`` (already divisible + even) => tail empty
+        # => byte-for-byte the previous behavior (native DP8/2xPP4/... all here).
+        self._pipeline_layers = self._compute_pipeline_layers()
+        self._tail_local_ids = set(range(self._pipeline_layers, self._seg_len))
         if self.enable_debug_logging:
             logger.info(
                 f"[SiDP rank{self.dp_rank}] setup: {len(layers)} layers, "
@@ -399,14 +420,25 @@ class SidpManager:
                     if self.cross_pp
                     else ""
                 )
+                + (
+                    f", pipeline_layers={self._pipeline_layers}, "
+                    f"tail_layers={len(self._tail_local_ids)}"
+                    if self._tail_local_ids
+                    else ""
+                )
             )
 
-        # Identify local vs non-local layers (owner math on the local segment id)
+        # Identify local vs non-local layers (owner math on the local segment id).
+        # Tail layers are neither: they stay full-resident, so they are excluded
+        # from both the owner-publish set and the remote-fetch set.
         local_layers = []
         non_local_layers = []
         for lid in sorted(layers.keys()):
+            local_lid = lid - self.layer_offset
+            if local_lid in self._tail_local_ids:
+                continue  # resident tail: not shared, not fetched
             if is_local_layer(
-                lid - self.layer_offset, self.dp_rank, self.dp_size, self.k
+                local_lid, self.dp_rank, self.dp_size, self.k
             ):
                 local_layers.append(lid)
             else:
@@ -1496,18 +1528,53 @@ class SidpManager:
         if self._cycle_backend is not None and self.enable_debug_logging:
             self._cycle_backend.debug_validate_cycle(0)
 
+    def _compute_pipeline_layers(self) -> int:
+        """Local-id count that rides the cycle pipeline (rest is resident tail).
+
+        The cross-forward overlap pipeline (k<G, depth-2 rolling cache) needs an
+        EVEN number of COMPLETE cycles: a partial final cycle would leave slot
+        group 0 half-filled, and an odd full-cycle count breaks the depth-2
+        next-forward cycle-0 refill (which advances by cache_depth=2). So the
+        pipeline covers ``even_full_cycles * G`` leading local layers; the
+        remaining ``seg_len - that`` layers are the resident tail.
+
+        Only the k<G overlap pipeline has this constraint. For k==G (fully
+        resident, no remote fetch) or the non-overlap fallback there is no tail:
+        every layer is local and computed in place, so return seg_len.
+        """
+        if not (self.enable_cycle_overlap and self.k < self.dp_size):
+            return self._seg_len
+        full_cycles = self._seg_len // self.dp_size
+        pipeline_cycles = full_cycles - (full_cycles % 2)  # round down to even
+        pipeline_layers = pipeline_cycles * self.dp_size
+        if pipeline_cycles == 0:
+            # Segment too short for even one pipeline pair (e.g. seg_len < 2G).
+            # Keep the whole segment resident -- SiDP does no sharing for this
+            # stage, but it stays correct. Loud because it forfeits the savings.
+            logger.warning(
+                "[SiDP rank%d] stage segment seg_len=%d with G=%d yields %d full "
+                "cycle(s) (<2 even); keeping the whole segment resident (no SiDP "
+                "sharing on this stage).",
+                self.dp_rank, self._seg_len, self.dp_size, full_cycles,
+            )
+        return pipeline_layers
+
     def _build_cycle_schedule(self):
         """Build compute-order cycle membership and stable slot identities.
 
         Owner/cycle math runs on this stage's LOCAL layer segment: the scheduler
-        helpers work in local ids ``[0, seg_len)`` with the per-stage subworld
-        size ``dp_size`` (== G), and every emitted local id is shifted by
+        helpers work in local ids ``[0, pipeline_layers)`` with the per-stage
+        subworld size ``dp_size`` (== G), and every emitted local id is shifted by
         ``layer_offset`` back to a global decoder-layer id. Native + external
-        single-stage services have layer_offset=0 and seg_len=num_layers, so this
-        is byte-for-byte identical to the previous full-model schedule.
+        single-stage services have layer_offset=0 and pipeline_layers=num_layers,
+        so this is byte-for-byte identical to the previous full-model schedule.
+
+        Only the first ``pipeline_layers`` local ids ride the pipeline; any
+        resident-tail local ids (>= pipeline_layers) are excluded here and compute
+        in place, so the pipeline always sees an even number of complete cycles.
         """
-        seg_len = self._seg_len
-        self._num_cycles = (seg_len + self.dp_size - 1) // self.dp_size
+        pipeline_layers = self._pipeline_layers
+        self._num_cycles = pipeline_layers // self.dp_size
         self._cycle_cache_depth = min(self.cache_cycles, self._num_cycles)
         if self.enable_cycle_overlap and self.k < self.dp_size:
             if self._cycle_cache_depth != 2:
@@ -1515,18 +1582,14 @@ class SidpManager:
                     "SiDP cross-forward cycle overlap currently requires "
                     "cache_cycles=2"
                 )
-            if self._num_cycles % 2 != 0:
-                # TODO(SiDP): for an odd cycle count, slot group 0 is still
-                # consumed by the final cycle. The future fallback should refill
-                # next-forward c0 position-by-position as that final cycle
-                # computes. This intentionally uses compute order (and may
-                # incast) for only the tail cycle. Current Gemma4 has 6 cycles,
-                # so leave this branch explicit but unimplemented for now.
-                # (Part B / P4 replaces this with a resident-tail fix.)
-                raise NotImplementedError(
-                    "SiDP cross-forward cycle overlap currently requires an even "
-                    "number of cycles; odd-cycle tail refill is reserved"
-                )
+            # _compute_pipeline_layers guarantees an even _num_cycles here (it
+            # rounds the full-cycle count down to even and moves the remainder to
+            # the resident tail), so the odd-cycle case no longer reaches this
+            # path -- assert the invariant instead of failing at runtime.
+            assert self._num_cycles % 2 == 0, (
+                f"pipeline cycles must be even, got {self._num_cycles} "
+                f"(pipeline_layers={pipeline_layers}, G={self.dp_size})"
+            )
         # Slot identity always follows compute order. The fetch policy may be
         # peak-shifted independently without changing buffer ownership.
         self._remote_positions = remote_positions(
@@ -1535,15 +1598,16 @@ class SidpManager:
         self._remote_position_to_index = {
             pos: index for index, pos in enumerate(self._remote_positions)
         }
-        # prefetch_order works in the local segment id space; shift each emitted
-        # id by layer_offset to name the global decoder layer it prefetches.
+        # prefetch_order works in the local segment id space (bounded to the
+        # pipeline region); shift each emitted id by layer_offset to name the
+        # global decoder layer it prefetches. Tail layers are never emitted.
         self._fetch_schedule = [
             local_lid + self.layer_offset
             for local_lid in prefetch_order(
                 self.dp_rank,
                 self.dp_size,
                 self.k,
-                seg_len,
+                pipeline_layers,
                 peak_shifting=(
                     self.prefetch_policy == SidpPrefetchPolicy.STATIC_PEAK.value
                 ),
