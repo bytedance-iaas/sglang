@@ -194,5 +194,109 @@ class TestHelionKDADispatcher(unittest.TestCase):
         self.assertEqual(args.linear_attn_backend, "helion")
 
 
+class TestKDATrackStateSnapshotDeclaration(unittest.TestCase):
+    """Bookkeeping: every KDA prefill kernel must declare whether extend()
+    honors the fp32 track snapshot (``supports_track_state_snapshot``).
+
+    KDAAttnBackend allocates the snapshot buffer whenever a tracked batch has
+    chunk-unaligned sequences and asserts the flag before use. A kernel that
+    serves extend() without the flag must reject tracked batches loudly
+    (NotImplementedError); a missing declaration used to mean the buffer was
+    silently left unwritten and prefix-cache restores read garbage (the
+    FlashKDA fallback once dropped the track arguments exactly this way).
+    """
+
+    def test_every_kda_prefill_kernel_declares_the_contract(self):
+        from sglang.srt.layers.attention.linear.kernels.kda_cutedsl import (
+            CuteDSLKDAKernel,
+        )
+        from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
+            FlashInferKDAKernel,
+        )
+        from sglang.srt.layers.attention.linear.kernels.kda_flashkda import (
+            FlashKDAKernel,
+        )
+        from sglang.srt.layers.attention.linear.kernels.kda_nvidia import (
+            NvidiaKDAKernel,
+        )
+        from sglang.srt.layers.attention.linear.kernels.kda_ptx import (
+            PtxKDAKernel,
+        )
+
+        # Native support or fallback that forwards the snapshot arguments.
+        for cls in (
+            TritonKDAKernel,
+            HelionKDAKernel,
+            NvidiaKDAKernel,
+            PtxKDAKernel,
+            FlashKDAKernel,
+        ):
+            self.assertTrue(
+                cls.supports_track_state_snapshot,
+                f"{cls.__name__} must declare supports_track_state_snapshot "
+                f"(native support or a fallback that forwards track_state)",
+            )
+        # Reject tracked batches loudly instead (extend() raises).
+        for cls in (CuteDSLKDAKernel, FlashInferKDAKernel):
+            self.assertFalse(
+                cls.supports_track_state_snapshot,
+                f"{cls.__name__} rejects tracked batches; it must not claim "
+                f"snapshot support it does not have",
+            )
+
+
+class TestKDATrackStateForwarding(unittest.TestCase):
+    def test_flashkda_fallback_forwards_snapshot_without_optional_package(self):
+        from sglang.srt.layers.attention.linear.kernels.kda_flashkda import (
+            FlashKDAKernel,
+        )
+
+        q = torch.zeros(1, 100, 2, 128, dtype=torch.bfloat16)
+        state = torch.zeros(1, 2, 128, 128)
+        snapshot = torch.full_like(state, float("nan"))
+        chunk = torch.tensor([1], dtype=torch.int32)
+        with patch("sglang.kernels.ops.attention.fla.kda.chunk_kda") as fallback:
+            FlashKDAKernel().extend(
+                q,
+                q,
+                q,
+                q,
+                torch.zeros(1, 100, 2),
+                ssm_states=state,
+                cache_indices=torch.tensor([0]),
+                query_start_loc=torch.tensor([0, 100]),
+                lower_bound=-5.0,
+                return_intermediate_states=True,
+                track_state=snapshot,
+                track_chunk_idx=chunk,
+            )
+        self.assertIs(fallback.call_args.kwargs["track_state"], snapshot)
+        self.assertIs(fallback.call_args.kwargs["track_chunk_idx"], chunk)
+
+    def test_effective_kernel_and_dispatch_agree_for_safe_gate(self):
+        dispatcher = object.__new__(KDAKernelDispatcher)
+        dispatcher.extend_kernel = MagicMock(supports_safe_gate=False)
+        dispatcher.triton_kernel = MagicMock(supports_track_state_snapshot=True)
+        self.assertIs(
+            dispatcher.effective_extend_kernel(None), dispatcher.extend_kernel
+        )
+        self.assertIs(
+            dispatcher.effective_extend_kernel(-5.0), dispatcher.triton_kernel
+        )
+        dispatcher.extend(
+            None,
+            None,
+            None,
+            None,
+            None,
+            ssm_states=None,
+            cache_indices=None,
+            query_start_loc=None,
+            lower_bound=-5.0,
+        )
+        dispatcher.extend_kernel.extend.assert_not_called()
+        dispatcher.triton_kernel.extend.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
