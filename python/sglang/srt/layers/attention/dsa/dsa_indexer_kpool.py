@@ -1387,15 +1387,10 @@ class IndexerKPool(MultiPlatformOp):
         buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
 
         def _compress_write() -> None:
-            score = self._compute_gate_score_if_missing(x, gate_score_maybe)
-            real_num_tokens = getattr(
-                forward_batch, "global_num_token_non_padded_cpu", None
-            )
-            if real_num_tokens is None:
-                real_num_tokens = key.shape[0]
-            assert 0 <= real_num_tokens <= key.shape[0], (
-                "DSA KPool target-verify real token count is outside the "
-                f"physical input: real={real_num_tokens}, physical={key.shape[0]}"
+            num_plan_tokens = plan.req.shape[0] * num_draft_tokens
+            assert num_plan_tokens <= key.shape[0], (
+                "DSA KPool write plan has more token rows than its input: "
+                f"planned={num_plan_tokens}, physical={key.shape[0]}"
             )
             ragged_verify_layout = getattr(
                 getattr(forward_batch, "spec_info", None),
@@ -1406,41 +1401,23 @@ class IndexerKPool(MultiPlatformOp):
                 "DSA KPool target-verify requires fixed-width EAGLE groups; "
                 "ragged verify must use its ragged KPool plan"
             )
-            assert real_num_tokens % num_draft_tokens == 0, (
-                "DSA KPool target-verify real token count must contain complete "
-                f"draft groups: real={real_num_tokens}, draft={num_draft_tokens}"
-            )
-            real_batch = real_num_tokens // num_draft_tokens
-            assert real_batch <= plan.req.shape[0], (
-                "DSA KPool target-verify real request count is outside the "
-                f"write plan: real={real_batch}, physical={plan.req.shape[0]}"
-            )
-            # DeepEP MLP-sync may append physical token rows after DSA metadata
-            # and its write plan have been built.  Those rows participate in the
-            # following collective but own no speculative request state.  Trim
-            # both token-domain inputs [B * N, ...] and request-domain plan
-            # inputs [B, ...] so the writer cannot associate a padding request
-            # with the final real draft group.
+            score = self._compute_gate_score_if_missing(x, gate_score_maybe)
             kpool_write_tail_and_maybe_compress(
                 pool=pool,
                 buf=buf,
-                key=key[:real_num_tokens],
-                score=score[:real_num_tokens],
+                key=key[:num_plan_tokens],
+                score=score[:num_plan_tokens],
                 tail_k=tail_k_buf,
                 tail_score=tail_score_buf,
                 ape=self.index_kpool_compress_ape,
-                req_pool_indices=plan.req[:real_batch],
-                write_start=plan.write_start[:real_batch],
-                tail_logical_start=plan.tail_logical_start[:real_batch],
-                write_loc=plan.write_loc[:real_batch],
-                out_cache_loc=forward_batch.out_cache_loc[:real_num_tokens],
+                req_pool_indices=plan.req,
+                write_start=plan.write_start,
+                tail_logical_start=plan.tail_logical_start,
+                write_loc=plan.write_loc,
+                out_cache_loc=forward_batch.out_cache_loc[:num_plan_tokens],
                 num_draft_tokens=num_draft_tokens,
                 round_scale=self.scale_fmt is not None,
-                effective_n_per_batch=(
-                    plan.effective_n_per_batch[:real_batch]
-                    if plan.effective_n_per_batch is not None
-                    else None
-                ),
+                effective_n_per_batch=plan.effective_n_per_batch,
             )
 
         if enable_dual_stream:

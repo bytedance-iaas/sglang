@@ -879,6 +879,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
         )
+        if (
+            (self.is_mla_backend or self.is_hybrid_mla_backend)
+            and not get_memory().enable_unified_memory
+            and not self.kv_args.mla_compression_ratios
+            and self.kv_args.kv_item_lens
+            and self.kv_args.kv_item_lens[0] != dst_kv_item_len
+        ):
+            raise RuntimeError(
+                "PD MLA KV layout mismatch: prefill page bytes="
+                f"{self.kv_args.kv_item_lens[0]}, decode page bytes={dst_kv_item_len}. "
+                "Both peers must use the same physical KV layout."
+            )
         dst_device_kv_ptrs = None
         if dst_device_kv_indices is not None:
             compression_ratios = self.kv_args.mla_compression_ratios

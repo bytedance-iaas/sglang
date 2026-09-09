@@ -14,7 +14,10 @@ because kernels read through the strided views, not through raw offsets.
 """
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
+import numpy as np
 import torch
 
 from sglang.srt.mem_cache.layout.page_major import (
@@ -120,6 +123,72 @@ class TestMambaEnvelopeTransferAddressing(CustomTestCase):
                 f"slot {slot} state bled outside its transfer envelope",
             )
             self.assertEqual(n_payload, entry)
+
+
+class TestMLAPeerLayout(CustomTestCase):
+    def _manager(self, page_bytes, *, hybrid=False, unified=False):
+        from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+        from sglang.srt.runtime_context import get_context
+
+        override = get_context().override_server_args(enable_unified_memory=unified)
+        override.install()
+        self.addCleanup(override.restore)
+        manager = object.__new__(MooncakeKVManager)
+        manager.is_mla_backend = not hybrid
+        manager.is_hybrid_mla_backend = hybrid
+        manager.attn_tp_size = 4
+        manager.kv_args = SimpleNamespace(
+            kv_data_ptrs=[1000],
+            kv_item_lens=[page_bytes],
+            kv_layer_ids=[3],
+            mla_compression_ratios=None,
+        )
+        manager._send_kvcache_generic = MagicMock(return_value=0)
+        return manager
+
+    def _send(self, manager, dst_page_bytes, dst_tp=1):
+        return manager.send_kvcache(
+            "session",
+            np.array([1], dtype=np.int32),
+            [10000],
+            np.array([7], dtype=np.int32),
+            MagicMock(),
+            dst_layer_ids=[3],
+            dst_kv_item_len=dst_page_bytes,
+            dst_attn_tp_size=dst_tp,
+        )
+
+    def test_raw_and_group_layouts_match_across_attention_tp(self):
+        for dimension in (512, 528):
+            for hybrid in (False, True):
+                with self.subTest(dimension=dimension, hybrid=hybrid):
+                    manager = self._manager(dimension * 64, hybrid=hybrid)
+                    self.assertEqual(self._send(manager, dimension * 64), 0)
+                    manager._send_kvcache_generic.assert_called_once()
+
+    def test_mismatch_or_missing_layout_rejected_before_transfer(self):
+        for src, dst in ((512, 528), (528, 512), (528, None)):
+            for hybrid in (False, True):
+                with self.subTest(src=src, dst=dst, hybrid=hybrid):
+                    manager = self._manager(src * 64, hybrid=hybrid)
+                    with self.assertRaisesRegex(
+                        RuntimeError, "PD MLA KV layout mismatch"
+                    ):
+                        self._send(manager, dst * 64 if dst is not None else None)
+                    manager._send_kvcache_generic.assert_not_called()
+
+    def test_unified_envelope_rejects_shape_and_tp_mismatches(self):
+        for dst_bytes, dst_tp in ((128, 4), (256, 1)):
+            with self.subTest(dst_bytes=dst_bytes, dst_tp=dst_tp):
+                manager = self._manager(256, unified=True)
+                with self.assertRaises(RuntimeError):
+                    self._send(manager, dst_bytes, dst_tp)
+                manager._send_kvcache_generic.assert_not_called()
+
+    def test_mha_does_not_require_mla_page_layout(self):
+        manager = self._manager(256)
+        manager.is_mla_backend = False
+        self.assertEqual(self._send(manager, 128), 0)
 
 
 if __name__ == "__main__":

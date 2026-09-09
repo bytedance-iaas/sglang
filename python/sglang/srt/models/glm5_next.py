@@ -342,7 +342,7 @@ class Glm5NextLinearAttention(nn.Module):
         # quantized: GLM-5.3-Flash ships FP8 experts with BF16 attention. Ask
         # per prefix, since the fused modules can only eat unquantized weights.
         self.do_fuse_qkvbfg = (
-            head_shard_size == self.tp_size
+            not envs.SGLANG_DISABLE_KDA_PROJECTION_FUSION.get()
             and (
                 quant_config is None
                 or envs.SGLANG_OPT_GLM5_NEXT_KDA_PROJECTION_FUSION.get()
@@ -382,6 +382,8 @@ class Glm5NextLinearAttention(nn.Module):
                 # layer whose source weights are BF16.
                 quant_config=None,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
+                tp_rank=head_shard_rank,
+                tp_size=head_shard_size,
             )
             self.split_sizes = [
                 3 * projection_size // head_shard_size,
@@ -394,7 +396,12 @@ class Glm5NextLinearAttention(nn.Module):
                 or torch.get_default_dtype()
             )
             self.fused_fg_b_proj = ColumnParallelBatchedLinear(
-                2, self.head_dim, projection_size, dtype=fused_dtype
+                2,
+                self.head_dim,
+                projection_size,
+                dtype=fused_dtype,
+                tp_rank=head_shard_rank,
+                tp_size=head_shard_size,
             )
         else:
             self.qkv_proj = QKVParallelLinear(

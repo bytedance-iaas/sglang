@@ -10,6 +10,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.runtime_context import (
@@ -294,6 +296,79 @@ class TestDefaultConfigurator(CustomTestCase):
         self.assertEqual(raw_configurator._cell_size, (576 + 132) * num_layers)
         self.assertEqual(packed_configurator._cell_size, (656 + 132) * num_layers)
         self.assertEqual(mock_calculate_mla_kv_cache_dim.call_count, 2)
+
+
+class TestDSAExplicitLayout(CustomTestCase):
+    def test_layout_controls_dimensions_and_capacity_charge(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            calculate_mla_kv_cache_dim,
+        )
+        from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+
+        runner = _make_model_runner(
+            self, num_layers=2, use_mla_backend=True, qk_rope_head_dim=0
+        )
+        _configure_dsa_model(runner)
+        runner.model_config.dtype = torch.bfloat16
+        runner.kv_cache_dtype = torch.float8_e4m3fn
+        for layout, dimension in (("raw512", 512), ("group528", 528)):
+            with (
+                self.subTest(layout=layout),
+                mock_cpu_env(kv_size=1),
+                patch("sglang.srt.mem_cache.kv_cache_configurator._is_hip", False),
+                envs.SGLANG_DSA_FP8_KV_LAYOUT.override(layout),
+            ):
+                self.assertEqual(
+                    calculate_mla_kv_cache_dim(
+                        model_config=runner.model_config,
+                        kv_cache_dtype=runner.kv_cache_dtype,
+                    ),
+                    dimension,
+                )
+                self.assertEqual(
+                    DefaultPoolConfigurator(runner)._cell_size, (dimension + 132) * 2
+                )
+
+    def test_explicit_layout_rejects_incompatible_storage(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            calculate_mla_kv_cache_dim,
+        )
+
+        for layout in ("raw512", "group528"):
+            for changed in (
+                "hip",
+                "kv_dtype",
+                "dtype",
+                "kv_lora_rank",
+                "qk_rope_head_dim",
+            ):
+                runner = _make_model_runner(
+                    self, use_mla_backend=True, qk_rope_head_dim=0
+                )
+                _configure_dsa_model(runner)
+                model = runner.model_config
+                model.dtype = torch.float16 if changed == "dtype" else torch.bfloat16
+                if changed == "kv_lora_rank":
+                    model.kv_lora_rank = 256
+                if changed == "qk_rope_head_dim":
+                    model.qk_rope_head_dim = 64
+                with (
+                    self.subTest(layout=layout, changed=changed),
+                    envs.SGLANG_DSA_FP8_KV_LAYOUT.override(layout),
+                    patch(
+                        "sglang.srt.mem_cache.kv_cache_configurator._is_hip",
+                        changed == "hip",
+                    ),
+                    self.assertRaisesRegex(ValueError, "Explicit DSA FP8 KV layouts"),
+                ):
+                    calculate_mla_kv_cache_dim(
+                        model_config=model,
+                        kv_cache_dtype=torch.bfloat16
+                        if changed == "kv_dtype"
+                        else torch.float8_e4m3fn,
+                    )
 
 
 class TestHybridSWAConfigurator(CustomTestCase):

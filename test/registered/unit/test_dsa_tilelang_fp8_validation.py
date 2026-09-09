@@ -1,9 +1,4 @@
-"""Validation for the raw fp8_e4m3 TileLang DSA backend on CUDA.
-
-Regression: the combination used to boot the server and crash at decode
-CUDA-graph capture with ``kernel main input KV dtype expected bfloat16,
-but got float8_e4m3fn``.
-"""
+"""Validate explicit raw and group-scaled CUDA DSA KV contracts."""
 
 import unittest
 from unittest.mock import patch
@@ -40,6 +35,51 @@ class TestDsaTilelangFp8Validation(CustomTestCase):
                 _check_tilelang_dsa_fp8_kv(
                     "fp8_e4m3", "tilelang", "tilelang", hip=False
                 )
+
+    def test_cuda_group_scaled_nope_allowed(self):
+        for prefill in ("tilelang", "cutedsl_h16"):
+            _check_tilelang_dsa_fp8_kv(
+                "fp8_e4m3",
+                prefill,
+                "tilelang",
+                hip=False,
+                nope_group_scaled=True,
+                kv_layout="group528",
+            )
+
+    def test_explicit_layout_rejects_incompatible_consumers(self):
+        for layout, prefill, decode, nope, dcp in (
+            ("group528", "tilelang", "trtllm", True, 1),
+            ("group528", "cutedsl_h16", "tilelang", False, 1),
+            ("group528", "cutedsl_h16", "tilelang", True, 2),
+            ("raw512", "cutedsl_h16", "tilelang", True, 1),
+            ("auto", "cutedsl_h16", "tilelang", True, 1),
+            ("unknown", "tilelang", "tilelang", True, 1),
+        ):
+            with self.subTest(
+                layout=layout, prefill=prefill, decode=decode, nope=nope, dcp=dcp
+            ):
+                with self.assertRaises(ValueError):
+                    _check_tilelang_dsa_fp8_kv(
+                        "fp8_e4m3",
+                        prefill,
+                        decode,
+                        hip=False,
+                        nope_group_scaled=nope,
+                        kv_layout=layout,
+                        dcp_size=dcp,
+                    )
+
+    def test_explicit_raw_allowed_on_hopper(self):
+        with patch("torch.cuda.get_device_capability", return_value=(9, 0)):
+            _check_tilelang_dsa_fp8_kv(
+                "fp8_e4m3",
+                "tilelang",
+                "tilelang",
+                hip=False,
+                nope_group_scaled=True,
+                kv_layout="raw512",
+            )
 
     def test_hip_fp8_tilelang_allowed(self):
         # ROCm has a real fp8 tilelang kernel

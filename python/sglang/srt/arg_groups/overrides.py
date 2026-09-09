@@ -684,14 +684,36 @@ def _check_tilelang_dsa_fp8_kv(
     *,
     hip: bool,
     dcp_size: int = 1,
+    nope_group_scaled: bool = False,
+    kv_layout: str = "auto",
 ) -> None:
-    """tilelang's fp8 KV path stores the raw MLA layout (nope + rope cast to
-    fp8_e4m3, no per-tile scales). On ROCm/HIP it is the default DSA path. On
-    CUDA the same generic TileLang fp8 kernel is used, but it requires fp8
-    tensor-core MMA (SM89+) and BOTH DSA backends to be tilelang, because every
-    other CUDA fp8 backend expects the scaled pool layout
-    (nope_fp8 + per-tile scales + bf16 rope). Reject unsupported combinations
-    here instead of crashing at decode CUDA-graph capture."""
+    if kv_layout not in ("auto", "raw512", "group528"):
+        raise ValueError(f"Unsupported SGLANG_DSA_FP8_KV_LAYOUT={kv_layout!r}")
+    if kv_layout != "auto":
+        if hip or kv_cache_dtype != "fp8_e4m3" or not nope_group_scaled:
+            raise ValueError(
+                "Explicit DSA FP8 KV layouts require CUDA BF16 Q with latent512/RoPE0"
+            )
+        if kv_layout == "group528":
+            if (
+                prefill_backend not in ("tilelang", "cutedsl_h16")
+                or decode_backend != "tilelang"
+            ):
+                raise ValueError(
+                    "group528 requires TileLang or CuTe H16 prefill and TileLang decode"
+                )
+            if dcp_size > 1:
+                raise ValueError("group528 is not validated with --dcp-size > 1")
+            return
+        if prefill_backend != "tilelang" or decode_backend != "tilelang":
+            raise ValueError("raw512 requires TileLang for both DSA backends")
+    if (
+        "cutedsl_h16" in {prefill_backend, decode_backend}
+        and kv_cache_dtype == "fp8_e4m3"
+    ):
+        raise ValueError(
+            "cutedsl_h16 FP8 KV requires explicit SGLANG_DSA_FP8_KV_LAYOUT=group528"
+        )
     if (
         hip
         or kv_cache_dtype != "fp8_e4m3"
@@ -859,6 +881,12 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         decode,
         hip=get_platform().is_hip,
         dcp_size=getattr(view, "dcp_size", 1) or 1,
+        nope_group_scaled=(
+            model_config_of(view).kv_lora_rank == 512
+            and model_config_of(view).qk_rope_head_dim == 0
+            and model_config_of(view).dtype == torch.bfloat16
+        ),
+        kv_layout=envs.SGLANG_DSA_FP8_KV_LAYOUT.get(),
     )
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "

@@ -94,83 +94,58 @@ def _allocate_prefill_result(
     return result
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["page_table_row_stride", "page_table_width"])
 def transform_index_page_table_decode_kernel(
-    page_table_ptr: torch.Tensor,
-    topk_indices_ptr: torch.Tensor,
-    result_ptr: torch.Tensor,
-    page_size: tl.constexpr,
-    page_table_row_stride: tl.constexpr,
-    PAGE_TABLE_WIDTH: tl.constexpr,
-):
-    TOPK: tl.constexpr = 2048
-    req_id = tl.program_id(0)
-    page_table_ptr = page_table_ptr + req_id * page_table_row_stride
-    topk_indices_ptr = topk_indices_ptr + req_id * TOPK
-    result_ptr = result_ptr + req_id * TOPK
-
-    offset = tl.arange(0, TOPK)  # topk should be 2048
-    loaded_topk_indices = tl.load(topk_indices_ptr + offset)
-    mask = (loaded_topk_indices >= 0) & (loaded_topk_indices < PAGE_TABLE_WIDTH)
-    loaded_kv_indices = tl.load(page_table_ptr + loaded_topk_indices, mask=mask)
-    tl.store(result_ptr + offset, loaded_kv_indices, mask=mask)
-    tl.store(result_ptr + offset, -1, mask=~mask)
-
-
-@triton.jit
-def transform_index_page_table_decode_tiled_kernel(
-    page_table_ptr: torch.Tensor,
-    topk_indices_ptr: torch.Tensor,
-    result_ptr: torch.Tensor,
-    page_table_row_stride: tl.constexpr,
-    topk_indices_stride_0: tl.constexpr,
-    topk_indices_stride_1: tl.constexpr,
-    result_stride_0: tl.constexpr,
-    result_stride_1: tl.constexpr,
-    PAGE_TABLE_WIDTH: tl.constexpr,
+    page_table_ptr,
+    topk_indices_ptr,
+    result_ptr,
+    page_table_row_stride,
+    page_table_width,
+    page_table_col_stride: tl.constexpr,
+    topk_row_stride: tl.constexpr,
+    topk_col_stride: tl.constexpr,
+    result_row_stride: tl.constexpr,
+    result_col_stride: tl.constexpr,
     TOPK: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
 ):
     req_id = tl.program_id(0)
-    topk_offsets = tl.program_id(1) * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
-    mask = topk_offsets < TOPK
-
-    loaded_topk_indices = tl.load(
-        topk_indices_ptr
-        + req_id * topk_indices_stride_0
-        + topk_offsets * topk_indices_stride_1,
-        mask=mask,
+    offset = tl.arange(0, BLOCK_TOPK)
+    indices = tl.load(
+        topk_indices_ptr + req_id * topk_row_stride + offset * topk_col_stride,
+        mask=offset < TOPK,
         other=-1,
     )
-    valid_topk_mask = (
-        mask & (loaded_topk_indices >= 0) & (loaded_topk_indices < PAGE_TABLE_WIDTH)
-    )
-    loaded_kv_indices = tl.load(
-        page_table_ptr + req_id * page_table_row_stride + loaded_topk_indices,
-        mask=valid_topk_mask,
+    valid = (offset < TOPK) & (indices >= 0) & (indices < page_table_width)
+    locations = tl.load(
+        page_table_ptr
+        + req_id * page_table_row_stride
+        + indices * page_table_col_stride,
+        mask=valid,
         other=-1,
     )
     tl.store(
-        result_ptr + req_id * result_stride_0 + topk_offsets * result_stride_1,
-        loaded_kv_indices,
-        mask=mask,
+        result_ptr + req_id * result_row_stride + offset * result_col_stride,
+        locations,
+        mask=offset < TOPK,
     )
 
 
-@triton.jit
+# Runtime strides avoid compiling a new kernel for every EAGLE context length.
+@triton.jit(do_not_specialize=["page_table_stride_0", "page_table_width"])
 def transform_index_page_table_prefill_kernel(
     page_table_ptr: torch.Tensor,
     topk_indices_ptr: torch.Tensor,
     cu_seqlens_q_ptr: torch.Tensor,
     result_ptr: torch.Tensor,
-    page_table_stride_0: tl.constexpr,
+    page_table_stride_0,
+    page_table_width,
     page_table_stride_1: tl.constexpr,
     topk_indices_stride_0: tl.constexpr,
     topk_indices_stride_1: tl.constexpr,
     result_stride_0: tl.constexpr,
     result_stride_1: tl.constexpr,
     PAGE_TABLE_IS_EXPANDED: tl.constexpr,
-    PAGE_TABLE_WIDTH: tl.constexpr,
     TOPK: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
@@ -195,7 +170,7 @@ def transform_index_page_table_prefill_kernel(
         other=-1,
     )
     valid_topk_mask = (
-        mask & (loaded_topk_indices >= 0) & (loaded_topk_indices < PAGE_TABLE_WIDTH)
+        mask & (loaded_topk_indices >= 0) & (loaded_topk_indices < page_table_width)
     )
 
     if PAGE_TABLE_IS_EXPANDED:
@@ -235,37 +210,25 @@ def transform_index_page_table_decode_fast(
     """
     assert page_size == 1
     assert page_table.shape[0] == topk_indices.shape[0]
+    assert topk_indices.ndim == 2 and topk_indices.shape[1] > 0
     qo_len = topk_indices.shape[0]
     if result is None:
         result = torch.empty_like(topk_indices, dtype=torch.int32)
-    topk = topk_indices.shape[1]
-    if topk == 2048:
-        transform_index_page_table_decode_kernel[(qo_len,)](
-            page_table,
-            topk_indices,
-            result,
-            page_size,
-            page_table_row_stride=page_table.stride(0),
-            PAGE_TABLE_WIDTH=page_table.shape[1],
-        )
-    else:
-        block_topk = 256
-        transform_index_page_table_decode_tiled_kernel[
-            (qo_len, triton.cdiv(topk, block_topk))
-        ](
-            page_table,
-            topk_indices,
-            result,
-            page_table.stride(0),
-            topk_indices.stride(0),
-            topk_indices.stride(1),
-            result.stride(0),
-            result.stride(1),
-            PAGE_TABLE_WIDTH=page_table.shape[1],
-            TOPK=topk,
-            BLOCK_TOPK=block_topk,
-            num_warps=4,
-        )
+    assert result.shape == topk_indices.shape
+    transform_index_page_table_decode_kernel[(qo_len,)](
+        page_table,
+        topk_indices,
+        result,
+        page_table_row_stride=page_table.stride(0),
+        page_table_width=page_table.shape[1],
+        page_table_col_stride=page_table.stride(1),
+        topk_row_stride=topk_indices.stride(0),
+        topk_col_stride=topk_indices.stride(1),
+        result_row_stride=result.stride(0),
+        result_col_stride=result.stride(1),
+        TOPK=topk_indices.shape[1],
+        BLOCK_TOPK=triton.next_power_of_2(topk_indices.shape[1]),
+    )
     return result
 
 
@@ -279,6 +242,7 @@ def transform_index_page_table_prefill_fast(
     cu_seqlens_q: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     assert page_size == 1
+    assert topk_indices.ndim == 2 and topk_indices.shape[1] > 0
     real_num_tokens = sum(extend_lens_cpu)
     result = _allocate_prefill_result(topk_indices, real_num_tokens, output_num_tokens)
     if real_num_tokens == 0:
@@ -304,13 +268,13 @@ def transform_index_page_table_prefill_fast(
         cu_seqlens_q,
         result,
         page_table.stride(0),
+        page_table.shape[1],
         page_table.stride(1),
         topk_indices.stride(0),
         topk_indices.stride(1),
         result.stride(0),
         result.stride(1),
         PAGE_TABLE_IS_EXPANDED=page_table_is_expanded,
-        PAGE_TABLE_WIDTH=page_table.shape[1],
         TOPK=topk_indices.shape[1],
         BLOCK_Q=block_q,
         BLOCK_TOPK=block_topk,

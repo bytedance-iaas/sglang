@@ -45,7 +45,8 @@ class TestDSATransformIndex(CustomTestCase):
         )
         if rows > 0:
             topk[:, 0] = 0
-            topk[:, 1] = context_length - 1
+            if TOPK > 1:
+                topk[:, 1] = context_length - 1
             topk[:, 257::257] = -1
         return topk
 
@@ -161,6 +162,73 @@ class TestDSATransformIndex(CustomTestCase):
         )
         torch.cuda.synchronize()
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_indexshare_widths(self):
+        # KPool expands 512 selections and appends the unpooled causal tail.
+        # Cover the logical width and TileLang's aligned storage widths.
+        for width in (1, 2051, 2112, 2176):
+            with self.subTest(width=width), patch(__name__ + ".TOPK", width):
+                self._check_decode_case(3, 4096, provide_result=True)
+                for expanded in (False, True):
+                    self._check_case(
+                        [2, 0, 1],
+                        4096,
+                        page_table_is_expanded=expanded,
+                        topk_padding=1,
+                        output_padding=2,
+                    )
+
+    def test_indexshare_bounds_strides_and_graph(self):
+        width, context = 2051, 128
+        for expanded in (False, True):
+            rows = 3 if expanded else 2
+            table = self._make_page_table(rows, context * 2)[:, ::2]
+            storage = torch.full(
+                (4, width * 2), -9, dtype=torch.int64, device=self.device
+            )
+            indices = storage[:, ::2]
+            indices[:3] = torch.arange(width, device=self.device) % context
+            indices[:3, -5:] = torch.tensor(
+                [-1, -7, context - 1, context, context + 29], device=self.device
+            )
+            cu = torch.tensor([0, 2, 3], dtype=torch.int32, device=self.device)
+
+            def run():
+                return transform_index_page_table_prefill_fast(
+                    table,
+                    indices,
+                    [2, 1],
+                    output_num_tokens=5,
+                    page_table_is_expanded=expanded,
+                    cu_seqlens_q=cu,
+                )
+
+            run()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                actual = run()
+            for iteration in range(2):
+                table.add_(iteration + 1)
+                indices[0, 0] = context + iteration
+                graph.replay()
+                selected = table if expanded else table[[0, 0, 1]]
+                valid = (indices[:3] >= 0) & (indices[:3] < context)
+                expected = torch.full(
+                    (5, width), -1, dtype=torch.int32, device=self.device
+                )
+                expected[:3] = torch.where(
+                    valid, selected.gather(1, indices[:3].clamp(0, context - 1)), -1
+                )
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                result_storage = torch.full(
+                    (3, width * 2), -77, dtype=torch.int32, device=self.device
+                )
+                result = result_storage[:, ::2]
+                transform_index_page_table_decode_fast(
+                    selected, indices[:3], result=result
+                )
+                torch.testing.assert_close(result, expected[:3], rtol=0, atol=0)
+                self.assertTrue(torch.all(result_storage[:, 1::2] == -77).item())
 
     def test_prefill_uses_dedicated_kernel(self):
         extend_lens_cpu = [2, 1]

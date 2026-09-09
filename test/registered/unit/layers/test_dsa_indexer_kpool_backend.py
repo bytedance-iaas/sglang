@@ -231,7 +231,7 @@ class TestKPoolMqaBackend(CustomTestCase):
             ]
         )
 
-    def test_target_verify_cache_write_drops_mlp_sync_padding_tokens(self):
+    def test_draft_extend_cache_write_uses_pre_padding_plan(self):
         indexer = object.__new__(dsa_indexer_kpool.IndexerKPool)
         indexer.index_kpool_compress_ape = torch.empty(4, 128)
         indexer.scale_fmt = None
@@ -254,11 +254,11 @@ class TestKPoolMqaBackend(CustomTestCase):
         pool.get_index_k_with_scale_buffer.return_value = torch.empty(1)
         plan = MagicMock()
         plan.num_draft_tokens = 6
-        plan.req = torch.tensor([17, 99])
-        plan.write_start = torch.tensor([23, 0], dtype=torch.int32)
-        plan.tail_logical_start = torch.tensor([19, 0], dtype=torch.int32)
-        plan.write_loc = torch.tensor([[29], [-1]])
-        plan.effective_n_per_batch = torch.tensor([6, 0], dtype=torch.int32)
+        plan.req = torch.tensor([17])
+        plan.write_start = torch.tensor([23], dtype=torch.int32)
+        plan.tail_logical_start = torch.tensor([19], dtype=torch.int32)
+        plan.write_loc = torch.tensor([[29]])
+        plan.effective_n_per_batch = torch.tensor([6], dtype=torch.int32)
         metadata = MagicMock()
         metadata.attn_metadata.kpool_write_plan = plan
         forward_batch = MagicMock()
@@ -323,7 +323,7 @@ class TestKPoolMqaBackend(CustomTestCase):
             torch.empty(1, 12, 128),
         )
         pool.get_index_k_with_scale_buffer.return_value = torch.empty(1)
-        plan = SimpleNamespace(num_draft_tokens=3)
+        plan = SimpleNamespace(num_draft_tokens=3, req=torch.tensor([1]))
         metadata = SimpleNamespace(attn_metadata=SimpleNamespace(kpool_write_plan=plan))
         forward_batch = SimpleNamespace(
             global_num_token_non_padded_cpu=4,

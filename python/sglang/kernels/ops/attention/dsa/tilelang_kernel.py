@@ -263,6 +263,7 @@ def fp8_index(
     out_idx=[-1],
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: False,
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
     },
 )
@@ -373,8 +374,12 @@ def sparse_attention_fwd_kernel_v1(
 
             for i_i in T.Pipelined(NI, num_stages=num_stages):
                 for bi_i in T.Parallel(BI):
-                    mask[bi_i] = Indices[b_i, s_i, g_i, i_i * BI + bi_i] >= 0
+                    idx = Indices[b_i, s_i, g_i, i_i * BI + bi_i]
+                    mask[bi_i] = (idx >= 0) & (idx < seq_len_kv)
 
+                # Safe-memory lowering emits predicated cp.async with zero-fill
+                # for out-of-range indices. Keep the direct gather expression:
+                # redirecting to row 0 loses this predicate (and propagates NaN).
                 for bi_i, d_i in T.Parallel(BI, D):
                     KV_shared[bi_i, d_i] = KV[
                         b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i
@@ -426,7 +431,7 @@ def sparse_attention_fwd_kernel_v1(
 
             # Rescale
             for h_i, d_i in T.Parallel(H_per_block, D):
-                acc_o[h_i, d_i] /= sumexp[h_i]
+                acc_o[h_i, d_i] /= T.if_then_else(sumexp[h_i] == 0.0, 1.0, sumexp[h_i])
             for h_i in T.Parallel(H_per_block):
                 sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
 

@@ -2474,6 +2474,22 @@ def calculate_mla_kv_cache_dim(
     if not is_dsa_model:
         return kv_cache_dim
 
+    kv_layout = envs.SGLANG_DSA_FP8_KV_LAYOUT.get()
+    if kv_layout not in ("auto", "raw512", "group528"):
+        raise ValueError(f"Unsupported SGLANG_DSA_FP8_KV_LAYOUT={kv_layout!r}")
+    if kv_layout != "auto":
+        if (
+            _is_hip
+            or kv_cache_dtype != torch.float8_e4m3fn
+            or kv_lora_rank != 512
+            or qk_rope_head_dim != 0
+            or model_config.dtype != torch.bfloat16
+        ):
+            raise ValueError(
+                "Explicit DSA FP8 KV layouts require CUDA BF16 Q with latent512/RoPE0"
+            )
+        return 512 if kv_layout == "raw512" else 528
+
     # TRTLLM uses the raw MLA KV layout. In disaggregated serving only the
     # backend for the local role determines the local pool layout; the
     # inactive role may legitimately have a different default backend.
