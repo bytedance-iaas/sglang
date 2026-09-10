@@ -470,14 +470,17 @@ class CudaGraphBufferRegistry:
             padded_num_tokens=padded_num_tokens,
             pp_proxy_tensors=pp_proxy_tensors,
         )
-        _validate_pp_proxy_buffer_keys(
-            (
-                name.removeprefix("pp_proxy_tensors.")
-                for name in self._slots
-                if name.startswith("pp_proxy_tensors.")
-            ),
-            pp_proxy_tensors,
-        )
+        pp_proxy_buffer_keys = [
+            name.removeprefix("pp_proxy_tensors.")
+            for name in self._slots
+            if name.startswith("pp_proxy_tensors.")
+        ]
+        # The same registry abstraction backs EagerRunner, whose PP proxy is
+        # passed directly to model execution and therefore has no stable graph
+        # slots. Enforce the fail-closed key contract only when this registry
+        # actually owns graph-resident PP proxy buffers.
+        if pp_proxy_buffer_keys:
+            _validate_pp_proxy_buffer_keys(pp_proxy_buffer_keys, pp_proxy_tensors)
 
         # Phase 1: reset padded regions where it matters.
         for slot in self._slots.values():

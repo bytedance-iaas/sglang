@@ -1098,6 +1098,46 @@ class TestBuildDecodeRegistry(unittest.TestCase):
                         pp_proxy_tensors=pp_proxy,
                     )
 
+    def test_registry_without_pp_proxy_slots_accepts_eager_proxy(self):
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_eager_registry,
+        )
+
+        registry = build_eager_registry(
+            device=torch.device("cpu"),
+            max_bs=4,
+            max_num_token=8,
+            cache_loc_dtype=torch.int64,
+        )
+        pp_proxy = SimpleNamespace(
+            tensors={
+                "hidden_states": torch.zeros((3, 2), dtype=torch.int32),
+                "residual": torch.zeros((3, 2), dtype=torch.int32),
+                "topk_indices": torch.zeros((3, 1), dtype=torch.int32),
+                "__msg_type__": "proxy",
+            }
+        )
+
+        # EagerRunner has no graph-resident pp_proxy_tensors.* slots. Its live
+        # proxy is consumed out of band by model execution, so fill_from must
+        # not reject those legitimate fields as unmatched graph buffers.
+        registry.fill_from(
+            _MiniForwardBatch(
+                batch_size=3,
+                input_ids=torch.arange(3, dtype=torch.int64),
+                positions=torch.arange(3, dtype=torch.int64),
+                out_cache_loc=torch.arange(3, dtype=torch.int64),
+                req_pool_indices=torch.arange(3, dtype=torch.int64),
+                seq_lens=torch.ones(3, dtype=torch.int64),
+                seq_lens_cpu=torch.ones(3, dtype=torch.int64),
+            ),
+            raw_bs=3,
+            padded_bs=3,
+            raw_num_tokens=3,
+            padded_num_tokens=3,
+            pp_proxy_tensors=pp_proxy,
+        )
+
     def test_source_with_canary_registers_bs_slots(self):
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
             build_decode_registry,
