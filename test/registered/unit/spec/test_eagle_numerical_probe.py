@@ -9,8 +9,8 @@ import torch
 
 from sglang.srt.speculative.eagle_numerical_probe import (
     EagleNumericalProbe,
+    EaglePDHandoffProbe,
     _synchronize_cuda_tensors,
-    _tensors_share_storage,
     maybe_record_eagle_numerical_stage,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -521,117 +521,161 @@ class TestEagleNumericalProbe(unittest.TestCase):
         self.assertFalse(payload["natural_stop"])
         self.assertFalse(payload["normal_completion"])
 
-    def test_prefill_handoff_records_value_change_and_storage_alias(self):
-        probe = self.probe()
+    def test_prefill_pd_handoff_records_and_seals_independently(self):
+        probe = EaglePDHandoffProbe(
+            "probe-rid",
+            role="prefill",
+            capture_id="capture-test-generation",
+            pod_name="prefill-pod",
+            pod_uid="prefill-pod-uid",
+        )
         sampled = torch.tensor([8451], dtype=torch.int64)
+        serialized = sampled.clone()
+        wire = torch.tensor([8451], dtype=torch.int32)
 
         with self.assertLogs(
             "sglang.srt.speculative.eagle_numerical_probe", level="WARNING"
         ) as logs:
-            probe.record_prefill_target_sample(
-                rids=["probe-rid"], next_token_ids=sampled
-            )
-            bonus_tokens = sampled
-            sampled.fill_(71)
-            probe.record_prefill_post_draft_extend(
-                rids=["probe-rid"],
-                next_token_ids=sampled,
-                bonus_tokens=bonus_tokens,
-            )
             probe.record_prefill_pp_output(
                 rids=["probe-rid"],
                 next_token_ids=sampled,
-                bonus_tokens=bonus_tokens,
-                pp_next_token_ids=sampled,
+                serialized_next_token_ids=serialized,
+            )
+            probe.record_prefill_metadata_write(
+                rid="probe-rid", sampled_token=8451, wire_output_id=wire
             )
 
         stage_payloads = [
-            json.loads(line.split("EAGLE_PREFILL_HANDOFF_PROBE_STAGE ", 1)[1])
+            json.loads(line.split("EAGLE_PD_HANDOFF_PROBE_STAGE ", 1)[1])
             for line in logs.output
-            if "EAGLE_PREFILL_HANDOFF_PROBE_STAGE " in line
+            if "EAGLE_PD_HANDOFF_PROBE_STAGE " in line
         ]
         self.assertEqual(
             [payload["stage"] for payload in stage_payloads],
-            ["target_sample", "post_draft_extend", "pp_output"],
+            ["pp_output", "metadata_write"],
+        )
+        self.assertEqual(
+            [payload["ordinal"] for payload in stage_payloads],
+            [1, 2],
         )
         self.assertEqual(
             stage_payloads[0]["fingerprints"]["next_token_ids"]["values"],
             [8451],
         )
         self.assertEqual(
-            stage_payloads[1]["fingerprints"]["next_token_ids"]["values"],
-            [71],
-        )
-        self.assertEqual(
-            stage_payloads[1]["fingerprints"]["shared_storage"]["values"],
-            [1],
+            stage_payloads[1]["fingerprints"]["wire_output_id"]["values"],
+            [8451],
         )
         result = json.loads(
-            logs.output[-1].split("EAGLE_PREFILL_HANDOFF_PROBE_RESULT ", 1)[1]
+            logs.output[-1].split("EAGLE_PD_HANDOFF_PROBE_RESULT ", 1)[1]
         )
         self.assertEqual(result["status"], "complete")
-        self.assertEqual(result["phase"], "prefill_handoff")
+        self.assertEqual(result["phase"], "pd_handoff")
+        self.assertEqual(result["role"], "prefill")
         self.assertEqual(result["capture"], probe.capture)
 
-    def test_prefill_handoff_wrong_order_fails_closed(self):
-        probe = self.probe()
-        token = torch.tensor([8451], dtype=torch.int64)
+    def test_decode_pd_handoff_records_wire_override_and_prebuilt_bonus(self):
+        probe = EaglePDHandoffProbe(
+            "probe-rid",
+            role="decode",
+            capture_id="capture-test-generation",
+            pod_name="decode-pod",
+            pod_uid="decode-pod-uid",
+        )
 
         with self.assertLogs(
             "sglang.srt.speculative.eagle_numerical_probe", level="WARNING"
         ) as logs:
-            probe.record_prefill_post_draft_extend(
-                rids=["probe-rid"],
-                next_token_ids=token,
-                bonus_tokens=token,
+            probe.record_decode_metadata_read(
+                rid="probe-rid",
+                wire_output_id=torch.tensor([8451], dtype=torch.int32),
+                committed_output_id=71,
             )
-            probe.finish(rid="probe-rid", natural_stop=True, normal_completion=True)
+            probe.record_decode_prebuilt_bonus(
+                rids=["probe-rid"],
+                committed_output_id=torch.tensor([71], dtype=torch.int64),
+                bonus_tokens=torch.tensor([71], dtype=torch.int64),
+            )
 
-        self.assertFalse(probe.can_probe_prefill_handoff)
-        self.assertIn("out-of-order", probe._prefill_rejection)
-        result_lines = [
-            line
-            for line in logs.output
-            if "EAGLE_PREFILL_HANDOFF_PROBE_RESULT " in line
-        ]
-        self.assertEqual(len(result_lines), 1)
         result = json.loads(
-            result_lines[0].split("EAGLE_PREFILL_HANDOFF_PROBE_RESULT ", 1)[1]
+            logs.output[-1].split("EAGLE_PD_HANDOFF_PROBE_RESULT ", 1)[1]
+        )
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["role"], "decode")
+        self.assertTrue(result["seen"])
+        self.assertEqual(
+            result["stages"]["metadata_read"]["tensors"]["wire_output_id"]["values"],
+            [8451],
+        )
+        self.assertEqual(
+            result["stages"]["metadata_read"]["tensors"]["committed_output_id"][
+                "values"
+            ],
+            [71],
+        )
+
+    def test_pd_handoff_wrong_order_fails_closed(self):
+        probe = EaglePDHandoffProbe(
+            "probe-rid",
+            role="prefill",
+            capture_id="capture-test-generation",
+            pod_name="prefill-pod",
+            pod_uid="prefill-pod-uid",
+        )
+
+        with self.assertLogs(
+            "sglang.srt.speculative.eagle_numerical_probe", level="WARNING"
+        ) as logs:
+            probe.record_prefill_metadata_write(
+                rid="probe-rid",
+                sampled_token=8451,
+                wire_output_id=torch.tensor([8451], dtype=torch.int32),
+            )
+
+        result = json.loads(
+            logs.output[-1].split("EAGLE_PD_HANDOFF_PROBE_RESULT ", 1)[1]
         )
         self.assertEqual(result["status"], "rejected")
         self.assertTrue(result["seen"])
         self.assertIn("out-of-order", result["rejection"])
-        self.assertNotIn("EAGLE_NUMERICAL_PROBE_RESULT ", "\n".join(logs.output))
 
-    def test_prefill_only_finish_seals_missing_handoff_without_decode_result(self):
-        probe = self.probe()
-        token = torch.tensor([8451], dtype=torch.int64)
-        probe.record_prefill_target_sample(rids=["probe-rid"], next_token_ids=token)
+    def test_pd_handoff_stage_error_uses_first_ordinal_and_seals(self):
+        probe = EaglePDHandoffProbe(
+            "probe-rid",
+            role="prefill",
+            capture_id="capture-test-generation",
+            pod_name="prefill-pod",
+            pod_uid="prefill-pod-uid",
+        )
 
-        with self.assertLogs(
-            "sglang.srt.speculative.eagle_numerical_probe", level="WARNING"
-        ) as logs:
-            probe.finish(rid="probe-rid", natural_stop=True, normal_completion=True)
+        with (
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe._tensor_fingerprint",
+                side_effect=ValueError("invalid fingerprint"),
+            ),
+            self.assertLogs(
+                "sglang.srt.speculative.eagle_numerical_probe", level="WARNING"
+            ) as logs,
+        ):
+            probe.record_prefill_pp_output(
+                rids=["probe-rid"],
+                next_token_ids=torch.tensor([8451]),
+                serialized_next_token_ids=torch.tensor([8451]),
+            )
 
-        result_lines = [
-            line
-            for line in logs.output
-            if "EAGLE_PREFILL_HANDOFF_PROBE_RESULT " in line
-        ]
-        self.assertEqual(len(result_lines), 1)
+        error = json.loads(
+            next(
+                line.split("EAGLE_PD_HANDOFF_PROBE_STAGE_ERROR ", 1)[1]
+                for line in logs.output
+                if "EAGLE_PD_HANDOFF_PROBE_STAGE_ERROR " in line
+            )
+        )
+        self.assertEqual(error["ordinal"], 1)
         result = json.loads(
-            result_lines[0].split("EAGLE_PREFILL_HANDOFF_PROBE_RESULT ", 1)[1]
+            logs.output[-1].split("EAGLE_PD_HANDOFF_PROBE_RESULT ", 1)[1]
         )
         self.assertEqual(result["status"], "rejected")
-        self.assertIn("missing stages", result["rejection"])
-        self.assertNotIn("EAGLE_NUMERICAL_PROBE_RESULT ", "\n".join(logs.output))
-        self.assertFalse(probe._sealed)
-
-    def test_storage_alias_detection_handles_views_and_copies(self):
-        source = torch.tensor([1, 2, 3], dtype=torch.int64)
-
-        self.assertTrue(_tensors_share_storage(source, source[1:]))
-        self.assertFalse(_tensors_share_storage(source, source.clone()))
+        self.assertIn("invalid fingerprint", result["rejection"])
 
 
 if __name__ == "__main__":

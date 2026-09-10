@@ -31,6 +31,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     KVArgsRegisterInfo,
     MooncakeKVManager,
 )
+from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     get_dsa_seed_metadata_dim,
@@ -41,8 +42,8 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import (
     should_seed_dsa_topk_from_draft_extend,
-    should_use_pd_dsa_seed_cuda_graph,
     should_use_dsa_fused_topk,
+    should_use_pd_dsa_seed_cuda_graph,
 )
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import ReqKvInfo
@@ -57,6 +58,60 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestDisaggregationWire(unittest.TestCase):
+    def test_prefill_metadata_probe_observes_written_wire_slot(self):
+        wire_output_ids = torch.zeros((2, 1), dtype=torch.int32)
+        metadata_buffers = SimpleNamespace(output_ids=wire_output_ids)
+
+        def set_buf(req):
+            wire_output_ids[req.metadata_buffer_index, 0] = req.output_ids[0]
+
+        metadata_buffers.set_buf = Mock(side_effect=set_buf)
+        probe = SimpleNamespace(record_prefill_metadata_write=Mock())
+        scheduler = SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace(
+                page_size=1,
+                translate_kv_indices_for_transfer=lambda indices: indices,
+            ),
+            disagg_metadata_buffers=metadata_buffers,
+            pd_handoff_probe=probe,
+            disagg_prefill_bootstrap_queue=SimpleNamespace(
+                kv_manager=SimpleNamespace(
+                    kv_args=SimpleNamespace(state_types=[]),
+                )
+            ),
+            enable_staging=False,
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.empty((1, 0), dtype=torch.int32)
+            ),
+            disagg_prefill_pending_chunk_rids={"probe-rid"},
+        )
+        req = SimpleNamespace(
+            rid="probe-rid",
+            start_send_idx=0,
+            origin_input_ids=[],
+            extend_range=SimpleNamespace(end=0),
+            metadata_buffer_index=1,
+            output_ids=[8451],
+            disagg_decode_prefix_len=0,
+            kv=SimpleNamespace(req_pool_idx=0),
+            disagg_kv_sender=SimpleNamespace(
+                should_send_kv_chunk=lambda _pages, _last: False
+            ),
+        )
+
+        SchedulerDisaggregationPrefillMixin.send_kv_chunk(
+            scheduler, req, last_chunk=True
+        )
+
+        metadata_buffers.set_buf.assert_called_once_with(req)
+        probe.record_prefill_metadata_write.assert_called_once()
+        call = probe.record_prefill_metadata_write.call_args.kwargs
+        self.assertEqual(call["rid"], "probe-rid")
+        self.assertEqual(call["sampled_token"], 8451)
+        self.assertTrue(
+            torch.equal(call["wire_output_id"], torch.tensor([8451], dtype=torch.int32))
+        )
+
     @patch("sglang.srt.disaggregation.utils.dist.get_world_size", return_value=2)
     @patch("sglang.srt.disaggregation.utils.dist.all_gather")
     def test_rank_local_queue_mismatch_defers_positional_poll(

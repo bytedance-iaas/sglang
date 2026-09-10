@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -104,12 +104,54 @@ class TestPPEaglePrebuiltMerge(unittest.TestCase):
     def test_non_pp_keeps_eagle_draft_input(self):
         draft_input = self._draft_input([303])
         batch = self._batch(draft_input)
-        with patch(
-            "sglang.srt.disaggregation.decode_schedule_batch_mixin.get_parallel",
-            return_value=SimpleNamespace(pp_size=1),
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode_schedule_batch_mixin.get_parallel",
+                return_value=SimpleNamespace(pp_size=2),
+            ),
+            patch(
+                "sglang.srt.disaggregation.decode_schedule_batch_mixin.get_spec",
+                return_value=SimpleNamespace(speculative_num_draft_tokens=4),
+            ),
         ):
             ScheduleBatchDisaggregationDecodeMixin.process_prebuilt(batch, None)
         self.assertIs(batch.spec_info, draft_input)
+
+    @patch(
+        "sglang.srt.disaggregation.decode_schedule_batch_mixin."
+        "maybe_cache_unfinished_req"
+    )
+    def test_prebuilt_probe_observes_committed_token_and_draft_bonus(self, _cache):
+        draft_input = self._draft_input([71])
+        req = SimpleNamespace(
+            rid="probe-rid",
+            output_ids=[71],
+            grammar=None,
+        )
+        batch = self._batch(draft_input)
+        batch.reqs = [req]
+        batch.tree_cache = MagicMock()
+        probe = SimpleNamespace(record_decode_prebuilt_bonus=MagicMock())
+
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode_schedule_batch_mixin.get_parallel",
+                return_value=SimpleNamespace(pp_size=2),
+            ),
+            patch(
+                "sglang.srt.disaggregation.decode_schedule_batch_mixin.get_spec",
+                return_value=SimpleNamespace(speculative_num_draft_tokens=4),
+            ),
+        ):
+            ScheduleBatchDisaggregationDecodeMixin.process_prebuilt(batch, None, probe)
+
+        self.assertIsInstance(batch.spec_info, EaglePPVerifyInputRaw)
+        self.assertEqual(batch.spec_info.draft_tokens, [[71, 71, 71, 71]])
+        probe.record_decode_prebuilt_bonus.assert_called_once()
+        call = probe.record_decode_prebuilt_bonus.call_args.kwargs
+        self.assertEqual(call["rids"], ["probe-rid"])
+        self.assertTrue(torch.equal(call["committed_output_id"], torch.tensor([71])))
+        self.assertTrue(torch.equal(call["bonus_tokens"], draft_input.bonus_tokens))
 
 
 if __name__ == "__main__":

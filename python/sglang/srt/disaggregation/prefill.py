@@ -1203,6 +1203,13 @@ class SchedulerDisaggregationPrefillMixin:
         state_indices: Optional[List] = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
+            self.pd_handoff_probe.record_prefill_metadata_write(
+                rid=req.rid,
+                sampled_token=req.output_ids[0],
+                wire_output_id=self.disagg_metadata_buffers.output_ids[
+                    req.metadata_buffer_index, :1
+                ],
+            )
 
             # Most state payloads read token-pool rows and should match the KV
             # range actually materialized on prefill. C128 state is request

@@ -1157,16 +1157,11 @@ class SchedulerPPMixin:
         add_auxiliary_output_to_pp_tensors(tensor_dict, auxiliary_output)
         if result.pp_verify_input_raw is not None:
             tensor_dict.update(result.pp_verify_input_raw.to_tensor_dict())
-        record_prefill_pp_output = getattr(
-            getattr(self, "draft_worker", None),
-            "record_prefill_pp_output",
-            None,
-        )
-        if record_prefill_pp_output is not None and batch.forward_mode.is_extend():
-            record_prefill_pp_output(
-                batch=batch,
-                result=result,
-                pp_next_token_ids=tensor_dict["next_token_ids"],
+        if batch.forward_mode.is_extend() and batch.contains_last_prefill_chunk:
+            self.pd_handoff_probe.record_prefill_pp_output(
+                rids=[req.rid for req in batch.reqs],
+                next_token_ids=result.next_token_ids,
+                serialized_next_token_ids=tensor_dict["next_token_ids"],
             )
         return tensor_dict
 

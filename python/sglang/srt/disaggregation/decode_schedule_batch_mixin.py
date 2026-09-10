@@ -114,6 +114,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
     def process_prebuilt(
         self: ScheduleBatch,
         future_map: FutureMap,
+        pd_handoff_probe=None,
     ):
         """Assign the buffered last input id to schedule batch"""
         last_tokens: List[int] = []
@@ -172,3 +173,19 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 self.req_pool_indices, RelayPayload(bonus_tokens=last_tokens_tensor)
             )
             self.input_ids = None
+
+        if pd_handoff_probe is not None:
+            # Observe the final PREBUILT representation. Under EAGLE+PP this is
+            # the dummy raw tree that becomes the first target-verify root.
+            bonus_tokens = getattr(spec_info, "bonus_tokens", last_tokens_tensor)
+            if not isinstance(bonus_tokens, torch.Tensor):
+                bonus_tokens = torch.as_tensor(
+                    bonus_tokens,
+                    dtype=last_tokens_tensor.dtype,
+                    device=last_tokens_tensor.device,
+                )
+            pd_handoff_probe.record_decode_prebuilt_bonus(
+                rids=[req.rid for req in self.reqs],
+                committed_output_id=last_tokens_tensor,
+                bonus_tokens=bonus_tokens,
+            )

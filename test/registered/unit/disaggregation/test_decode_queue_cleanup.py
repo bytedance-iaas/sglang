@@ -1,7 +1,10 @@
 import unittest
+from array import array
 from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import torch
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode import (
@@ -32,6 +35,62 @@ class FakeReceiver:
 
 
 class TestDecodeQueueCleanup(CustomTestCase):
+    def test_metadata_commit_probe_observes_wire_and_committed_token(self):
+        req = SimpleNamespace(
+            rid="probe-rid",
+            bootstrap_host="2.2.2.2",
+            bootstrap_room=7,
+            pd_rebootstrap_forced_output_id=None,
+            output_ids=array("q"),
+            return_logprob=False,
+            return_sampling_mask=False,
+            time_stats=SimpleNamespace(set_wait_queue_entry_time=MagicMock()),
+        )
+        receiver = FakeReceiver()
+        decode_req = SimpleNamespace(
+            req=req,
+            metadata_buffer_index=3,
+            is_rebootstrap=False,
+            kv_receiver=receiver,
+        )
+        output_id = torch.tensor([8451], dtype=torch.int32)
+        cached_tokens = torch.zeros(16, dtype=torch.int64)
+        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        queue.metadata_buffers = SimpleNamespace(
+            get_buf=MagicMock(
+                return_value=(
+                    output_id,
+                    cached_tokens,
+                    torch.zeros(1),
+                    torch.zeros(1, dtype=torch.int64),
+                    torch.zeros(1),
+                    torch.zeros(1, dtype=torch.int64),
+                    None,
+                    None,
+                    None,
+                    torch.zeros(1),
+                    torch.zeros(1, dtype=torch.int64),
+                    torch.zeros(1),
+                    None,
+                    torch.tensor([7]),
+                )
+            )
+        )
+        queue._commit_hicache_local_restore_to_req = MagicMock()
+        queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
+        probe = SimpleNamespace(record_decode_metadata_read=MagicMock())
+        queue.scheduler = SimpleNamespace(pd_handoff_probe=probe)
+
+        queue._commit_transfer_to_req(decode_req)
+
+        self.assertEqual(list(req.output_ids), [8451])
+        self.assertTrue(receiver.clear_called)
+        probe.record_decode_metadata_read.assert_called_once()
+        call = probe.record_decode_metadata_read.call_args.kwargs
+        self.assertEqual(call["rid"], "probe-rid")
+        self.assertTrue(torch.equal(call["wire_output_id"], output_id))
+        self.assertEqual(call["committed_output_id"], 8451)
+
     def test_paged_swa_retraction_resume_uses_physical_page_budget(self):
         # resume_retracted_reqs reads the retraction backend off the disagg
         # bag, so the case publishes a config instead of injecting one.

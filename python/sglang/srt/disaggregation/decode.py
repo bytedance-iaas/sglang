@@ -2145,6 +2145,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         else:
             committed_output_id = output_id[0].item()
         decode_req.req.output_ids.append(committed_output_id)
+        self.scheduler.pd_handoff_probe.record_decode_metadata_read(
+            rid=decode_req.req.rid,
+            wire_output_id=output_id[:1],
+            committed_output_id=committed_output_id,
+        )
         decode_req.req.cached_tokens = cached_tokens[0].item()
         # The prefill node already reported its prefix-cache hit in
         # cached_tokens[0]. Seed already_computed with it so that
@@ -2665,7 +2670,7 @@ class SchedulerDisaggregationDecodeMixin:
             # A finished request can still have one redundant forward in flight.
             # Drain it before a prebuilt request seeds a potentially reused row.
             self.schedule_stream.wait_stream(self.forward_stream)
-        new_batch.process_prebuilt(self.future_map)
+        new_batch.process_prebuilt(self.future_map, self.pd_handoff_probe)
 
         return new_batch
 

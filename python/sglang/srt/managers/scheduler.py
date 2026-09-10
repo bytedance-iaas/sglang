@@ -312,6 +312,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
+from sglang.srt.speculative.eagle_numerical_probe import EaglePDHandoffProbe
 from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec_from_config,
 )
@@ -1428,6 +1429,40 @@ class Scheduler(
         self.disagg_decode_transfer_queue = None
 
         self.disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
+        probe_role = (
+            self.disaggregation_mode.value
+            if self.disaggregation_mode
+            in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE)
+            else DisaggregationMode.PREFILL.value
+        )
+        probe_enabled_on_rank = (
+            self.disaggregation_mode
+            in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE)
+            and self.ps.pp_rank == self.ps.pp_size - 1
+        )
+        self.pd_handoff_probe = EaglePDHandoffProbe(
+            (
+                envs.SGLANG_EAGLE_NUMERICAL_PROBE_RID.get()
+                if probe_enabled_on_rank
+                else None
+            ),
+            role=probe_role,
+            capture_id=(
+                envs.SGLANG_EAGLE_NUMERICAL_PROBE_CAPTURE_ID.get()
+                if probe_enabled_on_rank
+                else None
+            ),
+            pod_name=(
+                envs.SGLANG_EAGLE_NUMERICAL_PROBE_POD_NAME.get()
+                if probe_enabled_on_rank
+                else None
+            ),
+            pod_uid=(
+                envs.SGLANG_EAGLE_NUMERICAL_PROBE_POD_UID.get()
+                if probe_enabled_on_rank
+                else None
+            ),
+        )
         self.transfer_backend = TransferBackend(
             get_disagg().disaggregation_transfer_backend
         )

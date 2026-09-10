@@ -1545,13 +1545,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             if self._pp_enabled and not self._pp_is_last_rank:
                 return batch_output
 
-            numerical_probe = self._draft_worker.eagle_numerical_probe
-            if batch.contains_last_prefill_chunk:
-                numerical_probe.record_prefill_target_sample(
-                    rids=[req.rid for req in batch.reqs],
-                    next_token_ids=batch_output.next_token_ids,
-                )
-
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
             # Extend processed L prompt tokens; next verify iter expects same L.
             batch_output.new_seq_lens = batch.seq_lens
@@ -1575,12 +1568,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         batch_output.next_token_ids,
                         batch_output.logits_output.mm_input_embeds,
                     )
-                )
-            if batch.contains_last_prefill_chunk:
-                numerical_probe.record_prefill_post_draft_extend(
-                    rids=[req.rid for req in batch.reqs],
-                    next_token_ids=batch_output.next_token_ids,
-                    bonus_tokens=batch_output.next_draft_input.bonus_tokens,
                 )
             return batch_output
         else:
@@ -2128,24 +2115,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 if self._draft_worker is not None
                 else None
             ),
-        )
-
-    def record_prefill_pp_output(
-        self,
-        *,
-        batch: ScheduleBatch,
-        result: GenerationBatchResult,
-        pp_next_token_ids: torch.Tensor,
-    ) -> None:
-        if self._draft_worker is None or result.next_draft_input is None:
-            return
-        if not batch.contains_last_prefill_chunk:
-            return
-        self._draft_worker.eagle_numerical_probe.record_prefill_pp_output(
-            rids=[req.rid for req in batch.reqs],
-            next_token_ids=result.next_token_ids,
-            bonus_tokens=result.next_draft_input.bonus_tokens,
-            pp_next_token_ids=pp_next_token_ids,
         )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):

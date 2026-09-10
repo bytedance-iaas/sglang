@@ -35,7 +35,7 @@ class TestShouldPPAllgatherTensors(unittest.TestCase):
     def test_prefill_pp_output_callback_observes_serialized_target_token(self):
         callback = MagicMock()
         scheduler = SimpleNamespace(
-            draft_worker=SimpleNamespace(record_prefill_pp_output=callback)
+            pd_handoff_probe=SimpleNamespace(record_prefill_pp_output=callback)
         )
         token = torch.tensor([8451], dtype=torch.int64)
         result = GenerationBatchResult(
@@ -43,13 +43,20 @@ class TestShouldPPAllgatherTensors(unittest.TestCase):
             next_token_ids=token,
             next_draft_input=SimpleNamespace(topk_p=None, bonus_tokens=token),
         )
-        batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND, return_logprob=False)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            return_logprob=False,
+            contains_last_prefill_chunk=True,
+            reqs=[SimpleNamespace(rid="probe-rid")],
+        )
 
         tensors = SchedulerPPMixin._pp_prepare_tensor_dict(scheduler, result, batch)
 
         self.assertIs(tensors["next_token_ids"], token)
         callback.assert_called_once_with(
-            batch=batch, result=result, pp_next_token_ids=token
+            rids=["probe-rid"],
+            next_token_ids=token,
+            serialized_next_token_ids=token,
         )
 
     def test_dsa_prefill_cp_sends_each_lane_intact(self):
