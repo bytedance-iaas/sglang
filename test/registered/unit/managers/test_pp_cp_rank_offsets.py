@@ -424,6 +424,63 @@ class TestPPCPRankOffsets(unittest.TestCase):
             tensor_dict, async_send=True, msg_type="proxy"
         )
 
+    def test_pp_launch_applies_war_dependency_before_return(self):
+        events = []
+        launch_event = Mock()
+        launch_event.record.side_effect = lambda stream: events.append(
+            ("record_launch", stream)
+        )
+        schedule_stream = object()
+        current_stream = object()
+        batch = SimpleNamespace(reqs=[])
+        result = SimpleNamespace(can_run_cuda_graph=True)
+        scheduler = SimpleNamespace(
+            forward_stream_ctx=nullcontext(),
+            forward_stream=SimpleNamespace(
+                wait_stream=lambda stream: events.append(
+                    ("forward_wait_schedule", stream)
+                )
+            ),
+            schedule_stream=schedule_stream,
+            run_batch=Mock(
+                side_effect=lambda cur_batch, proxy: events.append("run_batch")
+                or result
+            ),
+            pp_group=SimpleNamespace(is_last_rank=False),
+            device_module=SimpleNamespace(
+                Event=Mock(return_value=launch_event),
+                current_stream=Mock(return_value=current_stream),
+            ),
+            _apply_war_barrier=Mock(
+                side_effect=lambda: events.append("apply_war_barrier")
+            ),
+        )
+        metadata = [None]
+
+        with patch("sglang.srt.managers.scheduler_pp_mixin.set_time_batch"):
+            actual_result, actual_event = SchedulerPPMixin._pp_launch_batch(
+                scheduler,
+                mb_id=0,
+                cur_batch=batch,
+                pp_proxy_tensors=None,
+                mb_metadata=metadata,
+                last_rank_comm_queue=deque(),
+            )
+
+        self.assertIs(actual_result, result)
+        self.assertIs(actual_event, launch_event)
+        self.assertTrue(metadata[0].can_run_cuda_graph)
+        self.assertEqual(
+            events,
+            [
+                ("forward_wait_schedule", schedule_stream),
+                "run_batch",
+                ("record_launch", current_stream),
+                "apply_war_barrier",
+            ],
+        )
+        scheduler._apply_war_barrier.assert_called_once_with()
+
     def test_pp_control_ring_forwards_typed_payload_on_dedicated_group(self):
         events = []
         payload = [["ready"], []]
@@ -567,10 +624,7 @@ class TestPPCPRankOffsets(unittest.TestCase):
         )
         self.assertEqual(
             prefill_specs,
-            [
-                (phase, [28, 29, 30, 31])
-                for phase in _PP_DISAGG_SCHEDULER_FENCE_PHASES
-            ],
+            [(phase, [28, 29, 30, 31]) for phase in _PP_DISAGG_SCHEDULER_FENCE_PHASES],
         )
         self.assertEqual(
             _pp_disagg_scheduler_fence_specs("decode", ps, shifted_tp_ranks),

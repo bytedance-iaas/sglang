@@ -1572,6 +1572,11 @@ class SchedulerPPMixin:
                             PPProxyTensors(output_tensors),
                         )
                     )
+        # PP launches the forward on ``forward_stream`` just like the overlap
+        # schedulers, but its result/control work resumes immediately on
+        # ``schedule_stream``.  Publish the same per-rank WAR dependency before
+        # any of that work can reuse allocator or shared scheduler buffers.
+        self._apply_war_barrier()
         return result, event
 
     def get_rids(
