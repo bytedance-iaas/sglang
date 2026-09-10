@@ -1583,7 +1583,8 @@ class UnifiedRadixCacheSuite:
         req.swa_uuid_for_lock = None
         req.extra_key = None
         if self.cfg.has_mamba:
-            req.kv.mamba_last_track_seqlen = kv_len
+            # Stripping output requires a checkpoint at the retained prompt depth.
+            req.kv.mamba_last_track_seqlen = len(prompt_ids) // ps * ps
         req.reasoning_tokens = 1
 
         # cache_finished_req reads get_serving().strip_thinking_cache
@@ -1807,7 +1808,7 @@ class UnifiedRadixCacheSuite:
             len(req.prefix_indices), len(req.full_untruncated_fill_ids)
         )
         if self.cfg.has_mamba:
-            req.kv.mamba_last_track_seqlen = kv_len
+            req.kv.mamba_last_track_seqlen = kv_len // ps * ps
 
         avail_before = allocator.available_size()
         cache.cache_finished_req(
