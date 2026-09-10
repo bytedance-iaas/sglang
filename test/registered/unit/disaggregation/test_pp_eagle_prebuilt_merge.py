@@ -104,15 +104,9 @@ class TestPPEaglePrebuiltMerge(unittest.TestCase):
     def test_non_pp_keeps_eagle_draft_input(self):
         draft_input = self._draft_input([303])
         batch = self._batch(draft_input)
-        with (
-            patch(
-                "sglang.srt.disaggregation.decode_schedule_batch_mixin.get_parallel",
-                return_value=SimpleNamespace(pp_size=2),
-            ),
-            patch(
-                "sglang.srt.disaggregation.decode_schedule_batch_mixin.get_spec",
-                return_value=SimpleNamespace(speculative_num_draft_tokens=4),
-            ),
+        with patch(
+            "sglang.srt.disaggregation.decode_schedule_batch_mixin.get_parallel",
+            return_value=SimpleNamespace(pp_size=1),
         ):
             ScheduleBatchDisaggregationDecodeMixin.process_prebuilt(batch, None)
         self.assertIs(batch.spec_info, draft_input)
