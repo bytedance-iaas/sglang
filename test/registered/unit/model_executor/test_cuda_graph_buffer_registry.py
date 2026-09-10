@@ -1076,12 +1076,17 @@ class TestBuildDecodeRegistry(unittest.TestCase):
 
         for builder in (build_decode_registry, build_prefill_registry):
             with self.subTest(builder=builder.__name__):
+                kwargs = {
+                    "device": torch.device("cpu"),
+                    "max_bs": 4,
+                    "max_num_token": 8,
+                    "cache_loc_dtype": torch.int64,
+                    "source": source,
+                }
+                if builder is build_decode_registry:
+                    kwargs["seq_len_fill_value"] = 5
                 registry = builder(
-                    device=torch.device("cpu"),
-                    max_bs=4,
-                    max_num_token=8,
-                    cache_loc_dtype=torch.int64,
-                    source=source,
+                    **kwargs,
                 )
                 with self.assertRaisesRegex(ValueError, r"extra=\['topk_indices'\]"):
                     registry.fill_from(

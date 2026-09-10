@@ -1040,19 +1040,6 @@ def build_prefill_registry(
 
                 return _fn
 
-            def _pp_zero_tail(key):
-                def _fn(buf, _fb, ctx):
-                    ppx = ctx.pp_proxy_tensors
-                    if ppx is None:
-                        return
-                    src = ppx.tensors.get(key)
-                    if src is None:
-                        buf.zero_()
-                    else:
-                        zero_pp_proxy_buffer_tail(buf, src)
-
-                return _fn
-
             for _key, _backing in pp.items():
                 reg.register_slot(
                     GraphSlot(
@@ -1065,7 +1052,6 @@ def build_prefill_registry(
                         axis="tokens",
                         padding_policy=PaddingPolicy.ZERO,
                         source_fn=_pp_source(_key),
-                        post_fill=_pp_zero_tail(_key),
                     ),
                     bind=_backing,
                 )
