@@ -1,9 +1,11 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
 
-from sglang.kernels.ops.attention.fla.kda import chunk_kda
+from sglang.kernels.ops.attention.fla.kda import chunk_kda, chunk_kda_fwd_intra
 from sglang.kernels.ops.attention.linear.kda_nvidia_prefill import (
     chunk_kda_fwd as nvidia_chunk_kda_fwd,
 )
@@ -170,9 +172,147 @@ class TestKdaTrackState(CustomTestCase):
                 with self.subTest(lower_bound=lower_bound, num_heads=num_heads):
                     self._check_snapshot(lower_bound, num_heads)
 
-    def _check_snapshot(self, lower_bound, num_heads):
-        lens = [100, 64, 193]
-        boundaries = [64, None, 128]
+    @torch.inference_mode()
+    def test_long_chunk_branch_snapshot_preserves_active_state(self):
+        def same_intra_schedule(**kwargs):
+            # Keep truncation from selecting a different fusion schedule.
+            kwargs.update(fuse_diagonal=False, fuse_recompute=False)
+            return chunk_kda_fwd_intra(**kwargs)
+
+        with patch(
+            "sglang.kernels.ops.attention.fla.kda.chunk_kda_fwd_intra",
+            side_effect=same_intra_schedule,
+        ):
+            for lower_bound in (None, -5.0):
+                with self.subTest(lower_bound=lower_bound):
+                    self._check_snapshot(lower_bound, 16, seq_len=8192, boundary=576)
+
+    @torch.inference_mode()
+    def test_branch_tracking_preserves_backend_continuation(self):
+        from sglang.srt.layers.attention.linear.kda_backend import (
+            KDAAttnBackend,
+            KDAKernelDispatcher,
+        )
+        from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
+        from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        torch.manual_seed(4891)
+        heads, dim, width = 16, 128, 3 * 16 * 128
+        slots = torch.tensor([5, 1], device="cuda", dtype=torch.int32)
+        track_slots = torch.tensor([6, 3], device="cuda", dtype=torch.int32)
+        layer = SimpleNamespace(
+            layer_id=0,
+            q_dim=heads * dim,
+            k_dim=heads * dim,
+            v_dim=heads * dim,
+            head_q_dim=dim,
+            head_k_dim=dim,
+            head_v_dim=dim,
+            conv_weights=(0.1 * torch.randn(width, 4, device="cuda")).bfloat16(),
+            bias=None,
+            A_log=0.1 * torch.randn(heads, device="cuda"),
+            dt_bias=0.1 * torch.randn(heads * dim, device="cuda"),
+            lower_bound=-5.0,
+        )
+        initial_conv = (0.1 * torch.randn(7, 3, width, device="cuda")).bfloat16()
+        initial_ssm = 0.01 * torch.randn(7, heads, dim, dim, device="cuda")
+        initial_ssm[5].zero_()
+        backends = []
+        for _ in range(2):
+            conv = torch.full(
+                (7, 2, 3, width), 123.0, device="cuda", dtype=torch.bfloat16
+            )
+            ssm = torch.full((7, 2, heads, dim, dim), 123.0, device="cuda")
+            conv[:, 0].copy_(initial_conv)
+            ssm[:, 0].copy_(initial_ssm)
+            cache = SimpleNamespace(conv=[conv[:, 0]], temporal=ssm[:, 0])
+            backend = object.__new__(KDAAttnBackend)
+            backend.device = torch.device("cuda")
+            backend._mamba_chunk_size = 64
+            backend.conv_states_shape = (width, 3)
+            backend.accepted_state = None
+            backend.accept_lens_pool = None
+            backend.req_to_token_pool = SimpleNamespace(
+                mamba2_layer_cache=lambda _, cache=cache: cache
+            )
+            kind = LinearAttnKernelBackend.TRITON
+            backend.kernel_dispatcher = KDAKernelDispatcher(kind, kind, kind)
+            backends.append((backend, cache, conv, ssm))
+
+        for step, (lens, prefixes) in enumerate(
+            (([8192, 193], [0, 64]), ([64, 64], [8192, 257]))
+        ):
+            total = sum(lens)
+            mixed = (0.5 * torch.randn(total, width, device="cuda")).bfloat16()
+            gate = (0.5 * torch.randn(1, total, heads * dim, device="cuda")).bfloat16()
+            beta = torch.randn(1, total, heads, device="cuda").bfloat16()
+            outputs = []
+            for branch, (backend, cache, conv, ssm) in enumerate(backends):
+                cu = torch.tensor([0, lens[0], total], device="cuda", dtype=torch.int32)
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.EXTEND,
+                    extend_prefix_lens=torch.tensor(
+                        prefixes, device="cuda", dtype=torch.int32
+                    ),
+                    extend_seq_lens=torch.tensor(
+                        lens, device="cuda", dtype=torch.int32
+                    ),
+                    extend_seq_lens_cpu=lens,
+                    mamba_track_mask=torch.tensor([True, False], device="cuda"),
+                    mamba_track_indices=track_slots,
+                    mamba_track_seqlens=torch.tensor(
+                        [577 if branch else 8192, -1], device="cuda", dtype=torch.int32
+                    ),
+                )
+                metadata = ForwardMetadata(
+                    query_start_loc=cu, mamba_cache_indices=slots
+                )
+                if step == 0:
+                    metadata.has_mamba_track_mask = True
+                    metadata.conv_states_mask_indices = track_slots[:1]
+                    with patch(
+                        "sglang.srt.layers.attention.hybrid_linear_attn_backend.mamba_cache_chunk_size",
+                        return_value=64,
+                    ):
+                        metadata.track_conv_indices = backend._init_track_conv_indices(
+                            cu, batch
+                        )
+                    (
+                        metadata.track_chunk_idx,
+                        metadata.track_ssm_h_src,
+                        metadata.track_ssm_h_dst,
+                        metadata.track_ssm_h_batch_src,
+                        metadata.track_ssm_final_src,
+                        metadata.track_ssm_final_dst,
+                        metadata.track_ssm_seq_idx,
+                        metadata.track_ssm_end_locs,
+                        metadata.track_ssm_recompute_dst,
+                    ) = backend._init_track_ssm_indices(slots, batch)
+                backend.forward_metadata = metadata
+                outputs.append(
+                    backend.forward_extend(
+                        layer, batch, mixed.clone(), gate.clone(), beta.clone()
+                    )
+                )
+                self.assertTrue(torch.all(conv[:, 1] == 123.0))
+                self.assertTrue(torch.all(ssm[:, 1] == 123.0))
+                if step == 0:
+                    boundary = 576 if branch else 8192
+                    torch.testing.assert_close(
+                        cache.conv[0][6], mixed[boundary - 3 : boundary], rtol=0, atol=0
+                    )
+                    self.assertTrue(torch.isfinite(cache.temporal[6]).all())
+            torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
+            for name in ("temporal", "conv"):
+                left, right = [getattr(item[1], name) for item in backends]
+                if name == "conv":
+                    left, right = left[0], right[0]
+                torch.testing.assert_close(left[:6], right[:6], rtol=0, atol=0)
+
+    def _check_snapshot(self, lower_bound, num_heads, seq_len=100, boundary=64):
+        lens = [seq_len, 64, 193]
+        boundaries = [boundary, None, 128]
         head_dim = 128
         generator = torch.Generator(device="cuda").manual_seed(0)
 
@@ -189,7 +329,9 @@ class TestKdaTrackState(CustomTestCase):
         dt_bias = randn(num_heads * head_dim)
         initial = 0.01 * randn(7, num_heads, head_dim, head_dim)
         slots = torch.tensor([5, 1, 3], device="cuda", dtype=torch.int32)
-        cu_seqlens = torch.tensor([0, 100, 164, 357], device="cuda", dtype=torch.int32)
+        cu_seqlens = torch.tensor(
+            [0, seq_len, seq_len + 64, sum(lens)], device="cuda", dtype=torch.int32
+        )
 
         def run(q, k, v, gate, beta, state, indices, cu, **kwargs):
             return chunk_kda(
@@ -228,7 +370,9 @@ class TestKdaTrackState(CustomTestCase):
             cu_seqlens,
             output_intermediate_states=True,
             track_state=snapshot,
-            track_chunk_idx=torch.tensor([1, -1, 2], device="cuda", dtype=torch.int32),
+            track_chunk_idx=torch.tensor(
+                [boundary // 64, -1, 2], device="cuda", dtype=torch.int32
+            ),
         )
         self.assertTrue(torch.isnan(snapshot[1]).all())
         self.assertTrue(torch.isfinite(snapshot[[0, 2]]).all())
@@ -243,8 +387,8 @@ class TestKdaTrackState(CustomTestCase):
         torch.testing.assert_close(state, untracked_state, rtol=0, atol=0)
 
         for row, start, boundary, h_row in (
-            (0, 0, boundaries[0], 1),
-            (2, 164, boundaries[2], 5),
+            (0, 0, boundaries[0], boundary // 64),
+            (2, seq_len + 64, boundaries[2], (seq_len + 63) // 64 + 3),
         ):
             prefix = slice(start, start + boundary)
             reference = initial[slots[row].item()].unsqueeze(0).clone()

@@ -535,6 +535,14 @@ class MambaComponent(TreeComponent):
     ) -> Optional[int]:
         if self.cache.enable_mamba_extra_buffer:
             cache_len = req.kv.mamba_last_track_seqlen
+            # A recurrent checkpoint cannot be rounded down with its radix key.
+            if (
+                cache_len is None
+                or cache_len <= 0
+                or cache_len > token_ids_len
+                or cache_len % self.cache.page_size != 0
+            ):
+                return 0
         else:
             cache_len = token_ids_len
             # ReplaySSM (no_buffer): `temporal[slot]` lags the live state by the

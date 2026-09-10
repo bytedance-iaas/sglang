@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import logging
+import math
 import threading
 import time
 from dataclasses import replace
@@ -118,6 +119,21 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 logger = logging.getLogger(__name__)
 
 
+def _compressed_index_tree_params(params: CacheInitParams) -> CacheInitParams:
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
+
+    if params.disable or params.token_to_kv_pool_allocator is None:
+        return params
+    pool = params.token_to_kv_pool_allocator.get_kvcache()
+    if isinstance(pool, HybridLinearKVPool):
+        pool = pool.full_kv_pool
+    if not isinstance(pool, DSATokenToKVPool) or not pool.kpool_use_compress:
+        return params
+    # A packed index page must never straddle independently owned radix branches.
+    tree_page = math.lcm(params.page_size, pool.page_size * pool.index_kpool)
+    return replace(params, page_size=tree_page)
+
+
 class _OngoingWriteThrough(NamedTuple):
     """Tracks an in-flight D→H write-through operation."""
 
@@ -150,6 +166,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self,
         params: CacheInitParams,
     ):
+        self._transfer_page_size = params.page_size
+        params = _compressed_index_tree_params(params)
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.disable = params.disable
@@ -338,6 +356,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
+        if self.page_size != self._transfer_page_size:
+            raise ValueError(
+                "Compressed DSA does not support the external cache linker."
+            )
         self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
 
     def reset(self) -> None:
@@ -378,6 +400,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
+        if self.page_size != self._transfer_page_size:
+            raise ValueError(
+                "Compressed DSA HiCache requires index-buffer restore support; "
+                "only device-resident caching is supported."
+            )
         self.host_memory_mode = get_memory().hicache_host_memory_mode
         if self.host_memory_mode == "buffer_only":
             # TODO(Jialin): Extend buffer-only state handoff to Mamba in a
@@ -875,17 +902,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 priority=getattr(req, "priority", 0) or 0,
             )
 
-            # components prepare insert data + return effective cache_len
-            effective_cache_len = len(token_ids)
-            for comp in self._components_tuple:
-                cl = comp.prepare_for_caching_req(
-                    req=req,
-                    insert_params=insert_params,
-                    token_ids_len=len(token_ids),
-                    is_finished=True,
-                )
-                if cl is not None:
-                    effective_cache_len = min(effective_cache_len, cl)
+            effective_cache_len = self._prepare_for_caching_req(
+                req, insert_params, len(token_ids), is_finished=True
+            )
 
             # Truncate if needed; the tail free is deferred and batched with
             # the unaligned tail below so a shared boundary page is emitted once.
@@ -961,16 +980,9 @@ class UnifiedRadixCache(BasePrefixCache):
             chunked=chunked,
             priority=getattr(req, "priority", 0) or 0,
         )
-        effective_cache_len = len(token_ids)
-        for comp in self._components_tuple:
-            cl = comp.prepare_for_caching_req(
-                req=req,
-                insert_params=insert_params,
-                token_ids_len=len(token_ids),
-                is_finished=False,
-            )
-            if cl is not None:
-                effective_cache_len = min(effective_cache_len, cl)
+        effective_cache_len = self._prepare_for_caching_req(
+            req, insert_params, len(token_ids), is_finished=False
+        )
 
         radix_key = RadixKey(
             token_ids[:effective_cache_len],
@@ -1064,6 +1076,46 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
     # ---- Internal Helpers ----
+
+    def _prepare_for_caching_req(
+        self,
+        req: Req,
+        insert_params: InsertParams,
+        token_ids_len: int,
+        *,
+        is_finished: bool,
+    ) -> int:
+        effective_cache_len = token_ids_len
+        checkpoint_component = None
+        for comp in self._components_tuple:
+            if comp.component_type == ComponentType.MAMBA:
+                checkpoint_component = comp
+                continue
+            cl = comp.prepare_for_caching_req(
+                req=req,
+                insert_params=insert_params,
+                token_ids_len=token_ids_len,
+                is_finished=is_finished,
+            )
+            if cl is not None:
+                effective_cache_len = min(effective_cache_len, cl)
+
+        # Resolve other components' key limits before donating an immutable state.
+        if checkpoint_component is not None:
+            if (
+                not self.enable_mamba_extra_buffer
+                and effective_cache_len < token_ids_len
+            ):
+                return 0
+            cl = checkpoint_component.prepare_for_caching_req(
+                req=req,
+                insert_params=insert_params,
+                token_ids_len=effective_cache_len,
+                is_finished=is_finished,
+            )
+            if cl is not None:
+                effective_cache_len = min(effective_cache_len, cl)
+        return effective_cache_len
 
     def _apply_cache_actions(
         self, actions: list[CacheAction | ComponentAction]
