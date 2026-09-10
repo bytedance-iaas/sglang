@@ -255,9 +255,7 @@ def _draft_extend_terminal_select_index(
             f"accept_lens must be 1-D, got shape={tuple(accept_lens.shape)}"
         )
     if num_draft_tokens <= 0:
-        raise ValueError(
-            f"num_draft_tokens must be positive, got {num_draft_tokens}"
-        )
+        raise ValueError(f"num_draft_tokens must be positive, got {num_draft_tokens}")
     return (
         torch.arange(
             0,
@@ -1177,9 +1175,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         numerical_probe_requested = (
             self.eagle_numerical_probe.needs_eager_for_schedule_batch(batch)
         )
-        numerical_probe_rows = (
-            len(batch.seq_lens) * self.speculative_num_draft_tokens
-        )
+        numerical_probe_rows = len(batch.seq_lens) * self.speculative_num_draft_tokens
         # Batch 2: Draft extend
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
@@ -1429,9 +1425,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         shadow_probe = getattr(self._draft_worker, "dsa_topk_shadow_probe", None)
         if shadow_probe is not None and shadow_probe.matches_schedule_batch(batch):
             return True
-        numerical_probe = getattr(
-            self._draft_worker, "eagle_numerical_probe", None
-        )
+        numerical_probe = getattr(self._draft_worker, "eagle_numerical_probe", None)
         if (
             numerical_probe is not None
             and numerical_probe.needs_eager_for_schedule_batch(batch)
@@ -1465,9 +1459,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         shadow_probe = getattr(self._draft_worker, "dsa_topk_shadow_probe", None)
         if shadow_probe is not None:
             shadow_probe.finish(rid=rid, natural_stop=normal_completion)
-        numerical_probe = getattr(
-            self._draft_worker, "eagle_numerical_probe", None
-        )
+        numerical_probe = getattr(self._draft_worker, "eagle_numerical_probe", None)
         if numerical_probe is not None:
             numerical_probe.finish(
                 rid=rid,
@@ -1553,6 +1545,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
             if self._pp_enabled and not self._pp_is_last_rank:
                 return batch_output
 
+            numerical_probe = self._draft_worker.eagle_numerical_probe
+            if batch.contains_last_prefill_chunk:
+                numerical_probe.record_prefill_target_sample(
+                    rids=[req.rid for req in batch.reqs],
+                    next_token_ids=batch_output.next_token_ids,
+                )
+
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
             # Extend processed L prompt tokens; next verify iter expects same L.
             batch_output.new_seq_lens = batch.seq_lens
@@ -1576,6 +1575,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         batch_output.next_token_ids,
                         batch_output.logits_output.mm_input_embeds,
                     )
+                )
+            if batch.contains_last_prefill_chunk:
+                numerical_probe.record_prefill_post_draft_extend(
+                    rids=[req.rid for req in batch.reqs],
+                    next_token_ids=batch_output.next_token_ids,
+                    bonus_tokens=batch_output.next_draft_input.bonus_tokens,
                 )
             return batch_output
         else:
@@ -2123,6 +2128,24 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 if self._draft_worker is not None
                 else None
             ),
+        )
+
+    def record_prefill_pp_output(
+        self,
+        *,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+        pp_next_token_ids: torch.Tensor,
+    ) -> None:
+        if self._draft_worker is None or result.next_draft_input is None:
+            return
+        if not batch.contains_last_prefill_chunk:
+            return
+        self._draft_worker.eagle_numerical_probe.record_prefill_pp_output(
+            rids=[req.rid for req in batch.reqs],
+            next_token_ids=result.next_token_ids,
+            bonus_tokens=result.next_draft_input.bonus_tokens,
+            pp_next_token_ids=pp_next_token_ids,
         )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):

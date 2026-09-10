@@ -1493,10 +1493,9 @@ class Envs:
     # the probe.  The matching request is forced off the draft CUDA graph and
     # the probe seals itself when that request finishes.
     SGLANG_DSA_TOPK_SHADOW_RID = EnvStr(None)
-    # Diagnostic-only exact request id for one eager decode draft-extend
-    # numerical fingerprint. Empty disables the probe. The matching request
-    # captures logical rows at the NextN input/embed/decoder/norm/logits/token
-    # boundaries and is never eligible for performance conclusions.
+    # Diagnostic-only exact request id for the prefill target-token handoff and
+    # one eager decode draft-extend numerical fingerprint. Empty disables the
+    # probe. The matching request is never eligible for performance conclusions.
     SGLANG_EAGLE_NUMERICAL_PROBE_RID = EnvStr(None)
     # Generation-scoped capture identity for the numerical probe. The Pod name
     # and UID come from the Kubernetes Downward API. All three are required

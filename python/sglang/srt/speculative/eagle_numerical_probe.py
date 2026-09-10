@@ -1,9 +1,10 @@
-"""Exact-request numerical fingerprints for EAGLE verify/NextN localization.
+"""Exact-request numerical fingerprints for EAGLE prefill/decode localization.
 
-The probe is diagnostic-only and default-off.  It records the first matching
-decode target-verify and draft-extend sequence.  Every selected stage
-synchronizes its current CUDA stream and emits a fingerprint immediately, so a
-later device fault does not erase the completed stage prefix.
+The probe is diagnostic-only and default-off. It separately records the
+matching Prefill target-token handoff and the first matching Decode
+target-verify/draft-extend sequence. Every selected stage synchronizes its
+current CUDA stream and emits a fingerprint immediately, so a later device
+fault does not erase the completed stage prefix.
 """
 
 from __future__ import annotations
@@ -59,6 +60,19 @@ _DENSE_ROW_DOMAIN = "dense_request_major_prefix"
 _PROPOSAL_ROW_DOMAIN = "request_terminal"
 _TARGET_TREE_ROW_DOMAIN = "target_verify_tree_node"
 _REQUEST_ROW_DOMAIN = "request"
+_PREFILL_HANDOFF_PHASE = "prefill_handoff"
+_PREFILL_HANDOFF_STAGES = (
+    "target_sample",
+    "post_draft_extend",
+    "pp_output",
+)
+_PREFILL_HANDOFF_REQUIRED_TENSORS = {
+    "target_sample": frozenset({"next_token_ids"}),
+    "post_draft_extend": frozenset(
+        {"next_token_ids", "bonus_tokens", "shared_storage"}
+    ),
+    "pp_output": frozenset({"next_token_ids", "bonus_tokens", "pp_next_token_ids"}),
+}
 
 
 def _rank_payload() -> Optional[dict[str, int]]:
@@ -124,8 +138,16 @@ def _tensor_fingerprint(tensor: torch.Tensor, logical_rows: int) -> dict:
     return result
 
 
+def _tensors_share_storage(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
+    """Return storage aliasing without exposing process-local addresses."""
+
+    if lhs.device != rhs.device:
+        return False
+    return lhs.untyped_storage().data_ptr() == rhs.untyped_storage().data_ptr()
+
+
 class EagleNumericalProbe:
-    """Capture one complete target-verify through draft-extend fingerprint."""
+    """Capture one Prefill handoff and one Decode numerical fingerprint."""
 
     def __init__(
         self,
@@ -158,6 +180,11 @@ class EagleNumericalProbe:
         self._records: dict[str, dict[str, dict]] = {}
         self._proposal_rows: dict[str, int] = {}
         self._next_ordinal = 1
+        self._prefill_rejection: Optional[str] = None
+        self._prefill_sealed = False
+        self._prefill_seen = False
+        self._prefill_records: dict[str, dict] = {}
+        self._prefill_next_ordinal = 1
 
     @property
     def can_probe(self) -> bool:
@@ -175,6 +202,206 @@ class EagleNumericalProbe:
 
     def matches_schedule_batch(self, batch) -> bool:
         return self.matches_rids([req.rid for req in batch.reqs])
+
+    @property
+    def can_probe_prefill_handoff(self) -> bool:
+        return (
+            self.expected_rid is not None
+            and self._prefill_rejection is None
+            and not self._prefill_sealed
+        )
+
+    def _reject_prefill_handoff(self, reason: str) -> None:
+        if self._prefill_rejection is None:
+            self._prefill_rejection = reason
+            logger.error(
+                "EAGLE prefill handoff diagnostic failed closed for rid=%s: %s",
+                self.expected_rid,
+                reason,
+            )
+
+    def _emit_prefill_handoff_event(
+        self,
+        *,
+        prefix: str,
+        stage: str,
+        logical_rows: int,
+        fingerprints: dict[str, dict],
+        error: Optional[BaseException] = None,
+    ) -> None:
+        payload = {
+            "rid": self.expected_rid,
+            "capture": self.capture,
+            "phase": _PREFILL_HANDOFF_PHASE,
+            "stage": stage,
+            "ordinal": self._prefill_next_ordinal,
+            "row_domain": _REQUEST_ROW_DOMAIN,
+            "logical_rows": logical_rows,
+            "fingerprints": fingerprints,
+            "rank": _rank_payload(),
+        }
+        if error is not None:
+            payload.update({"error_type": type(error).__name__, "error": str(error)})
+        logger.warning(
+            "%s %s",
+            prefix,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
+
+    def _record_prefill_handoff(
+        self,
+        stage: str,
+        tensors: dict[str, Optional[torch.Tensor]],
+        *,
+        logical_rows: int,
+    ) -> None:
+        if not self.can_probe_prefill_handoff:
+            return
+        if logical_rows <= 0:
+            self._reject_prefill_handoff(
+                f"stage {stage} has invalid logical_rows={logical_rows}"
+            )
+            return
+        if stage in self._prefill_records:
+            self._reject_prefill_handoff(f"duplicate stage {stage}")
+            return
+        if len(self._prefill_records) >= len(_PREFILL_HANDOFF_STAGES):
+            self._reject_prefill_handoff(f"unexpected stage {stage}")
+            return
+        expected_stage = _PREFILL_HANDOFF_STAGES[len(self._prefill_records)]
+        if stage != expected_stage:
+            self._reject_prefill_handoff(
+                f"out-of-order stage {stage}, expected {expected_stage}"
+            )
+            return
+        required = _PREFILL_HANDOFF_REQUIRED_TENSORS[stage]
+        missing = sorted(name for name in required if tensors.get(name) is None)
+        if missing:
+            self._reject_prefill_handoff(f"stage {stage} missing tensors {missing}")
+            return
+        try:
+            _synchronize_cuda_tensors(tensors)
+            fingerprints = {
+                name: _tensor_fingerprint(tensor, logical_rows)
+                for name, tensor in sorted(tensors.items())
+                if tensor is not None
+            }
+        except (RuntimeError, TypeError, ValueError) as exc:
+            self._emit_prefill_handoff_event(
+                prefix="EAGLE_PREFILL_HANDOFF_PROBE_STAGE_ERROR",
+                stage=stage,
+                logical_rows=logical_rows,
+                fingerprints={},
+                error=exc,
+            )
+            self._reject_prefill_handoff(
+                f"failed to synchronize/fingerprint {stage}: {exc}"
+            )
+            if isinstance(exc, RuntimeError) and any(
+                tensor is not None and tensor.is_cuda for tensor in tensors.values()
+            ):
+                raise
+            return
+
+        self._prefill_records[stage] = {
+            "row_domain": _REQUEST_ROW_DOMAIN,
+            "logical_rows": logical_rows,
+            "tensors": fingerprints,
+        }
+        self._emit_prefill_handoff_event(
+            prefix="EAGLE_PREFILL_HANDOFF_PROBE_STAGE",
+            stage=stage,
+            logical_rows=logical_rows,
+            fingerprints=fingerprints,
+        )
+        self._prefill_next_ordinal += 1
+
+    def record_prefill_target_sample(
+        self, *, rids: Optional[list[str]], next_token_ids: torch.Tensor
+    ) -> None:
+        if not (self.can_probe_prefill_handoff and rids == [self.expected_rid]):
+            return
+        self._prefill_seen = True
+        self._record_prefill_handoff(
+            "target_sample",
+            {"next_token_ids": next_token_ids},
+            logical_rows=len(rids),
+        )
+
+    def record_prefill_post_draft_extend(
+        self,
+        *,
+        rids: Optional[list[str]],
+        next_token_ids: torch.Tensor,
+        bonus_tokens: torch.Tensor,
+    ) -> None:
+        if not (self.can_probe_prefill_handoff and rids == [self.expected_rid]):
+            return
+        self._prefill_seen = True
+        shared_storage = torch.tensor(
+            [int(_tensors_share_storage(next_token_ids, bonus_tokens))],
+            dtype=torch.int64,
+        )
+        self._record_prefill_handoff(
+            "post_draft_extend",
+            {
+                "next_token_ids": next_token_ids,
+                "bonus_tokens": bonus_tokens,
+                "shared_storage": shared_storage,
+            },
+            logical_rows=len(rids),
+        )
+
+    def record_prefill_pp_output(
+        self,
+        *,
+        rids: Optional[list[str]],
+        next_token_ids: torch.Tensor,
+        bonus_tokens: torch.Tensor,
+        pp_next_token_ids: torch.Tensor,
+    ) -> None:
+        if not (self.can_probe_prefill_handoff and rids == [self.expected_rid]):
+            return
+        self._prefill_seen = True
+        self._record_prefill_handoff(
+            "pp_output",
+            {
+                "next_token_ids": next_token_ids,
+                "bonus_tokens": bonus_tokens,
+                "pp_next_token_ids": pp_next_token_ids,
+            },
+            logical_rows=len(rids),
+        )
+        self._seal_prefill_handoff()
+
+    def _seal_prefill_handoff(self) -> None:
+        if self._prefill_sealed:
+            return
+        self._prefill_sealed = True
+        if self._prefill_rejection is None:
+            missing = [
+                stage
+                for stage in _PREFILL_HANDOFF_STAGES
+                if stage not in self._prefill_records
+            ]
+            if missing:
+                self._prefill_rejection = f"missing stages {missing}"
+        payload = {
+            "rid": self.expected_rid,
+            "capture": self.capture,
+            "phase": _PREFILL_HANDOFF_PHASE,
+            "status": "rejected" if self._prefill_rejection else "complete",
+            "rejection": self._prefill_rejection,
+            "seen": self._prefill_seen,
+            "stages": self._prefill_records,
+        }
+        rank = _rank_payload()
+        if rank is not None:
+            payload["rank"] = rank
+        logger.warning(
+            "EAGLE_PREFILL_HANDOFF_PROBE_RESULT %s",
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
 
     def needs_eager_for_schedule_batch(self, batch) -> bool:
         return self.matches_schedule_batch(batch) and "draft_extend_input" not in (
@@ -498,6 +725,13 @@ class EagleNumericalProbe:
 
     def finish(self, *, rid: str, natural_stop: bool, normal_completion: bool) -> None:
         if rid != self.expected_rid or self._sealed:
+            return
+        # Prefill and decode are separate processes under PD disaggregation.
+        # A prefill-only instance seals its handoff result at PP serialization;
+        # it must not emit a spurious missing-decode-stage result if the prefill
+        # scheduler later reports that request as finished.
+        if self._prefill_seen and not self._seen:
+            self._seal_prefill_handoff()
             return
         self._sealed = True
         if self._rejection is None and not normal_completion:
