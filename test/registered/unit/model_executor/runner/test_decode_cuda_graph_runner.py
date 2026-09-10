@@ -28,6 +28,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
+
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
@@ -132,6 +134,64 @@ class TestInitProfileBatchMode(CustomTestCase):
             mock_makedirs.call_args.args[0],
             os.path.join("/tmp", "graph_capture_profile"),
         )
+
+
+class TestPreplannedPPProxyRefresh(CustomTestCase):
+    def test_main_stream_refreshes_proxy_after_plan_stream_without_proxy(self):
+        buffers = SimpleNamespace(
+            input_ids=torch.zeros(4, dtype=torch.int64),
+            positions=torch.zeros(4, dtype=torch.int64),
+            pp_proxy_tensors={
+                "hidden_states": torch.full((4, 2), 9, dtype=torch.int32),
+                "residual": torch.full((4, 2), 8, dtype=torch.int32),
+                "topk_indices": torch.full((4, 1), 7, dtype=torch.int32),
+            },
+        )
+        fake_self = SimpleNamespace(
+            ragged_verify_mode=False,
+            deepep_adapter=SimpleNamespace(replay=mock.Mock()),
+            bs=1,
+            captured_req_width=4,
+            raw_num_token=4,
+            buffers=buffers,
+            model_runner=SimpleNamespace(
+                spec_algorithm=SimpleNamespace(is_dflash_family=lambda: False),
+                is_draft_worker=False,
+            ),
+            enable_pdmux=False,
+            _capture_graph_size=lambda **_kwargs: 4,
+            _resolve_lora_variant=lambda _forward_batch: None,
+            _resolve_dsa_variant=lambda _forward_batch: None,
+            _make_graph_key=lambda *args: args,
+        )
+        forward_batch = SimpleNamespace(
+            needs_forward_metadata_init=lambda: False,
+            input_ids=torch.tensor([1, 2, 3, 4], dtype=torch.int64),
+            positions=torch.tensor([5, 6, 7, 8], dtype=torch.int64),
+            input_embeds=None,
+        )
+
+        # Plan-stream preparation has no PP output yet and must leave the
+        # graph-resident proxy alone.
+        DecodeCudaGraphRunner.load_batch(fake_self, forward_batch, None)
+        self.assertTrue(torch.all(buffers.pp_proxy_tensors["hidden_states"] == 9))
+
+        # PP0 then produces the live proxy. The main-stream replay must replace
+        # all live heads and clear stale rows/fields before graph execution.
+        live_proxy = SimpleNamespace(
+            tensors={
+                "hidden_states": torch.ones((2, 2), dtype=torch.int32),
+                "residual": torch.full((3, 2), 2, dtype=torch.int32),
+                "__msg_type__": "proxy",
+            }
+        )
+        DecodeCudaGraphRunner.load_batch(fake_self, forward_batch, live_proxy)
+
+        self.assertTrue(torch.all(buffers.pp_proxy_tensors["hidden_states"][:2] == 1))
+        self.assertTrue(torch.all(buffers.pp_proxy_tensors["hidden_states"][2:] == 0))
+        self.assertTrue(torch.all(buffers.pp_proxy_tensors["residual"][:3] == 2))
+        self.assertTrue(torch.all(buffers.pp_proxy_tensors["residual"][3:] == 0))
+        self.assertTrue(torch.all(buffers.pp_proxy_tensors["topk_indices"] == 0))
 
 
 class TestInitProfileOriginalMode(CustomTestCase):

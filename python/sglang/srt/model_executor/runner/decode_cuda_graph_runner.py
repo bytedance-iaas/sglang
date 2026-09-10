@@ -59,6 +59,7 @@ from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     build_decode_registry,
+    copy_pp_proxy_tensors_to_graph_buffers,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -1319,6 +1320,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            graph_pp_proxy_tensors = getattr(self.buffers, "pp_proxy_tensors", None)
+            if pp_proxy_tensors is not None and graph_pp_proxy_tensors is not None:
+                copy_pp_proxy_tensors_to_graph_buffers(
+                    graph_pp_proxy_tensors, pp_proxy_tensors
+                )
             if (
                 not is_ragged
                 and self.model_runner.spec_algorithm.is_dflash_family()

@@ -25,6 +25,7 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     GraphSlot,
     PaddingPolicy,
+    copy_pp_proxy_tensors_to_graph_buffers,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -984,6 +985,113 @@ class TestBuildDecodeRegistry(unittest.TestCase):
         )
         self.assertTrue(torch.all(hs[:3] == 1))
         self.assertTrue(torch.all(hs[3:] == 0))
+
+    def test_direct_pp_proxy_copy_refreshes_live_fields_and_clears_stale_data(self):
+        destination = {
+            "hidden_states": torch.full((8, 2), 9, dtype=torch.int32),
+            "residual": torch.full((8, 2), 8, dtype=torch.int32),
+            "topk_indices": torch.full((8, 1), 7, dtype=torch.int32),
+        }
+
+        # The plan-stream pass has no PP input. It must not fabricate one; the
+        # subsequent main-stream pass is what supplies and refreshes live rows.
+        planned_pp_proxy = None
+        if planned_pp_proxy is not None:
+            copy_pp_proxy_tensors_to_graph_buffers(destination, planned_pp_proxy)
+        self.assertTrue(torch.all(destination["hidden_states"] == 9))
+
+        live_pp_proxy = SimpleNamespace(
+            tensors={
+                "hidden_states": torch.ones((3, 2), dtype=torch.int32),
+                "residual": torch.full((5, 2), 2, dtype=torch.int32),
+                "topk_indices": torch.full((3, 1), 4, dtype=torch.int32),
+                "__msg_type__": "proxy",
+            }
+        )
+        copy_pp_proxy_tensors_to_graph_buffers(destination, live_pp_proxy)
+
+        self.assertTrue(torch.all(destination["hidden_states"][:3] == 1))
+        self.assertTrue(torch.all(destination["hidden_states"][3:] == 0))
+        self.assertTrue(torch.all(destination["residual"][:5] == 2))
+        self.assertTrue(torch.all(destination["residual"][5:] == 0))
+        self.assertTrue(torch.all(destination["topk_indices"][:3] == 4))
+        self.assertTrue(torch.all(destination["topk_indices"][3:] == 0))
+
+    def test_direct_pp_proxy_copy_clears_missing_field(self):
+        destination = {
+            "hidden_states": torch.zeros((2, 2)),
+            "residual": torch.full((2, 2), 9.0),
+        }
+        pp_proxy = SimpleNamespace(tensors={"hidden_states": torch.ones((2, 2))})
+
+        copy_pp_proxy_tensors_to_graph_buffers(destination, pp_proxy)
+
+        self.assertTrue(torch.all(destination["hidden_states"] == 1))
+        self.assertTrue(torch.all(destination["residual"] == 0))
+
+    def test_direct_pp_proxy_copy_rejects_unknown_source_field(self):
+        destination = {"hidden_states": torch.zeros((2, 2))}
+        pp_proxy = SimpleNamespace(
+            tensors={
+                "hidden_states": torch.zeros((2, 2)),
+                "topk_indices": torch.zeros((2, 1)),
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, r"extra=\['topk_indices'\]"):
+            copy_pp_proxy_tensors_to_graph_buffers(destination, pp_proxy)
+
+    def test_direct_pp_proxy_copy_rejects_oversized_source(self):
+        destination = {"hidden_states": torch.zeros((2, 2))}
+        pp_proxy = SimpleNamespace(tensors={"hidden_states": torch.zeros((3, 2))})
+
+        with self.assertRaisesRegex(ValueError, "3 rows.*only 2"):
+            copy_pp_proxy_tensors_to_graph_buffers(destination, pp_proxy)
+
+    def test_pp_proxy_registry_rejects_unknown_source_field(self):
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_decode_registry,
+            build_prefill_registry,
+        )
+
+        hidden_states = torch.zeros((8, 2), dtype=torch.int32)
+        source = SimpleNamespace(
+            input_ids=torch.zeros(8, dtype=torch.int64),
+            positions=torch.zeros(8, dtype=torch.int64),
+            out_cache_loc=torch.zeros(8, dtype=torch.int64),
+            req_pool_indices=torch.zeros(4, dtype=torch.int64),
+            seq_lens=torch.full((4,), 5, dtype=torch.int64),
+            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int64),
+            mrope_positions=torch.zeros((3, 8), dtype=torch.int64),
+            global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
+            global_num_tokens_for_logprob_gpu=torch.zeros(1, dtype=torch.int32),
+            pp_proxy_tensors={"hidden_states": hidden_states},
+        )
+        pp_proxy = SimpleNamespace(
+            tensors={
+                "hidden_states": torch.zeros((3, 2), dtype=torch.int32),
+                "topk_indices": torch.zeros((3, 1), dtype=torch.int32),
+            }
+        )
+
+        for builder in (build_decode_registry, build_prefill_registry):
+            with self.subTest(builder=builder.__name__):
+                registry = builder(
+                    device=torch.device("cpu"),
+                    max_bs=4,
+                    max_num_token=8,
+                    cache_loc_dtype=torch.int64,
+                    source=source,
+                )
+                with self.assertRaisesRegex(ValueError, r"extra=\['topk_indices'\]"):
+                    registry.fill_from(
+                        _MiniForwardBatch(batch_size=3),
+                        raw_bs=3,
+                        padded_bs=4,
+                        raw_num_tokens=3,
+                        padded_num_tokens=8,
+                        pp_proxy_tensors=pp_proxy,
+                    )
 
     def test_source_with_canary_registers_bs_slots(self):
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
