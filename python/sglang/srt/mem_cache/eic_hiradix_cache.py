@@ -489,6 +489,17 @@ class EICHiRadixCache(RadixCache):
             self.dec_lock_ref(req.last_node)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
+        if self.ongoing_load_back:
+            key = RadixKey(req.fill_ids, req.extra_key, is_bigram=self.is_eagle)
+            match = self.match_prefix(MatchPrefixParams(key=key))
+            if self.prefix_loading(match.last_device_node):
+                # Inserting now would swap this req's own KV for slots still
+                # landing from EIC; keep it private, as ChunkCache does, until
+                # the load settles.
+                req.prefix_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, : len(req.fill_ids)
+                ].to(dtype=torch.int64, copy=True)
+                return
         super().cache_unfinished_req(req, chunked=chunked)
         if req.last_node is not None:
             self._backup_unbacked_path(req.last_node)

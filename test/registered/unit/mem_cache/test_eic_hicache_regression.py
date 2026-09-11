@@ -431,6 +431,7 @@ class TestEICHiCacheRegression(unittest.TestCase):
                 len(host_indices)
             ),
         )
+        c.token_to_kv_pool_allocator = SimpleNamespace(free=free)
         root = TreeNode()
         root.key, root.value, root.lock_ref = RadixKey([], None), [], 1
         c.root_node = root
@@ -463,6 +464,55 @@ class TestEICHiCacheRegression(unittest.TestCase):
         prefix_len = c.insert(InsertParams(key=key, value=b_kv)).prefix_len
         free(b_kv[len(b.device_indices) : prefix_len])
         c.dec_lock_ref(b.last_device_node)
+
+        cached = set()
+        stack = list(c.root_node.children.values())
+        while stack:
+            n = stack.pop()
+            if n.value is not None:
+                cached.update(n.value.tolist())
+            stack.extend(n.children.values())
+        self.assertFalse(cached & free_ids)
+        self.assertEqual(
+            len(free_ids) + c.evictable_size_ + c.protected_size_, total
+        )
+
+    def test_chunk_insert_through_inflight_load_keeps_pool_invariant(self):
+        # A running chunked req recomputing the same prefix reaches the in-flight
+        # tail T at its next chunk boundary. Inserting then would free its own KV
+        # and adopt T's still-landing slots; after T's load fails and the req
+        # finishes, those slots would be both free and cached.
+        total = 64
+        c, alloc, free, free_ids = self._make_pool_cache(total, page=4)
+        c.cache_controller.write_page = lambda **kw: None
+        key = RadixKey(list(range(32)), None)
+        c.insert(InsertParams(key=key, value=alloc(32)))
+        head = c.root_node.children[key.child_key(4)]
+        tail = head
+        head = c._split_node(tail.key, tail, 16)
+        tail.host_value = torch.arange(16)
+        c._evict_backuped(tail)
+
+        # The chunked req holds the shared head and its own recomputed tail.
+        own = torch.cat([head.value, alloc(16)])
+        r2t = own.view(1, -1).clone()
+        c.req_to_token_pool = SimpleNamespace(
+            req_to_token=r2t, write=lambda idx, v: r2t.__setitem__(idx, v)
+        )
+        req = SimpleNamespace(
+            fill_ids=list(range(32)), extra_key=None, req_pool_idx=0,
+            cache_protected_len=16, last_node=head, prefix_indices=own[:16],
+        )
+        c.inc_lock_ref(head)
+
+        c.load_back(c.match_prefix(MatchPrefixParams(key=key)).best_match_node)
+        c.cache_unfinished_req(req, chunked=True)  # chunk boundary mid-load
+        c._free_failed_loadback(tail.id, 0)
+
+        kv = c.req_to_token_pool.req_to_token[0, :32].to(torch.int64)
+        prefix_len = c.insert(InsertParams(key=key, value=kv)).prefix_len
+        free(kv[req.cache_protected_len : prefix_len])
+        c.dec_lock_ref(req.last_node)
 
         cached = set()
         stack = list(c.root_node.children.values())
