@@ -67,6 +67,8 @@ def test_full_and_paged_readers(rope_dim):
     )
     graph, output = capture(lambda: dequantize_k_cache_paged(cache, pages))
     pages[0] = 7
+    cache[:, :, 512:528].view(torch.float32).mul_(0.5)
+    expected[:, :, :512].mul_(0.5)
     graph.replay()
     torch.testing.assert_close(output, expected[pages.long()], rtol=0, atol=0)
 
@@ -88,6 +90,8 @@ def test_sparse_reader_mapping_and_graph(pool_size):
     check(dequantize_sparse_nope_cache(cache, indices))
     graph, output = capture(lambda: dequantize_sparse_nope_cache(cache, indices))
     indices[0, 0] = 5
+    cache[:, :, 512:528].view(torch.float32).mul_(0.5)
+    expected.mul_(0.5)
     graph.replay()
     check(output)
 
