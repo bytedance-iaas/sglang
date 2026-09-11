@@ -337,7 +337,9 @@ class Glm5NextLinearAttention(nn.Module):
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
-        self.do_fuse_qkvbfg = quant_config is None and head_shard_size == self.tp_size
+        # Both fused projections shard on attention TP, including under DP
+        # attention where the attention and global TP groups differ.
+        self.do_fuse_qkvbfg = quant_config is None
         if self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
                 projection_size,
@@ -353,6 +355,8 @@ class Glm5NextLinearAttention(nn.Module):
                 self.fg_sizes,
                 quant_config=quant_config,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
+                tp_rank=head_shard_rank,
+                tp_size=head_shard_size,
             )
             self.split_sizes = [
                 3 * projection_size // head_shard_size,
@@ -365,7 +369,12 @@ class Glm5NextLinearAttention(nn.Module):
                 or torch.get_default_dtype()
             )
             self.fused_fg_b_proj = ColumnParallelBatchedLinear(
-                2, self.head_dim, projection_size, dtype=fused_dtype
+                2,
+                self.head_dim,
+                projection_size,
+                dtype=fused_dtype,
+                tp_rank=head_shard_rank,
+                tp_size=head_shard_size,
             )
         else:
             self.qkv_proj = QKVParallelLinear(
