@@ -78,11 +78,29 @@ def deepgemm_paged_mqa_logits_split(
     *,
     q_offset: int,
 ) -> torch.Tensor:
-    q_fp8 = q_fp8.unsqueeze(1)
+    q_fp8 = q_fp8[:q_offset].unsqueeze(1)
+    weights = weights[:q_offset]
+    batch_axes = {
+        "q": q_fp8.shape[0],
+        "weights": weights.shape[0],
+        "context_lens": ctx_lens_2d.shape[0],
+        "block_table": block_tables.shape[0],
+    }
+    if ctx_lens_2d.dim() != 2 or ctx_lens_2d.shape[1] != 1:
+        raise RuntimeError(
+            "DeepGEMM split paged-MQA requires context_lens shape "
+            f"(batch_size, 1), got {tuple(ctx_lens_2d.shape)}; "
+            f"batch axes: {batch_axes}"
+        )
+    if len(set(batch_axes.values())) != 1:
+        raise RuntimeError(
+            "DeepGEMM split paged-MQA batch axes must match before dispatch: "
+            + ", ".join(f"{name}={rows}" for name, rows in batch_axes.items())
+        )
     logits = fp8_paged_mqa_logits_fn(
-        q_fp8[:q_offset],
+        q_fp8,
         kv_cache_fp8,
-        weights[:q_offset],
+        weights,
         ctx_lens_2d,
         block_tables,
         schedule_metadata,

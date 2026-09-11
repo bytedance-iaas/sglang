@@ -4,22 +4,283 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+import sglang.srt.layers.attention.dsa.dsa_indexer as dsa_indexer_module
+from sglang.kernels.ops.attention.dsa import deepgemm_paged_mqa_logits_split
 from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     DeepseekSparseAttnBackendMTPPrecomputeMixin,
 )
+from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
 from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
     DeepseekSparseAttnMultiStepBackend,
     _restore_dsa_decode_dp_padding,
     _trim_dsa_decode_dp_padding,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestDSAMultiStepDecode(unittest.TestCase):
+    def test_split_paged_mqa_rejects_mismatched_batch_axes_before_dispatch(self):
+        kernel = MagicMock()
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "q=8, weights=8, context_lens=4, block_table=4",
+        ):
+            deepgemm_paged_mqa_logits_split(
+                kernel,
+                q_fp8=torch.empty((8, 2, 128)),
+                kv_cache_fp8=torch.empty((2, 64, 1, 132)),
+                weights=torch.empty((8, 2)),
+                ctx_lens_2d=torch.empty((4, 1), dtype=torch.int32),
+                block_tables=torch.empty((4, 2), dtype=torch.int32),
+                schedule_metadata=torch.empty((1,), dtype=torch.int32),
+                max_seq_len=128,
+                q_offset=8,
+            )
+
+        kernel.assert_not_called()
+
+    def test_draft_extend_v2_paged_mqa_uses_per_draft_token_batch_axis(self):
+        logical_bs = 1
+        draft_tokens = 4
+        total_rows = logical_bs * draft_tokens
+        captured = {}
+
+        def fake_paged_mqa(
+            q,
+            _kv_cache,
+            weights,
+            context_lens,
+            block_table,
+            _schedule_metadata,
+            max_len,
+            *,
+            clean_logits,
+        ):
+            captured.update(
+                q_rows=q.shape[0],
+                weight_rows=weights.shape[0],
+                context_rows=context_lens.shape[0],
+                block_table_rows=block_table.shape[0],
+                clean_logits=clean_logits,
+            )
+            return torch.zeros((q.shape[0], max_len), dtype=torch.float32)
+
+        indexer = SimpleNamespace(
+            paged_mqa_logits_backend=SimpleNamespace(
+                is_aiter=lambda: False,
+                is_cutedsl=lambda: False,
+            ),
+            sm_count=132,
+            n_heads=2,
+            index_topk=1,
+            num_init_tokens=0,
+            num_local_tokens=0,
+            _get_index_k_read_buffer=lambda _pool, _layer_id: torch.empty(
+                (2, 64 * 132)
+            ),
+            _mask_init_and_local_tokens=lambda logits, _lengths: logits,
+        )
+        context_lens = torch.tensor([[10], [11], [12], [13]], dtype=torch.int32)
+        metadata = SimpleNamespace(
+            paged_mqa_schedule_metadata=torch.empty((1,), dtype=torch.int32),
+            paged_mqa_ctx_lens_2d=context_lens,
+            get_page_table_64=lambda: torch.zeros((total_rows, 2), dtype=torch.int32),
+            # The eager backend produces a flat per-query length vector.
+            get_seqlens_expanded=lambda: context_lens.flatten(),
+            get_seqlens_int32=lambda: torch.tensor([13], dtype=torch.int32),
+            get_dsa_extend_len_cpu=lambda: [draft_tokens],
+            topk_transform=lambda logits, _topk: logits,
+        )
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.DRAFT_EXTEND_V2)
+        deep_gemm = SimpleNamespace(
+            fp8_paged_mqa_logits=fake_paged_mqa,
+            get_paged_mqa_logits_metadata=MagicMock(),
+        )
+
+        with (
+            patch.object(dsa_indexer_module, "_is_cuda", True),
+            patch.object(dsa_indexer_module, "deep_gemm", deep_gemm, create=True),
+            patch.object(
+                dsa_indexer_module,
+                "get_token_to_kv_pool",
+                return_value=SimpleNamespace(page_size=64),
+            ),
+        ):
+            logits = Indexer._get_topk_paged(
+                indexer,
+                forward_batch,
+                layer_id=0,
+                q_fp8=torch.empty((total_rows, 2, 128)),
+                weights=torch.empty((total_rows, 2, 1)),
+                metadata=metadata,
+            )
+
+        self.assertEqual(logits.shape[0], total_rows)
+        self.assertEqual(
+            captured,
+            {
+                "q_rows": total_rows,
+                "weight_rows": total_rows,
+                "context_rows": total_rows,
+                "block_table_rows": total_rows,
+                "clean_logits": False,
+            },
+        )
+
+    def test_eager_draft_extend_metadata_owns_pre_padding_lengths(self):
+        draft_tokens = 4
+        backend = SimpleNamespace(
+            speculative_num_draft_tokens=draft_tokens,
+            use_mha=False,
+            dsa_decode_impl="fa3",
+            dsa_index_topk=16,
+            real_page_size=1,
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.arange(64, dtype=torch.int32).view(4, 16)
+            ),
+            set_dsa_prefill_impl=MagicMock(),
+            get_topk_transform_method=MagicMock(),
+            _draft_decode_seq_len_offset=MagicMock(return_value=0),
+            _cal_indexer_k_start_end=MagicMock(return_value=(None, None)),
+            get_device_int32_arange=lambda size: torch.arange(size, dtype=torch.int32),
+            _transform_table_1_to_real=lambda table: table,
+            _build_topk_v2_plan=MagicMock(return_value=None),
+        )
+        spec_info = SimpleNamespace(
+            is_draft_input=lambda: True,
+            hidden_states=torch.empty((draft_tokens, 8)),
+            num_tokens_per_req=draft_tokens,
+        )
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            batch_size=1,
+            input_ids=torch.arange(draft_tokens),
+            seq_lens=torch.tensor([13]),
+            req_pool_indices=torch.tensor([0]),
+            out_cache_loc=torch.arange(draft_tokens),
+            seq_lens_sum=13,
+            positions=torch.arange(9, 13),
+            seq_lens_cpu=torch.tensor([13]),
+            extend_prefix_lens_cpu=[9],
+            extend_prefix_lens=torch.tensor([9]),
+            extend_seq_lens_cpu=[draft_tokens],
+            extend_seq_lens=torch.tensor([draft_tokens], dtype=torch.int32),
+            extend_num_tokens=draft_tokens,
+            extend_logprob_start_lens_cpu=[0],
+            lora_ids=[None],
+            spec_info=spec_info,
+        )
+
+        with (
+            patch(
+                "sglang.srt.layers.attention.dsa_backend.is_cuda",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.layers.attention.dsa_backend.seqlens_expand_triton",
+                return_value=torch.tensor([10, 11, 12, 13], dtype=torch.int32),
+            ),
+            patch(
+                "sglang.srt.layers.attention.dsa_backend.pad_dsa_cache_seqlens",
+                side_effect=lambda _forward_batch, lengths: lengths,
+            ),
+        ):
+            DeepseekSparseAttnBackend.init_forward_metadata(backend, forward_batch)
+
+        metadata = backend.forward_metadata
+        self.assertEqual(metadata.real_page_table.shape[0], draft_tokens)
+
+        # TP8 padding happens after eager DSA metadata planning. Exercise the
+        # production mutator rather than editing the host list directly.
+        model_runner = MagicMock()
+        model_runner.attn_backend.get_cuda_graph_seq_len_fill_value.return_value = 1
+        forward_batch._pad_inputs_to_size(model_runner, num_tokens=8, bs=2)
+        self.assertEqual(forward_batch.extend_seq_lens_cpu, [draft_tokens] * 2)
+        self.assertEqual(forward_batch.input_ids.shape[0], 8)
+
+        captured = {}
+
+        def fake_paged_mqa(
+            q,
+            _kv_cache,
+            _weights,
+            _context_lens,
+            block_table,
+            _schedule_metadata,
+            max_len,
+            *,
+            clean_logits,
+        ):
+            captured.update(
+                q_rows=q.shape[0],
+                block_table_rows=block_table.shape[0],
+                clean_logits=clean_logits,
+            )
+            return torch.zeros((q.shape[0], max_len), dtype=torch.float32)
+
+        indexer_metadata = SimpleNamespace(
+            paged_mqa_schedule_metadata=torch.empty((1,), dtype=torch.int32),
+            paged_mqa_ctx_lens_2d=None,
+            get_page_table_64=lambda: metadata.real_page_table,
+            get_seqlens_expanded=lambda: metadata.dsa_seqlens_expanded,
+            get_seqlens_int32=lambda: metadata.cache_seqlens_int32,
+            get_dsa_extend_len_cpu=lambda: metadata.dsa_extend_seq_lens_list,
+            topk_transform=lambda logits, _topk: logits,
+        )
+        indexer = SimpleNamespace(
+            paged_mqa_logits_backend=SimpleNamespace(
+                is_aiter=lambda: False,
+                is_cutedsl=lambda: False,
+            ),
+            sm_count=132,
+            n_heads=2,
+            index_topk=1,
+            num_init_tokens=0,
+            num_local_tokens=0,
+            _get_index_k_read_buffer=lambda _pool, _layer_id: torch.empty(
+                (2, 64 * 132)
+            ),
+            _mask_init_and_local_tokens=lambda logits, _lengths: logits,
+        )
+        deep_gemm = SimpleNamespace(
+            fp8_paged_mqa_logits=fake_paged_mqa,
+            get_paged_mqa_logits_metadata=MagicMock(return_value=torch.empty(1)),
+        )
+        with (
+            patch.object(dsa_indexer_module, "_is_cuda", True),
+            patch.object(dsa_indexer_module, "deep_gemm", deep_gemm, create=True),
+            patch.object(
+                dsa_indexer_module,
+                "get_token_to_kv_pool",
+                return_value=SimpleNamespace(page_size=64),
+            ),
+        ):
+            logits = Indexer._get_topk_paged(
+                indexer,
+                forward_batch,
+                layer_id=0,
+                q_fp8=torch.empty((8, 2, 128)),
+                weights=torch.empty((8, 2, 1)),
+                metadata=indexer_metadata,
+            )
+
+        self.assertEqual(logits.shape[0], 8)
+        self.assertIsNot(
+            metadata.dsa_extend_seq_lens_list, forward_batch.extend_seq_lens_cpu
+        )
+        self.assertEqual(metadata.dsa_extend_seq_lens_list, [draft_tokens])
+        self.assertEqual(sum(metadata.dsa_extend_seq_lens_list), draft_tokens)
+        self.assertEqual(metadata.real_page_table.shape[0], draft_tokens)
+        self.assertEqual(
+            captured,
+            {"q_rows": 4, "block_table_rows": 4, "clean_logits": False},
+        )
+
     def test_eager_flashmla_scheduler_stays_on_live_query_axis(self):
         flashmla_metadata = object()
         backend = SimpleNamespace(

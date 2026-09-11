@@ -1114,7 +1114,12 @@ class DeepseekSparseAttnBackend(
             dsa_cu_seqlens_q=dsa_cu_seqlens_q,
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
             dsa_seqlens_expanded=seqlens_expanded,
-            dsa_extend_seq_lens_list=extend_seq_lens_cpu,
+            # Eager speculative metadata is planned before MLP-sync padding.
+            # ForwardBatch._pad_inputs_to_size() extends its host list in place,
+            # so retaining that alias would widen q_offset after page_table was
+            # built (for example 4 -> 8 rows under TP8) and violate DeepGEMM's
+            # q/block-table batch invariant. Metadata owns the logical snapshot.
+            dsa_extend_seq_lens_list=list(extend_seq_lens_cpu),
             real_page_table=self._transform_table_1_to_real(page_table),
             dsa_max_seqlen_q=1,
             topk_indices_offset=topk_indices_offset,
