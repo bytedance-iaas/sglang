@@ -2617,6 +2617,8 @@ class Scheduler(
             )
             if not deferring_load_back:
                 req.init_next_round_input(tc)
+                if self.enable_eic_cache and tc.prefix_loading(req.last_node):
+                    continue
             # PP>1 gates EVERY candidate (not only needs_host_load_back): host
             # metadata is per-stage (EIC write acks fail per namespace), so the
             # needs flag itself can diverge across stages; gating all candidates

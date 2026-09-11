@@ -9,10 +9,13 @@ import torch
 from sglang.srt.managers.eic_cache_controller import (
     EICCacheController,
     EICCacheOperation,
+    get_content_hash,
 )
 from sglang.srt.mem_cache.eic_chunk_cache import EICChunkCache
 from sglang.srt.mem_cache.eic_pp_reconcile import EICPPReconciler
 from sglang.srt.mem_cache.eic_hiradix_cache import EICPagedHiRadixCache
+from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
+from sglang.srt.mem_cache.radix_cache import RadixKey, TreeNode
 from sglang.srt.mem_cache.unified_cache_components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -393,6 +396,252 @@ class TestEICHiCacheRegression(unittest.TestCase):
         self.assertIs(req.last_node, node_c)  # resident node at depth 14, not node_d
         req.set_extend_input_len.assert_called_once_with(20 - 14)
         self.assertEqual(req.eic_loaded_len, 10)
+
+    def _make_pool_cache(self, total, page):
+        free_ids = set(range(1, total + 1))
+
+        def alloc(n):
+            ids = sorted(free_ids)[:n]
+            free_ids.difference_update(ids)
+            return torch.tensor(ids, dtype=torch.int64)
+
+        def free(t):
+            ids = set(t.tolist())
+            self.assertFalse(ids & free_ids, "double free")
+            free_ids.update(ids)
+
+        def evict_device(dev, host):
+            free(dev)
+            return len(dev)
+
+        c = object.__new__(EICPagedHiRadixCache)
+        c.disable, c.is_eagle, c.page_size, c.device = False, False, page, "cpu"
+        c.sliding_window_size, c.pp_size = None, 1
+        c.evictable_size_ = c.protected_size_ = 0
+        c.evictable_leaves = set()
+        c.write_through_threshold = 10**9
+        c.load_back_threshold, c.load_back_check = 0, False
+        c.ongoing_load_back = {}
+        c.calculate_hash_fn = get_content_hash
+        c.cache_controller = SimpleNamespace(
+            write_policy="write_through",
+            mem_pool_device_allocator=SimpleNamespace(free=free),
+            evict_device=evict_device,
+            load_page=lambda host_indices, node_id, content_hash: alloc(
+                len(host_indices)
+            ),
+        )
+        c.token_to_kv_pool_allocator = SimpleNamespace(free=free)
+        root = TreeNode()
+        root.key, root.value, root.lock_ref = RadixKey([], None), [], 1
+        c.root_node = root
+        return c, alloc, free, free_ids
+
+    def test_failed_load_under_same_prefix_req_keeps_pool_invariant(self):
+        # Chat cc32 crash: req A's load of a shared-prefix tail T failed while req
+        # B, admitted mid-load, had matched T's in-flight slots as a GPU hit. The
+        # failed-tail free returned them to the allocator and B's insert re-linked
+        # them into T: available + evictable exceeded total by exactly T.
+        total = 64
+        c, alloc, free, free_ids = self._make_pool_cache(total, page=4)
+        key = RadixKey(list(range(32)), None)
+        c.insert(InsertParams(key=key, value=alloc(32)))
+        tail = c.root_node.children[key.child_key(4)]
+        c._split_node(tail.key, tail, 16)
+        tail.host_value = torch.arange(16)
+        c._evict_backuped(tail)  # tail [16, 32) lives only in EIC
+
+        a = c.match_prefix(MatchPrefixParams(key=key))
+        c.load_back(a.best_match_node)  # A kicks the load; DMA in flight
+        b = c.match_prefix(MatchPrefixParams(key=key))
+        self.assertTrue(c.prefix_loading(b.last_device_node))  # B defers
+        c._free_failed_loadback(tail.id, 0)  # the whole tail's mget failed
+
+        b = c.match_prefix(MatchPrefixParams(key=key))  # B retries after settle
+        self.assertFalse(c.prefix_loading(b.last_device_node))
+        b_kv = torch.cat([b.device_indices, alloc(32 - len(b.device_indices))])
+        c.inc_lock_ref(b.last_device_node)
+        prefix_len = c.insert(InsertParams(key=key, value=b_kv)).prefix_len
+        free(b_kv[len(b.device_indices) : prefix_len])
+        c.dec_lock_ref(b.last_device_node)
+
+        cached = set()
+        stack = list(c.root_node.children.values())
+        while stack:
+            n = stack.pop()
+            if n.value is not None:
+                cached.update(n.value.tolist())
+            stack.extend(n.children.values())
+        self.assertFalse(cached & free_ids)
+        self.assertEqual(
+            len(free_ids) + c.evictable_size_ + c.protected_size_, total
+        )
+
+    def test_chunk_insert_through_inflight_load_keeps_pool_invariant(self):
+        # A running chunked req recomputing the same prefix reaches the in-flight
+        # tail T at its next chunk boundary. Inserting then would free its own KV
+        # and adopt T's still-landing slots; after T's load fails and the req
+        # finishes, those slots would be both free and cached.
+        total = 64
+        c, alloc, free, free_ids = self._make_pool_cache(total, page=4)
+        c.cache_controller.write_page = lambda **kw: None
+        key = RadixKey(list(range(32)), None)
+        c.insert(InsertParams(key=key, value=alloc(32)))
+        head = c.root_node.children[key.child_key(4)]
+        tail = head
+        head = c._split_node(tail.key, tail, 16)
+        tail.host_value = torch.arange(16)
+        c._evict_backuped(tail)
+
+        # The chunked req holds the shared head and its own recomputed tail.
+        own = torch.cat([head.value, alloc(16)])
+        r2t = own.view(1, -1).clone()
+        c.req_to_token_pool = SimpleNamespace(
+            req_to_token=r2t, write=lambda idx, v: r2t.__setitem__(idx, v)
+        )
+        req = SimpleNamespace(
+            fill_ids=list(range(32)), extra_key=None, req_pool_idx=0,
+            cache_protected_len=16, last_node=head, prefix_indices=own[:16],
+        )
+        c.inc_lock_ref(head)
+
+        c.load_back(c.match_prefix(MatchPrefixParams(key=key)).best_match_node)
+        c.cache_unfinished_req(req, chunked=True)  # chunk boundary mid-load
+        c._free_failed_loadback(tail.id, 0)
+
+        kv = c.req_to_token_pool.req_to_token[0, :32].to(torch.int64)
+        prefix_len = c.insert(InsertParams(key=key, value=kv)).prefix_len
+        free(kv[req.cache_protected_len : prefix_len])
+        c.dec_lock_ref(req.last_node)
+
+        cached = set()
+        stack = list(c.root_node.children.values())
+        while stack:
+            n = stack.pop()
+            if n.value is not None:
+                cached.update(n.value.tolist())
+            stack.extend(n.children.values())
+        self.assertFalse(cached & free_ids)
+        self.assertEqual(
+            len(free_ids) + c.evictable_size_ + c.protected_size_, total
+        )
+
+    def test_partial_mget_refetches_only_failed_keys(self):
+        # A partial mget (per-key RPC timeouts) used to cut the load at the first
+        # failed key, discarding every later page that did arrive. The failed keys
+        # are re-got once into their own buffers; the device copy then covers the
+        # whole batch, and a key that fails again still cuts the prefix there.
+        from sglang.srt.mem_cache import eic_memory_pool as pool_mod
+
+        S = SimpleNamespace(SUCCESS=0, FAILED=1, PARTIAL_FAILED=2)
+
+        class Buffers(list):
+            def append(self, ptr, size, registered):
+                super().append(ptr)
+
+        fake_eic = SimpleNamespace(
+            StatusCode=S, StringVector=list, IOBuffers=Buffers,
+            GetOption=lambda: SimpleNamespace(),
+        )
+        objs = [torch.zeros(2) for _ in range(4)]
+        client = object.__new__(pool_mod.EICKVClient)
+        client.eic_namespace = "ns"
+        client.allocate_eic_read_buffer = lambda n: (objs, None, list(range(n)), True)
+        client.kv_cache_read_mem_pool = SimpleNamespace(free_to_mempool=lambda p: None)
+        calls = []
+
+        def mget(keys, option, vals):
+            calls.append((list(keys), list(vals)))
+            if len(calls) == 1:
+                codes = [S.SUCCESS, S.FAILED, S.SUCCESS, S.FAILED]
+                return S.PARTIAL_FAILED, vals, SimpleNamespace(status_codes=codes)
+            return S.SUCCESS, vals, SimpleNamespace(status_codes=[S.SUCCESS] * 2)
+
+        client.connection = SimpleNamespace(mget=mget)
+        copied = []
+        with mock.patch.object(pool_mod, "eic", fake_eic):
+            _, mask = client.batch_get(
+                ["k0", "k1", "k2", "k3"], torch.arange(4),
+                copy_func=lambda dev, pool, idx: copied.append(list(idx)),
+            )
+        self.assertEqual(calls[1], (["k1", "k3"], [objs[1].data_ptr(), objs[3].data_ptr()]))
+        self.assertEqual(mask, [True] * 4)
+        self.assertEqual(copied, [[0, 1, 2, 3]])
+
+        calls.clear()
+        copied.clear()
+
+        def mget_k3_fails_again(keys, option, vals):
+            calls.append(list(keys))
+            if len(calls) == 1:
+                codes = [S.SUCCESS, S.FAILED, S.SUCCESS, S.FAILED]
+            else:
+                codes = [S.SUCCESS, S.FAILED]
+            return S.PARTIAL_FAILED, vals, SimpleNamespace(status_codes=codes)
+
+        client.connection = SimpleNamespace(mget=mget_k3_fails_again)
+        with mock.patch.object(pool_mod, "eic", fake_eic):
+            _, mask = client.batch_get(
+                ["k0", "k1", "k2", "k3"], torch.arange(4),
+                copy_func=lambda dev, pool, idx: copied.append(list(idx)),
+            )
+        self.assertEqual(mask, [True, True, True, False])
+        self.assertEqual(copied, [[0, 1, 2]])
+
+        calls.clear()
+
+        def mget_mostly_down(keys, option, vals):
+            calls.append(list(keys))
+            codes = [S.SUCCESS, S.FAILED, S.FAILED, S.FAILED]
+            return S.PARTIAL_FAILED, vals, SimpleNamespace(status_codes=codes)
+
+        client.connection = SimpleNamespace(mget=mget_mostly_down)
+        with mock.patch.object(pool_mod, "eic", fake_eic):
+            _, mask = client.batch_get(["k0", "k1", "k2", "k3"])
+        self.assertEqual(len(calls), 1)  # backend down: no retry round
+        self.assertEqual(mask, [True, False, False, False])
+
+    def test_match_stops_at_resident_node_under_evicted_gap(self):
+        # A failed load-back frees a chain node whose child was inserted while
+        # the load was in flight, leaving resident KV under an evicted gap. The
+        # match used to append that child's slots after the prefix above the gap,
+        # splicing KV from non-adjacent positions into one prefix.
+        c, alloc, free, free_ids = self._make_pool_cache(64, page=4)
+        key = RadixKey(list(range(24)), None)
+        c.insert(InsertParams(key=key, value=alloc(24)))
+        low = c.root_node.children[key.child_key(4)]
+        mid = c._split_node(low.key, low, 16)
+        top = c._split_node(mid.key, mid, 8)
+        mid.host_value = torch.arange(8)
+        free(mid.value)
+        c.evictable_size_ -= len(mid.value)
+        mid.value = None  # the gap [8, 16); `low` [16, 24) stays resident
+
+        m = c.match_prefix(MatchPrefixParams(key=key))
+        self.assertEqual(m.device_indices.tolist(), top.value.tolist())
+        self.assertIs(m.last_device_node, top)
+        self.assertEqual(m.host_hit_length, 8)
+
+    def test_prefix_loading_covers_split_chain_until_settled(self):
+        cache = object.__new__(EICPagedHiRadixCache)
+        cache.pp_size = 1
+        root = TreeNode()
+        cache.root_node = root
+        a = TreeNode()  # resident ancestor the load hangs from
+        a.parent = root
+        t = TreeNode()  # load chain bottom
+        t.parent = a
+        child = TreeNode()
+        child.parent = t
+        cache.ongoing_load_back = {t.id: (a, t, 256)}
+        self.assertFalse(cache.prefix_loading(a))
+        self.assertTrue(cache.prefix_loading(t))
+        self.assertTrue(cache.prefix_loading(child))
+        upper = TreeNode()  # a match split T: upper half sits between a and t
+        upper.parent, t.parent = a, upper
+        self.assertTrue(cache.prefix_loading(upper))
+        cache.ongoing_load_back.pop(t.id)  # _free_failed_loadback settled it
+        self.assertFalse(cache.prefix_loading(child))
 
     # ---- two-stage lockstep protocol tests --------------------------------
 
