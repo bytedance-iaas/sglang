@@ -1396,6 +1396,11 @@ class EICHiRadixCache(RadixCache):
 
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
+            if node.evicted and not child.evicted:
+                # A resident node under an evicted one (left by a failed
+                # load-back) is unusable until the gap reloads: appending it
+                # would splice KV across the gap.
+                break
             child.last_access_time = time.monotonic()
             prefix_len = child.key.match(key, page_size=self.page_size)
             if prefix_len < len(child.key):

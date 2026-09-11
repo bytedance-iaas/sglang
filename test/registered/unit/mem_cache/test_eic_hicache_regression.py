@@ -588,6 +588,40 @@ class TestEICHiCacheRegression(unittest.TestCase):
         self.assertEqual(mask, [True, True, True, False])
         self.assertEqual(copied, [[0, 1, 2]])
 
+        calls.clear()
+
+        def mget_mostly_down(keys, option, vals):
+            calls.append(list(keys))
+            codes = [S.SUCCESS, S.FAILED, S.FAILED, S.FAILED]
+            return S.PARTIAL_FAILED, vals, SimpleNamespace(status_codes=codes)
+
+        client.connection = SimpleNamespace(mget=mget_mostly_down)
+        with mock.patch.object(pool_mod, "eic", fake_eic):
+            _, mask = client.batch_get(["k0", "k1", "k2", "k3"])
+        self.assertEqual(len(calls), 1)  # backend down: no retry round
+        self.assertEqual(mask, [True, False, False, False])
+
+    def test_match_stops_at_resident_node_under_evicted_gap(self):
+        # A failed load-back frees a chain node whose child was inserted while
+        # the load was in flight, leaving resident KV under an evicted gap. The
+        # match used to append that child's slots after the prefix above the gap,
+        # splicing KV from non-adjacent positions into one prefix.
+        c, alloc, free, free_ids = self._make_pool_cache(64, page=4)
+        key = RadixKey(list(range(24)), None)
+        c.insert(InsertParams(key=key, value=alloc(24)))
+        low = c.root_node.children[key.child_key(4)]
+        mid = c._split_node(low.key, low, 16)
+        top = c._split_node(mid.key, mid, 8)
+        mid.host_value = torch.arange(8)
+        free(mid.value)
+        c.evictable_size_ -= len(mid.value)
+        mid.value = None  # the gap [8, 16); `low` [16, 24) stays resident
+
+        m = c.match_prefix(MatchPrefixParams(key=key))
+        self.assertEqual(m.device_indices.tolist(), top.value.tolist())
+        self.assertIs(m.last_device_node, top)
+        self.assertEqual(m.host_hit_length, 8)
+
     def test_prefix_loading_covers_split_chain_until_settled(self):
         cache = object.__new__(EICPagedHiRadixCache)
         cache.pp_size = 1

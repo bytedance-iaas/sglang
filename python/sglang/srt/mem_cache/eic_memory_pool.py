@@ -518,10 +518,15 @@ class EICKVClient:
         # Partial mget failures are per-key RPC timeouts on a loaded backend, and
         # the load keeps only the prefix before the first failed key. Re-getting
         # just the failed keys once, into their own buffers, saves the rest from
-        # recompute. A missing status counts as failed.
+        # recompute. A missing status counts as failed. ponytail: one retry, only
+        # when at most half failed; per-key backoff if the backend flaps.
         codes = list(outcome.status_codes)[: len(keys)]
         codes += [None] * (len(keys) - len(codes))
         failed = [i for i, c in enumerate(codes) if c != eic.StatusCode.SUCCESS]
+        if 2 * len(failed) > len(keys):
+            # Most keys failing means the backend itself is down; a retry would
+            # only stall the serial load thread for another timeout round.
+            return eic.StatusCode.PARTIAL_FAILED, SimpleNamespace(status_codes=codes)
         retry_keys, retry_vals = eic.StringVector(), eic.IOBuffers()
         for i in failed:
             retry_keys.append(keys[i])
