@@ -237,6 +237,8 @@ class TreeNode:
         self.hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
         self.priority = priority
+        # per-page content hashes, populated by the block-wise (EIC) caches
+        self.content_hash: Optional[List[str]] = None
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
