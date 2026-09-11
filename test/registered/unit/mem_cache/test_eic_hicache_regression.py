@@ -9,10 +9,13 @@ import torch
 from sglang.srt.managers.eic_cache_controller import (
     EICCacheController,
     EICCacheOperation,
+    get_content_hash,
 )
 from sglang.srt.mem_cache.eic_chunk_cache import EICChunkCache
 from sglang.srt.mem_cache.eic_pp_reconcile import EICPPReconciler
 from sglang.srt.mem_cache.eic_hiradix_cache import EICPagedHiRadixCache
+from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
+from sglang.srt.mem_cache.radix_cache import RadixKey, TreeNode
 from sglang.srt.mem_cache.unified_cache_components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -393,6 +396,106 @@ class TestEICHiCacheRegression(unittest.TestCase):
         self.assertIs(req.last_node, node_c)  # resident node at depth 14, not node_d
         req.set_extend_input_len.assert_called_once_with(20 - 14)
         self.assertEqual(req.eic_loaded_len, 10)
+
+    def _make_pool_cache(self, total, page):
+        free_ids = set(range(1, total + 1))
+
+        def alloc(n):
+            ids = sorted(free_ids)[:n]
+            free_ids.difference_update(ids)
+            return torch.tensor(ids, dtype=torch.int64)
+
+        def free(t):
+            ids = set(t.tolist())
+            self.assertFalse(ids & free_ids, "double free")
+            free_ids.update(ids)
+
+        def evict_device(dev, host):
+            free(dev)
+            return len(dev)
+
+        c = object.__new__(EICPagedHiRadixCache)
+        c.disable, c.is_eagle, c.page_size, c.device = False, False, page, "cpu"
+        c.sliding_window_size, c.pp_size = None, 1
+        c.evictable_size_ = c.protected_size_ = 0
+        c.evictable_leaves = set()
+        c.write_through_threshold = 10**9
+        c.load_back_threshold, c.load_back_check = 0, False
+        c.ongoing_load_back = {}
+        c.calculate_hash_fn = get_content_hash
+        c.cache_controller = SimpleNamespace(
+            write_policy="write_through",
+            mem_pool_device_allocator=SimpleNamespace(free=free),
+            evict_device=evict_device,
+            load_page=lambda host_indices, node_id, content_hash: alloc(
+                len(host_indices)
+            ),
+        )
+        root = TreeNode()
+        root.key, root.value, root.lock_ref = RadixKey([], None), [], 1
+        c.root_node = root
+        return c, alloc, free, free_ids
+
+    def test_failed_load_under_same_prefix_req_keeps_pool_invariant(self):
+        # Chat cc32 crash: req A's load of a shared-prefix tail T failed while req
+        # B, admitted mid-load, had matched T's in-flight slots as a GPU hit. The
+        # failed-tail free returned them to the allocator and B's insert re-linked
+        # them into T: available + evictable exceeded total by exactly T.
+        total = 64
+        c, alloc, free, free_ids = self._make_pool_cache(total, page=4)
+        key = RadixKey(list(range(32)), None)
+        c.insert(InsertParams(key=key, value=alloc(32)))
+        tail = c.root_node.children[key.child_key(4)]
+        c._split_node(tail.key, tail, 16)
+        tail.host_value = torch.arange(16)
+        c._evict_backuped(tail)  # tail [16, 32) lives only in EIC
+
+        a = c.match_prefix(MatchPrefixParams(key=key))
+        c.load_back(a.best_match_node)  # A kicks the load; DMA in flight
+        b = c.match_prefix(MatchPrefixParams(key=key))
+        self.assertTrue(c.prefix_loading(b.last_device_node))  # B defers
+        c._free_failed_loadback(tail.id, 0)  # the whole tail's mget failed
+
+        b = c.match_prefix(MatchPrefixParams(key=key))  # B retries after settle
+        self.assertFalse(c.prefix_loading(b.last_device_node))
+        b_kv = torch.cat([b.device_indices, alloc(32 - len(b.device_indices))])
+        c.inc_lock_ref(b.last_device_node)
+        prefix_len = c.insert(InsertParams(key=key, value=b_kv)).prefix_len
+        free(b_kv[len(b.device_indices) : prefix_len])
+        c.dec_lock_ref(b.last_device_node)
+
+        cached = set()
+        stack = list(c.root_node.children.values())
+        while stack:
+            n = stack.pop()
+            if n.value is not None:
+                cached.update(n.value.tolist())
+            stack.extend(n.children.values())
+        self.assertFalse(cached & free_ids)
+        self.assertEqual(
+            len(free_ids) + c.evictable_size_ + c.protected_size_, total
+        )
+
+    def test_prefix_loading_covers_split_chain_until_settled(self):
+        cache = object.__new__(EICPagedHiRadixCache)
+        cache.pp_size = 1
+        root = TreeNode()
+        cache.root_node = root
+        a = TreeNode()  # resident ancestor the load hangs from
+        a.parent = root
+        t = TreeNode()  # load chain bottom
+        t.parent = a
+        child = TreeNode()
+        child.parent = t
+        cache.ongoing_load_back = {t.id: (a, t, 256)}
+        self.assertFalse(cache.prefix_loading(a))
+        self.assertTrue(cache.prefix_loading(t))
+        self.assertTrue(cache.prefix_loading(child))
+        upper = TreeNode()  # a match split T: upper half sits between a and t
+        upper.parent, t.parent = a, upper
+        self.assertTrue(cache.prefix_loading(upper))
+        cache.ongoing_load_back.pop(t.id)  # _free_failed_loadback settled it
+        self.assertFalse(cache.prefix_loading(child))
 
     # ---- two-stage lockstep protocol tests --------------------------------
 

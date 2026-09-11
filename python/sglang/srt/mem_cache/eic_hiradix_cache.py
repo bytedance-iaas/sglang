@@ -911,6 +911,26 @@ class EICHiRadixCache(RadixCache):
             else:
                 self._queue_report(st, self._KIND_FINAL, st["d"] + complete_token)
 
+    def prefix_loading(self, node: TreeNode) -> bool:
+        # load_back publishes node.value before its DMA acks. A req adopting those
+        # slots reads KV that is still landing, and if the load fails the tail is
+        # freed under it; its insert then re-links the freed slots into the tree
+        # (a page both free and cached). Such a req must wait for the load to settle.
+        if not self.ongoing_load_back or self.pp_size > 1:
+            # ponytail: PP stages hold per-stage chains, so deferring here would fork
+            # admission across stages; PP>1 still adopts in-flight slots.
+            return False
+        loading = set()
+        for start, end, _ in self.ongoing_load_back.values():
+            while end is not start:
+                loading.add(end.id)
+                end = end.parent
+        while node is not None and node is not self.root_node:
+            if node.id in loading:
+                return True
+            node = node.parent
+        return False
+
     def _free_failed_loadback(self, node_id, complete_token):
         # Local cleanup: release the load lock and free the failed-load tail so the
         # tree never holds garbage KV. Per-stage; the tree may diverge across PP.
