@@ -526,6 +526,68 @@ class TestEICHiCacheRegression(unittest.TestCase):
             len(free_ids) + c.evictable_size_ + c.protected_size_, total
         )
 
+    def test_partial_mget_refetches_only_failed_keys(self):
+        # A partial mget (per-key RPC timeouts) used to cut the load at the first
+        # failed key, discarding every later page that did arrive. The failed keys
+        # are re-got once into their own buffers; the device copy then covers the
+        # whole batch, and a key that fails again still cuts the prefix there.
+        from sglang.srt.mem_cache import eic_memory_pool as pool_mod
+
+        S = SimpleNamespace(SUCCESS=0, FAILED=1, PARTIAL_FAILED=2)
+
+        class Buffers(list):
+            def append(self, ptr, size, registered):
+                super().append(ptr)
+
+        fake_eic = SimpleNamespace(
+            StatusCode=S, StringVector=list, IOBuffers=Buffers,
+            GetOption=lambda: SimpleNamespace(),
+        )
+        objs = [torch.zeros(2) for _ in range(4)]
+        client = object.__new__(pool_mod.EICKVClient)
+        client.eic_namespace = "ns"
+        client.allocate_eic_read_buffer = lambda n: (objs, None, list(range(n)), True)
+        client.kv_cache_read_mem_pool = SimpleNamespace(free_to_mempool=lambda p: None)
+        calls = []
+
+        def mget(keys, option, vals):
+            calls.append((list(keys), list(vals)))
+            if len(calls) == 1:
+                codes = [S.SUCCESS, S.FAILED, S.SUCCESS, S.FAILED]
+                return S.PARTIAL_FAILED, vals, SimpleNamespace(status_codes=codes)
+            return S.SUCCESS, vals, SimpleNamespace(status_codes=[S.SUCCESS] * 2)
+
+        client.connection = SimpleNamespace(mget=mget)
+        copied = []
+        with mock.patch.object(pool_mod, "eic", fake_eic):
+            _, mask = client.batch_get(
+                ["k0", "k1", "k2", "k3"], torch.arange(4),
+                copy_func=lambda dev, pool, idx: copied.append(list(idx)),
+            )
+        self.assertEqual(calls[1], (["k1", "k3"], [objs[1].data_ptr(), objs[3].data_ptr()]))
+        self.assertEqual(mask, [True] * 4)
+        self.assertEqual(copied, [[0, 1, 2, 3]])
+
+        calls.clear()
+        copied.clear()
+
+        def mget_k3_fails_again(keys, option, vals):
+            calls.append(list(keys))
+            if len(calls) == 1:
+                codes = [S.SUCCESS, S.FAILED, S.SUCCESS, S.FAILED]
+            else:
+                codes = [S.SUCCESS, S.FAILED]
+            return S.PARTIAL_FAILED, vals, SimpleNamespace(status_codes=codes)
+
+        client.connection = SimpleNamespace(mget=mget_k3_fails_again)
+        with mock.patch.object(pool_mod, "eic", fake_eic):
+            _, mask = client.batch_get(
+                ["k0", "k1", "k2", "k3"], torch.arange(4),
+                copy_func=lambda dev, pool, idx: copied.append(list(idx)),
+            )
+        self.assertEqual(mask, [True, True, True, False])
+        self.assertEqual(copied, [[0, 1, 2]])
+
     def test_prefix_loading_covers_split_chain_until_settled(self):
         cache = object.__new__(EICPagedHiRadixCache)
         cache.pp_size = 1

@@ -5,6 +5,7 @@ import queue
 import threading
 import time
 from enum import IntEnum
+from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
 import torch
@@ -513,6 +514,37 @@ class EICKVClient:
             indices = range(count)
         return tensors, host_memory_pool, indices, registered
 
+    def _refetch_failed(self, keys, objs, registered, get_option, outcome):
+        # Partial mget failures are per-key RPC timeouts on a loaded backend, and
+        # the load keeps only the prefix before the first failed key. Re-getting
+        # just the failed keys once, into their own buffers, saves the rest from
+        # recompute. A missing status counts as failed.
+        codes = list(outcome.status_codes)[: len(keys)]
+        codes += [None] * (len(keys) - len(codes))
+        failed = [i for i, c in enumerate(codes) if c != eic.StatusCode.SUCCESS]
+        retry_keys, retry_vals = eic.StringVector(), eic.IOBuffers()
+        for i in failed:
+            retry_keys.append(keys[i])
+            retry_vals.append(
+                objs[i].data_ptr(), objs[i].element_size() * objs[i].numel(), registered
+            )
+        status, _, retry_outcome = self.connection.mget(
+            retry_keys, get_option, retry_vals
+        )
+        retry_codes = list(retry_outcome.status_codes)
+        for j, i in enumerate(failed):
+            if status == eic.StatusCode.SUCCESS or (
+                status == eic.StatusCode.PARTIAL_FAILED
+                and j < len(retry_codes)
+                and retry_codes[j] == eic.StatusCode.SUCCESS
+            ):
+                codes[i] = eic.StatusCode.SUCCESS
+        recovered = sum(codes[i] == eic.StatusCode.SUCCESS for i in failed)
+        logger.info(f"eic mget refetched {len(failed)} failed keys, {recovered} recovered")
+        ok = all(c == eic.StatusCode.SUCCESS for c in codes)
+        status = eic.StatusCode.SUCCESS if ok else eic.StatusCode.PARTIAL_FAILED
+        return status, SimpleNamespace(status_codes=codes)
+
     def batch_get(
         self, keys: List[str], device_indices: torch.Tensor = None, copy_func=None
     ) -> Tuple[Optional[List[torch.Tensor]], List[bool]]:
@@ -542,6 +574,10 @@ class EICKVClient:
         status_code, data_vals, get_outcome = self.connection.mget(
             data_keys, get_option, data_vals
         )
+        if status_code == eic.StatusCode.PARTIAL_FAILED:
+            status_code, get_outcome = self._refetch_failed(
+                keys, objs, registered, get_option, get_outcome
+            )
 
         result = []
         device_copy = False
