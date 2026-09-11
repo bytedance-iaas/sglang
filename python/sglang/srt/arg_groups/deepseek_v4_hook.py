@@ -251,7 +251,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "context parallelism",
                 cfg.enable_prefill_context_parallel or cfg.attn_cp_size > 1,
             ),
-            ("HiCache", cfg.enable_hierarchical_cache),
             ("external cache linker", cfg.enable_unified_cache_external_linker),
             ("unified memory", cfg.enable_unified_memory),
             ("PD disaggregation", cfg.disaggregation_mode != "null"),
@@ -290,6 +289,27 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             raise ValueError(
                 f"DeepSeek-V4.1 does not support {feature} yet; disable it to "
                 "serve this model."
+            )
+
+    if cfg.disaggregation_mode != "null" and cfg.speculative_algorithm is not None:
+        from sglang.srt.speculative.ragged_verify import (
+            RaggedVerifyMode,
+            read_ragged_verify_mode,
+        )
+
+        if (
+            read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
+            or cfg.disaggregation_transfer_backend != "mooncake"
+            or cfg.dp_size != 1
+            or cfg.enable_dp_attention
+            or cfg.attn_cp_size != 1
+            or cfg.dcp_size != 1
+            or cfg.enable_prefill_context_parallel
+        ):
+            raise ValueError(
+                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, "
+                "DP=1 and CP=1. Both servers must enable DSpark with the same "
+                "block size and TP size."
             )
 
     from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
