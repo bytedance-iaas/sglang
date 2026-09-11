@@ -158,3 +158,7 @@ def test_tilelang_consumer_and_graph(pool_size, queries):
     q.mul_(0.5)
     graph.replay()
     check(output)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
