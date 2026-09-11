@@ -21,6 +21,26 @@ def dequantize_k_cache(quant_k_cache, dv: int | None = None):
     return _dequantize_k_cache_fast_wrapped(quant_k_cache, dv=dv)
 
 
+def dequantize_sparse_nope_cache(
+    quant_k_cache: torch.Tensor, indices: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Read 528-byte FP8 KV while preserving invalid sparse-index masks."""
+    if (
+        quant_k_cache.ndim != 3
+        or quant_k_cache.shape[1:] != (1, 528)
+        or quant_k_cache.dtype != torch.float8_e4m3fn
+    ):
+        raise ValueError("expected [physical tokens, 1, 528] group-scaled FP8 NoPE KV")
+    if indices.numel() >= quant_k_cache.shape[0]:
+        return dequantize_k_cache(quant_k_cache), indices
+    valid = (indices >= 0) & (indices < quant_k_cache.shape[0])
+    safe_indices = torch.where(valid, indices, 0).flatten()
+    kv = dequantize_k_cache_paged(quant_k_cache, safe_indices)
+    remapped = torch.arange(indices.numel(), device=indices.device, dtype=indices.dtype)
+    remapped = torch.where(valid, remapped.view_as(indices), -1)
+    return kv, remapped
+
+
 def _dequantize_k_cache_fast_wrapped(
     quant_k_cache: torch.Tensor,
     dv: int | None = None,
