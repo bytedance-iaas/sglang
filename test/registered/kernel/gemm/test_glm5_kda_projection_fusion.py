@@ -2,6 +2,7 @@
 
 import sys
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -10,10 +11,11 @@ from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("mixed_fp8", [False, True])
 @pytest.mark.parametrize(
     "tp_size,tp_rank,attn_size,attn_rank",
     [
@@ -25,7 +27,7 @@ register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-large")
     ],
 )
 def test_bf16_projection_loading_and_outputs(
-    monkeypatch, tp_size, tp_rank, attn_size, attn_rank
+    monkeypatch, tp_size, tp_rank, attn_size, attn_rank, mixed_fp8
 ):
     import sglang.srt.layers.linear as linear
     import sglang.srt.models.glm5_next as glm
@@ -70,19 +72,39 @@ def test_bf16_projection_loading_and_outputs(
             "g_b_proj",
             "o_proj",
         )
-        # A non-null config must still select the existing unfused path, even
-        # if its attention weights are BF16. Use it as the public reference
-        # without introducing a production switch or changing the fusion gate.
-        unfused_config = Fp8Config(
+        mixed_config = Fp8Config(
             ignored_layers=[f"{prefix}.{name}" for name in projection_names]
         )
+        quant_config = mixed_config if mixed_fp8 else None
         with torch.device("cuda"):
-            fused = glm.Glm5NextLinearAttention(0, 256, config, prefix=prefix)
-            unfused = glm.Glm5NextLinearAttention(
-                0, 256, config, quant_config=unfused_config, prefix=prefix
+            fused = glm.Glm5NextLinearAttention(
+                0, 256, config, quant_config=quant_config, prefix=prefix
             )
+            # Construct the existing unfused reference with identical precision.
+            with patch.object(
+                glm, "are_linear_prefixes_unquantized", return_value=False
+            ):
+                unfused = glm.Glm5NextLinearAttention(
+                    0, 256, config, quant_config=quant_config, prefix=prefix
+                )
         assert fused.do_fuse_qkvbfg
         assert not unfused.do_fuse_qkvbfg
+
+        if mixed_fp8 and tp_size == 1:
+            for lora in (
+                SimpleNamespace(enable_lora=True, lora_paths=None),
+                SimpleNamespace(enable_lora=False, lora_paths=["adapter"]),
+            ):
+                with (
+                    torch.device("cuda"),
+                    patch.object(glm, "get_lora", return_value=lora),
+                ):
+                    with_lora = glm.Glm5NextLinearAttention(
+                        0, 256, config, quant_config=quant_config, prefix=prefix
+                    )
+                assert not with_lora.do_fuse_qkvbfg
+                assert hasattr(with_lora, "qkv_proj")
+                del with_lora
 
         generator = torch.Generator(device="cuda").manual_seed(5381)
         mapping = [
@@ -150,6 +172,40 @@ def test_bf16_projection_loading_and_outputs(
     finally:
         torch.set_default_dtype(old_dtype)
         reset_context()
+
+
+@pytest.mark.parametrize(
+    "quantized_projection",
+    [None, "qkv_proj", "b_proj", "f_a_proj", "f_b_proj", "g_a_proj", "g_b_proj"],
+)
+def test_fp8_projection_eligibility(quantized_projection):
+    from sglang.srt.layers.quantization.fp8 import Fp8Config
+    from sglang.srt.layers.quantization.utils import are_linear_prefixes_unquantized
+
+    prefix = "model.layers.0.self_attn"
+    names = ("qkv_proj", "b_proj", "f_a_proj", "f_b_proj", "g_a_proj", "g_b_proj")
+    ignored = []
+    for name in names:
+        if name == quantized_projection:
+            continue
+        # Exercise the checkpoint's unfused Q/K/V names too.
+        for shard in ("q_proj", "k_proj", "v_proj") if name == "qkv_proj" else (name,):
+            ignored.append(f"{prefix}.{shard}")
+    config = Fp8Config(ignored_layers=ignored)
+    assert are_linear_prefixes_unquantized(
+        config, [f"{prefix}.{name}" for name in names]
+    ) == (quantized_projection is None)
+
+
+def test_fusion_does_not_probe_other_quant_configs():
+    from sglang.srt.layers.quantization.fp8 import Fp8Config
+    from sglang.srt.layers.quantization.utils import are_linear_prefixes_unquantized
+
+    class ClassSensitiveConfig(Fp8Config):
+        def get_quant_method(self, layer, prefix):
+            raise AssertionError("A base-class probe cannot resolve this config")
+
+    assert not are_linear_prefixes_unquantized(ClassSensitiveConfig(), ["qkv_proj"])
 
 
 if __name__ == "__main__":
