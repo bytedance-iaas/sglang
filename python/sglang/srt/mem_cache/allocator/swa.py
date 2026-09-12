@@ -20,6 +20,9 @@ if _is_npu:
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """Allocator for SWA hybrid KV cache."""
 
+    # Set by the EIC caches, which alias FULL spans onto reused SWA slots.
+    dedup_aliased_swa: bool = False
+
     def __init__(
         self,
         size: int,
@@ -354,7 +357,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             mapping_indices = self._expand_to_full_pages(free_index)
 
         swa_indices = self.full_to_swa_index_mapping[mapping_indices]
-        swa_indices = swa_indices[swa_indices > 0]
+        if self.dedup_aliased_swa:
+            # Skip the reserved page and free each aliased SWA slot once.
+            swa_indices = torch.unique(swa_indices[swa_indices >= self.page_size])
+        else:
+            swa_indices = swa_indices[swa_indices > 0]
         self.swa_attn_allocator.free(swa_indices)
         self.full_to_swa_index_mapping[mapping_indices] = 0
 
