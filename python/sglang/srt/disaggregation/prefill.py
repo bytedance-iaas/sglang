@@ -47,6 +47,7 @@ from sglang.srt.disaggregation.utils import (
     build_staging_slot_metadata,
     get_dsv4_c128_state_indices,
     get_kv_class,
+    get_qsa_pending_state_indices,
     is_aborted,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
@@ -1248,6 +1249,11 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
                 return kv_to_page_indices(kv_indices_full, page_size)
 
+            def _qsa_pending_payload():
+                # Raw index-K/RoPE state is one full compression-group ring per
+                # request, addressed by the request-pool slot rather than KV pages.
+                return get_qsa_pending_state_indices(req)
+
             def _swa_ring_payload():
                 # Unified_kv SWA ring rows (req_pool_idx*ring_stride + pos%ring_stride)
                 # for the last `window` positions, in ascending position order so
@@ -1282,6 +1288,8 @@ class SchedulerDisaggregationPrefillMixin:
             )
             payloads = {
                 StateType.MAMBA: _mamba_payload,
+                StateType.QSA_PENDING: _qsa_pending_payload,
+                StateType.QSA_COMPRESSED: _full_kv_pages_payload,
                 StateType.SWA: _swa_payload,
                 StateType.DSA: _full_kv_pages_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
