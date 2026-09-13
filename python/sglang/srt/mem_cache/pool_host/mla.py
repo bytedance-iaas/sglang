@@ -18,7 +18,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
-from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, MLATokenToKVPoolFP4
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
@@ -71,6 +71,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
         self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
+        self._check_host_row_geometry(device_pool, pool_label)
         super().__init__(
             device_pool,
             host_to_device_ratio,
@@ -113,6 +114,31 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 buffer for pool in device_pools for buffer in pool.kv_buffer
             ]
         self._init_write_back_staging_buffers()
+
+    def _check_host_row_geometry(self, device_pool, pool_label: str) -> None:
+        pools = (device_pool, *self.mtp_draft_device_pools)
+        if any(isinstance(pool, MLATokenToKVPoolFP4) for pool in pools):
+            raise NotImplementedError(
+                "HiCache does not support FP4 MLA KV rows and their separate scale buffers."
+            )
+        host_dim = self.override_kv_cache_dim or (
+            device_pool.kv_lora_rank + device_pool.qk_rope_head_dim
+        )
+        target_dim = getattr(device_pool, "kv_cache_dim", host_dim)
+        if host_dim != target_dim:
+            raise ValueError(
+                f"HiCache {pool_label} host row width {host_dim} differs from "
+                f"device width {target_dim}; set override_kv_cache_dim to the device width."
+            )
+        for draft_id, pool in enumerate(self.mtp_draft_device_pools):
+            if (
+                pool.store_dtype != device_pool.store_dtype
+                or pool.kv_cache_dim != target_dim
+            ):
+                raise ValueError(
+                    f"HiCache {pool_label} draft pool {draft_id} must match "
+                    "the target row width and storage dtype when packed."
+                )
 
     def get_contiguous_buf_infos(self):
         """Return (data_ptrs, data_lens, item_lens) in the same format as device pool,

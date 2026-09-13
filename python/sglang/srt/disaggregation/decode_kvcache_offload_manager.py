@@ -63,6 +63,11 @@ class DecodeKVCacheOffloadManager:
             kv_pool=kv_cache,
             page_size=self.page_size,
             use_mla=isinstance(kv_cache, MLATokenToKVPool),
+            override_kv_cache_dim=(
+                kv_cache.kv_cache_dim
+                if isinstance(kv_cache, MLATokenToKVPool)
+                else None
+            ),
         )
 
         self.tp_group = tp_group

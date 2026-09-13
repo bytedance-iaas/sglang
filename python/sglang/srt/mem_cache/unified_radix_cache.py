@@ -400,11 +400,6 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
-        if self.page_size != self._transfer_page_size:
-            raise ValueError(
-                "Compressed DSA HiCache requires index-buffer restore support; "
-                "only device-resident caching is supported."
-            )
         self.host_memory_mode = get_memory().hicache_host_memory_mode
         if self.host_memory_mode == "buffer_only":
             # TODO(Jialin): Extend buffer-only state handoff to Mamba in a
@@ -431,6 +426,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Parse storage config once, share with assembler and tree
         storage_backend = get_memory().hicache_storage_backend
+        if storage_backend is not None and self.page_size != params.page_size:
+            raise ValueError(
+                "Compressed DSA currently supports L2 HiCache only; "
+                "storage hashes and transfers require matching page sizes."
+            )
         storage_extra_config = None
         storage_prefetch_threshold = 256
         prefetch_timeout_base = 1.0
@@ -2751,6 +2751,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 "HiCache is not initialized; launch with "
                 "--enable-hierarchical-cache to attach a storage backend.",
             )
+        if self.page_size != self.cache_controller.page_size:
+            return False, "Compressed DSA currently supports L2 HiCache only."
         return self._storage_attachment.attach(
             storage_backend=storage_backend,
             storage_backend_extra_config_json=storage_backend_extra_config_json,
