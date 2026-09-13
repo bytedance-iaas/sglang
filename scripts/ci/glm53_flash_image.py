@@ -241,7 +241,9 @@ def verify_install(runtime=False):
     for entry in document["files"]:
         if entry["path"].startswith("python/sglang/") and entry["path"].endswith(".py"):
             relative = entry["path"].removeprefix("python/sglang/")
-            if relative.startswith("kernels/aot/"):
+            if relative.startswith("kernels/aot/") or any(
+                part.startswith(".") for part in Path(relative).parts
+            ):
                 continue
             require(
                 sha256(installed_root / relative) == entry["sha256"],
