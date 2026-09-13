@@ -19,11 +19,13 @@ from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
     _PP_DISAGG_SCHEDULER_FENCE_PHASES,
     SchedulerPPMixin,
     _pp_attention_dp_control_ranks,
+    _pp_can_skip_output_comm,
     _pp_disagg_scheduler_fence_specs,
     _pp_fence_scheduler_phase,
     _pp_pack_control_ring_message,
     _pp_unpack_control_ring_message,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -76,6 +78,40 @@ def _make_receiver(ps: ParallelState) -> SchedulerRequestReceiver:
 
 
 class TestPPCPRankOffsets(unittest.TestCase):
+    def test_pp_output_skip_is_limited_to_pure_middle_prefill_chunk(self):
+        def batch(**overrides):
+            values = dict(
+                forward_mode=ForwardMode.EXTEND,
+                reqs=[object()],
+                contains_last_prefill_chunk=False,
+                return_logprob=False,
+            )
+            values.update(overrides)
+            return SimpleNamespace(**values)
+
+        with patch(
+            "sglang.srt.managers.scheduler_pp_mixin.envs."
+            "SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get",
+            return_value=True,
+        ):
+            self.assertTrue(_pp_can_skip_output_comm(batch()))
+            self.assertFalse(
+                _pp_can_skip_output_comm(batch(contains_last_prefill_chunk=True))
+            )
+            self.assertFalse(_pp_can_skip_output_comm(batch(return_logprob=True)))
+            self.assertFalse(_pp_can_skip_output_comm(batch(reqs=[object(), object()])))
+            self.assertFalse(
+                _pp_can_skip_output_comm(batch(forward_mode=ForwardMode.DECODE))
+            )
+            self.assertFalse(_pp_can_skip_output_comm(None))
+
+        with patch(
+            "sglang.srt.managers.scheduler_pp_mixin.envs."
+            "SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get",
+            return_value=False,
+        ):
+            self.assertFalse(_pp_can_skip_output_comm(batch()))
+
     def test_nccl_prewarm_initializes_proxy_and_output_pp_channels(self):
         tp_handle = object()
         proxy_handle = object()
@@ -281,6 +317,62 @@ class TestPPCPRankOffsets(unittest.TestCase):
         )
         schedule_stream.synchronize.assert_called_once_with()
         scheduler._pp_send_output_to_next_stage.assert_not_called()
+
+    def test_pp_disagg_pure_middle_chunk_skips_immediate_output_relay(self):
+        recorded_event = Mock()
+        schedule_stream = SimpleNamespace(synchronize=Mock())
+        target = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            reqs=[object()],
+            contains_last_prefill_chunk=False,
+            return_logprob=False,
+        )
+        metadata = SimpleNamespace(can_run_cuda_graph=False)
+        scheduler = SimpleNamespace(
+            device="cpu",
+            pp_group=SimpleNamespace(is_last_rank=False),
+            schedule_stream=schedule_stream,
+            device_module=SimpleNamespace(
+                Event=Mock(return_value=recorded_event),
+                current_stream=Mock(return_value=object()),
+            ),
+            _pp_make_skip_output_result=lambda batch, metadata: (
+                SchedulerPPMixin._pp_make_skip_output_result(scheduler, batch, metadata)
+            ),
+            _pp_recv_dict_from_prev_stage=Mock(),
+            _pp_send_dict_to_next_stage=Mock(),
+            _pp_send_output_to_next_stage=Mock(),
+            _pp_commit_comm_work=Mock(),
+        )
+
+        with patch(
+            "sglang.srt.managers.scheduler_pp_mixin.envs."
+            "SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get",
+            return_value=True,
+        ):
+            outputs, result, event, work = (
+                SchedulerPPMixin._pp_send_recv_and_preprocess_output_tensors(
+                    scheduler,
+                    next_first_rank_mb_id=0,
+                    next_mb_id=0,
+                    mbs=[target],
+                    mb_metadata=[metadata],
+                    last_rank_comm_queue=deque(),
+                    pp_outputs=None,
+                    relay_output_immediately=True,
+                )
+            )
+
+        self.assertIsNone(outputs)
+        self.assertTrue(result.skipped_output_comm)
+        self.assertEqual(result.next_token_ids.tolist(), [0])
+        self.assertIs(event, recorded_event)
+        self.assertEqual(work, [])
+        schedule_stream.synchronize.assert_not_called()
+        scheduler._pp_recv_dict_from_prev_stage.assert_not_called()
+        scheduler._pp_send_dict_to_next_stage.assert_not_called()
+        scheduler._pp_send_output_to_next_stage.assert_not_called()
+        scheduler._pp_commit_comm_work.assert_called_once_with([])
 
     def test_pp_disagg_output_ring_last_stage_starts_relay_chain(self):
         events = []
