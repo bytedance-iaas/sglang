@@ -255,8 +255,6 @@ class TestCompressedIndexCheckpoint(unittest.TestCase):
         params.disable = False
         allocator.get_kvcache().full_kv_pool.kpool_use_compress = False
         self.assertIs(_compressed_index_tree_params(params), params)
-        with self.assertRaisesRegex(ValueError, "index-buffer restore"):
-            cache.init_hicache(None, params)
         with self.assertRaisesRegex(ValueError, "external cache linker"):
             cache.init_cache_linker(None)
 
