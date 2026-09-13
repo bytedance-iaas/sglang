@@ -3594,6 +3594,7 @@ class DeepseekV4Model(nn.Module):
         dspark_aux_hidden_states: List[torch.Tensor],
         layer_ids: Sequence[int],
         prev_pre: Optional[torch.Tensor] = None,
+        vpp_tail_active: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
         assert self.pp_group.world_size == 1 or self.pipeline_layout.is_interleaved, (
             "pre-mix hand-off across ordinary PP is not wired"
@@ -3647,8 +3648,22 @@ class DeepseekV4Model(nn.Module):
             attn_backend = get_attn_backend()
             tail = attn_backend.tail_forward_metadata.late_layer_tail
         saved_full = None
+        if vpp_tail_active:
+            if tail is None:
+                raise RuntimeError("VPP tail continuation has no replay metadata")
+            if layer_ids[0] <= self.late_layer_start:
+                raise RuntimeError("VPP tail continuation precedes the replay boundary")
+            saved_full = attn_backend.enter_late_layer_tail(
+                forward_batch,
+                inherit_full_state=False,
+            )
+            input_ids = tail.rows(input_ids)
+            input_ids_global = tail.rows(input_ids_global)
+            positions = tail.positions
+            if hash_ids is not None:
+                hash_ids = tail.rows(hash_ids)
         for i in layer_ids:
-            if tail is not None and i == self.late_layer_start:
+            if tail is not None and not vpp_tail_active and i == self.late_layer_start:
                 # Past the last kv_source layer a layer only owes its window KV,
                 # and decode reaches back at most SWA_WINDOW positions.
                 saved_full = attn_backend.enter_late_layer_tail(forward_batch)
@@ -3856,10 +3871,22 @@ class DeepseekV4Model(nn.Module):
             return torch.empty(0, dtype=torch.int64, device=req_to_token.device)
         return torch.cat(page_ids)
 
+    def _vpp_attention_metadata(self, tail_active: bool):
+        attn_backend = get_attn_backend()
+        metadata = (
+            attn_backend.tail_forward_metadata
+            if tail_active
+            else attn_backend.forward_metadata
+        )
+        if metadata is None:
+            raise RuntimeError("VPP activation references unavailable attention metadata")
+        return metadata
+
     def _install_vpp_state(
         self,
         pp_proxy_tensors: PPProxyTensors,
         forward_batch: ForwardBatch,
+        tail_active: bool,
     ) -> None:
         tensors = pp_proxy_tensors.tensors
         source_layer_id = tensors.get("vpp_source_layer_id")
@@ -3875,7 +3902,7 @@ class DeepseekV4Model(nn.Module):
                 },
             )
 
-        metadata = get_attn_backend().forward_metadata
+        metadata = self._vpp_attention_metadata(tail_active)
         core = metadata.core_metadata
         index_state = {
             "c4_sparse_topk_lengths": core.c4_sparse_topk_lengths,
@@ -3911,6 +3938,7 @@ class DeepseekV4Model(nn.Module):
         tensors: dict,
         stage_id: int,
         forward_batch: ForwardBatch,
+        tail_active: bool,
     ) -> None:
         next_stage = self.pipeline_layout.stage(stage_id + 1)
         next_layer_id = next_stage.layer_ids[0]
@@ -3936,7 +3964,7 @@ class DeepseekV4Model(nn.Module):
                     }
                 )
 
-        metadata = get_attn_backend().forward_metadata
+        metadata = self._vpp_attention_metadata(tail_active)
         core = metadata.core_metadata
         index_state = {
             "c4_sparse_topk_lengths": core.c4_sparse_topk_lengths,
@@ -3995,6 +4023,11 @@ class DeepseekV4Model(nn.Module):
             is_first_stage = self.pp_group.is_first_rank
             is_last_stage = self.pp_group.is_last_rank
 
+        vpp_tail_active = (
+            self.pipeline_layout.is_interleaved
+            and pp_proxy_tensors is not None
+            and bool(pp_proxy_tensors.tensors.get("vpp_late_layer_tail", False))
+        )
         if is_first_stage:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -4015,7 +4048,11 @@ class DeepseekV4Model(nn.Module):
             else pp_proxy_tensors.tensors.get("prev_pre")
         )
         if self.pipeline_layout.is_interleaved and pp_proxy_tensors is not None:
-            self._install_vpp_state(pp_proxy_tensors, forward_batch)
+            self._install_vpp_state(
+                pp_proxy_tensors,
+                forward_batch,
+                vpp_tail_active,
+            )
 
         if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
@@ -4070,6 +4107,7 @@ class DeepseekV4Model(nn.Module):
                 dspark_aux_hidden_states,
                 execution_layer_ids,
                 prev_pre,
+                vpp_tail_active,
             )
         elif run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
@@ -4124,8 +4162,16 @@ class DeepseekV4Model(nn.Module):
             }
             if last_pre is not None:
                 tensors["prev_pre"] = last_pre
+            tail_active = tail is not None
+            if tail_active:
+                tensors["vpp_late_layer_tail"] = True
             if self.pipeline_layout.is_interleaved:
-                self._export_vpp_state(tensors, stage_id, forward_batch)
+                self._export_vpp_state(
+                    tensors,
+                    stage_id,
+                    forward_batch,
+                    tail_active,
+                )
             return PPProxyTensors(tensors)
 
         pre_hc_head = hidden_states.flatten(1)

@@ -18,6 +18,7 @@ def _config(**overrides):
         "dp_size": 1,
         "dcp_size": 1,
         "enable_prefill_cp": False,
+        "enable_dp_attention": False,
         "speculative_algorithm": None,
         "disaggregation_mode": "prefill",
         "disaggregation_transfer_backend": "mooncake",
@@ -62,6 +63,9 @@ def _validate(config):
 class TestDeepSeekV41VPPGate(unittest.TestCase):
     def test_pp4_tp2_vpp2_without_cp_is_supported(self):
         _validate(_config())
+
+    def test_pp4_tp2_vpp2_supports_decoder_swa_bounded_replay(self):
+        _validate(_config(enable_decoder_swa_bounded_replay=True))
 
     def test_vpp2_rejects_prefill_cp(self):
         for config in (
