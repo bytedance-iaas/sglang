@@ -1136,6 +1136,8 @@ class Envs:
     # MegaMoE owns EP dispatch. Falling through to the local MoE runner would
     # skip its all-to-all and is therefore not a correct serving fallback.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_FAIL_CLOSED = EnvBool(True)
+    # Opt-in until full-model paired quality and serving A/B are complete.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS = EnvBool(False)
 
     # ===================================================================
     # Top-k kernels
