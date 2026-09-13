@@ -489,6 +489,17 @@ class EICHiRadixCache(RadixCache):
             self.dec_lock_ref(req.last_node)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
+        if self.ongoing_load_back:
+            key = RadixKey(req.fill_ids, req.extra_key, is_bigram=self.is_eagle)
+            match = self.match_prefix(MatchPrefixParams(key=key))
+            if self.prefix_loading(match.last_device_node):
+                # Inserting now would swap this req's own KV for slots still
+                # landing from EIC; keep it private, as ChunkCache does, until
+                # the load settles.
+                req.prefix_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, : len(req.fill_ids)
+                ].to(dtype=torch.int64, copy=True)
+                return
         super().cache_unfinished_req(req, chunked=chunked)
         if req.last_node is not None:
             self._backup_unbacked_path(req.last_node)
@@ -910,6 +921,26 @@ class EICHiRadixCache(RadixCache):
                 self._admit_verdict[st["h"]] = st["d"] + complete_token
             else:
                 self._queue_report(st, self._KIND_FINAL, st["d"] + complete_token)
+
+    def prefix_loading(self, node: TreeNode) -> bool:
+        # load_back publishes node.value before its DMA acks. A req adopting those
+        # slots reads KV that is still landing, and if the load fails the tail is
+        # freed under it; its insert then re-links the freed slots into the tree
+        # (a page both free and cached). Such a req must wait for the load to settle.
+        if not self.ongoing_load_back or self.pp_size > 1:
+            # ponytail: PP stages hold per-stage chains, so deferring here would fork
+            # admission across stages; PP>1 still adopts in-flight slots.
+            return False
+        loading = set()
+        for start, end, _ in self.ongoing_load_back.values():
+            while end is not start:
+                loading.add(end.id)
+                end = end.parent
+        while node is not None and node is not self.root_node:
+            if node.id in loading:
+                return True
+            node = node.parent
+        return False
 
     def _free_failed_loadback(self, node_id, complete_token):
         # Local cleanup: release the load lock and free the failed-load tail so the
@@ -1365,6 +1396,11 @@ class EICHiRadixCache(RadixCache):
 
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
+            if node.evicted and not child.evicted:
+                # A resident node under an evicted one (left by a failed
+                # load-back) is unusable until the gap reloads: appending it
+                # would splice KV across the gap.
+                break
             child.last_access_time = time.monotonic()
             prefix_len = child.key.match(key, page_size=self.page_size)
             if prefix_len < len(child.key):
