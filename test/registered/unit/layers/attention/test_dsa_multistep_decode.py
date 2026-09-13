@@ -13,6 +13,7 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
 from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
     DeepseekSparseAttnMultiStepBackend,
+    TopkTransformMethod,
     _restore_dsa_decode_dp_padding,
     _trim_dsa_decode_dp_padding,
 )
@@ -388,6 +389,70 @@ class TestDSAMultiStepDecode(unittest.TestCase):
         self.assertEqual(captured["indices"].shape[0], 1)
         self.assertEqual(captured["num_splits"].shape[0], 2)
         self.assertEqual(output.shape, (1, 1, 2, 2))
+
+    def test_draft_extend_v2_flashmla_trims_eager_padding_and_restores_output(self):
+        captured = {}
+        metadata = SimpleNamespace(
+            dsa_extend_seq_lens_list=[4],
+            cu_seqlens_q=torch.arange(5, dtype=torch.int32),
+            page_table_1=torch.zeros((1, 16), dtype=torch.int32),
+            flashmla_metadata=SimpleNamespace(
+                flashmla_metadata=torch.empty((1,), dtype=torch.int32),
+                num_splits=torch.empty((5,), dtype=torch.int32),
+            ),
+        )
+
+        def fake_flashmla(**kwargs):
+            captured.update(
+                q_rows=kwargs["q_all"].shape[0],
+                page_table_rows=kwargs["page_table_1"].shape[0],
+            )
+            return torch.ones((4, 1, 2, 2))
+
+        backend = SimpleNamespace(
+            forward_metadata=metadata,
+            dsa_decode_impl="flashmla_kv",
+            dsa_prefill_impl="fa3",
+            use_mha=False,
+            use_fused_topk=False,
+            hisparse_coordinator=None,
+            token_to_kv_pool=SimpleNamespace(
+                get_key_buffer=lambda _layer_id: torch.empty((64, 3))
+            ),
+            get_topk_transform_method=MagicMock(return_value=TopkTransformMethod.PAGED),
+            _forward_flashmla_kv=fake_flashmla,
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+        )
+        layer = SimpleNamespace(
+            is_cross_attention=False,
+            layer_id=0,
+            tp_q_head_num=2,
+            v_head_dim=2,
+            head_dim=3,
+            scaling=1.0,
+        )
+
+        with patch(
+            "sglang.srt.layers.attention.dsa_backend.transform_index_page_table_prefill",
+            return_value=torch.zeros((4, 2), dtype=torch.int32),
+        ):
+            output = DeepseekSparseAttnBackend.forward_extend(
+                backend,
+                q=torch.empty((8, 4)),
+                k=None,
+                v=None,
+                layer=layer,
+                forward_batch=forward_batch,
+                q_rope=torch.empty((8, 2)),
+                topk_indices=torch.zeros((8, 16), dtype=torch.int32),
+            )
+
+        self.assertEqual(captured, {"q_rows": 4, "page_table_rows": 4})
+        self.assertEqual(output.shape, (8, 1, 2, 2))
+        self.assertTrue(torch.equal(output[:4], torch.ones_like(output[:4])))
+        self.assertTrue(torch.equal(output[4:], torch.zeros_like(output[4:])))
 
     def test_flashmla_decode_rejects_scheduler_row_mismatch(self):
         flashmla = ModuleType("sgl_kernel.flash_mla")

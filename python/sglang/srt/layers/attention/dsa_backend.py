@@ -1997,6 +1997,39 @@ class DeepseekSparseAttnBackend(
                     k_rope,
                 )
 
+        # DRAFT_EXTEND_V2 plans FlashMLA metadata on the logical draft-token
+        # axis before eager MLP-sync padding widens the live activations. Keep
+        # the KV write above on the physical layout, but feed FlashMLA exactly
+        # the rows covered by its immutable scheduler metadata. The output is
+        # padded back below for the following collective, just like decode.
+        num_extend_padding_rows = 0
+        if (
+            dsa_impl == "flashmla_kv"
+            and forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            assert metadata.flashmla_metadata is not None
+            real_num_tokens = sum(metadata.dsa_extend_seq_lens_list)
+            q, num_extend_padding_rows = _trim_dsa_decode_dp_padding(q, real_num_tokens)
+            q_rope, q_rope_padding_rows = _trim_dsa_decode_dp_padding(
+                q_rope, real_num_tokens
+            )
+            topk_indices, topk_padding_rows = _trim_dsa_decode_dp_padding(
+                topk_indices, real_num_tokens
+            )
+            if q_rope_padding_rows != num_extend_padding_rows:
+                raise RuntimeError(
+                    "DSA q/q_rope padding rows disagree: "
+                    f"q={num_extend_padding_rows}, q_rope={q_rope_padding_rows}"
+                )
+            if topk_indices is not None and topk_padding_rows not in (
+                0,
+                num_extend_padding_rows,
+            ):
+                raise RuntimeError(
+                    "DSA q/topk padding rows disagree: "
+                    f"q={num_extend_padding_rows}, topk={topk_padding_rows}"
+                )
+
         # Use MHA kernel if in MHA_ONE_SHOT mode
         if self.use_mha:
             assert k is not None and v is not None
@@ -2205,7 +2238,7 @@ class DeepseekSparseAttnBackend(
         elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
-            return self._forward_flashmla_kv(
+            output = self._forward_flashmla_kv(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 sm_scale=layer.scaling,
@@ -2215,6 +2248,7 @@ class DeepseekSparseAttnBackend(
                 metadata=metadata,
                 page_table_1=page_table_1,
             )
+            return _restore_dsa_decode_dp_padding(output, num_extend_padding_rows)
         elif dsa_impl == "fa3":
             return self._forward_fa3(
                 q_rope=q_rope,
