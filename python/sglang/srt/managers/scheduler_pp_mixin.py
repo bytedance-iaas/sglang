@@ -51,6 +51,10 @@ from sglang.srt.utils import (
     require_attn_tp_gather,
 )
 from sglang.srt.utils.common import get_device_module, is_xpu
+from sglang.srt.utils.nvtx_utils import (
+    PREFILL_PP_CP_COMMUNICATION_RANGE,
+    detailed_profile_range,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1029,9 +1033,10 @@ class SchedulerPPMixin:
         )
 
     def _pp_commit_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
-        for p2p_work in work:
-            p2p_work.work.wait()
-        work.clear()
+        with detailed_profile_range(PREFILL_PP_CP_COMMUNICATION_RANGE):
+            for p2p_work in work:
+                p2p_work.work.wait()
+            work.clear()
 
     def _pp_commit_send_output_work_and_preprocess_output_tensors(
         self: Scheduler,
@@ -1072,14 +1077,16 @@ class SchedulerPPMixin:
             dp_offset = (
                 self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
             )
-            p2p_work = point_to_point_pyobj(
-                data,
-                self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                group,
-                self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                ((self.ps.pp_rank + 1) % self.ps.pp_size) * self.ps.tp_size + dp_offset,
-                async_send=async_send,
-            )
+            with detailed_profile_range(PREFILL_PP_CP_COMMUNICATION_RANGE):
+                p2p_work = point_to_point_pyobj(
+                    data,
+                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                    group,
+                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                    ((self.ps.pp_rank + 1) % self.ps.pp_size) * self.ps.tp_size
+                    + dp_offset,
+                    async_send=async_send,
+                )
         return p2p_work
 
     def _pp_recv_pyobj_from_prev_stage(
@@ -1092,13 +1099,15 @@ class SchedulerPPMixin:
             dp_offset = (
                 self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
             )
-            data = point_to_point_pyobj(
-                [],
-                self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                group,
-                ((self.ps.pp_rank - 1) % self.ps.pp_size) * self.ps.tp_size + dp_offset,
-                self.ps.pp_rank * self.ps.tp_size + dp_offset,
-            )
+            with detailed_profile_range(PREFILL_PP_CP_COMMUNICATION_RANGE):
+                data = point_to_point_pyobj(
+                    [],
+                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                    group,
+                    ((self.ps.pp_rank - 1) % self.ps.pp_size) * self.ps.tp_size
+                    + dp_offset,
+                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                )
         else:
             data = None
 
@@ -1182,15 +1191,16 @@ class SchedulerPPMixin:
         # that can overlap. Keep their untagged P2P sequence spaces separate.
         tensor_group = self.pp_output_group if msg_type == "output" else self.pp_group
         p2p_work = []
-        p2p_work.extend(
-            tensor_group.send_tensor_dict(
-                tensor_dict=tensor_dict,
-                all_gather_group=(
-                    self.attn_tp_group if self.require_attn_tp_allgather else None
-                ),
-                async_send=async_send,
+        with detailed_profile_range(PREFILL_PP_CP_COMMUNICATION_RANGE):
+            p2p_work.extend(
+                tensor_group.send_tensor_dict(
+                    tensor_dict=tensor_dict,
+                    all_gather_group=(
+                        self.attn_tp_group if self.require_attn_tp_allgather else None
+                    ),
+                    async_send=async_send,
+                )
             )
-        )
         return p2p_work
 
     def _pp_recv_typed_dict(
@@ -1212,9 +1222,10 @@ class SchedulerPPMixin:
             self.pp_output_group if expected_kind == "output" else self.pp_group
         )
         while True:
-            tensor_dict = tensor_group.recv_tensor_dict(
-                all_gather_group=all_gather_group
-            )
+            with detailed_profile_range(PREFILL_PP_CP_COMMUNICATION_RANGE):
+                tensor_dict = tensor_group.recv_tensor_dict(
+                    all_gather_group=all_gather_group
+                )
             received_kind = tensor_dict.get("__msg_type__", "default")
             if received_kind == expected_kind:
                 if received_kind == "default":

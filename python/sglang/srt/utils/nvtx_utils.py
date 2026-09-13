@@ -65,6 +65,21 @@ _NVTX_COLOR_MAP = {
 }
 
 _NULL_CONTEXT = nullcontext()
+_DETAILED_ANNOTATIONS_ENABLED = False
+
+# Stable, low-cardinality names used to attribute the GLM/DeepSeek sparse
+# Prefill path in per-rank torch-profiler traces. Rank identity belongs in the
+# trace filename (ProfileManager emits TP/DP/PP/EP), not in every hot-path span.
+PREFILL_DSA_INDEXER_RANGE = "prefill.dsa_indexer"
+PREFILL_SPARSE_ATTENTION_RANGE = "prefill.sparse_flashmla_attention"
+PREFILL_ROUTER_MEGAMOE_RANGE = "prefill.router_megamoe"
+PREFILL_PP_CP_COMMUNICATION_RANGE = "prefill.pp_cp_communication"
+PREFILL_DETAILED_RANGES = (
+    PREFILL_DSA_INDEXER_RANGE,
+    PREFILL_SPARSE_ATTENTION_RANGE,
+    PREFILL_ROUTER_MEGAMOE_RANGE,
+    PREFILL_PP_CP_COMMUNICATION_RANGE,
+)
 
 
 @contextmanager
@@ -95,6 +110,26 @@ def profile_range(
     if not record and not nvtx_enabled:
         return _NULL_CONTEXT
     return _profile_range_impl(debug_name, color, record, nvtx_enabled)
+
+
+def detailed_profile_range(debug_name: str):
+    """Emit ``debug_name`` only for an active detailed torch profile.
+
+    Normal serving returns the shared no-op context before querying torch's
+    profiler state.
+    """
+    if not _DETAILED_ANNOTATIONS_ENABLED:
+        return _NULL_CONTEXT
+    return profile_range(debug_name)
+
+
+def set_detailed_annotations_enabled(enabled: bool) -> None:
+    global _DETAILED_ANNOTATIONS_ENABLED
+    _DETAILED_ANNOTATIONS_ENABLED = bool(enabled)
+
+
+def detailed_annotations_enabled() -> bool:
+    return _DETAILED_ANNOTATIONS_ENABLED
 
 
 def profile_method(

@@ -217,6 +217,10 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.async_probe import maybe_sync_eagle_cuda_debug
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils.nvtx_utils import (
+    PREFILL_ROUTER_MEGAMOE_RANGE,
+    detailed_profile_range,
+)
 
 if _use_aiter:
     from sglang.srt.layers.rocm_linear_utils import aiter_dsv3_router_gemm
@@ -910,12 +914,13 @@ class DeepseekV2MoE(nn.Module):
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
         if should_use_mega_moe(self, hidden_states):
-            return forward_mega_moe(
-                self,
-                hidden_states,
-                forward_batch,
-                input_ids_global=input_ids_global,
-            )
+            with detailed_profile_range(PREFILL_ROUTER_MEGAMOE_RANGE):
+                return forward_mega_moe(
+                    self,
+                    hidden_states,
+                    forward_batch,
+                    input_ids_global=input_ids_global,
+                )
 
         if not self._enable_a2a_moe:
             if self._can_dual_stream_graph(hidden_states):

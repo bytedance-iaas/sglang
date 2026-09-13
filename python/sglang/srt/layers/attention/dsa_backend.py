@@ -82,6 +82,11 @@ from sglang.srt.utils import (
     is_hip,
     print_warning_once,
 )
+from sglang.srt.utils.nvtx_utils import (
+    PREFILL_PP_CP_COMMUNICATION_RANGE,
+    PREFILL_SPARSE_ATTENTION_RANGE,
+    detailed_profile_range,
+)
 
 # Opt-in (default off): route the fp8 sparse-MLA prefill path through the Triton
 # per-query flash kernel instead of TileLang. Validated on gfx950 (GLM-5.1 @
@@ -124,14 +129,15 @@ def materialize_full_kv_cp(
     k_nope: torch.Tensor,
     k_pe: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if is_cp_v2_active(forward_batch):
-        return get_cp_strategy().materialize_full_mla_kv(
-            forward_batch,
-            attn_mla.attn_mqa,
-            k_nope,
-            k_pe,
-        )
-    return attn_mla.rebuild_cp_kv_cache(latent_cache, forward_batch, k_nope, k_pe)
+    with detailed_profile_range(PREFILL_PP_CP_COMMUNICATION_RANGE):
+        if is_cp_v2_active(forward_batch):
+            return get_cp_strategy().materialize_full_mla_kv(
+                forward_batch,
+                attn_mla.attn_mqa,
+                k_nope,
+                k_pe,
+            )
+        return attn_mla.rebuild_cp_kv_cache(latent_cache, forward_batch, k_nope, k_pe)
 
 
 _is_hip = is_hip()
@@ -2562,14 +2568,15 @@ class DeepseekSparseAttnBackend(
             # they ever diverge.
             topk_length = None
 
-        o, _, _ = flash_mla_sparse_fwd(
-            q=q_input,
-            kv=kv_cache,
-            indices=indices_input,
-            sm_scale=sm_scale,
-            d_v=v_head_dim,
-            topk_length=topk_length,
-        )
+        with detailed_profile_range(PREFILL_SPARSE_ATTENTION_RANGE):
+            o, _, _ = flash_mla_sparse_fwd(
+                q=q_input,
+                kv=kv_cache,
+                indices=indices_input,
+                sm_scale=sm_scale,
+                d_v=v_head_dim,
+                topk_length=topk_length,
+            )
 
         # Trim output back to original num_heads if we padded
         if need_padding:

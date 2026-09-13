@@ -67,6 +67,10 @@ from sglang.srt.state_capturer.indexer_topk import (
 )
 from sglang.srt.utils import BumpAllocator
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils.nvtx_utils import (
+    PREFILL_DSA_INDEXER_RANGE,
+    detailed_profile_range,
+)
 
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
@@ -193,13 +197,14 @@ class DeepseekMLAForwardMixin:
             and getattr(forward_batch, "refresh_dsa_topk_indices", False)
         )
         if self.should_run_indexer(prev_topk_indices) or refresh:
-            self_topk_indices = self.indexer(
-                x=hidden_states,
-                q_lora=q_lora,
-                positions=positions,
-                forward_batch=forward_batch,
-                layer_id=self.layer_id,
-            )
+            with detailed_profile_range(PREFILL_DSA_INDEXER_RANGE):
+                self_topk_indices = self.indexer(
+                    x=hidden_states,
+                    q_lora=q_lora,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    layer_id=self.layer_id,
+                )
             if refresh:
                 self._maybe_compare_carried_dsa_topk(
                     hidden_states=hidden_states,
