@@ -60,8 +60,8 @@ jobs:
         with:
           driver-opts: |
             network=host
-            env.NO_PROXY=localhost,127.0.0.1,.cr.volces.com
-            env.no_proxy=localhost,127.0.0.1,.cr.volces.com
+            env.NO_PROXY=.cr.volces.com
+            env.no_proxy=.cr.volces.com
 
       - name: Build, publish, and verify registry digest
         id: build
