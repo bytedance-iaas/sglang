@@ -23,7 +23,8 @@ RUN rm -rf /sgl-workspace/sglang && mkdir -p /sgl-workspace/sglang && \
 WORKDIR /sgl-workspace/sglang
 RUN timeout 3600 env SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0.dev0+glm53.${SOURCE_COMMIT:0:12}" \
       SGLANG_BUILD_RUST_EXTS=all \
-      python3 -m pip wheel --no-deps --no-build-isolation --wheel-dir /tmp/output ./python
+      python3 -m pip wheel --no-deps --no-build-isolation --wheel-dir /tmp/output ./python && \
+    rm -rf rust/target rust/sglang-radix-tree/target python/build /root/.cargo/registry /root/.cache/pip
 
 FROM iaas-gpu-cn-beijing.cr.volces.com/serving/sglang@sha256:d33d932aee374f3884e7f49c54447c82ce61ac9e58749ebf5aa3a50d25c9cb28
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
