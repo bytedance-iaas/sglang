@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 import msgspec
 from torch import nn
 
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
@@ -133,6 +134,7 @@ class ModelLayerInfo(msgspec.Struct, frozen=True, kw_only=True):
     start_layer: int
     end_layer: int
     num_effective_layers: int
+    layer_ids: tuple[int, ...]
 
 
 def resolve_layer_indices(
@@ -151,7 +153,12 @@ def resolve_layer_indices(
     _nnpl = model_config.num_nextn_predict_layers
     model_has_mtp_layers = _nnpl is not None and _nnpl > 0
     pp_range = _resolve_pp_layer_range(model=model, model_num_layers=model_num_layers)
-    num_effective_layers = pp_range.end_layer - pp_range.start_layer
+    layer_ids = (
+        tuple(model.layer_ids)
+        if get_parallel().pp_virtual_stages > 1
+        else tuple(range(pp_range.start_layer, pp_range.end_layer))
+    )
+    num_effective_layers = len(layer_ids)
 
     # For LoopCoder models, each loop has its own layer_id, so we need to multiply by loop_num
     loop_num = _get_loop_num(model_config.hf_config)
@@ -170,6 +177,7 @@ def resolve_layer_indices(
         start_layer=pp_range.start_layer,
         end_layer=pp_range.end_layer,
         num_effective_layers=num_effective_layers,
+        layer_ids=layer_ids,
     )
 
 

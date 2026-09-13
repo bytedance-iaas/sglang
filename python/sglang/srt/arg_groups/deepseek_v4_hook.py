@@ -211,11 +211,58 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
 
     cfg = resolving_view(server_args)
     if model_config_of(server_args).hf_config.model_type != "deepseek_v41":
+        if cfg.pp_virtual_stages != 1:
+            raise ValueError(
+                "--pp-virtual-stages is currently supported only for DeepSeek-V4.1"
+            )
         if cfg.enable_encoder_swa_bounded_replay:
             raise ValueError(
                 "--enable-encoder-swa-bounded-replay requires DeepSeek-V4.1"
             )
         return
+    vpp_enabled = cfg.pp_virtual_stages > 1
+    if vpp_enabled:
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+
+        incompatible = (
+            ("a physical PP size other than 4", cfg.pp_size != 4),
+            ("a virtual pipeline size other than 2", cfg.pp_virtual_stages != 2),
+            ("tensor parallel size other than 2", cfg.tp_size != 2),
+            ("attention CP size other than 2", cfg.attn_cp_size != 2),
+            ("data parallelism", cfg.dp_size != 1),
+            ("decode context parallelism", cfg.dcp_size != 1),
+            ("disabled prefill CP", not cfg.enable_prefill_cp),
+            ("a CP strategy other than interleave", cfg.cp_strategy != "interleave"),
+            ("speculative decoding", cfg.speculative_algorithm is not None),
+            (
+                "a mode other than disaggregated Prefill",
+                cfg.disaggregation_mode != "prefill",
+            ),
+            (
+                "a transfer backend other than Mooncake",
+                cfg.disaggregation_transfer_backend != "mooncake",
+            ),
+            (
+                "multimodal model loading",
+                not cfg.language_only and not cfg.language_model_only,
+            ),
+            ("HiCache", cfg.enable_hierarchical_cache),
+            ("pipeline async batch depth", cfg.pp_async_batch_depth != 0),
+            ("encoder SWA bounded replay", cfg.enable_encoder_swa_bounded_replay),
+            ("decoder SWA bounded replay", cfg.enable_decoder_swa_bounded_replay),
+            (
+                "prefill CUDA graphs",
+                cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+            ),
+            ("mixed prefill/decode", cfg.enable_mixed_chunk),
+            ("two-batch overlap", cfg.enable_two_batch_overlap),
+        )
+        for feature, enabled in incompatible:
+            if enabled:
+                raise ValueError(
+                    "DeepSeek-V4.1 VPP2 does not support "
+                    f"{feature}; use PP4 x CP2 eager Prefill."
+                )
     if cfg.enable_encoder_swa_bounded_replay:
         from sglang.srt.model_executor.cuda_graph_config import Backend
 
@@ -258,7 +305,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         ("HiSparse", cfg.enable_hisparse),
         ("the unified KV layout", is_unified_kv_triton()),
         ("two-batch overlap", cfg.enable_two_batch_overlap),
-        ("pipeline parallelism", cfg.pp_size > 1),
+        ("pipeline parallelism", cfg.pp_size > 1 and not vpp_enabled),
     )
     for feature, enabled in unsupported:
         if enabled:

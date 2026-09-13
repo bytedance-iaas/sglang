@@ -386,16 +386,24 @@ class EagerRunner(BaseRunner):
         model = self.model_runner.model
 
         input_embeds = kwargs.get("input_embeds")
-        if input_embeds is None:
+        pp_proxy_tensors = kwargs.get("pp_proxy_tensors")
+        if input_embeds is None and pp_proxy_tensors is None:
             input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
+        shard_input = (
+            forward_batch.input_ids if pp_proxy_tensors is not None else input_embeds
+        )
         with cp_shard_model_inputs(
-            input_embeds,
+            shard_input,
             forward_batch.positions,
             forward_batch,
             forward_batch.input_ids,
         ) as (sharded_input_embeds, sharded_positions, model_input_ids):
-            model_kwargs = {"input_embeds": sharded_input_embeds}
-            if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
+            model_kwargs = {
+                "input_embeds": (
+                    None if pp_proxy_tensors is not None else sharded_input_embeds
+                )
+            }
+            if pp_proxy_tensors is not None:
                 model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
             hidden_states = model.model(
                 model_input_ids,
@@ -403,6 +411,8 @@ class EagerRunner(BaseRunner):
                 forward_batch,
                 **model_kwargs,
             )
+        if isinstance(hidden_states, PPProxyTensors):
+            return hidden_states
         capture_aux_hidden_states = getattr(model, "capture_aux_hidden_states", False)
         aux_hidden_states = None
         if capture_aux_hidden_states:

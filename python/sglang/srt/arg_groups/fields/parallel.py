@@ -70,6 +70,10 @@ class Parallel:
             aliases=["--pipeline-parallel-size"],
         ),
     ] = 1
+    pp_virtual_stages: A[
+        int,
+        "The number of interleaved logical pipeline stages hosted by each physical pipeline rank.",
+    ] = 1
     pp_max_micro_batch_size: A[
         Optional[int], "The maximum micro batch size in pipeline parallelism."
     ] = None

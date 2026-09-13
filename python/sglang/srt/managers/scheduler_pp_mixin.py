@@ -58,6 +58,9 @@ class PPBatchMetadata:
 
 
 class SchedulerPPMixin:
+    def _pp_vpp_enabled(self: Scheduler) -> bool:
+        return get_parallel().pp_virtual_stages > 1
+
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
         """
@@ -111,7 +114,11 @@ class SchedulerPPMixin:
                 self.cur_batch_for_debug = cur_batch
                 if cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    pp_proxy_tensors = (
+                        self._pp_recv_vpp_proxy_tensors(first_visit=True)
+                        if self._pp_vpp_enabled()
+                        else self._pp_recv_proxy_tensors()
+                    )
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -124,13 +131,22 @@ class SchedulerPPMixin:
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
                 if cur_batch:
-                    result, self.launch_event = self._pp_launch_batch(
-                        mb_id,
-                        cur_batch,
-                        pp_proxy_tensors,
-                        self.mb_metadata,
-                        self.last_rank_comm_queue,
-                    )
+                    if self._pp_vpp_enabled():
+                        result, self.launch_event = self._pp_launch_vpp_batch(
+                            mb_id,
+                            cur_batch,
+                            pp_proxy_tensors,
+                            self.mb_metadata,
+                            self.last_rank_comm_queue,
+                        )
+                    else:
+                        result, self.launch_event = self._pp_launch_batch(
+                            mb_id,
+                            cur_batch,
+                            pp_proxy_tensors,
+                            self.mb_metadata,
+                            self.last_rank_comm_queue,
+                        )
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -146,7 +162,7 @@ class SchedulerPPMixin:
                             next_batch_result,
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
-                if not self.pp_group.is_last_rank:
+                if not self.pp_group.is_last_rank and not self._pp_vpp_enabled():
                     if cur_batch:
                         self.device_module.current_stream().wait_event(
                             self.launch_event
@@ -258,7 +274,11 @@ class SchedulerPPMixin:
                 self.cur_batch_for_debug = cur_batch
                 if cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    pp_proxy_tensors = (
+                        self._pp_recv_vpp_proxy_tensors(first_visit=True)
+                        if self._pp_vpp_enabled()
+                        else self._pp_recv_proxy_tensors()
+                    )
 
                 if get_parallel().pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -271,13 +291,22 @@ class SchedulerPPMixin:
                 if cur_batch:
                     if self.enable_staging:
                         self.maybe_prefetch_staging_for_batch(cur_batch)
-                    result, self.launch_event = self._pp_launch_batch(
-                        mb_id,
-                        cur_batch,
-                        pp_proxy_tensors,
-                        self.mb_metadata,
-                        self.last_rank_comm_queue,
-                    )
+                    if self._pp_vpp_enabled():
+                        result, self.launch_event = self._pp_launch_vpp_batch(
+                            mb_id,
+                            cur_batch,
+                            pp_proxy_tensors,
+                            self.mb_metadata,
+                            self.last_rank_comm_queue,
+                        )
+                    else:
+                        result, self.launch_event = self._pp_launch_batch(
+                            mb_id,
+                            cur_batch,
+                            pp_proxy_tensors,
+                            self.mb_metadata,
+                            self.last_rank_comm_queue,
+                        )
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -331,7 +360,7 @@ class SchedulerPPMixin:
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
-                    if cur_batch:
+                    if cur_batch and not self._pp_vpp_enabled():
                         self.device_module.current_stream().wait_event(
                             self.launch_event
                         )
@@ -860,6 +889,18 @@ class SchedulerPPMixin:
             )
         return pp_proxy_tensors
 
+    def _pp_recv_vpp_proxy_tensors(
+        self: Scheduler, *, first_visit: bool
+    ) -> Optional[PPProxyTensors]:
+        if first_visit and self.pp_group.is_first_rank:
+            return None
+        return PPProxyTensors(
+            self._pp_recv_typed_dict(
+                expected_kind="vpp_proxy",
+                all_gather_group=self.attn_tp_group,
+            )
+        )
+
     def _pp_recv_dict_from_prev_stage(
         self: Scheduler,
     ) -> Dict[str, torch.Tensor]:
@@ -1105,6 +1146,77 @@ class SchedulerPPMixin:
                 event.record(self.device_module.current_stream())
                 if self.pp_group.is_last_rank:
                     # (last rank) buffer the outputs for async batch depth
+                    last_rank_comm_queue.append(
+                        (
+                            event,
+                            PPProxyTensors(
+                                self._pp_prepare_tensor_dict(result, cur_batch)
+                            ),
+                        )
+                    )
+        return result, event
+
+    def _pp_launch_vpp_batch(
+        self: Scheduler,
+        mb_id: int,
+        cur_batch: ScheduleBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors],
+        mb_metadata: List[Optional[PPBatchMetadata]],
+        last_rank_comm_queue: deque,
+    ):
+        if get_parallel().pp_virtual_stages != 2:
+            raise RuntimeError("the VPP scheduler currently supports VPP2 only")
+
+        with torch.profiler.record_function("run_vpp_batch"):
+            with self.forward_stream_ctx:
+                self.forward_stream.wait_stream(self.schedule_stream)
+                set_time_batch(
+                    cur_batch.reqs,
+                    "set_run_batch_cpu_start_time",
+                    trace_only=True,
+                )
+                first_result = self.run_batch(cur_batch, pp_proxy_tensors)
+                first_proxy = first_result.pp_hidden_states_proxy_tensors
+                if first_proxy is None:
+                    raise RuntimeError("the first VPP visit must produce an activation")
+                first_send = self._pp_send_dict_to_next_stage(
+                    first_proxy.tensors,
+                    async_send=True,
+                    msg_type="vpp_proxy",
+                )
+
+                second_proxy = self._pp_recv_vpp_proxy_tensors(first_visit=False)
+                self._pp_commit_comm_work(first_send)
+                result = self.run_batch(cur_batch, second_proxy)
+
+                if self.pp_group.is_last_rank:
+                    if result.pp_hidden_states_proxy_tensors is not None:
+                        raise RuntimeError("the final VPP stage did not produce logits")
+                else:
+                    proxy = result.pp_hidden_states_proxy_tensors
+                    if proxy is None:
+                        raise RuntimeError(
+                            "a non-final VPP stage produced no activation"
+                        )
+                    second_send = self._pp_send_dict_to_next_stage(
+                        proxy.tensors,
+                        async_send=True,
+                        msg_type="vpp_proxy",
+                    )
+                    self._pp_commit_comm_work(second_send)
+                set_time_batch(
+                    cur_batch.reqs,
+                    "set_run_batch_cpu_end_time",
+                    trace_only=True,
+                    attrs={"pp_mb_id": mb_id},
+                )
+
+                mb_metadata[mb_id] = PPBatchMetadata(
+                    can_run_cuda_graph=result.can_run_cuda_graph,
+                )
+                event = self.device_module.Event()
+                event.record(self.device_module.current_stream())
+                if self.pp_group.is_last_rank:
                     last_rank_comm_queue.append(
                         (
                             event,
