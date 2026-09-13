@@ -1,12 +1,10 @@
 from contextlib import contextmanager
 from unittest.mock import patch
 
-from sglang.srt.model_executor.step_span_utils import (
-    set_detailed_annotations_enabled,
-)
 from sglang.srt.utils.nvtx_utils import (
     PREFILL_DETAILED_RANGES,
     detailed_profile_range,
+    set_detailed_annotations_enabled,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
