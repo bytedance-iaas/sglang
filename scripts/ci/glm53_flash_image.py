@@ -9,7 +9,6 @@ import re
 import shutil
 import subprocess
 import tarfile
-import tempfile
 
 BASE_IMAGE = "iaas-gpu-cn-beijing.cr.volces.com/serving/sglang@sha256:d33d932aee374f3884e7f49c54447c82ce61ac9e58749ebf5aa3a50d25c9cb28"
 DEEP_GEMM_SHA256 = "f4e67086dc685ddcfcbb7833cc9770afd850cab23e173e77b9b18c19de0c2836"
@@ -37,8 +36,11 @@ def require(condition, message):
 
 
 def sha256(path):
+    digest = hashlib.sha256()
     with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def git_hash(kind, data):
@@ -119,10 +121,8 @@ def prepare(context):
         check=True,
     )
     entries = []
-    with tempfile.TemporaryDirectory() as directory:
-        extracted = Path(directory)
-        with tarfile.open(archive) as stream:
-            stream.extractall(extracted, filter="data")
+    with tarfile.open(archive) as stream:
+        members = {member.name: member for member in stream.getmembers()}
         for record in git("ls-tree", "-rz", "--full-tree", "HEAD").split(b"\0"):
             if not record:
                 continue
@@ -132,8 +132,15 @@ def prepare(context):
                 kind == "blob", "Submodules must be explicitly packaged before building"
             )
             relative = name.decode()
-            path = extracted / relative
-            data = os.readlink(path).encode() if mode == "120000" else path.read_bytes()
+            member = members[relative]
+            data = (
+                member.linkname.encode()
+                if mode == "120000"
+                else stream.extractfile(member).read()
+            )
+            require(
+                git_hash("blob", data) == blob, f"Archive blob mismatch: {relative}"
+            )
             entries.append(
                 {
                     "path": relative,
@@ -150,7 +157,7 @@ def prepare(context):
             "deep_gemm_sha256": DEEP_GEMM_SHA256,
             "files": entries,
         }
-        verify_sources(extracted, document)
+        verify_sources(root, document)
     (context / "source.json").write_text(
         json.dumps(document, sort_keys=True, indent=2) + "\n"
     )
