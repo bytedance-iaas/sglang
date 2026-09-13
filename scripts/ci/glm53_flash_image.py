@@ -182,11 +182,7 @@ def packages():
     result = {}
     for dist in metadata.distributions():
         name = re.sub(r"[-_.]+", "-", dist.metadata["Name"]).lower()
-        require(
-            name not in result or result[name] == dist.version,
-            f"Conflicting distributions: {name}",
-        )
-        result[name] = dist.version
+        result.setdefault(name, []).append(dist.version)
     return dict(sorted(result.items()))
 
 
@@ -194,7 +190,7 @@ def snapshot(path):
     installed = packages()
     for name, version in CORE_VERSIONS.items():
         require(
-            installed.get(name) == version,
+            metadata.version(name) == version,
             f"Unexpected base {name}: {installed.get(name)}",
         )
     path.write_text(json.dumps(installed, sort_keys=True, indent=2) + "\n")
@@ -227,9 +223,9 @@ def verify_install(runtime=False):
         if name not in allowed and before.get(name) != after.get(name)
     }
     require(not drift, f"Base dependency drift: {drift}")
-    require(after["sgl-deep-gemm"] == "0.1.7", "Wrong DeepGEMM version")
+    require(after["sgl-deep-gemm"] == ["0.1.7"], "Wrong DeepGEMM version")
     require(
-        after["sglang"] == f"0.0.0.dev0+glm53.{document['commit'][:12]}",
+        after["sglang"] == [f"0.0.0.dev0+glm53.{document['commit'][:12]}"],
         "Wrong SGLang build version",
     )
     distribution = metadata.distribution("sglang")
@@ -298,7 +294,8 @@ def verify_install(runtime=False):
                 f"External native import: {module}",
             )
         importlib.import_module("sgl_kernel")
-        importlib.import_module("sglang.srt.models.glm4_moe_lite")
+        importlib.import_module("sglang.srt.models.glm5_next")
+        importlib.import_module("sglang.srt.models.glm5_next_nextn")
         require(torch.tensor([2, 3]).sum().item() == 5, "Torch CPU smoke failed")
         result["runtime_imports"] = "PASS"
         result["cuda_available"] = torch.cuda.is_available()
