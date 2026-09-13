@@ -228,11 +228,12 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             ("a physical PP size other than 4", cfg.pp_size != 4),
             ("a virtual pipeline size other than 2", cfg.pp_virtual_stages != 2),
             ("tensor parallel size other than 2", cfg.tp_size != 2),
-            ("attention CP size other than 2", cfg.attn_cp_size != 2),
             ("data parallelism", cfg.dp_size != 1),
             ("decode context parallelism", cfg.dcp_size != 1),
-            ("disabled prefill CP", not cfg.enable_prefill_cp),
-            ("a CP strategy other than interleave", cfg.cp_strategy != "interleave"),
+            (
+                "context parallelism",
+                cfg.enable_prefill_cp or cfg.attn_cp_size != 1,
+            ),
             ("speculative decoding", cfg.speculative_algorithm is not None),
             (
                 "a mode other than disaggregated Prefill",
@@ -261,7 +262,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             if enabled:
                 raise ValueError(
                     "DeepSeek-V4.1 VPP2 does not support "
-                    f"{feature}; use PP4 x CP2 eager Prefill."
+                    f"{feature}; use PP4 x TP2 eager Prefill."
                 )
     if cfg.enable_encoder_swa_bounded_replay:
         from sglang.srt.model_executor.cuda_graph_config import Backend
