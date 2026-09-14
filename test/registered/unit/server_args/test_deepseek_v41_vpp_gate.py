@@ -23,7 +23,7 @@ def _config(**overrides):
         "disaggregation_mode": "prefill",
         "disaggregation_transfer_backend": "mooncake",
         "language_only": False,
-        "language_model_only": True,
+        "language_model_only": False,
         "enable_hierarchical_cache": False,
         "pp_async_batch_depth": 0,
         "enable_encoder_swa_bounded_replay": False,
@@ -63,6 +63,9 @@ def _validate(config):
 class TestDeepSeekV41VPPGate(unittest.TestCase):
     def test_pp4_tp2_vpp2_without_cp_is_supported(self):
         _validate(_config())
+
+    def test_pp4_tp2_vpp2_supports_multimodal_loading(self):
+        _validate(_config(language_only=False, language_model_only=False))
 
     def test_pp4_tp2_vpp2_supports_decoder_swa_bounded_replay(self):
         _validate(_config(enable_decoder_swa_bounded_replay=True))

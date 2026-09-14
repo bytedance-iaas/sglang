@@ -140,6 +140,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    ForwardMode,
     PPProxyTensors,
 )
 from sglang.srt.model_executor.forward_context import (
@@ -4204,6 +4205,66 @@ class DeepseekV4Model(nn.Module):
         return hidden_states, pre_hc_head
 
 
+def _dsv41_multimodal_enabled(config) -> bool:
+    return (
+        config.model_type == "deepseek_v41"
+        and config.vision_n_layers > 0
+        and not config.language_only
+        and not config.language_model_only
+    )
+
+
+def _should_build_dsv41_vision(config, pp_group) -> bool:
+    return _dsv41_multimodal_enabled(config) and pp_group.is_first_rank
+
+
+def _normalize_dsv41_prompt_input_ids(
+    config,
+    input_ids: torch.Tensor,
+    forward_mode: ForwardMode,
+) -> torch.Tensor:
+    if (
+        _dsv41_multimodal_enabled(config)
+        and not (
+            forward_mode.is_decode_or_idle()
+            or forward_mode.is_target_verify()
+        )
+    ):
+        return input_ids.masked_fill(
+            input_ids >= MM_PAD_SHIFT_VALUE,
+            config.image_token_id,
+        )
+    return input_ids
+
+
+def _should_prepare_dsv41_vision(
+    vision,
+    pp_proxy_tensors: Optional[PPProxyTensors],
+    forward_mode: ForwardMode,
+    mm_inputs,
+) -> bool:
+    return (
+        vision is not None
+        and pp_proxy_tensors is None
+        and not forward_mode.is_decode()
+        and mm_inputs is not None
+        and any(item is not None for item in mm_inputs)
+    )
+
+
+def _dsv41_weight_skip_group(
+    name: str,
+    *,
+    owns_vision: bool,
+    multimodal_enabled: bool,
+) -> Optional[str]:
+    if not owns_vision and name.startswith(("vision.", "aligner.", "image_")):
+        return "vision"
+    if not multimodal_enabled and name.endswith(".gate.e_score_correction_bias_vl"):
+        return "gate.bias_vl"
+    return None
+
+
 class DeepseekV4ForCausalLM(nn.Module):
     supports_cuda_vmm_feature_transport = True
 
@@ -4228,20 +4289,17 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.quant_config = quant_config
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
         self.determine_num_fused_shared_experts()
+        self.pp_group = get_pp_group()
+        self.dsv41_multimodal_enabled = _dsv41_multimodal_enabled(config)
         self.vision = None
-        if (
-            config.model_type == "deepseek_v41"
-            and config.vision_n_layers > 0
-            and not config.language_only
-            and not config.language_model_only
-        ):
+        if _should_build_dsv41_vision(config, self.pp_group):
             if (
                 get_parallel().attn_cp_size != 1
-                or get_pp_group().world_size != 1
                 or not get_moe_a2a_backend().is_none()
             ):
                 raise ValueError(
-                    "V4.1 vision currently supports TP/EP/DP without CP, PP or MoE A2A"
+                    "V4.1 vision on the first PP stage supports TP/EP/DP "
+                    "without CP or MoE A2A"
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
@@ -4253,7 +4311,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.model = DeepseekV4Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
-        self.pp_group = get_pp_group()
         if self.pp_group.is_last_rank:
             if self.pp_group.world_size == 1 and config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
@@ -4403,24 +4460,22 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        if (
-            self.vision is not None
-            and not forward_batch.forward_mode.is_decode()
-            and forward_batch.mm_inputs is not None
-            and any(x is not None for x in forward_batch.mm_inputs)
+        if _should_prepare_dsv41_vision(
+            self.vision,
+            pp_proxy_tensors,
+            forward_batch.forward_mode,
+            forward_batch.mm_inputs,
         ):
             if input_embeds is not None:
                 raise ValueError("Cannot combine input_embeds and image inputs")
             input_embeds = self._prepare_mm_embeddings(input_ids, forward_batch)
-        if self.vision is not None and not (
-            forward_batch.forward_mode.is_decode_or_idle()
-            or forward_batch.forward_mode.is_target_verify()
-        ):
-            # Decode/verify IDs are already vocabulary IDs. Remap prompt image
-            # hashes for Engram and routing without changing the scheduler's IDs.
-            input_ids = input_ids.masked_fill(
-                input_ids >= MM_PAD_SHIFT_VALUE, self.config.image_token_id
-            )
+        # Every PP stage needs the same image-token identity for Engram and MoE
+        # routing, even though only the first stage owns the vision tower.
+        input_ids = _normalize_dsv41_prompt_input_ids(
+            self.config,
+            input_ids,
+            forward_batch.forward_mode,
+        )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
@@ -4770,17 +4825,15 @@ class DeepseekV4ForCausalLM(nn.Module):
 
                     # V4.1 checkpoint tensors with no module in the text model yet;
                     # the per-group count is logged after loading.
-                    skip_group = None
-                    if not is_dsv41:
-                        pass
-                    elif self.vision is None and name.startswith(
-                        ("vision.", "aligner.", "image_")
-                    ):
-                        skip_group = "vision"
-                    elif self.vision is None and name.endswith(
-                        ".gate.e_score_correction_bias_vl"
-                    ):
-                        skip_group = "gate.bias_vl"
+                    skip_group = (
+                        _dsv41_weight_skip_group(
+                            name,
+                            owns_vision=self.vision is not None,
+                            multimodal_enabled=self.dsv41_multimodal_enabled,
+                        )
+                        if is_dsv41
+                        else None
+                    )
                     if skip_group is not None:
                         skipped_by_group[skip_group] = (
                             skipped_by_group.get(skip_group, 0) + 1

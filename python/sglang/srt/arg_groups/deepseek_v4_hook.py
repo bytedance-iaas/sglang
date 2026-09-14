@@ -243,10 +243,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "a transfer backend other than Mooncake",
                 cfg.disaggregation_transfer_backend != "mooncake",
             ),
-            (
-                "multimodal model loading",
-                not cfg.language_only and not cfg.language_model_only,
-            ),
             ("HiCache", cfg.enable_hierarchical_cache),
             ("pipeline async batch depth", cfg.pp_async_batch_depth != 0),
             ("encoder SWA bounded replay", cfg.enable_encoder_swa_bounded_replay),

@@ -8,6 +8,15 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers.moe.topk import TopKConfig
+from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.models.deepseek_v4 import (
+    _dsv41_multimodal_enabled,
+    _dsv41_weight_skip_group,
+    _normalize_dsv41_prompt_input_ids,
+    _should_build_dsv41_vision,
+    _should_prepare_dsv41_vision,
+)
 from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -81,6 +90,132 @@ class TestDsv41VisionTopK(CustomTestCase):
         )
         torch.testing.assert_close(
             scaled.topk_weights[:, :-1], fused.topk_weights[:, :-1]
+        )
+
+    def test_vpp_builds_vision_only_on_first_physical_stage(self):
+        config = SimpleNamespace(
+            model_type="deepseek_v41",
+            vision_n_layers=12,
+            language_only=False,
+            language_model_only=False,
+        )
+
+        self.assertTrue(
+            _should_build_dsv41_vision(
+                config,
+                SimpleNamespace(is_first_rank=True),
+            )
+        )
+        self.assertFalse(
+            _should_build_dsv41_vision(
+                config,
+                SimpleNamespace(is_first_rank=False),
+            )
+        )
+        self.assertTrue(_dsv41_multimodal_enabled(config))
+
+    def test_text_only_modes_skip_vision_on_first_stage(self):
+        for field in ("language_only", "language_model_only"):
+            config = SimpleNamespace(
+                model_type="deepseek_v41",
+                vision_n_layers=12,
+                language_only=False,
+                language_model_only=False,
+            )
+            setattr(config, field, True)
+            with self.subTest(field=field):
+                self.assertFalse(
+                    _should_build_dsv41_vision(
+                        config,
+                        SimpleNamespace(is_first_rank=True),
+                    )
+                )
+
+    def test_all_vpp_stages_normalize_prompt_image_ids(self):
+        config = SimpleNamespace(
+            model_type="deepseek_v41",
+            vision_n_layers=12,
+            image_token_id=99,
+            language_only=False,
+            language_model_only=False,
+        )
+        input_ids = torch.tensor([7, MM_PAD_SHIFT_VALUE + 123, 8])
+
+        normalized = _normalize_dsv41_prompt_input_ids(
+            config,
+            input_ids,
+            ForwardMode.EXTEND,
+        )
+
+        torch.testing.assert_close(normalized, torch.tensor([7, 99, 8]))
+        torch.testing.assert_close(
+            input_ids, torch.tensor([7, MM_PAD_SHIFT_VALUE + 123, 8])
+        )
+
+    def test_decode_ids_are_not_remapped(self):
+        config = SimpleNamespace(
+            model_type="deepseek_v41",
+            vision_n_layers=12,
+            image_token_id=99,
+            language_only=False,
+            language_model_only=False,
+        )
+        input_ids = torch.tensor([MM_PAD_SHIFT_VALUE + 123])
+
+        normalized = _normalize_dsv41_prompt_input_ids(
+            config,
+            input_ids,
+            ForwardMode.DECODE,
+        )
+
+        self.assertIs(normalized, input_ids)
+
+    def test_vpp_wraparound_does_not_repeat_vision(self):
+        vision = object()
+        mm_inputs = [object()]
+
+        self.assertTrue(
+            _should_prepare_dsv41_vision(
+                vision,
+                None,
+                ForwardMode.EXTEND,
+                mm_inputs,
+            )
+        )
+        self.assertFalse(
+            _should_prepare_dsv41_vision(
+                vision,
+                PPProxyTensors({"vpp_stage_id": 4}),
+                ForwardMode.EXTEND,
+                mm_inputs,
+            )
+        )
+
+    def test_non_owner_keeps_vl_routing_weights(self):
+        self.assertEqual(
+            _dsv41_weight_skip_group(
+                "vision.blocks.0.attn.qkv_proj.weight",
+                owns_vision=False,
+                multimodal_enabled=True,
+            ),
+            "vision",
+        )
+        self.assertIsNone(
+            _dsv41_weight_skip_group(
+                "model.layers.25.mlp.gate.e_score_correction_bias_vl",
+                owns_vision=False,
+                multimodal_enabled=True,
+            )
+        )
+
+    def test_text_only_rank_skips_vl_routing_weights(self):
+        self.assertEqual(
+            _dsv41_weight_skip_group(
+                "model.layers.25.mlp.gate.e_score_correction_bias_vl",
+                owns_vision=False,
+                multimodal_enabled=False,
+            ),
+            "gate.bias_vl",
         )
 
 
