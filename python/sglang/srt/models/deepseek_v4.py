@@ -71,6 +71,12 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     DeepseekV41Indexer,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
+from sglang.srt.layers.attention.dsv4.late_layer import (
+    LateLayerDPLayout,
+)
+from sglang.srt.layers.attention.dsv4.late_layer import (
+    scatter_tail_rows as _scatter_tail_rows,
+)
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_gather_hidden_states,
@@ -3363,6 +3369,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         precomputed_attn: Optional[tuple] = None,
         next_norm: Optional[RMSNorm] = None,
         next_input: Optional[list] = None,
+        late_dp_layout: Optional[LateLayerDPLayout] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Layer forward where each sublayer consumes the previous sublayer's
         pre-mix. Returns (hidden_states, ffn_pre)."""
@@ -3496,10 +3503,26 @@ class DeepseekV4DecoderLayer(nn.Module):
             context = use_mhc_post_fusion(mhc)
         else:
             context = nullcontext()
-        with context:
+        # Attention operates on unpadded local tail rows. Only the MoE needs
+        # the compact DP layout and attention-TP-aligned communication buffers.
+        with (
+            context,
+            late_dp_layout.activate(forward_batch)
+            if late_dp_layout is not None
+            else nullcontext(),
+        ):
             x = self._run_moe_ffn_dp_sync(
-                x, forward_batch, input_ids=input_ids, input_ids_global=input_ids_global
+                late_dp_layout.pad(x) if late_dp_layout is not None else x,
+                forward_batch,
+                input_ids=(
+                    late_dp_layout.pad(input_ids)
+                    if late_dp_layout is not None
+                    else input_ids
+                ),
+                input_ids_global=input_ids_global,
             )
+        if late_dp_layout is not None:
+            x = x[: late_dp_layout.local_rows]
         if mhc is not None:
             mhc.materialize_stats()
             ffn_pre, ffn_post, ffn_comb = mhc.pre, mhc.post, mhc.comb
@@ -3948,18 +3971,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         state.hidden_states_mlp_output = hidden
 
 
-def _scatter_tail_rows(
-    tail: LateLayerTail, rows: torch.Tensor, num_tokens: int
-) -> torch.Tensor:
-    # Rows outside the tail are never read (see _check_late_layer_tail_readers).
-    full = rows.new_empty((num_tokens, rows.shape[1]))
-    if tail.contiguous_start is not None:
-        full[tail.contiguous_start :].copy_(rows)
-    else:
-        full[tail.token_indices] = rows[: tail.token_indices.shape[0]]
-    return full
-
-
 class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
 
@@ -4203,29 +4214,63 @@ class DeepseekV4Model(nn.Module):
         saved_full = None
         prev_pre = None
         precomputed_attn = None
+        late_dp_layout = None
         for i in range(self.start_layer, self.end_layer):
             if tail is not None and i == self.late_layer_start:
                 # Decode reaches back at most SWA_WINDOW positions.
                 saved_full = attn_backend.enter_late_layer_tail(forward_batch)
-                hidden_states, prev_pre, input_ids, input_ids_global = (
+                hidden_states, prev_pre, input_ids = (
                     tail.rows(hidden_states),
                     tail.rows(prev_pre),
                     tail.rows(input_ids),
-                    tail.rows(input_ids_global),
                 )
+                # A local tail index cannot select from DP-gathered IDs. Rebuild
+                # those below, after every rank has selected its local rows.
+                input_ids_global = input_ids
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
+            if (
+                i == self.late_layer_start
+                and get_parallel().attn_dp_size > 1
+                and forward_batch.is_extend_in_batch
+            ):
+                # This condition is DP-wide: decode/idle ranks must join both
+                # the length exchange and the subsequent per-layer collectives.
+                late_dp_layout = LateLayerDPLayout.prepare(input_ids, forward_batch)
+                input_ids_global = late_dp_layout.gather_input_ids(
+                    input_ids,
+                    forward_batch,
+                    gather=get_moe_a2a_backend().is_none(),
+                )
             engram = self.layers[i].engram
             if engram is not None:
                 precomputed_attn = None
                 before_engram = hidden_states
-                hidden_states = engram(
-                    hidden_states,
-                    hash_ids[:, engram.layer_hash_index],
-                    forward_batch,
-                    cp_all_tokens=cp_extend,
-                )
+                layer_hash_ids = hash_ids[:, engram.layer_hash_index]
+                # A TP-sharded Engram table also gathers across DP ranks.
+                # Its IDs and embeddings must use the same compact layout.
+                with (
+                    late_dp_layout.activate(forward_batch)
+                    if late_dp_layout is not None
+                    else nullcontext()
+                ):
+                    hidden_states = engram(
+                        (
+                            late_dp_layout.pad(hidden_states)
+                            if late_dp_layout is not None
+                            else hidden_states
+                        ),
+                        (
+                            late_dp_layout.pad(layer_hash_ids)
+                            if late_dp_layout is not None
+                            else layer_hash_ids
+                        ),
+                        forward_batch,
+                        cp_all_tokens=cp_extend,
+                    )
+                if late_dp_layout is not None:
+                    hidden_states = hidden_states[: late_dp_layout.local_rows]
                 if (
                     self.config.model_type == "deepseek_v41"
                     and self.config.vision_n_layers > 0
@@ -4288,6 +4333,7 @@ class DeepseekV4Model(nn.Module):
                     precomputed_attn=precomputed_attn,
                     next_norm=next_norm,
                     next_input=next_input,
+                    late_dp_layout=late_dp_layout,
                 )
             precomputed_attn = next_input[0] if next_input else None
         if saved_full is not None:

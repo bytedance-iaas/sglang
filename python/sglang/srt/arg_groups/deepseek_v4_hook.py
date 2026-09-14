@@ -372,8 +372,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "the prefill CUDA graph",
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
-            # input_ids_global is a DP-wide gather, so the tail slice cannot apply.
-            ("DP attention", cfg.enable_dp_attention),
         )
         for feature, enabled in incompatible:
             if enabled:
