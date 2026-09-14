@@ -2509,6 +2509,17 @@ class DeepseekV2DecoderLayer(nn.Module):
                 quant_format=self._resolve_gfx95_quant_format(),
             )
         )
+        target_forward_probe = getattr(self, "target_forward_probe", None)
+        if (
+            target_forward_probe is not None
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            target_forward_probe.capture(
+                layer_id=self.layer_id,
+                boundary="attn_input",
+                hidden_states=hidden_states,
+                residual=residual,
+            )
 
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             hidden_states = self.self_attn(
@@ -2535,6 +2546,16 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+        if (
+            target_forward_probe is not None
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            target_forward_probe.capture(
+                layer_id=self.layer_id,
+                boundary="mlp_input",
+                hidden_states=hidden_states,
+                residual=residual,
+            )
 
         fuse_mlp_allreduce = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -2583,6 +2604,17 @@ class DeepseekV2DecoderLayer(nn.Module):
         if not fuse_mlp_allreduce:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
+            )
+
+        if (
+            target_forward_probe is not None
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            target_forward_probe.capture(
+                layer_id=self.layer_id,
+                boundary="layer_return",
+                hidden_states=hidden_states,
+                residual=residual,
             )
 
         return hidden_states, residual, topk_indices

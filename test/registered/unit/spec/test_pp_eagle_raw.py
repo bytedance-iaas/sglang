@@ -558,6 +558,10 @@ class TestEaglePPLastRankDraftOwnership(unittest.TestCase):
             model_runner=SimpleNamespace(
                 model_config=SimpleNamespace(context_len=4096),
                 attn_backend=object(),
+                model=object(),
+                dtype=torch.bfloat16,
+                device=torch.device("cpu"),
+                max_decode_logits_rows=MagicMock(return_value=32),
             ),
         )
 
@@ -604,6 +608,110 @@ class TestEaglePPLastRankDraftOwnership(unittest.TestCase):
         self.assertEqual(
             worker.spec_v2_attn_backends, (target.model_runner.attn_backend,)
         )
+
+    @patch(
+        "sglang.srt.speculative.eagle_worker_v2.get_plan_stream",
+        return_value=(object(), nullcontext()),
+    )
+    @patch("sglang.srt.speculative.eagle_worker_v2.get_pp_group")
+    @patch("sglang.srt.speculative.eagle_worker_v2.EagleDraftWorker")
+    @patch("sglang.srt.speculative.eagle_worker_v2.EaglePPSenderProbe")
+    def test_pp0_installs_target_observer_during_worker_construction(
+        self, probe_cls, draft_worker_cls, get_pp_group, _get_plan_stream
+    ):
+        get_pp_group.return_value.is_last_rank = False
+        get_pp_group.return_value.is_first_rank = True
+        probe = probe_cls.return_value
+        target = self._target(is_last_rank=False)
+        with (
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.get_parallel",
+                return_value=SimpleNamespace(pp_size=2),
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.get_spec",
+                return_value=SimpleNamespace(
+                    speculative_eagle_topk=1,
+                    speculative_num_steps=3,
+                    speculative_num_draft_tokens=4,
+                    speculative_algorithm="EAGLE",
+                    speculative_adaptive=False,
+                ),
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.get_device",
+                return_value=SimpleNamespace(device="cpu"),
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.get_schedule",
+                return_value=SimpleNamespace(page_size=1),
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.check_cuda_graph_backend",
+                return_value=True,
+            ),
+        ):
+            EAGLEWorkerV2(
+                SimpleNamespace(pp_size=2), 0, object(), 1234, target_worker=target
+            )
+
+        draft_worker_cls.assert_not_called()
+        probe.install_target_forward_observer.assert_called_once_with(
+            model=target.model_runner.model,
+            max_rows=32,
+            dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+        )
+
+    @patch(
+        "sglang.srt.speculative.eagle_worker_v2.get_plan_stream",
+        return_value=(object(), nullcontext()),
+    )
+    @patch("sglang.srt.speculative.eagle_worker_v2.get_pp_group")
+    @patch("sglang.srt.speculative.eagle_worker_v2.EagleDraftWorker")
+    @patch("sglang.srt.speculative.eagle_worker_v2.EaglePPSenderProbe")
+    def test_pp0_target_observer_rejects_non_full_decode_graph_backend(
+        self, probe_cls, draft_worker_cls, get_pp_group, _get_plan_stream
+    ):
+        get_pp_group.return_value.is_last_rank = False
+        get_pp_group.return_value.is_first_rank = True
+        probe_cls.return_value.can_probe = True
+        target = self._target(is_last_rank=False)
+        with (
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.get_parallel",
+                return_value=SimpleNamespace(pp_size=2),
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.get_spec",
+                return_value=SimpleNamespace(
+                    speculative_eagle_topk=1,
+                    speculative_num_steps=3,
+                    speculative_num_draft_tokens=4,
+                    speculative_algorithm="EAGLE",
+                    speculative_adaptive=False,
+                ),
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.get_device",
+                return_value=SimpleNamespace(device="cpu"),
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.get_schedule",
+                return_value=SimpleNamespace(page_size=1),
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.check_cuda_graph_backend",
+                return_value=False,
+            ),
+            self.assertRaisesRegex(ValueError, "requires explicit full Decode"),
+        ):
+            EAGLEWorkerV2(
+                SimpleNamespace(pp_size=2), 0, object(), 1234, target_worker=target
+            )
+
+        draft_worker_cls.assert_not_called()
+        probe_cls.return_value.install_target_forward_observer.assert_not_called()
 
     @patch(
         "sglang.srt.speculative.eagle_worker_v2.get_plan_stream",

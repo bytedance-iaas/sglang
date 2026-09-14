@@ -74,6 +74,125 @@ _PD_HANDOFF_REQUIRED_TENSORS = {
 }
 _PP_SENDER_STAGE = "target_verify_pp_output"
 _PP_SENDER_REQUIRED_TENSORS = frozenset({"hidden_states", "residual"})
+_PP_TARGET_FORWARD_BOUNDARIES = ("attn_input", "mlp_input", "layer_return")
+_PP_TARGET_FORWARD_TENSORS = ("hidden_states", "residual")
+
+
+class _PPTargetForwardDeviceObserver:
+    """Fixed CUDA-graph side buffer for PP0 target-layer boundaries.
+
+    The buffer is allocated before CUDA graph capture.  Selected decoder layers
+    only enqueue fixed device-to-device copies into it; request selection, host
+    copies, hashing, and logging stay outside capture/replay. Once captured,
+    every target-verify replay executes the fixed copies; exact-RID selection
+    applies only to the host snapshot. This is a diagnostic-only observer and
+    must not be used for performance evidence.
+    """
+
+    def __init__(
+        self,
+        *,
+        layer_ids: tuple[int, ...],
+        max_rows: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        if not layer_ids:
+            raise ValueError("PP target-forward observer requires layer anchors")
+        if max_rows <= 0 or hidden_size <= 0:
+            raise ValueError(
+                "PP target-forward observer dimensions must be positive: "
+                f"max_rows={max_rows}, hidden_size={hidden_size}"
+            )
+        self.layer_ids = layer_ids
+        self.max_rows = int(max_rows)
+        self.hidden_size = int(hidden_size)
+        self.dtype = dtype
+        self.stage_names = tuple(
+            f"target_verify_layer_{layer_id:02d}_{boundary}"
+            for layer_id in layer_ids
+            for boundary in _PP_TARGET_FORWARD_BOUNDARIES
+        )
+        self._stage_index = {name: index for index, name in enumerate(self.stage_names)}
+        self.buffer = torch.empty(
+            (
+                len(self.stage_names),
+                len(_PP_TARGET_FORWARD_TENSORS),
+                self.max_rows,
+                self.hidden_size,
+            ),
+            dtype=dtype,
+            device=device,
+        )
+        # Zero is the fail-closed sentinel if a stage is not executed by a
+        # captured path; successful capture/replay overwrites it in-graph.
+        self.row_counts = torch.zeros(
+            (len(self.stage_names),), dtype=torch.int32, device=device
+        )
+        self.device = self.buffer.device
+
+    def capture(
+        self,
+        *,
+        layer_id: int,
+        boundary: str,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> None:
+        stage = f"target_verify_layer_{layer_id:02d}_{boundary}"
+        stage_index = self._stage_index.get(stage)
+        if stage_index is None:
+            return
+        tensors = (hidden_states, residual)
+        if (
+            isinstance(hidden_states, torch.Tensor)
+            and isinstance(residual, torch.Tensor)
+            and hidden_states.shape[0] != residual.shape[0]
+        ):
+            raise ValueError(
+                f"{stage} row mismatch: hidden_states={hidden_states.shape[0]}, "
+                f"residual={residual.shape[0]}"
+            )
+        for tensor_index, (tensor_name, tensor) in enumerate(
+            zip(_PP_TARGET_FORWARD_TENSORS, tensors)
+        ):
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(f"{stage}.{tensor_name} must be a tensor")
+            if tensor.ndim != 2 or tensor.shape[1] != self.hidden_size:
+                raise ValueError(
+                    f"{stage}.{tensor_name} shape {tuple(tensor.shape)} does not "
+                    f"match [rows, {self.hidden_size}]"
+                )
+            if tensor.shape[0] > self.max_rows:
+                raise ValueError(
+                    f"{stage}.{tensor_name} rows {tensor.shape[0]} exceed fixed "
+                    f"capacity {self.max_rows}"
+                )
+            if tensor.dtype != self.dtype or tensor.device != self.device:
+                raise ValueError(
+                    f"{stage}.{tensor_name} identity changed: "
+                    f"dtype={tensor.dtype}, device={tensor.device}, "
+                    f"expected dtype={self.dtype}, device={self.device}"
+                )
+            self.buffer[stage_index, tensor_index, : tensor.shape[0]].copy_(tensor)
+        # Each graph shape writes its own valid-row count during replay.  This
+        # keeps one shared side buffer safe across all captured buckets.
+        self.row_counts[stage_index].fill_(hidden_states.shape[0])
+
+    def snapshot_stages(self) -> dict[str, dict]:
+        return {
+            stage: {
+                "logical_rows": self.row_counts[stage_index : stage_index + 1],
+                "tensors": {
+                    tensor_name: self.buffer[stage_index, tensor_index]
+                    for tensor_index, tensor_name in enumerate(
+                        _PP_TARGET_FORWARD_TENSORS
+                    )
+                },
+            }
+            for stage, stage_index in self._stage_index.items()
+        }
 
 
 class EaglePPSenderProbe:
@@ -111,6 +230,77 @@ class EaglePPSenderProbe:
         )
         self._sealed = False
         self._pending: Optional[dict] = None
+        self._target_forward_observer: Optional[_PPTargetForwardDeviceObserver] = None
+
+    @property
+    def target_forward_observer(self) -> Optional[_PPTargetForwardDeviceObserver]:
+        return self._target_forward_observer
+
+    def install_target_forward_observer(
+        self,
+        *,
+        model,
+        max_rows: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        """Install the fixed observer before target CUDA graphs are captured."""
+        if not self.can_probe:
+            return
+        body = getattr(model, "model", None)
+        layers = getattr(body, "layers", None)
+        start_layer = getattr(body, "start_layer", None)
+        end_layer = getattr(body, "end_layer", None)
+        if (
+            layers is None
+            or not isinstance(start_layer, int)
+            or not isinstance(end_layer, int)
+        ):
+            raise TypeError(
+                "PP target-forward observer requires a model body with local layers"
+            )
+        if model.__class__.__name__ not in {
+            "DeepseekV2ForCausalLM",
+            "DeepseekV3ForCausalLM",
+            "DeepseekV32ForCausalLM",
+            "GlmMoeDsaForCausalLM",
+        }:
+            raise TypeError(
+                "PP target-forward observer requires a DeepseekV2 decoder body, "
+                f"got {model.__class__.__name__}"
+            )
+        num_local_layers = end_layer - start_layer
+        if start_layer != 0 or num_local_layers <= 0:
+            raise ValueError(
+                "PP target-forward observer is restricted to PP0, got "
+                f"layer range [{start_layer}, {end_layer})"
+            )
+        layer_ids = tuple(
+            dict.fromkeys(
+                (
+                    start_layer,
+                    min(start_layer + 1, end_layer - 1),
+                    start_layer + num_local_layers // 4,
+                    start_layer + num_local_layers // 2,
+                    end_layer - 1,
+                )
+            )
+        )
+        observer = _PPTargetForwardDeviceObserver(
+            layer_ids=layer_ids,
+            max_rows=max_rows,
+            hidden_size=int(model.config.hidden_size),
+            dtype=dtype,
+            device=device,
+        )
+        for layer_id in layer_ids:
+            layer = layers[layer_id]
+            if getattr(layer, "target_forward_probe", None) is not None:
+                raise RuntimeError(
+                    f"target-forward observer already installed on layer {layer_id}"
+                )
+            layer.target_forward_probe = observer
+        self._target_forward_observer = observer
 
     @property
     def can_probe(self) -> bool:
@@ -158,20 +348,50 @@ class EaglePPSenderProbe:
             return False
 
         try:
+            stage_sources = {
+                _PP_SENDER_STAGE: {"logical_rows": hidden_rows, "tensors": tensors}
+            }
+            if self._target_forward_observer is not None:
+                stage_sources.update(self._target_forward_observer.snapshot_stages())
             snapshots = {}
             cuda_devices = set()
-            for name, tensor in tensors.items():
-                value = tensor.detach()
-                if value.is_cuda:
-                    snapshot = torch.empty(
-                        value.shape, dtype=value.dtype, device="cpu", pin_memory=True
-                    )
-                    snapshot.copy_(value, non_blocking=True)
-                    value.record_stream(torch.cuda.current_stream(value.device))
-                    cuda_devices.add(value.device)
+            for stage_name, stage_source in stage_sources.items():
+                snapshots[stage_name] = {"tensors": {}}
+                logical_rows = stage_source["logical_rows"]
+                if isinstance(logical_rows, torch.Tensor):
+                    row_count = logical_rows.detach()
+                    if row_count.is_cuda:
+                        host_row_count = torch.empty(
+                            row_count.shape,
+                            dtype=row_count.dtype,
+                            device="cpu",
+                            pin_memory=True,
+                        )
+                        host_row_count.copy_(row_count, non_blocking=True)
+                        row_count.record_stream(
+                            torch.cuda.current_stream(row_count.device)
+                        )
+                        cuda_devices.add(row_count.device)
+                    else:
+                        host_row_count = row_count.clone()
+                    snapshots[stage_name]["logical_rows"] = host_row_count
                 else:
-                    snapshot = value.clone()
-                snapshots[name] = snapshot
+                    snapshots[stage_name]["logical_rows"] = int(logical_rows)
+                for name, tensor in stage_source["tensors"].items():
+                    value = tensor.detach()
+                    if value.is_cuda:
+                        snapshot = torch.empty(
+                            value.shape,
+                            dtype=value.dtype,
+                            device="cpu",
+                            pin_memory=True,
+                        )
+                        snapshot.copy_(value, non_blocking=True)
+                        value.record_stream(torch.cuda.current_stream(value.device))
+                        cuda_devices.add(value.device)
+                    else:
+                        snapshot = value.clone()
+                    snapshots[stage_name]["tensors"][name] = snapshot
             if len(cuda_devices) > 1:
                 raise RuntimeError(
                     "PP sender tensors span multiple CUDA devices: "
@@ -205,7 +425,6 @@ class EaglePPSenderProbe:
                 rank[name] = value
         self._pending = {
             "snapshots": snapshots,
-            "logical_rows": hidden_rows,
             "completion_event": completion_event,
             "rank": rank,
             "transport": {
@@ -228,14 +447,9 @@ class EaglePPSenderProbe:
         try:
             if pending["completion_event"] is not None:
                 pending["completion_event"].synchronize()
-            fingerprints = {
-                name: _tensor_fingerprint(tensor, pending["logical_rows"])
-                for name, tensor in sorted(pending["snapshots"].items())
-            }
-            stage = {
-                "row_domain": _PP_RANK_LOCAL_TARGET_TREE_ROW_DOMAIN,
-                "logical_rows": pending["logical_rows"],
-                "tensors": fingerprints,
+            stages = {
+                stage_name: self._finalize_stage_snapshot(stage_snapshot)
+                for stage_name, stage_snapshot in pending["snapshots"].items()
             }
         except (RuntimeError, TypeError, ValueError) as exc:
             self._emit(
@@ -247,15 +461,39 @@ class EaglePPSenderProbe:
             )
             raise
         self._emit(
-            stage=stage,
+            stages=stages,
             rank=pending["rank"],
             transport=pending["transport"],
         )
+
+    def _finalize_stage_snapshot(self, stage_snapshot: dict) -> dict:
+        logical_rows = stage_snapshot["logical_rows"]
+        if isinstance(logical_rows, torch.Tensor):
+            if logical_rows.numel() != 1:
+                raise ValueError("target-forward row count must be scalar")
+            logical_rows = int(logical_rows.item())
+        tensor_rows = {
+            name: int(tensor.shape[0])
+            for name, tensor in stage_snapshot["tensors"].items()
+        }
+        if logical_rows <= 0 or any(
+            logical_rows > rows for rows in tensor_rows.values()
+        ):
+            raise ValueError(f"invalid target-forward logical_rows={logical_rows}")
+        return {
+            "row_domain": _PP_RANK_LOCAL_TARGET_TREE_ROW_DOMAIN,
+            "logical_rows": logical_rows,
+            "tensors": {
+                name: _tensor_fingerprint(tensor, logical_rows)
+                for name, tensor in sorted(stage_snapshot["tensors"].items())
+            },
+        }
 
     def _emit(
         self,
         *,
         stage: Optional[dict] = None,
+        stages: Optional[dict[str, dict]] = None,
         rejection: Optional[str] = None,
         rank: Optional[dict] = None,
         transport: Optional[dict] = None,
@@ -267,7 +505,11 @@ class EaglePPSenderProbe:
             "role": "decode",
             "status": "rejected" if rejection else "complete",
             "rejection": rejection,
-            "stages": ({_PP_SENDER_STAGE: stage} if stage is not None else {}),
+            "stages": (
+                stages
+                if stages is not None
+                else ({_PP_SENDER_STAGE: stage} if stage is not None else {})
+            ),
         }
         rank = _rank_payload() if rank is None else rank
         if rank is not None:

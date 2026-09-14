@@ -1403,7 +1403,27 @@ class EAGLEWorkerV2(BaseSpecWorker):
             if self._pp_enabled and not self._pp_is_last_rank
             else None
         )
-
+        # The scheduler captures target CUDA graphs before it initializes the
+        # speculative worker's own graphs.  Install this fixed side buffer now,
+        # after the target model exists but before memory-pool sizing and target
+        # graph capture, so every target-verify graph records the D2D copies.
+        if (
+            self.eagle_pp_sender_probe is not None
+            and self.eagle_pp_sender_probe.can_probe
+            and get_pp_group().is_first_rank
+        ):
+            if not check_cuda_graph_backend(Phase.DECODE, Backend.FULL):
+                raise ValueError(
+                    "PP target-forward observer requires explicit full Decode "
+                    "CUDA graphs"
+                )
+            target_model_runner = self._target_worker.model_runner
+            self.eagle_pp_sender_probe.install_target_forward_observer(
+                model=target_model_runner.model,
+                max_rows=target_model_runner.max_decode_logits_rows(),
+                dtype=target_model_runner.dtype,
+                device=target_model_runner.device,
+            )
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
         if get_spec().speculative_adaptive and self._hosts_draft:

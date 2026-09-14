@@ -11,6 +11,7 @@ from sglang.srt.speculative.eagle_numerical_probe import (
     EagleNumericalProbe,
     EaglePDHandoffProbe,
     EaglePPSenderProbe,
+    _PPTargetForwardDeviceObserver,
     _synchronize_cuda_tensors,
     maybe_record_eagle_numerical_stage,
 )
@@ -174,6 +175,244 @@ class TestEagleNumericalProbe(unittest.TestCase):
             },
         )
         self.assertFalse(probe.can_probe)
+
+    def test_pp_target_forward_observer_uses_fixed_slots(self):
+        observer = _PPTargetForwardDeviceObserver(
+            layer_ids=(0, 3),
+            max_rows=4,
+            hidden_size=3,
+            dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+        )
+        hidden = torch.arange(6, dtype=torch.bfloat16).reshape(2, 3)
+
+        observer.capture(
+            layer_id=0,
+            boundary="attn_input",
+            hidden_states=hidden,
+            residual=hidden + 10,
+        )
+        observer.capture(
+            layer_id=1,
+            boundary="attn_input",
+            hidden_states=hidden + 20,
+            residual=hidden + 30,
+        )
+        snapshot = observer.snapshot_stages()
+
+        self.assertEqual(
+            observer.stage_names,
+            (
+                "target_verify_layer_00_attn_input",
+                "target_verify_layer_00_mlp_input",
+                "target_verify_layer_00_layer_return",
+                "target_verify_layer_03_attn_input",
+                "target_verify_layer_03_mlp_input",
+                "target_verify_layer_03_layer_return",
+            ),
+        )
+        self.assertTrue(
+            torch.equal(
+                snapshot["target_verify_layer_00_attn_input"]["tensors"][
+                    "hidden_states"
+                ][:2],
+                hidden,
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                snapshot["target_verify_layer_00_attn_input"]["tensors"]["residual"][
+                    :2
+                ],
+                hidden + 10,
+            )
+        )
+        self.assertEqual(
+            snapshot["target_verify_layer_00_attn_input"]["logical_rows"].item(),
+            2,
+        )
+        self.assertEqual(
+            snapshot["target_verify_layer_03_attn_input"]["logical_rows"].item(),
+            0,
+        )
+
+    def test_pp_target_forward_observer_rejects_shape_or_capacity_drift(self):
+        observer = _PPTargetForwardDeviceObserver(
+            layer_ids=(0,),
+            max_rows=2,
+            hidden_size=3,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            observer.capture(
+                layer_id=0,
+                boundary="attn_input",
+                hidden_states=torch.ones((1, 4)),
+                residual=torch.ones((1, 4)),
+            )
+        with self.assertRaisesRegex(ValueError, "exceed fixed capacity"):
+            observer.capture(
+                layer_id=0,
+                boundary="attn_input",
+                hidden_states=torch.ones((3, 3)),
+                residual=torch.ones((3, 3)),
+            )
+        with self.assertRaisesRegex(ValueError, "row mismatch"):
+            observer.capture(
+                layer_id=0,
+                boundary="attn_input",
+                hidden_states=torch.ones((2, 3)),
+                residual=torch.ones((1, 3)),
+            )
+
+    def test_pp_target_forward_observer_tracks_replayed_bucket_rows(self):
+        observer = _PPTargetForwardDeviceObserver(
+            layer_ids=(0,),
+            max_rows=4,
+            hidden_size=3,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        stage = "target_verify_layer_00_layer_return"
+        observer.capture(
+            layer_id=0,
+            boundary="layer_return",
+            hidden_states=torch.full((4, 3), 4.0),
+            residual=torch.full((4, 3), 5.0),
+        )
+        observer.capture(
+            layer_id=0,
+            boundary="layer_return",
+            hidden_states=torch.full((2, 3), 2.0),
+            residual=torch.full((2, 3), 3.0),
+        )
+
+        snapshot = observer.snapshot_stages()[stage]
+        self.assertEqual(snapshot["logical_rows"].item(), 2)
+        self.assertTrue(
+            torch.equal(
+                snapshot["tensors"]["hidden_states"][:2], torch.full((2, 3), 2.0)
+            )
+        )
+        self.assertTrue(
+            torch.equal(snapshot["tensors"]["residual"][:2], torch.full((2, 3), 3.0))
+        )
+
+    def test_pp_sender_probe_installs_expected_pp0_layer_anchors(self):
+        probe = EaglePPSenderProbe(
+            "probe-rid",
+            capture_id="capture-test-generation",
+            pod_name="probe-pod",
+            pod_uid="probe-pod-uid",
+        )
+        layers = [SimpleNamespace() for _ in range(78)]
+        model = type(
+            "GlmMoeDsaForCausalLM",
+            (),
+            {
+                "model": SimpleNamespace(layers=layers, start_layer=0, end_layer=40),
+                "config": SimpleNamespace(hidden_size=16),
+            },
+        )()
+
+        probe.install_target_forward_observer(
+            model=model,
+            max_rows=32,
+            dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+        )
+
+        observer = probe.target_forward_observer
+        self.assertIsNotNone(observer)
+        self.assertEqual(observer.layer_ids, (0, 1, 10, 20, 39))
+        for layer_id in observer.layer_ids:
+            self.assertIs(layers[layer_id].target_forward_probe, observer)
+        self.assertFalse(
+            any(
+                hasattr(layer, "target_forward_probe")
+                for index, layer in enumerate(layers)
+                if index not in observer.layer_ids
+            )
+        )
+
+    def test_pp_sender_probe_includes_target_forward_sidecar_without_proxy_mutation(
+        self,
+    ):
+        probe = EaglePPSenderProbe(
+            "probe-rid",
+            capture_id="capture-test-generation",
+            pod_name="probe-pod",
+            pod_uid="probe-pod-uid",
+        )
+        observer = _PPTargetForwardDeviceObserver(
+            layer_ids=(0,),
+            max_rows=2,
+            hidden_size=3,
+            dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+        )
+        hidden = torch.arange(6, dtype=torch.bfloat16).reshape(2, 3)
+        for boundary, offset in zip(
+            ("attn_input", "mlp_input", "layer_return"), (10, 20, 30)
+        ):
+            observer.capture(
+                layer_id=0,
+                boundary=boundary,
+                hidden_states=hidden + offset,
+                residual=hidden + offset + 1,
+            )
+        probe._target_forward_observer = observer
+        proxy = {"hidden_states": hidden, "residual": hidden + 1}
+        original_keys = tuple(proxy)
+
+        with self.assertLogs(
+            "sglang.srt.speculative.eagle_numerical_probe", level="WARNING"
+        ) as logs:
+            self.assertTrue(
+                probe.begin_target_verify_pp_output(
+                    pp_proxy_tensors=proxy,
+                    target_world_rank=8,
+                    require_attn_tp_allgather=False,
+                )
+            )
+            probe.finalize_target_verify_pp_output()
+
+        payload = json.loads(
+            logs.output[-1].split("EAGLE_PP_SENDER_PROBE_RESULT ", 1)[1]
+        )
+        self.assertEqual(tuple(proxy), original_keys)
+        self.assertEqual(
+            tuple(payload["stages"]),
+            (
+                "target_verify_pp_output",
+                "target_verify_layer_00_attn_input",
+                "target_verify_layer_00_mlp_input",
+                "target_verify_layer_00_layer_return",
+            ),
+        )
+        self.assertEqual(
+            set(payload["stages"]["target_verify_layer_00_mlp_input"]["tensors"]),
+            {"hidden_states", "residual"},
+        )
+
+    def test_pp_sender_probe_rejects_stage_rows_beyond_snapshot_capacity(self):
+        probe = EaglePPSenderProbe(
+            "probe-rid",
+            capture_id="capture-test-generation",
+            pod_name="probe-pod",
+            pod_uid="probe-pod-uid",
+        )
+        with self.assertRaisesRegex(ValueError, "invalid target-forward logical_rows"):
+            probe._finalize_stage_snapshot(
+                {
+                    "logical_rows": 3,
+                    "tensors": {
+                        "hidden_states": torch.ones((2, 3)),
+                        "residual": torch.ones((2, 3)),
+                    },
+                }
+            )
 
     def test_pp_sender_probe_wrong_or_cobatched_rid_is_noop(self):
         probe = EaglePPSenderProbe(
