@@ -77,7 +77,12 @@ _PD_HANDOFF_REQUIRED_TENSORS = {
 }
 _PP_SENDER_STAGE = "target_verify_pp_output"
 _PP_SENDER_REQUIRED_TENSORS = frozenset({"hidden_states", "residual"})
-_PP_TARGET_FORWARD_BOUNDARIES = ("attn_input", "mlp_input", "layer_return")
+_PP_TARGET_FORWARD_BOUNDARIES = (
+    "attn_input",
+    "attn_output",
+    "mlp_input",
+    "layer_return",
+)
 _PP_TARGET_FORWARD_TENSORS = ("hidden_states", "residual")
 
 

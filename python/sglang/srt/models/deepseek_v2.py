@@ -2559,6 +2559,26 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             topk_indices = None
         get_attn_tp_context().clear_attn_inputs()
+        if (
+            target_forward_probe is not None
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            # self_attn returns the rank-local o_proj partial.  Capture it
+            # before prepare_mlp performs the TP all-reduce and post-attention
+            # residual/RMSNorm, so the diagnostic can assign a first numeric
+            # divergence to attention or to the following collective boundary.
+            target_forward_probe.capture(
+                layer_id=self.layer_id,
+                boundary="attn_output",
+                hidden_states=hidden_states,
+                residual=residual,
+                hidden_row_domain=_pp_target_forward_row_domain(
+                    self.layer_scatter_modes.attn_mode
+                ),
+                residual_row_domain=_pp_target_forward_row_domain(
+                    self.layer_scatter_modes.layer_input_mode
+                ),
+            )
 
         maybe_prefetch_next_full_attention_kv(
             forward_batch, next_full_attention_layer_id

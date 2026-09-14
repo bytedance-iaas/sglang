@@ -226,9 +226,11 @@ class TestEagleNumericalProbe(unittest.TestCase):
             observer.stage_names,
             (
                 "target_verify_layer_00_attn_input",
+                "target_verify_layer_00_attn_output",
                 "target_verify_layer_00_mlp_input",
                 "target_verify_layer_00_layer_return",
                 "target_verify_layer_03_attn_input",
+                "target_verify_layer_03_attn_output",
                 "target_verify_layer_03_mlp_input",
                 "target_verify_layer_03_layer_return",
             ),
@@ -474,7 +476,8 @@ class TestEagleNumericalProbe(unittest.TestCase):
         )
         hidden = torch.arange(6, dtype=torch.bfloat16).reshape(2, 3)
         for boundary, offset in zip(
-            ("attn_input", "mlp_input", "layer_return"), (10, 20, 30)
+            ("attn_input", "attn_output", "mlp_input", "layer_return"),
+            (10, 20, 30, 40),
         ):
             observer.capture(
                 layer_id=0,
@@ -526,6 +529,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
             {
                 "target_verify_pp_output",
                 "target_verify_layer_00_attn_input",
+                "target_verify_layer_00_attn_output",
                 "target_verify_layer_00_mlp_input",
                 "target_verify_layer_00_layer_return",
             },
