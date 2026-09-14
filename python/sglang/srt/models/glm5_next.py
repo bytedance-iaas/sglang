@@ -367,15 +367,38 @@ class Glm5NextLinearAttention(nn.Module):
                 ],
             )
         )
-        if self.do_fuse_qkvbfg:
-            self.qkvb_sizes = [
-                projection_size,
-                projection_size,
-                projection_size,
-                self.num_heads,
-            ]
-            self.fg_sizes = [self.head_dim, self.head_dim]
+        fusion_mode = (
+            envs.SGLANG_OPT_GLM5_NEXT_KDA_PROJECTION_FUSION_MODE.get()
+            if self.do_fuse_qkvbfg
+            else "off"
+        )
+        if fusion_mode not in {"off", "full", "a_only", "b_only"}:
+            raise ValueError(
+                "SGLANG_OPT_GLM5_NEXT_KDA_PROJECTION_FUSION_MODE must be "
+                "one of: full, a_only, b_only"
+            )
+        self.fuse_qkvbfg_a = fusion_mode in {"full", "a_only"}
+        self.fuse_fg_b = fusion_mode in {"full", "b_only"}
 
+        self.qkvb_sizes = [
+            projection_size,
+            projection_size,
+            projection_size,
+            self.num_heads,
+        ]
+        self.fg_sizes = [self.head_dim, self.head_dim]
+        self.split_sizes = [
+            3 * projection_size // head_shard_size,
+            self.num_heads // head_shard_size,
+            2 * self.head_dim,
+        ]
+        fused_dtype = (
+            getattr(config, "dtype", None)
+            or getattr(config, "torch_dtype", None)
+            or torch.get_default_dtype()
+        )
+
+        if self.fuse_qkvbfg_a:
             self.fused_qkvbfg_a_proj = MergedColumnParallelRepeatedLinear(
                 self.hidden_size,
                 self.qkvb_sizes,
@@ -387,24 +410,6 @@ class Glm5NextLinearAttention(nn.Module):
                 # layer whose source weights are BF16.
                 quant_config=None,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
-                tp_rank=head_shard_rank,
-                tp_size=head_shard_size,
-            )
-            self.split_sizes = [
-                3 * projection_size // head_shard_size,
-                self.num_heads // head_shard_size,
-                2 * self.head_dim,
-            ]
-            fused_dtype = (
-                getattr(config, "dtype", None)
-                or getattr(config, "torch_dtype", None)
-                or torch.get_default_dtype()
-            )
-            self.fused_fg_b_proj = ColumnParallelBatchedLinear(
-                2,
-                self.head_dim,
-                projection_size,
-                dtype=fused_dtype,
                 tp_rank=head_shard_rank,
                 tp_size=head_shard_size,
             )
@@ -420,7 +425,6 @@ class Glm5NextLinearAttention(nn.Module):
                 tp_size=head_shard_size,
                 prefix=f"{prefix}.qkv_proj",
             )
-
             self.f_a_proj = ReplicatedLinear(
                 self.hidden_size,
                 self.head_dim,
@@ -428,17 +432,6 @@ class Glm5NextLinearAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.f_a_proj",
             )
-
-            self.f_b_proj = ColumnParallelLinear(
-                self.head_dim,
-                projection_size,
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.f_b_proj",
-                tp_rank=head_shard_rank,
-                tp_size=head_shard_size,
-            )
-
             self.b_proj = ColumnParallelLinear(
                 self.hidden_size,
                 self.num_heads,
@@ -448,13 +441,32 @@ class Glm5NextLinearAttention(nn.Module):
                 tp_rank=head_shard_rank,
                 tp_size=head_shard_size,
             )
-
             self.g_a_proj = ReplicatedLinear(
                 self.hidden_size,
                 self.head_dim,
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.g_a_proj",
+            )
+
+        if self.fuse_fg_b:
+            self.fused_fg_b_proj = ColumnParallelBatchedLinear(
+                2,
+                self.head_dim,
+                projection_size,
+                dtype=fused_dtype,
+                tp_rank=head_shard_rank,
+                tp_size=head_shard_size,
+            )
+        else:
+            self.f_b_proj = ColumnParallelLinear(
+                self.head_dim,
+                projection_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.f_b_proj",
+                tp_rank=head_shard_rank,
+                tp_size=head_shard_size,
             )
             self.g_b_proj = ColumnParallelLinear(
                 self.head_dim,
@@ -546,13 +558,24 @@ class Glm5NextLinearAttention(nn.Module):
     def forward_qkvbfg_fused(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
-        fused_states = self.fused_qkvbfg_a_proj(hidden_states)
+        if self.fuse_qkvbfg_a:
+            fused_states = self.fused_qkvbfg_a_proj(hidden_states)
+            qkv, beta, fg_a_states = torch.split(
+                fused_states, self.split_sizes, dim=-1
+            )
+            f_a_states, g_a_states = fg_a_states.split(self.head_dim, dim=-1)
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+            beta = self.b_proj(hidden_states)[0]
+            f_a_states = self.f_a_proj(hidden_states)[0]
+            g_a_states = self.g_a_proj(hidden_states)[0]
 
-        qkv, beta, fg_a_states = torch.split(fused_states, self.split_sizes, dim=-1)
-
-        forget_gate, g_proj_states = self.fused_fg_b_proj(
-            fg_a_states.view(-1, 2, self.head_dim).transpose(0, 1)
-        )
+        if self.fuse_fg_b:
+            fg_a_states = torch.stack((f_a_states, g_a_states))
+            forget_gate, g_proj_states = self.fused_fg_b_proj(fg_a_states)
+        else:
+            forget_gate = self.f_b_proj(f_a_states)[0]
+            g_proj_states = self.g_b_proj(g_a_states)[0]
 
         return (
             qkv,
