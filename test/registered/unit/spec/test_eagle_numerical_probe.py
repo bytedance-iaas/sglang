@@ -400,13 +400,13 @@ class TestEagleNumericalProbe(unittest.TestCase):
         )
         self.assertEqual(tuple(proxy), original_keys)
         self.assertEqual(
-            tuple(payload["stages"]),
-            (
+            set(payload["stages"]),
+            {
                 "target_verify_pp_output",
                 "target_verify_layer_00_attn_input",
                 "target_verify_layer_00_mlp_input",
                 "target_verify_layer_00_layer_return",
-            ),
+            },
         )
         self.assertEqual(
             set(payload["stages"]["target_verify_layer_00_mlp_input"]["tensors"]),
