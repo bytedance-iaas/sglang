@@ -54,6 +54,13 @@ jobs:
           docker image rm -f \
             "${IMAGE_REPO}:glm53-w4a8-community-f0ccf011eb-pp-target-forward-v1@sha256:7524d41aa989c679db9e2159be014533062c910179557b922df30e4fd2293f00" \
             || true
+          # The v4 probe image is also immutable and recoverable from the
+          # registry.  Its serving generation has been released, so retain the
+          # shared kernel base but reclaim this recent output before building
+          # the replacement; the 72-hour prune below deliberately keeps it.
+          docker image rm -f \
+            "${IMAGE_REPO}:glm53-w4a8-community-ddd0904fce-pp-attn-output-v4@sha256:c87ef715eb36c77ba91785171a7ed99248d6a02685b8c33716553d3326da8e13" \
+            || true
           docker buildx prune --filter "until=72h" -f
           docker system prune -af --filter "until=72h"
           df -h /
