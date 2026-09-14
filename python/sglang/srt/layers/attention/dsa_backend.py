@@ -2253,6 +2253,7 @@ class DeepseekSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                capture_target_forward=forward_batch.forward_mode.is_target_verify(),
             )
             return _restore_dsa_decode_dp_padding(output, num_extend_padding_rows)
         elif dsa_impl == "fa3":
@@ -2435,6 +2436,7 @@ class DeepseekSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                capture_target_forward=forward_batch.forward_mode.is_target_verify(),
             )
         elif self.dsa_decode_impl == "tilelang":
             # Cat-skip (HIP-only): when caller passes q_rope=None on HIP, q_all
@@ -2933,6 +2935,7 @@ class DeepseekSparseAttnBackend(
         layer,
         metadata: DSAMetadata,
         page_table_1,
+        capture_target_forward: bool,
     ) -> torch.Tensor:
         from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
@@ -2999,6 +3002,18 @@ class DeepseekSparseAttnBackend(
 
         if target_q_heads != num_q_heads:
             o = o[:, :, :num_q_heads, :]
+
+        target_forward_probe = getattr(layer, "target_forward_probe", None)
+        if target_forward_probe is not None and capture_target_forward:
+            # Record after head-padding trim so the diagnostic hashes only the
+            # logical FlashMLA-KV output. The observer performs fixed
+            # device-to-device copies; exact-request selection and host work
+            # remain outside CUDA graph replay.
+            target_forward_probe.capture_attention(
+                layer_id=layer.layer_id,
+                boundary="flashmla_raw_output",
+                output=o,
+            )
 
         return o
 

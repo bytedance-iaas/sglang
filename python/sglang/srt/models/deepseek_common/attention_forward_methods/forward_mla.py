@@ -875,6 +875,7 @@ class DeepseekMLAForwardMixin:
                     )
                     attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+        target_forward_probe = getattr(self, "target_forward_probe", None)
 
         _kvb_v = None
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
@@ -987,6 +988,17 @@ class DeepseekMLAForwardMixin:
             )
         if gate is not None:
             attn_bmm_output = self._apply_gated(attn_bmm_output, gate)
+        if (
+            target_forward_probe is not None
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            # Split V projection/correction/gating from the following
+            # rank-local quantized o_proj.
+            target_forward_probe.capture_attention(
+                layer_id=self.layer_id,
+                boundary="v_projection_output",
+                output=attn_bmm_output,
+            )
         output, _ = self.o_proj(attn_bmm_output)
 
         if self.next_skip_topk is None:

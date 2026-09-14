@@ -531,6 +531,78 @@ class TestEagleNumericalProbe(unittest.TestCase):
         self.assertEqual(stage["tensors"]["residual"]["shape"], [4, 3])
         self.assertEqual(stage["tensors"]["residual"]["logical_rows"], 4)
 
+    def test_pp_target_forward_observer_captures_attention_internal_cuts(self):
+        observer = _PPTargetForwardDeviceObserver(
+            layer_ids=(0,),
+            max_rows=4,
+            hidden_size=3,
+            dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+        )
+        observer.install_attention_boundaries(
+            layer_id=0,
+            raw_output_width=6,
+            v_projection_width=4,
+            row_domain="pp_attn_group_target_verify_tree_node",
+        )
+        raw = torch.arange(12, dtype=torch.bfloat16).reshape(2, 2, 3)
+        v_projection = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4)
+
+        observer.capture_attention(
+            layer_id=0, boundary="flashmla_raw_output", output=raw
+        )
+        observer.capture_attention(
+            layer_id=0, boundary="v_projection_output", output=v_projection
+        )
+        snapshot = observer.snapshot_stages()
+
+        raw_stage = snapshot["target_verify_layer_00_flashmla_raw_output"]
+        self.assertEqual(
+            raw_stage["tensor_metadata"]["output"]["logical_rows"].item(), 2
+        )
+        self.assertEqual(
+            raw_stage["tensor_metadata"]["output"]["row_domain"],
+            "pp_attn_group_target_verify_tree_node",
+        )
+        self.assertTrue(
+            torch.equal(raw_stage["tensors"]["output"][:2], raw.reshape(2, 6))
+        )
+        self.assertTrue(
+            torch.equal(
+                snapshot["target_verify_layer_00_v_projection_output"]["tensors"][
+                    "output"
+                ][:2],
+                v_projection,
+            )
+        )
+
+    def test_pp_target_forward_observer_rejects_attention_shape_drift(self):
+        observer = _PPTargetForwardDeviceObserver(
+            layer_ids=(0,),
+            max_rows=2,
+            hidden_size=3,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        observer.install_attention_boundaries(
+            layer_id=0,
+            raw_output_width=6,
+            v_projection_width=4,
+            row_domain="pp_attn_group_target_verify_tree_node",
+        )
+        with self.assertRaisesRegex(ValueError, "width 8 does not match"):
+            observer.capture_attention(
+                layer_id=0,
+                boundary="flashmla_raw_output",
+                output=torch.ones((2, 2, 4)),
+            )
+        with self.assertRaisesRegex(ValueError, "outside fixed capacity"):
+            observer.capture_attention(
+                layer_id=0,
+                boundary="v_projection_output",
+                output=torch.ones((3, 4)),
+            )
+
     def test_pp_target_forward_observer_tracks_replayed_bucket_rows(self):
         observer = _PPTargetForwardDeviceObserver(
             layer_ids=(0,),
@@ -610,6 +682,12 @@ class TestEagleNumericalProbe(unittest.TestCase):
             pod_uid="probe-pod-uid",
         )
         layers = [SimpleNamespace() for _ in range(78)]
+        layers[0].self_attn = SimpleNamespace(
+            num_local_heads=2,
+            kv_lora_rank=8,
+            v_head_dim=4,
+            attn_mqa=SimpleNamespace(),
+        )
         model = type(
             "GlmMoeDsaForCausalLM",
             (),
@@ -631,6 +709,15 @@ class TestEagleNumericalProbe(unittest.TestCase):
         self.assertEqual(observer.layer_ids, (0, 1, 10, 20, 39))
         for layer_id in observer.layer_ids:
             self.assertIs(layers[layer_id].target_forward_probe, observer)
+        self.assertIs(layers[0].self_attn.target_forward_probe, observer)
+        self.assertIs(layers[0].self_attn.attn_mqa.target_forward_probe, observer)
+        self.assertEqual(
+            set(observer._attention_buffers),
+            {
+                "target_verify_layer_00_flashmla_raw_output",
+                "target_verify_layer_00_v_projection_output",
+            },
+        )
         self.assertFalse(
             any(
                 hasattr(layer, "target_forward_probe")

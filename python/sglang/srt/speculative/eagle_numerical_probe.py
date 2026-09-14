@@ -140,6 +140,11 @@ _PP_TARGET_FORWARD_BOUNDARIES = (
     "layer_return",
 )
 _PP_TARGET_FORWARD_TENSORS = ("hidden_states", "residual")
+_PP_TARGET_ATTENTION_BOUNDARIES = (
+    "flashmla_raw_output",
+    "v_projection_output",
+)
+_PP_TARGET_ATTENTION_TENSOR = "output"
 
 
 class _PPTargetForwardDeviceObserver:
@@ -197,7 +202,80 @@ class _PPTargetForwardDeviceObserver:
             device=device,
         )
         self._row_domains: dict[str, dict[str, str]] = {}
+        self._attention_buffers: dict[str, torch.Tensor] = {}
+        self._attention_row_counts: dict[str, torch.Tensor] = {}
+        self._attention_widths: dict[str, int] = {}
         self.device = self.buffer.device
+
+    def install_attention_boundaries(
+        self,
+        *,
+        layer_id: int,
+        raw_output_width: int,
+        v_projection_width: int,
+        row_domain: str,
+    ) -> None:
+        """Allocate first-attention cut buffers before CUDA graph capture."""
+        widths = {
+            "flashmla_raw_output": raw_output_width,
+            "v_projection_output": v_projection_width,
+        }
+        for boundary in _PP_TARGET_ATTENTION_BOUNDARIES:
+            width = int(widths[boundary])
+            if width <= 0:
+                raise ValueError(
+                    f"PP target-attention observer width must be positive: "
+                    f"boundary={boundary}, width={width}"
+                )
+            stage = f"target_verify_layer_{layer_id:02d}_{boundary}"
+            if stage in self._attention_buffers:
+                raise RuntimeError(
+                    f"target-attention observer already installed: {stage}"
+                )
+            self._attention_buffers[stage] = torch.empty(
+                (self.max_rows, width), dtype=self.dtype, device=self.device
+            )
+            self._attention_row_counts[stage] = torch.zeros(
+                (1,), dtype=torch.int32, device=self.device
+            )
+            self._attention_widths[stage] = width
+            self._row_domains[stage] = {_PP_TARGET_ATTENTION_TENSOR: row_domain}
+
+    def capture_attention(
+        self,
+        *,
+        layer_id: int,
+        boundary: str,
+        output: torch.Tensor,
+    ) -> None:
+        """Copy one fixed attention intermediate into its graph-side slot."""
+        stage = f"target_verify_layer_{layer_id:02d}_{boundary}"
+        buffer = self._attention_buffers.get(stage)
+        if buffer is None:
+            return
+        if not isinstance(output, torch.Tensor) or output.ndim < 2:
+            raise TypeError(f"{stage}.output must be a rank >= 2 tensor")
+        rows = int(output.shape[0])
+        flattened = output.reshape(rows, -1)
+        expected_width = self._attention_widths[stage]
+        if flattened.shape[1] != expected_width:
+            raise ValueError(
+                f"{stage}.output width {flattened.shape[1]} does not match "
+                f"fixed width {expected_width}"
+            )
+        if rows <= 0 or rows > self.max_rows:
+            raise ValueError(
+                f"{stage}.output rows {rows} outside fixed capacity "
+                f"[1, {self.max_rows}]"
+            )
+        if output.dtype != self.dtype or output.device != self.device:
+            raise ValueError(
+                f"{stage}.output identity changed: dtype={output.dtype}, "
+                f"device={output.device}, expected dtype={self.dtype}, "
+                f"device={self.device}"
+            )
+        buffer[:rows].copy_(flattened)
+        self._attention_row_counts[stage].fill_(rows)
 
     def capture(
         self,
@@ -275,7 +353,7 @@ class _PPTargetForwardDeviceObserver:
                 )
 
     def snapshot_stages(self) -> dict[str, dict]:
-        return {
+        stages = {
             stage: {
                 "tensor_metadata": {
                     tensor_name: {
@@ -299,6 +377,25 @@ class _PPTargetForwardDeviceObserver:
             }
             for stage, stage_index in self._stage_index.items()
         }
+        stages.update(
+            {
+                stage: {
+                    "tensor_metadata": {
+                        _PP_TARGET_ATTENTION_TENSOR: {
+                            "logical_rows": self._attention_row_counts[stage],
+                            "row_domain": self._row_domains[stage][
+                                _PP_TARGET_ATTENTION_TENSOR
+                            ],
+                        }
+                    },
+                    "tensors": {
+                        _PP_TARGET_ATTENTION_TENSOR: buffer,
+                    },
+                }
+                for stage, buffer in self._attention_buffers.items()
+            }
+        )
+        return stages
 
 
 class EaglePPSenderProbe:
@@ -406,6 +503,39 @@ class EaglePPSenderProbe:
                     f"target-forward observer already installed on layer {layer_id}"
                 )
             layer.target_forward_probe = observer
+        first_layer = layers[start_layer]
+        attention = getattr(first_layer, "self_attn", None)
+        if attention is None:
+            raise TypeError(
+                "PP target-attention observer requires self_attn on the first layer"
+            )
+        if getattr(attention, "target_forward_probe", None) is not None:
+            raise RuntimeError(
+                f"target-attention observer already installed on layer {start_layer}"
+            )
+        radix_attention = getattr(attention, "attn_mqa", None)
+        if radix_attention is None:
+            raise TypeError(
+                "PP target-attention observer requires attn_mqa on the first layer"
+            )
+        if getattr(radix_attention, "target_forward_probe", None) is not None:
+            raise RuntimeError(
+                f"FlashMLA observer already installed on layer {start_layer}"
+            )
+        observer.install_attention_boundaries(
+            layer_id=start_layer,
+            raw_output_width=(
+                int(attention.num_local_heads) * int(attention.kv_lora_rank)
+            ),
+            v_projection_width=(
+                int(attention.num_local_heads) * int(attention.v_head_dim)
+            ),
+            # Both cuts precede the rank-local o_proj partial and therefore
+            # retain the attention-group target-tree row layout.
+            row_domain=_PP_ATTN_GROUP_TARGET_TREE_ROW_DOMAIN,
+        )
+        attention.target_forward_probe = observer
+        radix_attention.target_forward_probe = observer
         self._target_forward_observer = observer
 
     @property

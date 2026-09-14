@@ -364,7 +364,13 @@ class TestDSAMultiStepDecode(unittest.TestCase):
                 num_splits=torch.empty((2,), dtype=torch.int32),
             ),
         )
-        layer = SimpleNamespace(tp_q_head_num=2, head_dim=3)
+        target_forward_probe = MagicMock()
+        layer = SimpleNamespace(
+            tp_q_head_num=2,
+            head_dim=3,
+            layer_id=0,
+            target_forward_probe=target_forward_probe,
+        )
 
         with patch.dict(
             "sys.modules",
@@ -382,6 +388,19 @@ class TestDSAMultiStepDecode(unittest.TestCase):
                 layer=layer,
                 metadata=metadata,
                 page_table_1=torch.zeros((1, 2), dtype=torch.int32),
+                capture_target_forward=False,
+            )
+            target_forward_probe.capture_attention.assert_not_called()
+            target_output = DeepseekSparseAttnBackend._forward_flashmla_kv(
+                backend,
+                q_all=torch.empty((1, 2, 3)),
+                kv_cache=torch.empty((64, 3)),
+                v_head_dim=2,
+                sm_scale=1.0,
+                layer=layer,
+                metadata=metadata,
+                page_table_1=torch.zeros((1, 2), dtype=torch.int32),
+                capture_target_forward=True,
             )
 
         self.assertEqual(captured["q"].shape[0], 1)
@@ -389,6 +408,12 @@ class TestDSAMultiStepDecode(unittest.TestCase):
         self.assertEqual(captured["indices"].shape[0], 1)
         self.assertEqual(captured["num_splits"].shape[0], 2)
         self.assertEqual(output.shape, (1, 1, 2, 2))
+        self.assertEqual(target_output.shape, (1, 1, 2, 2))
+        target_forward_probe.capture_attention.assert_called_once_with(
+            layer_id=0,
+            boundary="flashmla_raw_output",
+            output=target_output,
+        )
 
     def test_draft_extend_v2_flashmla_trims_eager_padding_and_restores_output(self):
         captured = {}
@@ -487,6 +512,7 @@ class TestDSAMultiStepDecode(unittest.TestCase):
                 layer=SimpleNamespace(tp_q_head_num=2, head_dim=3),
                 metadata=metadata,
                 page_table_1=torch.zeros((1, 2), dtype=torch.int32),
+                capture_target_forward=False,
             )
 
     def test_flashmla_decode_rejects_missing_live_length_row(self):
@@ -521,6 +547,7 @@ class TestDSAMultiStepDecode(unittest.TestCase):
                 layer=SimpleNamespace(tp_q_head_num=2, head_dim=3),
                 metadata=metadata,
                 page_table_1=torch.zeros((2, 2), dtype=torch.int32),
+                capture_target_forward=False,
             )
 
     def test_draft_children_advance_visible_kv_length(self):
@@ -880,6 +907,7 @@ class TestDSAMultiStepDecode(unittest.TestCase):
             scaling=1.0,
         )
         forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
             req_pool_indices=torch.tensor([4, 5, 6, 7]),
             seq_lens=torch.tensor([8, 12, 1, 1]),
             out_cache_loc=torch.arange(4),
@@ -911,6 +939,9 @@ class TestDSAMultiStepDecode(unittest.TestCase):
         )
         self.assertEqual(output.shape[0], 4)
         self.assertTrue(torch.all(output[2:] == 0))
+        self.assertFalse(
+            backend._forward_flashmla_kv.call_args.kwargs["capture_target_forward"]
+        )
 
     def test_aiter_uses_real_batch_size(self):
         metadata = SimpleNamespace(
