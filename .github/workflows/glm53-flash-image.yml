@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - codex/glm53-flash-image
+      - poc_glm5.3-flash
     paths:
       - .github/workflows/glm53-flash-image.yml
       - docker/glm53-flash*
