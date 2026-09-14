@@ -366,9 +366,26 @@ class TestEagleNumericalProbe(unittest.TestCase):
         proxy = {"hidden_states": hidden, "residual": hidden + 1}
         original_keys = tuple(proxy)
 
-        with self.assertLogs(
-            "sglang.srt.speculative.eagle_numerical_probe", level="WARNING"
-        ) as logs:
+        rank = SimpleNamespace(
+            world_rank=0,
+            pp_rank=0,
+            pp_size=2,
+            tp_rank=0,
+            tp_size=8,
+            attn_tp_rank=0,
+            attn_tp_size=8,
+            attn_dp_rank=0,
+            attn_dp_size=1,
+        )
+        with (
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.get_parallel",
+                return_value=rank,
+            ),
+            self.assertLogs(
+                "sglang.srt.speculative.eagle_numerical_probe", level="WARNING"
+            ) as logs,
+        ):
             self.assertTrue(
                 probe.begin_target_verify_pp_output(
                     pp_proxy_tensors=proxy,
@@ -492,6 +509,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
             self.assertEqual(kwargs["device"], "cpu")
             self.assertTrue(kwargs["pin_memory"])
             snapshot = mock.MagicMock(spec=torch.Tensor)
+            snapshot.shape = _args[0]
             snapshot.copy_.side_effect = lambda _value, **copy_kwargs: events.append(
                 ("copy", copy_kwargs["non_blocking"])
             )
