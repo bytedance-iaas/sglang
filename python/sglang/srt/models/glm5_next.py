@@ -1088,7 +1088,6 @@ class Glm5NextModel(nn.Module):
             and 0 < hidden_states.shape[0] <= 32
             and self.pp_group.world_size == 1
             and get_parallel().attn_cp_size == 1
-            and get_parallel().attn_dp_size == 1
             and not forward_batch.can_run_tbo
             and not self.layers_to_capture
             and not self.dflash_capture

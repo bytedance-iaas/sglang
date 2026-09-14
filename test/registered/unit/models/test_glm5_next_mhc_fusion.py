@@ -41,7 +41,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
         "hidden",
         "pp",
         "cp",
-        "dp",
+        "dp_eight",
         "tbo",
         "aux",
         "dflash",
@@ -76,7 +76,8 @@ def test_cross_layer_mhc_guard_preserves_forward_contracts(case):
     with (
         get_context().override_server_args(),
         get_parallel().override(
-            attn_cp_size=2 if case == "cp" else 1, attn_dp_size=2 if case == "dp" else 1
+            attn_cp_size=2 if case == "cp" else 1,
+            attn_dp_size=8 if case == "dp_eight" else 1,
         ),
         envs.SGLANG_OPT_FUSE_MHC_POST_PRE.override(case != "fusion"),
         envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.override(case != "pre"),
@@ -86,7 +87,7 @@ def test_cross_layer_mhc_guard_preserves_forward_contracts(case):
         patch.object(torch.compiler, "is_compiling", return_value=case == "compile"),
     ):
         assert model._can_fuse_mhc_layers(hidden, batch) == (
-            case in {"eligible", "seven", "eight", "thirty_two"}
+            case in {"eligible", "seven", "eight", "thirty_two", "dp_eight"}
         )
 
 
