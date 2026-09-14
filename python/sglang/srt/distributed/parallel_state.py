@@ -145,7 +145,7 @@ def _vpp_p2p_debug_event(
                 "DEBUG_SESSION_ID",
                 "vpp-pd-warmup-hang",
             ),
-            "runId": "pre-fix",
+            "runId": os.getenv("DEBUG_RUN_ID", "pre-fix"),
             "hypothesisId": hypothesis_id,
             "location": location,
             "msg": f"[VPP-DEBUG] {message}",
