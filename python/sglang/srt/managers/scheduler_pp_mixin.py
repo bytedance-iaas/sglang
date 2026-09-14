@@ -127,37 +127,6 @@ class SchedulerPPMixin:
         self.pp_group.device_module.synchronize()
         logger.info("VPP pipeline device group prewarm completed")
 
-    def _pp_relay_vpp_control(self: Scheduler, data, *, kind: str, mb_id: int) -> None:
-        should_send = self._pp_vpp_enabled() and not self.pp_group.is_last_rank
-        # #region debug-point C:control-send
-        _vpp_debug_event(
-            self,
-            "C",
-            "scheduler_pp_mixin.py:_pp_relay_vpp_control",
-            "control send enter",
-            {
-                "mb_id": mb_id,
-                "kind": kind,
-                "will_send": should_send,
-            },
-        )
-        # #endregion
-        if should_send:
-            self._pp_send_pyobj_to_next_stage(data, async_send=False)
-        # #region debug-point C:control-send-complete
-        _vpp_debug_event(
-            self,
-            "C",
-            "scheduler_pp_mixin.py:_pp_relay_vpp_control",
-            "control send complete",
-            {
-                "mb_id": mb_id,
-                "kind": kind,
-                "did_send": should_send,
-            },
-        )
-        # #endregion
-
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
         """
@@ -317,6 +286,10 @@ class SchedulerPPMixin:
         - Both can have local failure and need to be consensus on. PP needs to guarantee eventual consistency of local failure and flush malfunc requests out as soft error.
 
         """
+        if self._pp_vpp_enabled():
+            self._event_loop_pp_disagg_prefill_vpp()
+            return
+
         self.init_pp_loop_state()
 
         # PD additional state initialization
@@ -329,8 +302,6 @@ class SchedulerPPMixin:
         send_transfer_work = []
         send_consensus_bootstrapped_work = []
         send_release_work = []
-        vpp_enabled = self._pp_vpp_enabled()
-
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
@@ -365,11 +336,6 @@ class SchedulerPPMixin:
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
-                    self._pp_relay_vpp_control(
-                        recv_reqs,
-                        kind="request",
-                        mb_id=mb_id,
-                    )
 
                 # #region debug-point C:bootstrap-forward-consensus
                 _vpp_debug_event(
@@ -394,11 +360,6 @@ class SchedulerPPMixin:
                 # #endregion
                 bmbs[mb_id] = bootstrapped_rids
                 self._pp_commit_comm_work(send_bootstrapped_work)
-                self._pp_relay_vpp_control(
-                    bootstrapped_rids,
-                    kind="bootstrap",
-                    mb_id=mb_id,
-                )
 
                 # #region debug-point C:transfer-forward-consensus
                 _vpp_debug_event(
@@ -419,11 +380,6 @@ class SchedulerPPMixin:
                 # #endregion
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
-                self._pp_relay_vpp_control(
-                    transferred_rids,
-                    kind="transfer",
-                    mb_id=mb_id,
-                )
                 # #region debug-point C:control-relay-complete
                 _vpp_debug_event(
                     self,
@@ -559,16 +515,15 @@ class SchedulerPPMixin:
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
                 if not self.pp_group.is_last_rank:
-                    if not vpp_enabled:
-                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                            recv_reqs, async_send=True
-                        )
-                        send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
-                            bootstrapped_rids, async_send=True
-                        )
-                        send_transfer_work = self._pp_send_pyobj_to_next_stage(
-                            transferred_rids, async_send=True
-                        )
+                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                        recv_reqs, async_send=True
+                    )
+                    send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
+                        bootstrapped_rids, async_send=True
+                    )
+                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
+                        transferred_rids, async_send=True
+                    )
                     if cur_batch and not self._pp_vpp_enabled():
                         self.device_module.current_stream().wait_event(
                             self.launch_event
@@ -586,6 +541,156 @@ class SchedulerPPMixin:
                 self.running_batch.batch_is_full = False
 
             # When the server is idle, self-check and re-init some states
+            if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
+                self.on_idle()
+
+    def _pp_vpp_ingest_requests(self: Scheduler):
+        recv_reqs = self.ingest_requests() if self.pp_group.is_first_rank else None
+        recv_reqs = self.pp_group.broadcast_object(recv_reqs, src=0)
+        if not self.pp_group.is_first_rank:
+            if recv_reqs:
+                self.metrics_reporter.record_scheduler_active()
+            self.process_input_requests(recv_reqs)
+        return recv_reqs
+
+    def _pp_vpp_collect_bootstrapped_ids(self: Scheduler):
+        good_rids, bad_rids = self.get_rids(
+            self.disagg_prefill_bootstrap_queue.queue,
+            True,
+            [KVPoll.WaitingForInput],
+            [KVPoll.Failed],
+        )
+        aborted_rids = {
+            req.rid
+            for req in self.disagg_prefill_bootstrap_queue.queue
+            if isinstance(req.finished_reason, FINISH_ABORT)
+        }
+        good_rids, bad_rids = self._route_aborts_to_bad(
+            good_rids, bad_rids, aborted_rids
+        )
+        gathered = self.pp_group.all_gather_object([good_rids, bad_rids])
+        consensus_good = set(gathered[0][0])
+        consensus_bad = set()
+        for rank_good, rank_bad in gathered:
+            consensus_good.intersection_update(rank_good)
+            consensus_bad.update(rank_bad)
+        consensus_good.difference_update(consensus_bad)
+        return [sorted(consensus_good), sorted(consensus_bad)]
+
+    def _pp_vpp_collect_transferred_ids(self: Scheduler):
+        local_rids = self.get_rids(
+            self.disagg_prefill_inflight_queue,
+            True,
+            [KVPoll.Success, KVPoll.Failed],
+        )
+        gathered = self.pp_group.all_gather_object(local_rids)
+        consensus = set(gathered[0])
+        for rank_rids in gathered[1:]:
+            consensus.intersection_update(rank_rids)
+        return sorted(consensus)
+
+    def _pp_vpp_broadcast_batch_result(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        mb_metadata: PPBatchMetadata,
+        last_rank_comm_queue: deque,
+    ) -> GenerationBatchResult:
+        output_tensors = None
+        if self.pp_group.is_last_rank:
+            output_event, output_proxy = last_rank_comm_queue.popleft()
+            self.device_module.current_stream().wait_event(output_event)
+            output_tensors = output_proxy.tensors
+        output_tensors = self.pp_group.broadcast_tensor_dict(
+            output_tensors,
+            src=self.pp_group.world_size - 1,
+        )
+        if output_tensors is None:
+            raise RuntimeError("the final VPP stage produced no output")
+        with self.copy_stream_ctx:
+            self.copy_stream.wait_stream(self.schedule_stream)
+            batch_result = self._pp_prep_batch_result(
+                batch,
+                mb_metadata,
+                PPProxyTensors(output_tensors),
+            )
+            d2h_event = self.device_module.Event()
+            d2h_event.record(self.device_module.current_stream())
+        d2h_event.synchronize()
+        return batch_result
+
+    def _event_loop_pp_disagg_prefill_vpp(self: Scheduler):
+        self.init_pp_loop_state()
+        self.running_batch = self.running_mbs[0]
+        self.last_batch = self.last_mbs[0]
+
+        while True:
+            server_is_idle = True
+            recv_reqs = self._pp_vpp_ingest_requests()
+            _vpp_debug_event(
+                self,
+                "F",
+                "scheduler_pp_mixin.py:_event_loop_pp_disagg_prefill_vpp",
+                "request broadcast complete",
+                {"request_count": len(recv_reqs)},
+            )
+
+            bootstrapped_rids = self._pp_vpp_collect_bootstrapped_ids()
+            self.process_bootstrapped_queue(bootstrapped_rids)
+            transferred_rids = self._pp_vpp_collect_transferred_ids()
+
+            self.process_prefill_chunk(
+                last_batch=self.last_batch,
+                running_batch=self.running_batch,
+            )
+            prefill_plan = self.get_new_batch_prefill(self.running_batch)
+            batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+                prefill_plan.batch_to_run
+            )
+            self.running_batch = prefill_plan.running_batch
+            self.running_mbs[0] = self.running_batch
+            self.mbs[0] = batch
+            self.cur_batch_for_debug = batch
+            _vpp_debug_event(
+                self,
+                "F",
+                "scheduler_pp_mixin.py:_event_loop_pp_disagg_prefill_vpp",
+                "collective batch plan complete",
+                {
+                    "has_batch": batch is not None,
+                    "running_count": len(self.running_batch.reqs),
+                    "bootstrapped_count": len(bootstrapped_rids[0]),
+                    "transferred_count": len(transferred_rids),
+                },
+            )
+
+            if batch is not None:
+                server_is_idle = False
+                pp_proxy_tensors = self._pp_recv_vpp_proxy_tensors(first_visit=True)
+                if self.enable_staging:
+                    self.maybe_prefetch_staging_for_batch(batch)
+                self._pp_launch_vpp_batch(
+                    0,
+                    batch,
+                    pp_proxy_tensors,
+                    self.mb_metadata,
+                    self.last_rank_comm_queue,
+                )
+                metadata = self.mb_metadata[0]
+                if metadata is None:
+                    raise RuntimeError("the VPP batch produced no pipeline metadata")
+                batch_result = self._pp_vpp_broadcast_batch_result(
+                    batch,
+                    metadata,
+                    self.last_rank_comm_queue,
+                )
+                self._pp_process_batch_result(batch, batch_result)
+                self.last_batch = batch
+                self.last_mbs[0] = batch
+
+            if transferred_rids:
+                self.process_disagg_prefill_inflight_queue(transferred_rids)
+
+            self.running_batch.batch_is_full = False
             if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
                 self.on_idle()
 
