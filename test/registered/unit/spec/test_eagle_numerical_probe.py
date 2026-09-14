@@ -851,7 +851,9 @@ class TestEagleNumericalProbe(unittest.TestCase):
             model=model,
             max_rows=32,
             dtype=torch.bfloat16,
-            device=torch.device("cpu"),
+            # ModelRunner.device is a string in the serving runtime. Keep this
+            # contract covered instead of relying only on torch.device fixtures.
+            device="cpu",
         )
 
         observer = probe.target_forward_observer

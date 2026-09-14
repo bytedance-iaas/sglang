@@ -597,7 +597,7 @@ class EaglePPSenderProbe:
         model,
         max_rows: int,
         dtype: torch.dtype,
-        device: torch.device,
+        device: torch.device | str,
     ) -> None:
         """Install the fixed observer before target CUDA graphs are captured."""
         if not self.can_probe:
@@ -641,12 +641,13 @@ class EaglePPSenderProbe:
                 )
             )
         )
+        observer_device = torch.device(device)
         observer = _PPTargetForwardDeviceObserver(
             layer_ids=layer_ids,
             max_rows=max_rows,
             hidden_size=int(model.config.hidden_size),
             dtype=dtype,
-            device=device,
+            device=observer_device,
         )
         for layer_id in layer_ids:
             layer = layers[layer_id]
@@ -699,8 +700,12 @@ class EaglePPSenderProbe:
             q_rope_head_dim=int(attention.qk_rope_head_dim),
             topk_width=int(model.config.index_topk),
             max_scheduler_rows=(
-                int(torch.cuda.get_device_properties(device).multi_processor_count)
-                if device.type == "cuda"
+                int(
+                    torch.cuda.get_device_properties(
+                        observer_device
+                    ).multi_processor_count
+                )
+                if observer_device.type == "cuda"
                 else 1
             ),
         )
