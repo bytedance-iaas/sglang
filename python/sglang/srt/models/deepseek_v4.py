@@ -2,11 +2,8 @@ from __future__ import annotations
 
 import concurrent.futures
 import functools
-import json
 import logging
-import os
 import time
-import urllib.request
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from typing import (
@@ -272,56 +269,6 @@ def _get_mhc_ops() -> MhcOps:
 
 
 logger = logging.getLogger(__name__)
-
-
-# #region debug-point C:vpp-source-state
-def _vpp_source_state_debug_event(message: str, data: dict) -> None:
-    if not envs.SGLANG_VPP_DEBUG_LOG.get():
-        return
-    if torch.cuda.is_available():
-        free_bytes, total_bytes = torch.cuda.mem_get_info()
-        data = {
-            "cuda_allocated_bytes": torch.cuda.memory_allocated(),
-            "cuda_reserved_bytes": torch.cuda.memory_reserved(),
-            "cuda_max_allocated_bytes": torch.cuda.max_memory_allocated(),
-            "cuda_max_reserved_bytes": torch.cuda.max_memory_reserved(),
-            "cuda_free_bytes": free_bytes,
-            "cuda_total_bytes": total_bytes,
-            **data,
-        }
-    data = {
-        "pp_rank": get_pp_group().rank_in_group,
-        "tp_rank": get_tp_group().rank_in_group,
-        **data,
-    }
-    logger.info("[VPP-DEBUG] %s %s", message, data)
-    url = os.getenv("DEBUG_SERVER_URL")
-    if not url:
-        return
-    payload = json.dumps(
-        {
-            "sessionId": os.getenv("DEBUG_SESSION_ID", "vpp-runtime-oom"),
-            "runId": os.getenv("DEBUG_RUN_ID", "pre-fix"),
-            "hypothesisId": "C",
-            "location": "deepseek_v4.py:vpp_source_state",
-            "msg": f"[VPP-DEBUG] {message}",
-            "data": data,
-        }
-    ).encode()
-    try:
-        urllib.request.urlopen(
-            urllib.request.Request(
-                url,
-                data=payload,
-                headers={"Content-Type": "application/json"},
-            ),
-            timeout=0.2,
-        ).read()
-    except Exception:
-        pass
-
-
-# #endregion
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 
@@ -3946,32 +3893,14 @@ class DeepseekV4Model(nn.Module):
         source_layer_id = tensors.get("vpp_source_layer_id")
         if source_layer_id is not None:
             prefix = "vpp_source_"
-            source_tensors = {
-                key.removeprefix(prefix): value
-                for key, value in tensors.items()
-                if key.startswith(prefix) and key not in ("vpp_source_layer_id",)
-            }
-            _vpp_source_state_debug_event(
-                "source state install enter",
-                {
-                    "source_layer_id": int(source_layer_id),
-                    "tensor_bytes": sum(
-                        value.numel() * value.element_size()
-                        for value in source_tensors.values()
-                    ),
-                    "tensor_shapes": {
-                        key: tuple(value.shape) for key, value in source_tensors.items()
-                    },
-                },
-            )
             get_token_to_kv_pool().install_source_pages(
                 int(source_layer_id),
                 self._vpp_full_page_ids(forward_batch),
-                source_tensors,
-            )
-            _vpp_source_state_debug_event(
-                "source state install complete",
-                {"source_layer_id": int(source_layer_id)},
+                {
+                    key.removeprefix(prefix): value
+                    for key, value in tensors.items()
+                    if key.startswith(prefix) and key not in ("vpp_source_layer_id",)
+                },
             )
 
         metadata = self._vpp_attention_metadata(tail_active)
@@ -4024,33 +3953,9 @@ class DeepseekV4Model(nn.Module):
             ]
             source_layer_id = max(sources)
             if source_layer_id < next_layer_id:
-                _vpp_source_state_debug_event(
-                    "source state export enter",
-                    {
-                        "stage_id": stage_id,
-                        "source_layer_id": source_layer_id,
-                        "next_layer_id": next_layer_id,
-                    },
-                )
                 source_tensors = get_token_to_kv_pool().export_source_pages(
                     source_layer_id,
                     self._vpp_full_page_ids(forward_batch),
-                )
-                _vpp_source_state_debug_event(
-                    "source state export complete",
-                    {
-                        "stage_id": stage_id,
-                        "source_layer_id": source_layer_id,
-                        "next_layer_id": next_layer_id,
-                        "tensor_bytes": sum(
-                            value.numel() * value.element_size()
-                            for value in source_tensors.values()
-                        ),
-                        "tensor_shapes": {
-                            key: tuple(value.shape)
-                            for key, value in source_tensors.items()
-                        },
-                    },
                 )
                 tensors["vpp_source_layer_id"] = source_layer_id
                 tensors.update(

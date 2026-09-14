@@ -26,11 +26,9 @@ If you only need to use the distributed environment without model/pipeline
 
 import contextlib
 import gc
-import json
 import logging
 import os
 import pickle
-import urllib.request
 import weakref
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
@@ -117,66 +115,6 @@ class GraphCaptureContext:
 class P2PWork:
     work: Optional[torch.distributed.Work]
     payload: Optional[torch.Tensor]
-
-
-# #region debug-point A:p2p-transport
-def _vpp_p2p_debug_event(
-    coordinator,
-    hypothesis_id: str,
-    location: str,
-    message: str,
-    data: dict,
-):
-    if not envs.SGLANG_VPP_DEBUG_LOG.get():
-        return
-    if torch.cuda.is_available():
-        free_bytes, total_bytes = torch.cuda.mem_get_info()
-        data = {
-            "cuda_allocated_bytes": torch.cuda.memory_allocated(),
-            "cuda_reserved_bytes": torch.cuda.memory_reserved(),
-            "cuda_max_allocated_bytes": torch.cuda.max_memory_allocated(),
-            "cuda_max_reserved_bytes": torch.cuda.max_memory_reserved(),
-            "cuda_free_bytes": free_bytes,
-            "cuda_total_bytes": total_bytes,
-            **data,
-        }
-    data = {
-        "group": coordinator.unique_name,
-        "group_rank": coordinator.rank_in_group,
-        "global_rank": coordinator.ranks[coordinator.rank_in_group],
-        **data,
-    }
-    logging.getLogger(__name__).info("[VPP-DEBUG] %s %s", message, data)
-    url = os.getenv("DEBUG_SERVER_URL")
-    if not url:
-        return
-    payload = json.dumps(
-        {
-            "sessionId": os.getenv(
-                "DEBUG_SESSION_ID",
-                "vpp-pd-warmup-hang",
-            ),
-            "runId": os.getenv("DEBUG_RUN_ID", "pre-fix"),
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "msg": f"[VPP-DEBUG] {message}",
-            "data": data,
-        }
-    ).encode()
-    try:
-        urllib.request.urlopen(
-            urllib.request.Request(
-                url,
-                data=payload,
-                headers={"Content-Type": "application/json"},
-            ),
-            timeout=0.2,
-        ).read()
-    except Exception:
-        pass
-
-
-# #endregion
 
 
 def _split_tensor_dict(
@@ -1701,26 +1639,6 @@ class GroupCoordinator:
                 f"Expecting a dictionary, got {type(tensor_dict)}"
             )
             metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
-            # #region debug-point E:broadcast-tensor-allocation
-            _vpp_p2p_debug_event(
-                self,
-                "E",
-                "parallel_state.py:broadcast_tensor_dict",
-                "broadcast tensor source metadata ready",
-                {
-                    "src": self.ranks[src],
-                    "tensors": [
-                        {
-                            "shape": tuple(tensor.shape),
-                            "dtype": str(tensor.dtype),
-                            "device": str(tensor.device),
-                            "bytes": tensor.numel() * tensor.element_size(),
-                        }
-                        for tensor in tensor_list
-                    ],
-                },
-            )
-            # #endregion
             # `metadata_list` lives in CPU memory.
             # `broadcast_object_list` has serialization & deserialization,
             # all happening on CPU. Therefore, we can use the CPU group.
@@ -1746,26 +1664,6 @@ class GroupCoordinator:
 
         else:
             metadata_list = self.broadcast_object(None, src=src)
-            # #region debug-point E:broadcast-tensor-allocation
-            _vpp_p2p_debug_event(
-                self,
-                "E",
-                "parallel_state.py:broadcast_tensor_dict",
-                "broadcast tensor receiver allocation enter",
-                {
-                    "src": self.ranks[src],
-                    "tensors": [
-                        {
-                            "key": key,
-                            "shape": tuple(value.size),
-                            "dtype": str(value.dtype),
-                            "device": str(value.device),
-                        }
-                        for key, value in metadata_list
-                        if isinstance(value, TensorMetadata)
-                    ],
-                },
-            )
             tensor_dict = {}
             async_handles = []
             for key, value in metadata_list:
@@ -1796,14 +1694,6 @@ class GroupCoordinator:
                     tensor_dict[key] = value
             for async_handle in async_handles:
                 async_handle.wait()
-            _vpp_p2p_debug_event(
-                self,
-                "E",
-                "parallel_state.py:broadcast_tensor_dict",
-                "broadcast tensor receiver complete",
-                {"src": self.ranks[src]},
-            )
-            # #endregion
         return tensor_dict
 
     def send_tensor_dict(
@@ -1845,30 +1735,7 @@ class GroupCoordinator:
         # Thus the net performance gain justifies this approach.
 
         send_func = torch.distributed.isend if async_send else torch.distributed.send
-        if batch_p2p:
-            # #region debug-point A:metadata-send
-            _vpp_p2p_debug_event(
-                self,
-                "A",
-                "parallel_state.py:send_tensor_dict",
-                "metadata send enter",
-                {
-                    "peer": self.ranks[dst],
-                    "keys": [key for key, _ in metadata_list],
-                },
-            )
-            # #endregion
         p2p_works = self.send_object(metadata_list, dst=dst, async_send=async_send)
-        if batch_p2p:
-            # #region debug-point A:metadata-send-complete
-            _vpp_p2p_debug_event(
-                self,
-                "A",
-                "parallel_state.py:send_tensor_dict",
-                "metadata send submitted",
-                {"peer": self.ranks[dst]},
-            )
-            # #endregion
 
         if not batch_p2p:
             for tensor in tensor_list:
@@ -1898,24 +1765,6 @@ class GroupCoordinator:
             comm_group = metadata_group if tensor.is_cpu else group
             tensors_to_send.append((tensor, comm_group))
         if tensors_to_send:
-            # #region debug-point B:tensor-send
-            _vpp_p2p_debug_event(
-                self,
-                "B",
-                "parallel_state.py:send_tensor_dict",
-                "batched tensor send enter",
-                {
-                    "peer": self.ranks[dst],
-                    "tensors": [
-                        {
-                            "shape": tuple(tensor.shape),
-                            "dtype": str(tensor.dtype),
-                            "device": str(tensor.device),
-                        }
-                        for tensor, _ in tensors_to_send
-                    ],
-                },
-            )
             ops = [
                 torch.distributed.P2POp(
                     torch.distributed.isend,
@@ -1926,14 +1775,6 @@ class GroupCoordinator:
                 for tensor, comm_group in tensors_to_send
             ]
             works = torch.distributed.batch_isend_irecv(ops)
-            _vpp_p2p_debug_event(
-                self,
-                "B",
-                "parallel_state.py:send_tensor_dict",
-                "batched tensor send submitted",
-                {"peer": self.ranks[dst], "work_count": len(works)},
-            )
-            # #endregion
             if async_send:
                 p2p_works.extend(
                     P2PWork(work, tensor)
@@ -1969,30 +1810,7 @@ class GroupCoordinator:
             src = (self.rank_in_group - 1) % self.world_size
         assert src < self.world_size, f"Invalid src rank ({src})"
 
-        if batch_p2p:
-            # #region debug-point A:metadata-recv
-            _vpp_p2p_debug_event(
-                self,
-                "A",
-                "parallel_state.py:recv_tensor_dict",
-                "metadata recv enter",
-                {"peer": self.ranks[src]},
-            )
-            # #endregion
         recv_metadata_list = self.recv_object(src=src)
-        if batch_p2p:
-            # #region debug-point A:metadata-recv-complete
-            _vpp_p2p_debug_event(
-                self,
-                "A",
-                "parallel_state.py:recv_tensor_dict",
-                "metadata recv complete",
-                {
-                    "peer": self.ranks[src],
-                    "keys": [key for key, _ in recv_metadata_list],
-                },
-            )
-            # #endregion
         tensor_dict: Dict[str, Any] = {}
         if not batch_p2p:
             for key, value in recv_metadata_list:
@@ -2048,25 +1866,6 @@ class GroupCoordinator:
             else:
                 tensor_dict[key] = value
         if tensors_to_recv:
-            # #region debug-point D:tensor-recv
-            _vpp_p2p_debug_event(
-                self,
-                "D",
-                "parallel_state.py:recv_tensor_dict",
-                "batched tensor recv enter",
-                {
-                    "peer": self.ranks[src],
-                    "tensors": [
-                        {
-                            "key": key,
-                            "shape": tuple(tensor.shape),
-                            "dtype": str(tensor.dtype),
-                            "device": str(tensor.device),
-                        }
-                        for key, tensor, _, _ in tensors_to_recv
-                    ],
-                },
-            )
             ops = [
                 torch.distributed.P2POp(
                     torch.distributed.irecv,
@@ -2079,28 +1878,11 @@ class GroupCoordinator:
             works = torch.distributed.batch_isend_irecv(ops)
             for work in works:
                 work.wait()
-            _vpp_p2p_debug_event(
-                self,
-                "D",
-                "parallel_state.py:recv_tensor_dict",
-                "batched tensor recv complete",
-                {"peer": self.ranks[src], "work_count": len(works)},
-            )
-            # #endregion
         for key, tensor, orig_shape, _ in tensors_to_recv:
             if orig_shape is not None:
                 tensor = all_gather_group.all_gather(tensor, dim=0)
                 tensor = tensor.reshape(orig_shape)
             tensor_dict[key] = tensor
-        # #region debug-point D:tensor-recv-ready
-        _vpp_p2p_debug_event(
-            self,
-            "D",
-            "parallel_state.py:recv_tensor_dict",
-            "tensor dict ready after TP all-gather",
-            {"peer": self.ranks[src], "keys": list(tensor_dict)},
-        )
-        # #endregion
         return tensor_dict
 
     def barrier(self):

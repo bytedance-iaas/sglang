@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import json
 import logging
-import os
-import urllib.request
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
@@ -38,65 +35,6 @@ from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj
 from sglang.srt.utils.common import is_xpu
 
 logger = logging.getLogger(__name__)
-
-
-# #region debug-point C:vpp-stage-flow
-def _vpp_debug_event(
-    scheduler: Scheduler,
-    hypothesis_id: str,
-    location: str,
-    message: str,
-    data: dict,
-):
-    if not envs.SGLANG_VPP_DEBUG_LOG.get():
-        return
-    if torch.cuda.is_available():
-        free_bytes, total_bytes = torch.cuda.mem_get_info()
-        data = {
-            "cuda_allocated_bytes": torch.cuda.memory_allocated(),
-            "cuda_reserved_bytes": torch.cuda.memory_reserved(),
-            "cuda_max_allocated_bytes": torch.cuda.max_memory_allocated(),
-            "cuda_max_reserved_bytes": torch.cuda.max_memory_reserved(),
-            "cuda_free_bytes": free_bytes,
-            "cuda_total_bytes": total_bytes,
-            **data,
-        }
-    data = {
-        "pp_rank": scheduler.ps.pp_rank,
-        "tp_rank": scheduler.ps.tp_rank,
-        **data,
-    }
-    logger.info("[VPP-DEBUG] %s %s", message, data)
-    url = os.getenv("DEBUG_SERVER_URL")
-    if not url:
-        return
-    payload = json.dumps(
-        {
-            "sessionId": os.getenv(
-                "DEBUG_SESSION_ID",
-                "vpp-pd-warmup-hang",
-            ),
-            "runId": os.getenv("DEBUG_RUN_ID", "pre-fix"),
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "msg": f"[VPP-DEBUG] {message}",
-            "data": data,
-        }
-    ).encode()
-    try:
-        urllib.request.urlopen(
-            urllib.request.Request(
-                url,
-                data=payload,
-                headers={"Content-Type": "application/json"},
-            ),
-            timeout=0.2,
-        ).read()
-    except Exception:
-        pass
-
-
-# #endregion
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -327,84 +265,18 @@ class SchedulerPPMixin:
                 d2h_event = None
                 next_batch_result = None
 
-                # #region debug-point C:control-request-relay
-                _vpp_debug_event(
-                    self,
-                    "C",
-                    "scheduler_pp_mixin.py:event_loop_pp_disagg_prefill",
-                    "request ingest enter",
-                    {"mb_id": mb_id},
-                )
                 recv_reqs = self.ingest_requests()
-                _vpp_debug_event(
-                    self,
-                    "C",
-                    "scheduler_pp_mixin.py:event_loop_pp_disagg_prefill",
-                    "request ingest complete",
-                    {"mb_id": mb_id, "request_count": len(recv_reqs)},
-                )
-                # #endregion
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
 
-                # #region debug-point C:bootstrap-forward-consensus
-                _vpp_debug_event(
-                    self,
-                    "C",
-                    "scheduler_pp_mixin.py:event_loop_pp_disagg_prefill",
-                    "bootstrap consensus enter",
-                    {"mb_id": mb_id},
-                )
                 bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
-                _vpp_debug_event(
-                    self,
-                    "C",
-                    "scheduler_pp_mixin.py:event_loop_pp_disagg_prefill",
-                    "bootstrap consensus complete",
-                    {
-                        "mb_id": mb_id,
-                        "good_count": len(bootstrapped_rids[0]),
-                        "bad_count": len(bootstrapped_rids[1]),
-                    },
-                )
-                # #endregion
                 bmbs[mb_id] = bootstrapped_rids
                 self._pp_commit_comm_work(send_bootstrapped_work)
 
-                # #region debug-point C:transfer-forward-consensus
-                _vpp_debug_event(
-                    self,
-                    "C",
-                    "scheduler_pp_mixin.py:event_loop_pp_disagg_prefill",
-                    "transfer consensus enter",
-                    {"mb_id": mb_id},
-                )
                 transferred_rids = self._pp_pd_get_prefill_transferred_ids()
-                _vpp_debug_event(
-                    self,
-                    "C",
-                    "scheduler_pp_mixin.py:event_loop_pp_disagg_prefill",
-                    "transfer consensus complete",
-                    {"mb_id": mb_id, "count": len(transferred_rids)},
-                )
-                # #endregion
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
-                # #region debug-point C:control-relay-complete
-                _vpp_debug_event(
-                    self,
-                    "C",
-                    "scheduler_pp_mixin.py:event_loop_pp_disagg_prefill",
-                    "control relay complete",
-                    {
-                        "mb_id": mb_id,
-                        "request_count": len(recv_reqs),
-                        "bootstrapped_count": len(bootstrapped_rids),
-                        "transferred_count": len(transferred_rids),
-                    },
-                )
-                # #endregion
 
                 self.process_prefill_chunk(
                     last_batch=self.last_batch, running_batch=self.running_batch
@@ -415,19 +287,6 @@ class SchedulerPPMixin:
                 batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
-                # #region debug-point C:batch-plan
-                _vpp_debug_event(
-                    self,
-                    "C",
-                    "scheduler_pp_mixin.py:event_loop_pp_disagg_prefill",
-                    "batch plan complete",
-                    {
-                        "mb_id": mb_id,
-                        "has_batch": batch is not None,
-                        "running_count": len(self.running_batch.reqs),
-                    },
-                )
-                # #endregion
 
                 cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 self.cur_batch_for_debug = cur_batch
@@ -473,14 +332,6 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                # #region debug-point C:reverse-consensus
-                _vpp_debug_event(
-                    self,
-                    "C",
-                    "scheduler_pp_mixin.py:event_loop_pp_disagg_prefill",
-                    "reverse consensus enter",
-                    {"mb_id": mb_id, "next_mb_id": next_mb_id},
-                )
                 send_consensus_bootstrapped_work, consensus_bootstrapped_rids = (
                     self._pp_pd_send_consensus_bootstrapped_ids(
                         bmbs,
@@ -506,14 +357,6 @@ class SchedulerPPMixin:
                 if tmbs[next_mb_id] is not None:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
                 self._pp_commit_comm_work(send_release_work)
-                _vpp_debug_event(
-                    self,
-                    "C",
-                    "scheduler_pp_mixin.py:event_loop_pp_disagg_prefill",
-                    "reverse consensus complete",
-                    {"mb_id": mb_id, "next_mb_id": next_mb_id},
-                )
-                # #endregion
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
@@ -611,55 +454,10 @@ class SchedulerPPMixin:
             output_event, output_proxy = last_rank_comm_queue.popleft()
             self.device_module.current_stream().wait_event(output_event)
             output_tensors = output_proxy.tensors
-        # #region debug-point E:final-output-broadcast
-        _vpp_debug_event(
-            self,
-            "E",
-            "scheduler_pp_mixin.py:_pp_vpp_broadcast_batch_result",
-            "final output broadcast enter",
-            {
-                "tensor_bytes": (
-                    None
-                    if output_tensors is None
-                    else sum(
-                        value.numel() * value.element_size()
-                        for value in output_tensors.values()
-                        if isinstance(value, torch.Tensor)
-                    )
-                ),
-                "tensor_shapes": (
-                    None
-                    if output_tensors is None
-                    else {
-                        key: tuple(value.shape)
-                        for key, value in output_tensors.items()
-                        if isinstance(value, torch.Tensor)
-                    }
-                ),
-            },
-        )
         output_tensors = self.pp_group.broadcast_tensor_dict(
             output_tensors,
             src=self.pp_group.world_size - 1,
         )
-        _vpp_debug_event(
-            self,
-            "E",
-            "scheduler_pp_mixin.py:_pp_vpp_broadcast_batch_result",
-            "final output broadcast complete",
-            {
-                "tensor_bytes": (
-                    None
-                    if output_tensors is None
-                    else sum(
-                        value.numel() * value.element_size()
-                        for value in output_tensors.values()
-                        if isinstance(value, torch.Tensor)
-                    )
-                ),
-            },
-        )
-        # #endregion
         if output_tensors is None:
             raise RuntimeError("the final VPP stage produced no output")
         with self.copy_stream_ctx:
@@ -681,14 +479,7 @@ class SchedulerPPMixin:
 
         while True:
             server_is_idle = True
-            recv_reqs = self._pp_vpp_ingest_requests()
-            _vpp_debug_event(
-                self,
-                "F",
-                "scheduler_pp_mixin.py:_event_loop_pp_disagg_prefill_vpp",
-                "request broadcast complete",
-                {"request_count": len(recv_reqs)},
-            )
+            self._pp_vpp_ingest_requests()
 
             bootstrapped_rids = self._pp_vpp_collect_bootstrapped_ids()
             self.process_bootstrapped_queue(bootstrapped_rids)
@@ -706,18 +497,6 @@ class SchedulerPPMixin:
             self.running_mbs[0] = self.running_batch
             self.mbs[0] = batch
             self.cur_batch_for_debug = batch
-            _vpp_debug_event(
-                self,
-                "F",
-                "scheduler_pp_mixin.py:_event_loop_pp_disagg_prefill_vpp",
-                "collective batch plan complete",
-                {
-                    "has_batch": batch is not None,
-                    "running_count": len(self.running_batch.reqs),
-                    "bootstrapped_count": len(bootstrapped_rids[0]),
-                    "transferred_count": len(transferred_rids),
-                },
-            )
 
             if batch is not None:
                 server_is_idle = False
@@ -1266,25 +1045,7 @@ class SchedulerPPMixin:
     def _pp_recv_vpp_proxy_tensors(
         self: Scheduler, *, first_visit: bool
     ) -> Optional[PPProxyTensors]:
-        # #region debug-point C:initial-proxy-recv
-        _vpp_debug_event(
-            self,
-            "C",
-            "scheduler_pp_mixin.py:_pp_recv_vpp_proxy_tensors",
-            "proxy recv enter",
-            {"first_visit": first_visit},
-        )
-        # #endregion
         if first_visit and self.pp_group.is_first_rank:
-            # #region debug-point C:initial-proxy-local
-            _vpp_debug_event(
-                self,
-                "C",
-                "scheduler_pp_mixin.py:_pp_recv_vpp_proxy_tensors",
-                "first logical stage uses local input",
-                {"first_visit": first_visit},
-            )
-            # #endregion
             return None
         proxy = PPProxyTensors(
             self._pp_recv_typed_dict(
@@ -1293,19 +1054,6 @@ class SchedulerPPMixin:
                 batch_p2p=True,
             )
         )
-        # #region debug-point C:initial-proxy-received
-        _vpp_debug_event(
-            self,
-            "C",
-            "scheduler_pp_mixin.py:_pp_recv_vpp_proxy_tensors",
-            "proxy recv complete",
-            {
-                "first_visit": first_visit,
-                "stage_id": proxy.tensors.get("vpp_stage_id"),
-                "keys": list(proxy.tensors),
-            },
-        )
-        # #endregion
         return proxy
 
     def _pp_recv_dict_from_prev_stage(
@@ -1582,103 +1330,20 @@ class SchedulerPPMixin:
                     "set_run_batch_cpu_start_time",
                     trace_only=True,
                 )
-                # #region debug-point E:first-stage-forward
-                if envs.SGLANG_VPP_DEBUG_LOG.get():
-                    _vpp_debug_event(
-                        self,
-                        "A",
-                        "scheduler_pp_mixin.py:_pp_launch_vpp_batch",
-                        "first stage forward enter",
-                        {
-                            "mb_id": mb_id,
-                            "batch_size": len(cur_batch.reqs),
-                            "extend_num_tokens": cur_batch.extend_num_tokens,
-                            "seq_lens_sum": cur_batch.seq_lens_sum,
-                            "max_total_num_tokens": self.max_total_num_tokens,
-                            "kv_available_tokens": (
-                                self.token_to_kv_pool_allocator.available_size()
-                            ),
-                            "input_stage_id": (
-                                None
-                                if pp_proxy_tensors is None
-                                else pp_proxy_tensors.tensors.get("vpp_stage_id")
-                            ),
-                        },
-                    )
                 first_result = self.run_batch(cur_batch, pp_proxy_tensors)
                 first_proxy = first_result.pp_hidden_states_proxy_tensors
                 if first_proxy is None:
                     raise RuntimeError("the first VPP visit must produce an activation")
-                _vpp_debug_event(
-                    self,
-                    "A",
-                    "scheduler_pp_mixin.py:_pp_launch_vpp_batch",
-                    "first stage forward complete",
-                    {
-                        "mb_id": mb_id,
-                        "output_stage_id": first_proxy.tensors.get("vpp_stage_id"),
-                        "keys": list(first_proxy.tensors),
-                    },
-                )
-                # #endregion
-                # #region debug-point A:first-stage-send
                 first_send = self._pp_send_dict_to_next_stage(
                     first_proxy.tensors,
                     async_send=True,
                     msg_type="vpp_proxy",
                     batch_p2p=True,
                 )
-                _vpp_debug_event(
-                    self,
-                    "A",
-                    "scheduler_pp_mixin.py:_pp_launch_vpp_batch",
-                    "first stage send submitted",
-                    {"mb_id": mb_id, "work_count": len(first_send)},
-                )
-                # #endregion
 
-                # #region debug-point D:second-stage-recv
                 second_proxy = self._pp_recv_vpp_proxy_tensors(first_visit=False)
-                _vpp_debug_event(
-                    self,
-                    "D",
-                    "scheduler_pp_mixin.py:_pp_launch_vpp_batch",
-                    "second stage proxy available",
-                    {
-                        "mb_id": mb_id,
-                        "stage_id": second_proxy.tensors.get("vpp_stage_id"),
-                    },
-                )
-                # #endregion
                 self._pp_commit_comm_work(first_send)
-                # #region debug-point E:second-stage-forward
-                _vpp_debug_event(
-                    self,
-                    "D",
-                    "scheduler_pp_mixin.py:_pp_launch_vpp_batch",
-                    "second stage forward enter",
-                    {
-                        "mb_id": mb_id,
-                        "stage_id": second_proxy.tensors.get("vpp_stage_id"),
-                        "proxy_tensor_bytes": sum(
-                            value.numel() * value.element_size()
-                            for value in second_proxy.tensors.values()
-                            if isinstance(value, torch.Tensor)
-                        ),
-                    },
-                )
                 result = self.run_batch(cur_batch, second_proxy)
-                _vpp_debug_event(
-                    self,
-                    "D",
-                    "scheduler_pp_mixin.py:_pp_launch_vpp_batch",
-                    "second stage forward complete",
-                    {
-                        "mb_id": mb_id,
-                        "has_proxy": result.pp_hidden_states_proxy_tensors is not None,
-                    },
-                )
-                # #endregion
 
                 if self.pp_group.is_last_rank:
                     if result.pp_hidden_states_proxy_tensors is not None:
