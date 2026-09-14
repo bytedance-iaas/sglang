@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
+import urllib.request
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
@@ -35,6 +38,54 @@ from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj
 from sglang.srt.utils.common import is_xpu
 
 logger = logging.getLogger(__name__)
+
+
+# #region debug-point C:vpp-stage-flow
+def _vpp_debug_event(
+    scheduler: Scheduler,
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: dict,
+):
+    if not envs.SGLANG_VPP_DEBUG_LOG.get():
+        return
+    data = {
+        "pp_rank": scheduler.ps.pp_rank,
+        "tp_rank": scheduler.ps.tp_rank,
+        **data,
+    }
+    logger.info("[VPP-DEBUG] %s %s", message, data)
+    url = os.getenv("DEBUG_SERVER_URL")
+    if not url:
+        return
+    payload = json.dumps(
+        {
+            "sessionId": os.getenv(
+                "DEBUG_SESSION_ID",
+                "vpp-pd-warmup-hang",
+            ),
+            "runId": "pre-fix",
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "msg": f"[VPP-DEBUG] {message}",
+            "data": data,
+        }
+    ).encode()
+    try:
+        urllib.request.urlopen(
+            urllib.request.Request(
+                url,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            ),
+            timeout=0.2,
+        ).read()
+    except Exception:
+        pass
+
+
+# #endregion
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -911,15 +962,47 @@ class SchedulerPPMixin:
     def _pp_recv_vpp_proxy_tensors(
         self: Scheduler, *, first_visit: bool
     ) -> Optional[PPProxyTensors]:
+        # #region debug-point C:initial-proxy-recv
+        _vpp_debug_event(
+            self,
+            "C",
+            "scheduler_pp_mixin.py:_pp_recv_vpp_proxy_tensors",
+            "proxy recv enter",
+            {"first_visit": first_visit},
+        )
+        # #endregion
         if first_visit and self.pp_group.is_first_rank:
+            # #region debug-point C:initial-proxy-local
+            _vpp_debug_event(
+                self,
+                "C",
+                "scheduler_pp_mixin.py:_pp_recv_vpp_proxy_tensors",
+                "first logical stage uses local input",
+                {"first_visit": first_visit},
+            )
+            # #endregion
             return None
-        return PPProxyTensors(
+        proxy = PPProxyTensors(
             self._pp_recv_typed_dict(
                 expected_kind="vpp_proxy",
                 all_gather_group=self.attn_tp_group,
                 batch_p2p=True,
             )
         )
+        # #region debug-point C:initial-proxy-received
+        _vpp_debug_event(
+            self,
+            "C",
+            "scheduler_pp_mixin.py:_pp_recv_vpp_proxy_tensors",
+            "proxy recv complete",
+            {
+                "first_visit": first_visit,
+                "stage_id": proxy.tensors.get("vpp_stage_id"),
+                "keys": list(proxy.tensors),
+            },
+        )
+        # #endregion
+        return proxy
 
     def _pp_recv_dict_from_prev_stage(
         self: Scheduler,
@@ -1195,20 +1278,90 @@ class SchedulerPPMixin:
                     "set_run_batch_cpu_start_time",
                     trace_only=True,
                 )
+                # #region debug-point E:first-stage-forward
+                _vpp_debug_event(
+                    self,
+                    "E",
+                    "scheduler_pp_mixin.py:_pp_launch_vpp_batch",
+                    "first stage forward enter",
+                    {
+                        "mb_id": mb_id,
+                        "input_stage_id": (
+                            None
+                            if pp_proxy_tensors is None
+                            else pp_proxy_tensors.tensors.get("vpp_stage_id")
+                        ),
+                    },
+                )
                 first_result = self.run_batch(cur_batch, pp_proxy_tensors)
                 first_proxy = first_result.pp_hidden_states_proxy_tensors
                 if first_proxy is None:
                     raise RuntimeError("the first VPP visit must produce an activation")
+                _vpp_debug_event(
+                    self,
+                    "E",
+                    "scheduler_pp_mixin.py:_pp_launch_vpp_batch",
+                    "first stage forward complete",
+                    {
+                        "mb_id": mb_id,
+                        "output_stage_id": first_proxy.tensors.get("vpp_stage_id"),
+                        "keys": list(first_proxy.tensors),
+                    },
+                )
+                # #endregion
+                # #region debug-point A:first-stage-send
                 first_send = self._pp_send_dict_to_next_stage(
                     first_proxy.tensors,
                     async_send=True,
                     msg_type="vpp_proxy",
                     batch_p2p=True,
                 )
+                _vpp_debug_event(
+                    self,
+                    "A",
+                    "scheduler_pp_mixin.py:_pp_launch_vpp_batch",
+                    "first stage send submitted",
+                    {"mb_id": mb_id, "work_count": len(first_send)},
+                )
+                # #endregion
 
+                # #region debug-point D:second-stage-recv
                 second_proxy = self._pp_recv_vpp_proxy_tensors(first_visit=False)
+                _vpp_debug_event(
+                    self,
+                    "D",
+                    "scheduler_pp_mixin.py:_pp_launch_vpp_batch",
+                    "second stage proxy available",
+                    {
+                        "mb_id": mb_id,
+                        "stage_id": second_proxy.tensors.get("vpp_stage_id"),
+                    },
+                )
+                # #endregion
                 self._pp_commit_comm_work(first_send)
+                # #region debug-point E:second-stage-forward
+                _vpp_debug_event(
+                    self,
+                    "E",
+                    "scheduler_pp_mixin.py:_pp_launch_vpp_batch",
+                    "second stage forward enter",
+                    {
+                        "mb_id": mb_id,
+                        "stage_id": second_proxy.tensors.get("vpp_stage_id"),
+                    },
+                )
                 result = self.run_batch(cur_batch, second_proxy)
+                _vpp_debug_event(
+                    self,
+                    "E",
+                    "scheduler_pp_mixin.py:_pp_launch_vpp_batch",
+                    "second stage forward complete",
+                    {
+                        "mb_id": mb_id,
+                        "has_proxy": result.pp_hidden_states_proxy_tensors is not None,
+                    },
+                )
+                # #endregion
 
                 if self.pp_group.is_last_rank:
                     if result.pp_hidden_states_proxy_tensors is not None:
