@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import os
+import stat
 import zlib
 from typing import Optional
 
@@ -26,48 +27,54 @@ from sglang.srt.runtime_context import get_parallel
 logger = logging.getLogger(__name__)
 
 _ATOMIC_LOG_FD = 2
-_FALLBACK_PIPE_BUF = 4096
 _COMPRESSED_RECORD_ENCODING = "zlib+base64"
 _COMPRESSED_RECORD_KEY = "__eagle_probe_encoding__"
 
 
 def _emit_json_record(marker: str, payload: dict) -> None:
-    """Emit large probe results as one atomic container-log write.
+    """Emit a probe result as one atomic container-log write.
 
     Multiple TP workers share the container stderr pipe.  Python logging can
-    split records larger than ``PIPE_BUF``, allowing two workers' JSON payloads
-    to interleave.  Keep ordinary records on the logger, but compress oversized
-    records and write the complete envelope in one syscall.  The comparator
-    verifies the envelope checksum and size before accepting its payload.
+    split a record across writes, allowing two workers' JSON payloads to
+    interleave even when the serialized record itself fits in ``PIPE_BUF``.
+    Emit every result in one syscall, compressing oversized records into a
+    checksum-bound envelope.  The comparator verifies the envelope checksum and
+    size before accepting its payload.
     """
 
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     plain_line = marker.encode() + b" " + raw + b"\n"
     try:
+        fd_mode = os.fstat(_ATOMIC_LOG_FD).st_mode
         pipe_buf = int(os.fpathconf(_ATOMIC_LOG_FD, "PC_PIPE_BUF"))
-    except (OSError, TypeError, ValueError):
-        pipe_buf = _FALLBACK_PIPE_BUF
-    if len(plain_line) <= pipe_buf:
-        logger.warning("%s %s", marker, raw.decode())
-        return
-
-    envelope = {
-        _COMPRESSED_RECORD_KEY: _COMPRESSED_RECORD_ENCODING,
-        "payload": base64.b64encode(zlib.compress(raw, level=9)).decode("ascii"),
-        "raw_bytes": len(raw),
-        "sha256": hashlib.sha256(raw).hexdigest(),
-    }
-    encoded = json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode()
-    compressed_line = marker.encode() + b" " + encoded + b"\n"
-    if len(compressed_line) > pipe_buf:
+    except (OSError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"cannot establish atomic {marker} stderr pipe limit"
+        ) from exc
+    if not stat.S_ISFIFO(fd_mode) or pipe_buf <= 0:
+        raise RuntimeError(
+            f"cannot establish atomic {marker} stderr pipe: "
+            f"mode={fd_mode:o}, pipe_buf={pipe_buf}"
+        )
+    output_line = plain_line
+    if len(output_line) > pipe_buf:
+        envelope = {
+            _COMPRESSED_RECORD_KEY: _COMPRESSED_RECORD_ENCODING,
+            "payload": base64.b64encode(zlib.compress(raw, level=9)).decode("ascii"),
+            "raw_bytes": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
+        encoded = json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode()
+        output_line = marker.encode() + b" " + encoded + b"\n"
+    if len(output_line) > pipe_buf:
         raise ValueError(
-            f"compressed {marker} record is {len(compressed_line)} bytes, "
+            f"encoded {marker} record is {len(output_line)} bytes, "
             f"exceeding atomic pipe limit {pipe_buf}"
         )
-    written = os.write(_ATOMIC_LOG_FD, compressed_line)
-    if written != len(compressed_line):
+    written = os.write(_ATOMIC_LOG_FD, output_line)
+    if written != len(output_line):
         raise RuntimeError(
-            f"short atomic {marker} write: {written}/{len(compressed_line)} bytes"
+            f"short atomic {marker} write: {written}/{len(output_line)} bytes"
         )
 
 

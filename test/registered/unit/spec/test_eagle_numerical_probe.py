@@ -1,8 +1,10 @@
 """CPU contracts for the exact-request EAGLE numerical probe."""
 
 import base64
+import contextlib
 import hashlib
 import json
+import stat
 import unittest
 import zlib
 from types import SimpleNamespace
@@ -27,9 +29,87 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestEagleNumericalProbe(unittest.TestCase):
+    @contextlib.contextmanager
+    def capture_atomic_probe_records(self):
+        records = []
+
+        def write(fd, value):
+            self.assertEqual(fd, 2)
+            self.assertLessEqual(len(value), 4096)
+            records.append(value)
+            return len(value)
+
+        with (
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.os.fstat",
+                return_value=SimpleNamespace(st_mode=stat.S_IFIFO),
+            ),
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.os.fpathconf",
+                return_value=4096,
+            ),
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.os.write",
+                side_effect=write,
+            ),
+        ):
+            yield records
+
+    def decode_atomic_probe_record(self, line, marker=b"EAGLE_PP_SENDER_PROBE_RESULT"):
+        self.assertTrue(line.endswith(b"\n"))
+        actual_marker, encoded = line[:-1].split(b" ", 1)
+        self.assertEqual(actual_marker, marker)
+        payload = json.loads(encoded)
+        if "__eagle_probe_encoding__" not in payload:
+            return payload
+
+        self.assertEqual(
+            set(payload),
+            {"__eagle_probe_encoding__", "payload", "raw_bytes", "sha256"},
+        )
+        self.assertEqual(payload["__eagle_probe_encoding__"], "zlib+base64")
+        compressed = base64.b64decode(payload["payload"], validate=True)
+        decompressor = zlib.decompressobj()
+        raw = decompressor.decompress(compressed, payload["raw_bytes"] + 1)
+        raw += decompressor.flush()
+        self.assertTrue(decompressor.eof)
+        self.assertEqual(decompressor.unused_data, b"")
+        self.assertEqual(decompressor.unconsumed_tail, b"")
+        self.assertEqual(len(raw), payload["raw_bytes"])
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), payload["sha256"])
+        return json.loads(raw)
+
+    def test_small_probe_result_also_uses_one_atomic_write(self):
+        payload = {"status": "complete"}
+        with (
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.os.fstat",
+                return_value=SimpleNamespace(st_mode=stat.S_IFIFO),
+            ),
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.os.fpathconf",
+                return_value=4096,
+            ),
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.os.write",
+                side_effect=lambda _fd, value: len(value),
+            ) as write,
+        ):
+            _emit_json_record("EAGLE_PP_SENDER_PROBE_RESULT", payload)
+
+        write.assert_called_once()
+        self.assertEqual(
+            write.call_args.args[1],
+            b'EAGLE_PP_SENDER_PROBE_RESULT {"status":"complete"}\n',
+        )
+
     def test_large_probe_result_uses_one_checksum_bound_atomic_write(self):
         payload = {"stages": {"large": "x" * 16000}}
         with (
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.os.fstat",
+                return_value=SimpleNamespace(st_mode=stat.S_IFIFO),
+            ),
             mock.patch(
                 "sglang.srt.speculative.eagle_numerical_probe.os.fpathconf",
                 return_value=4096,
@@ -53,6 +133,82 @@ class TestEagleNumericalProbe(unittest.TestCase):
         self.assertEqual(envelope["raw_bytes"], len(raw))
         self.assertEqual(envelope["sha256"], hashlib.sha256(raw).hexdigest())
         self.assertEqual(json.loads(raw), payload)
+
+    def test_incompressible_probe_result_fails_before_write(self):
+        payload = {
+            "hashes": [hashlib.sha256(str(i).encode()).hexdigest() for i in range(200)]
+        }
+        with (
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.os.fstat",
+                return_value=SimpleNamespace(st_mode=stat.S_IFIFO),
+            ),
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.os.fpathconf",
+                return_value=256,
+            ),
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.os.write"
+            ) as write,
+            self.assertRaisesRegex(ValueError, "exceeding atomic pipe limit"),
+        ):
+            _emit_json_record("EAGLE_PP_SENDER_PROBE_RESULT", payload)
+        write.assert_not_called()
+
+    def test_probe_result_fails_when_stderr_is_not_a_pipe(self):
+        with (
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.os.fstat",
+                return_value=SimpleNamespace(st_mode=stat.S_IFREG),
+            ),
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.os.fpathconf",
+                return_value=4096,
+            ),
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.os.write"
+            ) as write,
+            self.assertRaisesRegex(RuntimeError, "cannot establish atomic.*pipe"),
+        ):
+            _emit_json_record("EAGLE_PP_SENDER_PROBE_RESULT", {"status": "complete"})
+        write.assert_not_called()
+
+    def test_probe_result_fails_when_pipe_limit_is_unavailable(self):
+        with (
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.os.fstat",
+                return_value=SimpleNamespace(st_mode=stat.S_IFIFO),
+            ),
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.os.fpathconf",
+                side_effect=OSError(22, "invalid argument"),
+            ),
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.os.write"
+            ) as write,
+            self.assertRaisesRegex(RuntimeError, "cannot establish atomic.*limit"),
+        ):
+            _emit_json_record("EAGLE_PP_SENDER_PROBE_RESULT", {"status": "complete"})
+        write.assert_not_called()
+
+    def test_probe_result_short_write_fails_closed(self):
+        with (
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.os.fstat",
+                return_value=SimpleNamespace(st_mode=stat.S_IFIFO),
+            ),
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.os.fpathconf",
+                return_value=4096,
+            ),
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.os.write",
+                side_effect=lambda _fd, value: len(value) - 1,
+            ) as write,
+            self.assertRaisesRegex(RuntimeError, "short atomic.*write"),
+        ):
+            _emit_json_record("EAGLE_PP_SENDER_PROBE_RESULT", {"status": "complete"})
+        write.assert_called_once()
 
     def test_pp_target_forward_row_domain_uses_communicator_layout(self):
         self.assertEqual(
@@ -162,9 +318,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
                 "sglang.srt.speculative.eagle_numerical_probe.get_parallel",
                 return_value=rank,
             ),
-            self.assertLogs(
-                "sglang.srt.speculative.eagle_numerical_probe", level="WARNING"
-            ) as logs,
+            self.capture_atomic_probe_records() as records,
         ):
             self.assertTrue(
                 probe.begin_target_verify_pp_output(
@@ -189,11 +343,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
                 )
             )
 
-        results = [
-            json.loads(line.split("EAGLE_PP_SENDER_PROBE_RESULT ", 1)[1])
-            for line in logs.output
-            if "EAGLE_PP_SENDER_PROBE_RESULT " in line
-        ]
+        results = [self.decode_atomic_probe_record(line) for line in records]
         self.assertEqual(len(results), 1)
         payload = results[0]
         self.assertEqual(payload["status"], "complete")
@@ -538,9 +688,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
                 "sglang.srt.speculative.eagle_numerical_probe.get_parallel",
                 return_value=rank,
             ),
-            self.assertLogs(
-                "sglang.srt.speculative.eagle_numerical_probe", level="WARNING"
-            ) as logs,
+            self.capture_atomic_probe_records() as records,
         ):
             self.assertTrue(
                 probe.begin_target_verify_pp_output(
@@ -551,9 +699,8 @@ class TestEagleNumericalProbe(unittest.TestCase):
             )
             probe.finalize_target_verify_pp_output()
 
-        payload = json.loads(
-            logs.output[-1].split("EAGLE_PP_SENDER_PROBE_RESULT ", 1)[1]
-        )
+        self.assertEqual(len(records), 1)
+        payload = self.decode_atomic_probe_record(records[0])
         self.assertEqual(tuple(proxy), original_keys)
         self.assertEqual(
             set(payload["stages"]),
@@ -637,10 +784,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
                     pod_name="probe-pod",
                     pod_uid="probe-pod-uid",
                 )
-                with self.assertLogs(
-                    "sglang.srt.speculative.eagle_numerical_probe",
-                    level="WARNING",
-                ) as logs:
+                with self.capture_atomic_probe_records() as records:
                     self.assertFalse(
                         probe.begin_target_verify_pp_output(
                             pp_proxy_tensors=tensors,
@@ -648,9 +792,8 @@ class TestEagleNumericalProbe(unittest.TestCase):
                             require_attn_tp_allgather=False,
                         )
                     )
-                payload = json.loads(
-                    logs.output[-1].split("EAGLE_PP_SENDER_PROBE_RESULT ", 1)[1]
-                )
+                self.assertEqual(len(records), 1)
+                payload = self.decode_atomic_probe_record(records[0])
                 self.assertEqual(payload["status"], "rejected")
                 self.assertEqual(payload["stages"], {})
                 self.assertFalse(probe.can_probe)
@@ -726,9 +869,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
                 "sglang.srt.speculative.eagle_numerical_probe._tensor_fingerprint",
                 side_effect=lambda *_args: events.append("fingerprint") or {},
             ),
-            self.assertLogs(
-                "sglang.srt.speculative.eagle_numerical_probe", level="WARNING"
-            ),
+            self.capture_atomic_probe_records() as records,
         ):
             self.assertTrue(
                 probe.begin_target_verify_pp_output(
@@ -745,6 +886,10 @@ class TestEagleNumericalProbe(unittest.TestCase):
             probe.finalize_target_verify_pp_output()
 
         self.assertEqual(len(snapshots), 2)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(
+            self.decode_atomic_probe_record(records[0])["status"], "complete"
+        )
         self.assertEqual(events.count(("copy", True)), 2)
         self.assertLess(events.index("record"), events.index("synchronize"))
         self.assertLess(events.index("synchronize"), events.index("fingerprint"))
@@ -767,9 +912,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
                 "sglang.srt.speculative.eagle_numerical_probe.torch.empty",
                 side_effect=RuntimeError("pinned allocation failed"),
             ),
-            self.assertLogs(
-                "sglang.srt.speculative.eagle_numerical_probe", level="WARNING"
-            ) as logs,
+            self.capture_atomic_probe_records() as records,
             self.assertRaisesRegex(RuntimeError, "pinned allocation failed"),
         ):
             probe.begin_target_verify_pp_output(
@@ -778,9 +921,8 @@ class TestEagleNumericalProbe(unittest.TestCase):
                 require_attn_tp_allgather=False,
             )
 
-        payload = json.loads(
-            logs.output[-1].split("EAGLE_PP_SENDER_PROBE_RESULT ", 1)[1]
-        )
+        self.assertEqual(len(records), 1)
+        payload = self.decode_atomic_probe_record(records[0])
         self.assertEqual(payload["status"], "rejected")
         self.assertIn("pinned allocation failed", payload["rejection"])
         self.assertFalse(probe.can_probe)
