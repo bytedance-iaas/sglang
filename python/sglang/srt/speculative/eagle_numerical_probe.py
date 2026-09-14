@@ -209,6 +209,7 @@ _PP_FLASHMLA_INPUT_TENSORS = (
     "q_input",
     "topk_indices",
     "indices",
+    "logical_topk_indices",
     "cache_seqlens",
     "num_splits",
     "tile_scheduler_metadata",
@@ -277,6 +278,8 @@ class _PPTargetForwardDeviceObserver:
         self._attention_widths: dict[str, int] = {}
         self._flashmla_input_buffers: dict[str, torch.Tensor] = {}
         self._flashmla_input_row_counts: dict[str, torch.Tensor] = {}
+        self._flashmla_layer_id: Optional[int] = None
+        self._logical_topk_kernel_rows: Optional[int] = None
         self.device = self.buffer.device
 
     def install_attention_boundaries(
@@ -322,6 +325,7 @@ class _PPTargetForwardDeviceObserver:
         input_stage = f"target_verify_layer_{layer_id:02d}_flashmla_inputs"
         if self._flashmla_input_buffers:
             raise RuntimeError("FlashMLA input observer is already installed")
+        self._flashmla_layer_id = int(layer_id)
         shapes_and_dtypes = {
             "q_nope": (
                 (self.max_rows, num_q_heads, q_nope_head_dim),
@@ -342,6 +346,10 @@ class _PPTargetForwardDeviceObserver:
             ),
             "topk_indices": ((self.max_rows, topk_width), torch.int32),
             "indices": ((self.max_rows, 1, topk_width), torch.int32),
+            "logical_topk_indices": (
+                (self.max_rows, topk_width),
+                torch.int32,
+            ),
             "cache_seqlens": ((self.max_rows,), torch.int32),
             "num_splits": ((self.max_rows + 1,), torch.int32),
             "tile_scheduler_metadata": (
@@ -370,12 +378,78 @@ class _PPTargetForwardDeviceObserver:
                     "q_input",
                     "topk_indices",
                     "indices",
+                    "logical_topk_indices",
                     "cache_seqlens",
                 )
             },
             "num_splits": _FLASHMLA_QUERY_SPLIT_INDPTR_ROW_DOMAIN,
             "tile_scheduler_metadata": _FLASHMLA_SCHEDULER_ROW_DOMAIN,
         }
+
+    def logical_topk_kernel_output(
+        self,
+        *,
+        layer_id: int,
+        rows: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Return the preallocated output written by fused TopK v2."""
+        output = self._logical_topk_buffer_view(
+            layer_id=layer_id, rows=rows, dtype=dtype, device=device
+        )
+        # This is capture-time host state only. Each graph records a fixed-shape
+        # TopK write to the shared slot; replay does not execute this assignment.
+        self._logical_topk_kernel_rows = rows
+        return output
+
+    def logical_topk_flashmla_input(
+        self,
+        *,
+        layer_id: int,
+        rows: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Return the same logical rows previously written by fused TopK v2."""
+        if self._logical_topk_kernel_rows != rows:
+            raise RuntimeError(
+                "logical TopK producer/consumer row mismatch: "
+                f"kernel_rows={self._logical_topk_kernel_rows}, "
+                f"flashmla_rows={rows}"
+            )
+        return self._logical_topk_buffer_view(
+            layer_id=layer_id, rows=rows, dtype=dtype, device=device
+        )
+
+    def _logical_topk_buffer_view(
+        self,
+        *,
+        layer_id: int,
+        rows: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if self._flashmla_layer_id != layer_id:
+            raise ValueError(
+                "logical TopK output requested for the wrong layer: "
+                f"requested={layer_id}, installed={self._flashmla_layer_id}"
+            )
+        buffer = self._flashmla_input_buffers.get("logical_topk_indices")
+        if buffer is None:
+            raise RuntimeError("logical TopK output requested before observer install")
+        if rows <= 0 or rows > buffer.shape[0]:
+            raise ValueError(
+                f"logical TopK rows {rows} are outside fixed capacity "
+                f"1..{buffer.shape[0]}"
+            )
+        if dtype != buffer.dtype or device != buffer.device:
+            raise ValueError(
+                "logical TopK output identity changed: "
+                f"dtype={dtype}, device={device}, expected dtype={buffer.dtype}, "
+                f"device={buffer.device}"
+            )
+        return buffer[:rows]
 
     def capture_flashmla_inputs(
         self,
@@ -386,6 +460,7 @@ class _PPTargetForwardDeviceObserver:
         q_input: torch.Tensor,
         topk_indices: torch.Tensor,
         indices: torch.Tensor,
+        logical_topk_indices: torch.Tensor,
         cache_seqlens: torch.Tensor,
         num_splits: torch.Tensor,
         tile_scheduler_metadata: torch.Tensor,
@@ -398,6 +473,7 @@ class _PPTargetForwardDeviceObserver:
             "q_input": q_input,
             "topk_indices": topk_indices,
             "indices": indices,
+            "logical_topk_indices": logical_topk_indices,
             "cache_seqlens": cache_seqlens,
             "num_splits": num_splits,
             "tile_scheduler_metadata": tile_scheduler_metadata,
@@ -433,7 +509,11 @@ class _PPTargetForwardDeviceObserver:
             value = values[name]
             buffer = self._flashmla_input_buffers[name]
             rows = int(value.shape[0])
-            buffer[:rows].copy_(value)
+            # The fused v2 TopK kernel writes the logical selection directly to
+            # this preallocated slot. Do not add a redundant graph node when
+            # capture receives that exact view back from the attention path.
+            if value.data_ptr() != buffer.data_ptr():
+                buffer[:rows].copy_(value)
             self._flashmla_input_row_counts[name].fill_(rows)
 
     def capture_attention(
@@ -724,6 +804,15 @@ class EaglePPSenderProbe:
             raise RuntimeError(
                 f"target-attention observer already installed on layer {start_layer}"
             )
+        indexer = getattr(attention, "indexer", None)
+        if indexer is None:
+            raise TypeError(
+                "PP target-attention observer requires an indexer on the first layer"
+            )
+        if getattr(indexer, "target_forward_probe", None) is not None:
+            raise RuntimeError(
+                f"TopK observer already installed on layer {start_layer}"
+            )
         radix_attention = getattr(attention, "attn_mqa", None)
         if radix_attention is None:
             raise TypeError(
@@ -768,6 +857,7 @@ class EaglePPSenderProbe:
             ),
         )
         attention.target_forward_probe = observer
+        indexer.target_forward_probe = observer
         radix_attention.target_forward_probe = observer
         self._target_forward_observer = observer
 

@@ -2997,6 +2997,12 @@ class DeepseekSparseAttnBackend(
             # All slots were allocated before graph capture. This call records
             # only fixed D2D copies/fills; exact-RID selection and host hashing
             # remain in the existing post-send lifecycle.
+            logical_topk_indices = target_forward_probe.logical_topk_flashmla_input(
+                layer_id=layer.layer_id,
+                rows=live_num_tokens,
+                dtype=torch.int32,
+                device=topk_indices.device,
+            )
             target_forward_probe.capture_flashmla_inputs(
                 layer_id=layer.layer_id,
                 q_nope=logical_q[:, :, : self.kv_lora_rank],
@@ -3004,6 +3010,7 @@ class DeepseekSparseAttnBackend(
                 q_input=q_input,
                 topk_indices=topk_indices,
                 indices=indices,
+                logical_topk_indices=logical_topk_indices,
                 cache_seqlens=cache_seqlens,
                 num_splits=num_splits,
                 tile_scheduler_metadata=(metadata.flashmla_metadata.flashmla_metadata),

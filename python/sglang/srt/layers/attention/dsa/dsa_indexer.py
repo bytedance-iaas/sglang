@@ -950,7 +950,26 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         # NOTE(dark): logits should be cleaned in topk_transform
         self._mask_init_and_local_tokens(logits, seqlens_32)
-        topk_result = metadata.topk_transform(logits, self.index_topk)
+        logical_topk_output = None
+        target_forward_probe = getattr(self, "target_forward_probe", None)
+        if (
+            target_forward_probe is not None
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            if envs.SGLANG_DSA_TOPK_BROADCAST.get():
+                raise RuntimeError(
+                    "logical TopK observer does not support post-selection "
+                    "attn-TP broadcast"
+                )
+            logical_topk_output = target_forward_probe.logical_topk_kernel_output(
+                layer_id=layer_id,
+                rows=logits.shape[0],
+                dtype=torch.int32,
+                device=logits.device,
+            )
+        topk_result = metadata.topk_transform(
+            logits, self.index_topk, out_raw_indices=logical_topk_output
+        )
         # Restore possible padding exist in the hidden states.
         if not _is_hip and q_offset < q_fp8.shape[0]:
             pad_len = q_fp8.shape[0] - q_offset

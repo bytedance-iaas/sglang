@@ -183,6 +183,25 @@ def _run_raw(scores, seq_lens, k):
     return [[v for v in out_cpu[i] if v != -1] for i in range(batch)]
 
 
+def _run_paged_with_raw(scores, seq_lens, page_table, k):
+    """Return both outputs produced by one paged v2 kernel invocation."""
+    batch = scores.shape[0]
+    metadata = _plan(seq_lens)
+    out = torch.full((batch, k), -1, dtype=torch.int32, device=scores.device)
+    raw = torch.full_like(out, -2)
+    topk_transform_paged_v2(
+        scores,
+        seq_lens,
+        page_table,
+        out,
+        PAGE_SIZE,
+        metadata,
+        out_raw_indices=raw,
+    )
+    torch.cuda.synchronize()
+    return out.cpu().tolist(), raw.cpu().tolist()
+
+
 @pytest.mark.parametrize("page_mode", ["identity", "perm"])
 @pytest.mark.parametrize("k", [512, 1024, 2048])
 @pytest.mark.parametrize("batch,seq", FIXED_CONFIGS)
@@ -268,6 +287,42 @@ def test_topk_v2_output_indices(batch: int, seq: int, k: int) -> None:
     our_raw = _run_raw(scores, seq_lens, k)
     ref_raw = _reference(scores, seq_lens, k)
     _assert_topk_close(scores.cpu(), ref_raw, our_raw, batch, seq_lens.cpu(), k)
+
+
+@pytest.mark.parametrize(
+    "batch,seq,k",
+    [
+        (8, 256, 512),  # trivial
+        (8, 8192, 512),  # register
+        (8, 8193, 512),  # register4
+        (16, 65536, 512),  # streaming
+        (8, 65537, 512),  # fused small-batch cluster
+        (31, 131072, 512),  # persistent cluster + main epilogue
+    ],
+)
+@torch.inference_mode()
+def test_topk_v2_paged_optional_raw_matches_same_selection(
+    batch: int, seq: int, k: int
+) -> None:
+    """The optional raw side output must invert the paged output exactly."""
+    torch.manual_seed(batch * 100003 + seq * 7 + k + 2)
+    device = "cuda"
+    width = (seq + 3) & ~3
+    scores = torch.randn(batch, width, dtype=torch.float32, device=device)[:, :seq]
+    seq_lens = torch.full((batch,), seq, dtype=torch.int32, device=device)
+    # Include an idle DP companion row in every template launch. Both outputs
+    # must overwrite their sentinels with the all-invalid representation.
+    seq_lens[0] = 0
+    num_pages = (seq + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table, inv_cpu = _make_page_table(
+        batch, num_pages, "perm", device, per_row=True
+    )
+
+    paged, raw = _run_paged_with_raw(scores, seq_lens, page_table, k)
+    for row in range(batch):
+        assert [v for v in raw[row] if v != -1] == _invert(paged[row], inv_cpu[row])
+    assert paged[0] == [-1] * k
+    assert raw[0] == [-1] * k
 
 
 # --- ragged entry point ------------------------------------------------------

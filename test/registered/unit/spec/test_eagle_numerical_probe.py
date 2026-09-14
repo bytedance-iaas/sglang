@@ -12,6 +12,11 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+    DSATopKBackend,
+    TopkTransformMethod,
+)
 from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.models.deepseek_v2 import _pp_target_forward_row_domain
 from sglang.srt.speculative.eagle_numerical_probe import (
@@ -743,8 +748,16 @@ class TestEagleNumericalProbe(unittest.TestCase):
         q_nope = torch.arange(8, dtype=torch.bfloat16).reshape(2, 2, 2)
         q_rope = torch.arange(4, dtype=torch.bfloat16).reshape(2, 2, 1)
         q_input = torch.arange(24, dtype=torch.bfloat16).reshape(2, 1, 4, 3)
-        topk = torch.arange(6, dtype=torch.int32).reshape(2, 3)
-        indices = (topk + 10).unsqueeze(1)
+        topk = torch.tensor([[40, 41, 42], [80, 81, 82]], dtype=torch.int32)
+        indices = topk.unsqueeze(1)
+        logical_topk = observer.logical_topk_kernel_output(
+            layer_id=0, rows=2, dtype=torch.int32, device=torch.device("cpu")
+        )
+        logical_topk.copy_(torch.tensor([[0, 1, 2], [4, 5, 6]], dtype=torch.int32))
+        logical_topk_input = observer.logical_topk_flashmla_input(
+            layer_id=0, rows=2, dtype=torch.int32, device=torch.device("cpu")
+        )
+        self.assertEqual(logical_topk.data_ptr(), logical_topk_input.data_ptr())
         cache_seqlens = torch.tensor([3, 3], dtype=torch.int32)
         num_splits = torch.tensor([0, 1, 2], dtype=torch.int32)
         scheduler = torch.arange(16, dtype=torch.int32).reshape(2, 8)
@@ -760,6 +773,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
             q_input=q_input,
             topk_indices=topk,
             indices=indices,
+            logical_topk_indices=logical_topk_input,
             cache_seqlens=cache_seqlens,
             num_splits=num_splits,
             tile_scheduler_metadata=scheduler,
@@ -773,6 +787,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
                 "q_input",
                 "topk_indices",
                 "indices",
+                "logical_topk_indices",
                 "cache_seqlens",
                 "num_splits",
                 "tile_scheduler_metadata",
@@ -780,6 +795,9 @@ class TestEagleNumericalProbe(unittest.TestCase):
         )
         self.assertTrue(torch.equal(stage["tensors"]["q_input"][:2], q_input))
         self.assertTrue(torch.equal(stage["tensors"]["indices"][:2], indices))
+        self.assertTrue(
+            torch.equal(stage["tensors"]["logical_topk_indices"][:2], logical_topk)
+        )
         self.assertEqual(stage["tensor_metadata"]["q_input"]["logical_rows"].item(), 2)
         self.assertEqual(
             stage["tensor_metadata"]["num_splits"]["logical_rows"].item(), 3
@@ -799,6 +817,90 @@ class TestEagleNumericalProbe(unittest.TestCase):
                 for name, tensor in observer._flashmla_input_buffers.items()
             },
         )
+
+    def test_pp_target_forward_observer_rejects_logical_topk_output_drift(self):
+        observer = _PPTargetForwardDeviceObserver(
+            layer_ids=(0,),
+            max_rows=4,
+            hidden_size=3,
+            dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+        )
+        with self.assertRaisesRegex(ValueError, "wrong layer"):
+            observer.logical_topk_kernel_output(
+                layer_id=0, rows=1, dtype=torch.int32, device=torch.device("cpu")
+            )
+
+        observer.install_attention_boundaries(
+            layer_id=0,
+            raw_output_width=6,
+            v_projection_width=4,
+            row_domain="pp_attn_group_target_verify_tree_node",
+            num_q_heads=2,
+            padded_num_q_heads=4,
+            q_nope_head_dim=2,
+            q_rope_head_dim=1,
+            topk_width=3,
+            max_scheduler_rows=2,
+        )
+        invalid_output_cases = (
+            ("wrong layer", dict(layer_id=1, rows=2, dtype=torch.int32)),
+            ("outside fixed capacity", dict(layer_id=0, rows=0, dtype=torch.int32)),
+            ("outside fixed capacity", dict(layer_id=0, rows=5, dtype=torch.int32)),
+            ("identity changed", dict(layer_id=0, rows=2, dtype=torch.int64)),
+        )
+        for message, kwargs in invalid_output_cases:
+            with self.subTest(message=message, kwargs=kwargs):
+                with self.assertRaisesRegex((ValueError, RuntimeError), message):
+                    observer.logical_topk_kernel_output(
+                        **kwargs, device=torch.device("cpu")
+                    )
+
+        output = observer.logical_topk_kernel_output(
+            layer_id=0, rows=2, dtype=torch.int32, device=torch.device("cpu")
+        )
+        self.assertEqual(output.shape, (2, 3))
+        with self.assertRaisesRegex(RuntimeError, "producer/consumer row mismatch"):
+            observer.logical_topk_flashmla_input(
+                layer_id=0, rows=3, dtype=torch.int32, device=torch.device("cpu")
+            )
+        consumed = observer.logical_topk_flashmla_input(
+            layer_id=0, rows=2, dtype=torch.int32, device=torch.device("cpu")
+        )
+        self.assertEqual(output.data_ptr(), consumed.data_ptr())
+
+    def test_dsa_topk_backend_rejects_raw_output_outside_fused_v2_paged(self):
+        logits = torch.zeros((2, 4), dtype=torch.float32)
+        lengths = torch.ones((2,), dtype=torch.int32)
+        raw = torch.empty((2, 2), dtype=torch.int32)
+        cases = (
+            (DSATopKBackend.SGL_KERNEL, False, True),
+            (DSATopKBackend.SGL_KERNEL, True, False),
+            (DSATopKBackend.TORCH, True, True),
+        )
+        for backend, fuse_topk, use_v2 in cases:
+            with self.subTest(
+                backend=backend.value, fuse_topk=fuse_topk, use_v2=use_v2
+            ):
+                with (
+                    envs.SGLANG_DSA_FUSE_TOPK.override(fuse_topk),
+                    envs.SGLANG_OPT_USE_TOPK_V2.override(use_v2),
+                    self.assertRaisesRegex(
+                        RuntimeError,
+                        "raw TopK output requires fused DeepSeek-V4 v2 PAGED dispatch",
+                    ),
+                ):
+                    backend.topk_transform(
+                        logits=logits,
+                        lengths=lengths,
+                        topk=2,
+                        topk_transform_method=TopkTransformMethod.PAGED,
+                        attn_metadata=SimpleNamespace(
+                            real_page_table=torch.zeros((2, 1), dtype=torch.int32)
+                        ),
+                        force_unfused_topk=not fuse_topk,
+                        out_raw_indices=raw,
+                    )
 
     def test_pp_target_forward_observer_rejects_flashmla_input_drift_atomically(self):
         observer = _PPTargetForwardDeviceObserver(
@@ -826,6 +928,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
             "q_input": torch.zeros((2, 1, 4, 3), dtype=torch.bfloat16),
             "topk_indices": torch.zeros((2, 3), dtype=torch.int32),
             "indices": torch.zeros((2, 1, 3), dtype=torch.int32),
+            "logical_topk_indices": torch.zeros((2, 3), dtype=torch.int32),
             "cache_seqlens": torch.zeros((2,), dtype=torch.int32),
             "num_splits": torch.zeros((3,), dtype=torch.int32),
             "tile_scheduler_metadata": torch.zeros((2, 8), dtype=torch.int32),
@@ -941,6 +1044,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
             kv_lora_rank=8,
             qk_rope_head_dim=2,
             v_head_dim=4,
+            indexer=SimpleNamespace(),
             attn_mqa=SimpleNamespace(),
         )
         model = type(
@@ -967,6 +1071,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
         for layer_id in observer.layer_ids:
             self.assertIs(layers[layer_id].target_forward_probe, observer)
         self.assertIs(layers[0].self_attn.target_forward_probe, observer)
+        self.assertIs(layers[0].self_attn.indexer.target_forward_probe, observer)
         self.assertIs(layers[0].self_attn.attn_mqa.target_forward_probe, observer)
         self.assertEqual(
             set(observer._attention_buffers),
@@ -983,6 +1088,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
                 "q_input",
                 "topk_indices",
                 "indices",
+                "logical_topk_indices",
                 "cache_seqlens",
                 "num_splits",
                 "tile_scheduler_metadata",

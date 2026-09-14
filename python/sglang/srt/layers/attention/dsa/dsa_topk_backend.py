@@ -102,8 +102,13 @@ class DSATopKBackend(Enum):
         row_starts: Optional[torch.Tensor] = None,
         batch_idx_list: Optional[List[int]] = None,
         force_unfused_topk: bool = False,
+        out_raw_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
+            if out_raw_indices is not None:
+                raise RuntimeError(
+                    "raw TopK output requires fused DeepSeek-V4 v2 PAGED dispatch"
+                )
             return self.topk_func(logits, lengths, topk, row_starts=row_starts)
 
         # Decode-shaped PAGED top-k for the SGL backend (plain decode AND spec
@@ -127,7 +132,18 @@ class DSATopKBackend(Enum):
             == logits.shape[0]
             == attn_metadata.real_page_table.shape[0]
         ):
-            return _topk_transform_v2_paged(logits, lengths, topk, attn_metadata)
+            return _topk_transform_v2_paged(
+                logits,
+                lengths,
+                topk,
+                attn_metadata,
+                out_raw_indices=out_raw_indices,
+            )
+
+        if out_raw_indices is not None:
+            raise RuntimeError(
+                "raw TopK output requires fused DeepSeek-V4 v2 PAGED dispatch"
+            )
 
         # Extend-shaped RAGGED top-k for the SGL backend routes to the same v2
         # kernel through its ragged entry point: no page table (the columns are
@@ -278,6 +294,7 @@ def _topk_transform_v2_paged(
     lengths: torch.Tensor,
     topk: int,
     attn_metadata,
+    out_raw_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fused top-k + page-table transform via the DeepSeek-V4 v2 JIT kernel.
 
@@ -335,7 +352,15 @@ def _topk_transform_v2_paged(
 
     page_size = attn_metadata.page_size
     out = logits.new_empty((num_rows, topk), dtype=torch.int32)
-    topk_transform_paged_v2(logits, lengths, page_table, out, page_size, plan)
+    topk_transform_paged_v2(
+        logits,
+        lengths,
+        page_table,
+        out,
+        page_size,
+        plan,
+        out_raw_indices=out_raw_indices,
+    )
     return out
 
 
