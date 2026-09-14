@@ -127,9 +127,36 @@ class SchedulerPPMixin:
         self.pp_group.device_module.synchronize()
         logger.info("VPP pipeline device group prewarm completed")
 
-    def _pp_relay_vpp_control(self: Scheduler, data) -> None:
-        if self._pp_vpp_enabled() and not self.pp_group.is_last_rank:
+    def _pp_relay_vpp_control(self: Scheduler, data, *, kind: str, mb_id: int) -> None:
+        should_send = self._pp_vpp_enabled() and not self.pp_group.is_last_rank
+        # #region debug-point C:control-send
+        _vpp_debug_event(
+            self,
+            "C",
+            "scheduler_pp_mixin.py:_pp_relay_vpp_control",
+            "control send enter",
+            {
+                "mb_id": mb_id,
+                "kind": kind,
+                "will_send": should_send,
+            },
+        )
+        # #endregion
+        if should_send:
             self._pp_send_pyobj_to_next_stage(data, async_send=False)
+        # #region debug-point C:control-send-complete
+        _vpp_debug_event(
+            self,
+            "C",
+            "scheduler_pp_mixin.py:_pp_relay_vpp_control",
+            "control send complete",
+            {
+                "mb_id": mb_id,
+                "kind": kind,
+                "did_send": should_send,
+            },
+        )
+        # #endregion
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -338,17 +365,65 @@ class SchedulerPPMixin:
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
-                    self._pp_relay_vpp_control(recv_reqs)
+                    self._pp_relay_vpp_control(
+                        recv_reqs,
+                        kind="request",
+                        mb_id=mb_id,
+                    )
 
+                # #region debug-point C:bootstrap-forward-consensus
+                _vpp_debug_event(
+                    self,
+                    "C",
+                    "scheduler_pp_mixin.py:event_loop_pp_disagg_prefill",
+                    "bootstrap consensus enter",
+                    {"mb_id": mb_id},
+                )
                 bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
+                _vpp_debug_event(
+                    self,
+                    "C",
+                    "scheduler_pp_mixin.py:event_loop_pp_disagg_prefill",
+                    "bootstrap consensus complete",
+                    {
+                        "mb_id": mb_id,
+                        "good_count": len(bootstrapped_rids[0]),
+                        "bad_count": len(bootstrapped_rids[1]),
+                    },
+                )
+                # #endregion
                 bmbs[mb_id] = bootstrapped_rids
                 self._pp_commit_comm_work(send_bootstrapped_work)
-                self._pp_relay_vpp_control(bootstrapped_rids)
+                self._pp_relay_vpp_control(
+                    bootstrapped_rids,
+                    kind="bootstrap",
+                    mb_id=mb_id,
+                )
 
+                # #region debug-point C:transfer-forward-consensus
+                _vpp_debug_event(
+                    self,
+                    "C",
+                    "scheduler_pp_mixin.py:event_loop_pp_disagg_prefill",
+                    "transfer consensus enter",
+                    {"mb_id": mb_id},
+                )
                 transferred_rids = self._pp_pd_get_prefill_transferred_ids()
+                _vpp_debug_event(
+                    self,
+                    "C",
+                    "scheduler_pp_mixin.py:event_loop_pp_disagg_prefill",
+                    "transfer consensus complete",
+                    {"mb_id": mb_id, "count": len(transferred_rids)},
+                )
+                # #endregion
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
-                self._pp_relay_vpp_control(transferred_rids)
+                self._pp_relay_vpp_control(
+                    transferred_rids,
+                    kind="transfer",
+                    mb_id=mb_id,
+                )
                 # #region debug-point C:control-relay-complete
                 _vpp_debug_event(
                     self,
@@ -373,6 +448,19 @@ class SchedulerPPMixin:
                 batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
+                # #region debug-point C:batch-plan
+                _vpp_debug_event(
+                    self,
+                    "C",
+                    "scheduler_pp_mixin.py:event_loop_pp_disagg_prefill",
+                    "batch plan complete",
+                    {
+                        "mb_id": mb_id,
+                        "has_batch": batch is not None,
+                        "running_count": len(self.running_batch.reqs),
+                    },
+                )
+                # #endregion
 
                 cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 self.cur_batch_for_debug = cur_batch
@@ -418,6 +506,14 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
+                # #region debug-point C:reverse-consensus
+                _vpp_debug_event(
+                    self,
+                    "C",
+                    "scheduler_pp_mixin.py:event_loop_pp_disagg_prefill",
+                    "reverse consensus enter",
+                    {"mb_id": mb_id, "next_mb_id": next_mb_id},
+                )
                 send_consensus_bootstrapped_work, consensus_bootstrapped_rids = (
                     self._pp_pd_send_consensus_bootstrapped_ids(
                         bmbs,
@@ -443,6 +539,14 @@ class SchedulerPPMixin:
                 if tmbs[next_mb_id] is not None:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
                 self._pp_commit_comm_work(send_release_work)
+                _vpp_debug_event(
+                    self,
+                    "C",
+                    "scheduler_pp_mixin.py:event_loop_pp_disagg_prefill",
+                    "reverse consensus complete",
+                    {"mb_id": mb_id, "next_mb_id": next_mb_id},
+                )
+                # #endregion
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()

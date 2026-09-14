@@ -103,7 +103,7 @@ class TestSchedulerVPP(unittest.TestCase):
         payload = ["request"]
 
         with patch.object(scheduler, "_pp_vpp_enabled", return_value=True):
-            scheduler._pp_relay_vpp_control(payload)
+            scheduler._pp_relay_vpp_control(payload, kind="request", mb_id=0)
 
         scheduler._pp_send_pyobj_to_next_stage.assert_called_once_with(
             payload,
@@ -116,7 +116,7 @@ class TestSchedulerVPP(unittest.TestCase):
         scheduler._pp_send_pyobj_to_next_stage = MagicMock()
 
         with patch.object(scheduler, "_pp_vpp_enabled", return_value=True):
-            scheduler._pp_relay_vpp_control(["request"])
+            scheduler._pp_relay_vpp_control(["request"], kind="request", mb_id=0)
 
         scheduler._pp_send_pyobj_to_next_stage.assert_not_called()
 
