@@ -516,6 +516,75 @@ class TestPPCPRankOffsets(unittest.TestCase):
             tensor_dict, async_send=True, msg_type="proxy"
         )
 
+    def test_pp_sender_probe_starts_after_send_and_finalizes_after_commit(self):
+        events = []
+        proxy_work = [object()]
+        tensor_dict = {"hidden_states": object(), "residual": object()}
+        probe = SimpleNamespace(
+            begin_target_verify_pp_output=Mock(
+                side_effect=lambda **_kwargs: events.append("snapshot") or True
+            ),
+            finalize_target_verify_pp_output=Mock(
+                side_effect=lambda: events.append("finalize")
+            ),
+        )
+        scheduler = SimpleNamespace(
+            send_proxy_work=[],
+            pending_pp_sender_probe=None,
+            pp_group=SimpleNamespace(next_rank=8),
+            require_attn_tp_allgather=False,
+            _pp_send_dict_to_next_stage=Mock(
+                side_effect=lambda *_args, **_kwargs: events.append("send")
+                or proxy_work
+            ),
+        )
+
+        SchedulerPPMixin._pp_send_proxy(scheduler, tensor_dict, sender_probe=probe)
+        self.assertEqual(events, ["send", "snapshot"])
+        self.assertIs(scheduler.pending_pp_sender_probe, probe)
+        self.assertIs(scheduler.send_proxy_work, proxy_work)
+        probe.begin_target_verify_pp_output.assert_called_once_with(
+            pp_proxy_tensors=tensor_dict,
+            target_world_rank=8,
+            require_attn_tp_allgather=False,
+        )
+
+        SchedulerPPMixin._pp_finalize_sender_probe(scheduler)
+        self.assertEqual(events, ["send", "snapshot", "finalize"])
+        self.assertIsNone(scheduler.pending_pp_sender_probe)
+
+    def test_pp_sender_probe_rejection_does_not_leave_pending_state(self):
+        probe = SimpleNamespace(begin_target_verify_pp_output=Mock(return_value=False))
+        scheduler = SimpleNamespace(
+            send_proxy_work=[],
+            pending_pp_sender_probe=None,
+            pp_group=SimpleNamespace(next_rank=8),
+            require_attn_tp_allgather=False,
+            _pp_send_dict_to_next_stage=Mock(return_value=[object()]),
+        )
+
+        SchedulerPPMixin._pp_send_proxy(
+            scheduler, {"hidden_states": object()}, sender_probe=probe
+        )
+
+        self.assertIsNone(scheduler.pending_pp_sender_probe)
+
+    def test_pp_sender_probe_cannot_overwrite_pending_snapshot(self):
+        pending = object()
+        scheduler = SimpleNamespace(
+            send_proxy_work=[],
+            pending_pp_sender_probe=pending,
+            _pp_send_dict_to_next_stage=Mock(),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "must be finalized"):
+            SchedulerPPMixin._pp_send_proxy(
+                scheduler, {"hidden_states": object()}, sender_probe=object()
+            )
+
+        self.assertIs(scheduler.pending_pp_sender_probe, pending)
+        scheduler._pp_send_dict_to_next_stage.assert_not_called()
+
     def test_pp_launch_applies_war_dependency_before_return(self):
         events = []
         launch_event = Mock()
@@ -734,23 +803,46 @@ class TestPPCPRankOffsets(unittest.TestCase):
         commit_previous_proxy = source.index(
             "self._pp_commit_comm_work(self.send_proxy_work)"
         )
+        finalize_previous_sender_probe = source.index(
+            "self._pp_finalize_sender_probe()"
+        )
         launch = source.index("result, self.launch_event = self._pp_launch_batch(")
-        send_current_proxy = source.index(
-            "self._pp_send_proxy(result.pp_hidden_states_proxy_tensors.tensors)"
+        send_current_proxy = source.index("self._pp_send_proxy(")
+        attach_current_sender_probe = source.index(
+            "sender_probe=result.pp_sender_probe", send_current_proxy
         )
         retract = source.index('phase="decode_retract_consensus"')
         prealloc = source.index('phase="decode_prealloc_consensus"')
         release = source.index('phase="decode_release_consensus"')
         process = source.index("self._pp_process_batch_result(")
         advance = source.index("self.pp_outputs = next_pp_outputs")
-        self.assertLess(commit_previous_proxy, launch)
+        self.assertLess(commit_previous_proxy, finalize_previous_sender_probe)
+        self.assertLess(finalize_previous_sender_probe, launch)
         self.assertLess(launch, send_current_proxy)
+        self.assertLess(send_current_proxy, attach_current_sender_probe)
+        self.assertLess(attach_current_sender_probe, retract)
         self.assertLess(send_current_proxy, process)
         self.assertLess(retract, prealloc)
         self.assertLess(prealloc, release)
         self.assertLess(release, process)
         self.assertLess(process, advance)
         self.assertNotIn("decode_result_commit_done", source)
+
+    def test_all_pp_loops_finalize_sender_snapshot_after_commit_before_launch(self):
+        for loop in (
+            SchedulerPPMixin.event_loop_pp,
+            SchedulerPPMixin.event_loop_pp_disagg_prefill,
+            SchedulerPPMixin.event_loop_pp_disagg_decode,
+        ):
+            with self.subTest(loop=loop.__name__):
+                source = inspect.getsource(loop)
+                commit = source.index("self._pp_commit_comm_work(self.send_proxy_work)")
+                finalize = source.index("self._pp_finalize_sender_probe()")
+                launch = source.index(
+                    "result, self.launch_event = self._pp_launch_batch("
+                )
+                self.assertLess(commit, finalize)
+                self.assertLess(finalize, launch)
 
     def test_request_receiver_uses_cp_size_for_pp_recv_rank(self):
         ps = _make_ps()

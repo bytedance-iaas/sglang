@@ -48,6 +48,9 @@ def _async_d2h(t: torch.Tensor) -> torch.Tensor:
 class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput] = None
     pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
+    # Diagnostic-only PP sender observer selected by the target worker. The
+    # scheduler owns snapshot timing around the actual async proxy send.
+    pp_sender_probe: Optional[Any] = None
     next_token_ids: Optional[
         Union[torch.Tensor, List[torch.Tensor], List[List[int]]]
     ] = None

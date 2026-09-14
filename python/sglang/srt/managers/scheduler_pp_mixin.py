@@ -248,6 +248,7 @@ class SchedulerPPMixin:
                         )
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
+                self._pp_finalize_sender_probe()
                 if cur_batch:
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
@@ -279,10 +280,9 @@ class SchedulerPPMixin:
                         with torch.profiler.record_function(
                             "send_proxy_dict_to_next_stage"
                         ):
-                            self.send_proxy_work = self._pp_send_dict_to_next_stage(
+                            self._pp_send_proxy(
                                 result.pp_hidden_states_proxy_tensors.tensors,
-                                async_send=True,
-                                msg_type="proxy",
+                                sender_probe=result.pp_sender_probe,
                             )
 
                 self.pp_outputs = next_pp_outputs
@@ -400,6 +400,7 @@ class SchedulerPPMixin:
                         )
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
+                self._pp_finalize_sender_probe()
                 if cur_batch:
                     if self.enable_staging:
                         self.maybe_prefetch_staging_for_batch(cur_batch)
@@ -543,6 +544,7 @@ class SchedulerPPMixin:
                         )
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
+                self._pp_finalize_sender_probe()
 
                 if cur_batch:
                     result, self.launch_event = self._pp_launch_batch(
@@ -565,7 +567,10 @@ class SchedulerPPMixin:
                     # output/result phase, which forms a cycle at high load.
                     # ``send_proxy_work`` pins the payload and the next slot
                     # commits it before another forward can reuse graph buffers.
-                    self._pp_send_proxy(result.pp_hidden_states_proxy_tensors.tensors)
+                    self._pp_send_proxy(
+                        result.pp_hidden_states_proxy_tensors.tensors,
+                        sender_probe=result.pp_sender_probe,
+                    )
 
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -657,6 +662,7 @@ class SchedulerPPMixin:
 
         self.send_req_work = []
         self.send_proxy_work = []
+        self.pending_pp_sender_probe = None
         self.send_output_work = []
         self.launch_event = None
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
@@ -1024,13 +1030,40 @@ class SchedulerPPMixin:
         self._pp_send_proxy(tensor_dict)
         self._pp_commit_comm_work(self.send_proxy_work)
 
-    def _pp_send_proxy(self: Scheduler, tensor_dict: Dict[str, torch.Tensor]) -> None:
+    def _pp_send_proxy(
+        self: Scheduler,
+        tensor_dict: Dict[str, torch.Tensor],
+        *,
+        sender_probe=None,
+    ) -> None:
         """Start a proxy send and retain its work and payload until commit."""
+        if (
+            sender_probe is not None
+            and getattr(self, "pending_pp_sender_probe", None) is not None
+        ):
+            raise RuntimeError(
+                "PP sender probe snapshot must be finalized before reuse"
+            )
         self.send_proxy_work = self._pp_send_dict_to_next_stage(
             tensor_dict,
             async_send=True,
             msg_type="proxy",
         )
+        if sender_probe is not None:
+            queued = sender_probe.begin_target_verify_pp_output(
+                pp_proxy_tensors=tensor_dict,
+                target_world_rank=self.pp_group.next_rank,
+                require_attn_tp_allgather=self.require_attn_tp_allgather,
+            )
+            if queued:
+                self.pending_pp_sender_probe = sender_probe
+
+    def _pp_finalize_sender_probe(self: Scheduler) -> None:
+        probe = getattr(self, "pending_pp_sender_probe", None)
+        if probe is None:
+            return
+        self.pending_pp_sender_probe = None
+        probe.finalize_target_verify_pp_output()
 
     def _pp_commit_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
         with detailed_profile_range(PREFILL_PP_CP_COMMUNICATION_RANGE):

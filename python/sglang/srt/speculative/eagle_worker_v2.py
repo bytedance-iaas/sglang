@@ -83,7 +83,10 @@ from sglang.srt.speculative.eagle_info import (
     EaglePPVerifyInputRaw,
     EagleVerifyInput,
 )
-from sglang.srt.speculative.eagle_numerical_probe import EagleNumericalProbe
+from sglang.srt.speculative.eagle_numerical_probe import (
+    EagleNumericalProbe,
+    EaglePPSenderProbe,
+)
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     _eagle_prefill_tail_tokens,
@@ -1390,6 +1393,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
             if self._hosts_draft
             else None
         )
+        self.eagle_pp_sender_probe = (
+            EaglePPSenderProbe(
+                envs.SGLANG_EAGLE_NUMERICAL_PROBE_RID.get(),
+                capture_id=envs.SGLANG_EAGLE_NUMERICAL_PROBE_CAPTURE_ID.get(),
+                pod_name=envs.SGLANG_EAGLE_NUMERICAL_PROBE_POD_NAME.get(),
+                pod_uid=envs.SGLANG_EAGLE_NUMERICAL_PROBE_POD_UID.get(),
+            )
+            if self._pp_enabled and not self._pp_is_last_rank
+            else None
+        )
 
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
@@ -1626,6 +1639,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
             if "after_verify" in self._eagle_cuda_sync_debug_checkpoints:
                 _sync_eagle_cuda_debug("after_verify", self.device)
             if self._pp_enabled and not self._pp_is_last_rank:
+                sender_probe = getattr(self, "eagle_pp_sender_probe", None)
+                if sender_probe is not None and sender_probe.matches_schedule_batch(
+                    batch
+                ):
+                    batch_output.pp_sender_probe = sender_probe
                 return batch_output
 
             if on_publish is not None:

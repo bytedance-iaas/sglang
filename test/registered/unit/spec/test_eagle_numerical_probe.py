@@ -10,6 +10,7 @@ import torch
 from sglang.srt.speculative.eagle_numerical_probe import (
     EagleNumericalProbe,
     EaglePDHandoffProbe,
+    EaglePPSenderProbe,
     _synchronize_cuda_tensors,
     maybe_record_eagle_numerical_stage,
 )
@@ -85,6 +86,275 @@ class TestEagleNumericalProbe(unittest.TestCase):
 
         self.assertFalse(probe.can_probe)
         self.assertFalse(probe.matches_schedule_batch(batch))
+
+    def test_pp_sender_probe_records_exact_rid_once(self):
+        probe = EaglePPSenderProbe(
+            "probe-rid",
+            capture_id="capture-test-generation",
+            pod_name="probe-pod",
+            pod_uid="probe-pod-uid",
+        )
+        batch = SimpleNamespace(reqs=[SimpleNamespace(rid="probe-rid")])
+        hidden = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4)
+        rank = SimpleNamespace(
+            world_rank=5,
+            pp_rank=0,
+            pp_size=2,
+            tp_rank=5,
+            tp_size=8,
+            attn_tp_rank=0,
+            attn_tp_size=1,
+            attn_dp_rank=5,
+            attn_dp_size=8,
+        )
+        with (
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.get_parallel",
+                return_value=rank,
+            ),
+            self.assertLogs(
+                "sglang.srt.speculative.eagle_numerical_probe", level="WARNING"
+            ) as logs,
+        ):
+            self.assertTrue(
+                probe.begin_target_verify_pp_output(
+                    pp_proxy_tensors={
+                        "hidden_states": hidden,
+                        "residual": hidden + 1,
+                        "__msg_type__": "proxy",
+                    },
+                    target_world_rank=13,
+                    require_attn_tp_allgather=False,
+                )
+            )
+            probe.finalize_target_verify_pp_output()
+            self.assertFalse(
+                probe.begin_target_verify_pp_output(
+                    pp_proxy_tensors={
+                        "hidden_states": hidden + 2,
+                        "residual": hidden + 3,
+                    },
+                    target_world_rank=13,
+                    require_attn_tp_allgather=False,
+                )
+            )
+
+        results = [
+            json.loads(line.split("EAGLE_PP_SENDER_PROBE_RESULT ", 1)[1])
+            for line in logs.output
+            if "EAGLE_PP_SENDER_PROBE_RESULT " in line
+        ]
+        self.assertEqual(len(results), 1)
+        payload = results[0]
+        self.assertEqual(payload["status"], "complete")
+        self.assertEqual(
+            payload["rank"],
+            {
+                "world": 5,
+                "pp": 0,
+                "pp_size": 2,
+                "tp_rank": 5,
+                "tp_size": 8,
+                "attn_tp_rank": 0,
+                "attn_tp_size": 1,
+                "attn_dp": 5,
+                "attn_dp_size": 8,
+            },
+        )
+        stage = payload["stages"]["target_verify_pp_output"]
+        self.assertEqual(stage["logical_rows"], 2)
+        self.assertEqual(stage["row_domain"], "pp_rank_local_target_verify_tree_node")
+        self.assertEqual(set(stage["tensors"]), {"hidden_states", "residual"})
+        self.assertEqual(
+            payload["transport"],
+            {
+                "target_world_rank": 13,
+                "mode": "direct_rank_local",
+                "require_attn_tp_allgather": False,
+            },
+        )
+        self.assertFalse(probe.can_probe)
+
+    def test_pp_sender_probe_wrong_or_cobatched_rid_is_noop(self):
+        probe = EaglePPSenderProbe(
+            "probe-rid",
+            capture_id="capture-test-generation",
+            pod_name="probe-pod",
+            pod_uid="probe-pod-uid",
+        )
+        tensor = torch.ones((1, 2))
+        for rids in (["other"], ["probe-rid", "other"]):
+            with self.subTest(rids=rids):
+                self.assertFalse(
+                    probe.matches_schedule_batch(
+                        SimpleNamespace(reqs=[SimpleNamespace(rid=rid) for rid in rids])
+                    )
+                )
+        self.assertTrue(probe.can_probe)
+
+    def test_pp_sender_probe_missing_or_mismatched_tensors_fail_closed(self):
+        batch = SimpleNamespace(reqs=[SimpleNamespace(rid="probe-rid")])
+        cases = {
+            "missing": {"hidden_states": torch.ones((1, 2))},
+            "row_mismatch": {
+                "hidden_states": torch.ones((1, 2)),
+                "residual": torch.ones((2, 2)),
+            },
+        }
+        for case, tensors in cases.items():
+            with self.subTest(case=case):
+                probe = EaglePPSenderProbe(
+                    "probe-rid",
+                    capture_id="capture-test-generation",
+                    pod_name="probe-pod",
+                    pod_uid="probe-pod-uid",
+                )
+                with self.assertLogs(
+                    "sglang.srt.speculative.eagle_numerical_probe",
+                    level="WARNING",
+                ) as logs:
+                    self.assertFalse(
+                        probe.begin_target_verify_pp_output(
+                            pp_proxy_tensors=tensors,
+                            target_world_rank=13,
+                            require_attn_tp_allgather=False,
+                        )
+                    )
+                payload = json.loads(
+                    logs.output[-1].split("EAGLE_PP_SENDER_PROBE_RESULT ", 1)[1]
+                )
+                self.assertEqual(payload["status"], "rejected")
+                self.assertEqual(payload["stages"], {})
+                self.assertFalse(probe.can_probe)
+
+    def test_pp_sender_probe_cuda_snapshot_is_nonblocking_and_finalized_later(self):
+        events = []
+        stream = object()
+        event = SimpleNamespace(
+            record=mock.Mock(side_effect=lambda _stream: events.append("record")),
+            synchronize=mock.Mock(side_effect=lambda: events.append("synchronize")),
+        )
+
+        def cuda_tensor(name):
+            tensor = mock.MagicMock(spec=torch.Tensor)
+            tensor.detach.return_value = tensor
+            tensor.is_cuda = True
+            tensor.shape = (2, 4)
+            tensor.dtype = torch.bfloat16
+            tensor.device = torch.device("cuda:0")
+            tensor.record_stream.side_effect = lambda _stream: events.append(
+                f"record_stream:{name}"
+            )
+            return tensor
+
+        snapshots = []
+
+        def empty(*_args, **kwargs):
+            self.assertEqual(kwargs["device"], "cpu")
+            self.assertTrue(kwargs["pin_memory"])
+            snapshot = mock.MagicMock(spec=torch.Tensor)
+            snapshot.copy_.side_effect = lambda _value, **copy_kwargs: events.append(
+                ("copy", copy_kwargs["non_blocking"])
+            )
+            snapshots.append(snapshot)
+            return snapshot
+
+        probe = EaglePPSenderProbe(
+            "probe-rid",
+            capture_id="capture-test-generation",
+            pod_name="probe-pod",
+            pod_uid="probe-pod-uid",
+        )
+        rank = SimpleNamespace(
+            world_rank=0,
+            pp_rank=0,
+            pp_size=2,
+            tp_rank=0,
+            tp_size=8,
+            attn_tp_rank=0,
+            attn_tp_size=8,
+            attn_dp_rank=0,
+            attn_dp_size=1,
+        )
+        with (
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.get_parallel",
+                return_value=rank,
+            ),
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.torch.empty",
+                side_effect=empty,
+            ),
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.torch.cuda.current_stream",
+                return_value=stream,
+            ),
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.torch.cuda.Event",
+                return_value=event,
+            ),
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe._tensor_fingerprint",
+                side_effect=lambda *_args: events.append("fingerprint") or {},
+            ),
+            self.assertLogs(
+                "sglang.srt.speculative.eagle_numerical_probe", level="WARNING"
+            ),
+        ):
+            self.assertTrue(
+                probe.begin_target_verify_pp_output(
+                    pp_proxy_tensors={
+                        "hidden_states": cuda_tensor("hidden_states"),
+                        "residual": cuda_tensor("residual"),
+                    },
+                    target_world_rank=8,
+                    require_attn_tp_allgather=False,
+                )
+            )
+            self.assertNotIn("synchronize", events)
+            self.assertNotIn("fingerprint", events)
+            probe.finalize_target_verify_pp_output()
+
+        self.assertEqual(len(snapshots), 2)
+        self.assertEqual(events.count(("copy", True)), 2)
+        self.assertLess(events.index("record"), events.index("synchronize"))
+        self.assertLess(events.index("synchronize"), events.index("fingerprint"))
+
+    def test_pp_sender_probe_cuda_queue_error_emits_rejection_and_raises(self):
+        tensor = mock.MagicMock(spec=torch.Tensor)
+        tensor.detach.return_value = tensor
+        tensor.is_cuda = True
+        tensor.shape = (1, 2)
+        tensor.dtype = torch.bfloat16
+        tensor.device = torch.device("cuda:0")
+        probe = EaglePPSenderProbe(
+            "probe-rid",
+            capture_id="capture-test-generation",
+            pod_name="probe-pod",
+            pod_uid="probe-pod-uid",
+        )
+        with (
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.torch.empty",
+                side_effect=RuntimeError("pinned allocation failed"),
+            ),
+            self.assertLogs(
+                "sglang.srt.speculative.eagle_numerical_probe", level="WARNING"
+            ) as logs,
+            self.assertRaisesRegex(RuntimeError, "pinned allocation failed"),
+        ):
+            probe.begin_target_verify_pp_output(
+                pp_proxy_tensors={"hidden_states": tensor, "residual": tensor},
+                target_world_rank=8,
+                require_attn_tp_allgather=False,
+            )
+
+        payload = json.loads(
+            logs.output[-1].split("EAGLE_PP_SENDER_PROBE_RESULT ", 1)[1]
+        )
+        self.assertEqual(payload["status"], "rejected")
+        self.assertIn("pinned allocation failed", payload["rejection"])
+        self.assertFalse(probe.can_probe)
 
     def test_non_pipeline_probe_keeps_original_stage_contract(self):
         probe = self.probe()

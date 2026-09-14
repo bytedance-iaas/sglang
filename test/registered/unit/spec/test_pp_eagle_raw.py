@@ -10,7 +10,11 @@ from sglang.srt.layers.attention.verify_mask import VerifyMask
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     _assert_pp_mtp_compat,
 )
@@ -112,6 +116,13 @@ class TestEagleCudaSyncDebug(unittest.TestCase):
     @classmethod
     def _pp_worker(cls, *, is_last_rank, checkpoints):
         output = cls._decode_output()
+        if not is_last_rank:
+            output.pp_hidden_states_proxy_tensors = PPProxyTensors(
+                {
+                    "hidden_states": torch.ones((1, 2)),
+                    "residual": torch.ones((1, 2)),
+                }
+            )
         draft_worker = SimpleNamespace(
             draft_runner=SimpleNamespace(tp_group=object()),
             draft_tp_context=MagicMock(return_value=nullcontext()),
@@ -138,6 +149,7 @@ class TestEagleCudaSyncDebug(unittest.TestCase):
                 return_value=SimpleNamespace(is_verify_input=lambda: True)
             ),
             verify=MagicMock(return_value=output),
+            eagle_pp_sender_probe=MagicMock(),
             _prepare_pp_next_draft_batch=MagicMock(),
         )
         return worker, output
@@ -392,6 +404,8 @@ class TestEagleCudaSyncDebug(unittest.TestCase):
             ["call.verify", "call.sync"],
         )
         sync_debug.assert_called_once_with("after_verify", "cuda:1")
+        worker.eagle_pp_sender_probe.matches_schedule_batch.assert_called_once()
+        self.assertIs(output.pp_sender_probe, worker.eagle_pp_sender_probe)
         worker.draft_worker._draft_extend_for_decode.assert_not_called()
         worker.draft_worker.draft.assert_not_called()
 
@@ -454,6 +468,7 @@ class TestEagleCudaSyncDebug(unittest.TestCase):
 
         self.assertIs(result, output)
         sync_debug.assert_not_called()
+        worker.eagle_pp_sender_probe.matches_schedule_batch.assert_not_called()
 
 
 class TestEaglePPVerifyRebuild(unittest.TestCase):
@@ -585,9 +600,51 @@ class TestEaglePPLastRankDraftOwnership(unittest.TestCase):
             worker = EAGLEWorkerV2(server_args, 0, object(), 1234, target_worker=target)
         draft_worker_cls.assert_not_called()
         self.assertIsNone(worker.draft_worker)
+        self.assertIsNotNone(worker.eagle_pp_sender_probe)
         self.assertEqual(
             worker.spec_v2_attn_backends, (target.model_runner.attn_backend,)
         )
+
+    @patch(
+        "sglang.srt.speculative.eagle_worker_v2.get_plan_stream",
+        return_value=(object(), nullcontext()),
+    )
+    @patch("sglang.srt.speculative.eagle_worker_v2.get_pp_group")
+    @patch("sglang.srt.speculative.eagle_worker_v2.EagleDraftWorker")
+    def test_last_rank_does_not_construct_pp_sender_probe(
+        self, draft_worker_cls, get_pp_group, _get_plan_stream
+    ):
+        get_pp_group.return_value.is_last_rank = True
+        target = self._target(is_last_rank=True)
+        with (
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.get_parallel",
+                return_value=SimpleNamespace(pp_size=2),
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.get_spec",
+                return_value=SimpleNamespace(
+                    speculative_eagle_topk=1,
+                    speculative_num_steps=3,
+                    speculative_num_draft_tokens=4,
+                    speculative_algorithm="EAGLE",
+                    speculative_adaptive=False,
+                ),
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.get_device",
+                return_value=SimpleNamespace(device="cpu"),
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.get_schedule",
+                return_value=SimpleNamespace(page_size=1),
+            ),
+        ):
+            worker = EAGLEWorkerV2(
+                SimpleNamespace(pp_size=2), 0, object(), 1234, target_worker=target
+            )
+        draft_worker_cls.assert_called_once()
+        self.assertIsNone(worker.eagle_pp_sender_probe)
 
     def test_pp_idle_build_does_not_call_draft_worker(self):
         draft_worker = SimpleNamespace(draft=MagicMock())

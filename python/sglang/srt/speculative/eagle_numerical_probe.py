@@ -3,9 +3,9 @@
 The probes are diagnostic-only and default-off. ``EaglePDHandoffProbe`` records
 the physical Prefill-to-Decode token boundary without depending on a draft
 worker; ``EagleNumericalProbe`` records the first Decode target-verify and
-draft-extend sequence. Every selected stage synchronizes its current CUDA
-stream and emits a fingerprint immediately, so a later device fault does not
-erase the completed stage prefix.
+draft-extend sequence. Those probes synchronize and emit each selected stage
+immediately. ``EaglePPSenderProbe`` instead snapshots asynchronously after the
+proxy send is enqueued and finalizes at the scheduler's next safe boundary.
 """
 
 from __future__ import annotations
@@ -72,6 +72,212 @@ _PD_HANDOFF_REQUIRED_TENSORS = {
     "metadata_read": frozenset({"wire_output_id", "committed_output_id"}),
     "prebuilt_bonus": frozenset({"committed_output_id", "bonus_tokens"}),
 }
+_PP_SENDER_STAGE = "target_verify_pp_output"
+_PP_SENDER_REQUIRED_TENSORS = frozenset({"hidden_states", "residual"})
+
+
+class EaglePPSenderProbe:
+    """Capture one PP-non-last target output before the async proxy send.
+
+    The sender cannot complete the PP-last EAGLE numerical state machine, so
+    this observer owns an independent one-stage record. The worker only attaches
+    the observer to an exact-RID result. The scheduler first enqueues the proxy
+    send, then starts a non-blocking host snapshot, and finalizes the hash after
+    the existing next-slot send commit.
+    """
+
+    def __init__(
+        self,
+        expected_rid: Optional[str],
+        *,
+        capture_id: Optional[str] = None,
+        pod_name: Optional[str] = None,
+        pod_uid: Optional[str] = None,
+    ) -> None:
+        self.expected_rid = expected_rid or None
+        capture_values = (capture_id, pod_name, pod_uid)
+        if self.expected_rid is None and any(capture_values):
+            raise ValueError(
+                "PP sender probe capture identity requires an exact request id"
+            )
+        if self.expected_rid is not None and not all(capture_values):
+            raise ValueError(
+                "PP sender probe requires capture id and Downward API Pod name/UID"
+            )
+        self.capture = (
+            {"id": capture_id, "pod_name": pod_name, "pod_uid": pod_uid}
+            if self.expected_rid is not None
+            else None
+        )
+        self._sealed = False
+        self._pending: Optional[dict] = None
+
+    @property
+    def can_probe(self) -> bool:
+        return self.expected_rid is not None and not self._sealed
+
+    def matches_schedule_batch(self, batch) -> bool:
+        reqs = getattr(batch, "reqs", ())
+        return bool(
+            self.can_probe
+            and [getattr(req, "rid", None) for req in reqs] == [self.expected_rid]
+        )
+
+    def begin_target_verify_pp_output(
+        self,
+        *,
+        pp_proxy_tensors: Optional[dict[str, object]],
+        target_world_rank: int,
+        require_attn_tp_allgather: bool,
+    ) -> bool:
+        """Queue a snapshot after the proxy send without waiting for it."""
+        if not self.can_probe:
+            return False
+        self._sealed = True
+        proxy = pp_proxy_tensors or {}
+        tensors = {
+            name: proxy.get(name)
+            for name in _PP_SENDER_REQUIRED_TENSORS
+            if isinstance(proxy.get(name), torch.Tensor)
+        }
+        missing = sorted(_PP_SENDER_REQUIRED_TENSORS - tensors.keys())
+        if missing:
+            self._emit(
+                rejection=f"stage decode.{_PP_SENDER_STAGE} missing tensors {missing}"
+            )
+            return False
+        hidden_rows = tensors["hidden_states"].shape[0]
+        residual_rows = tensors["residual"].shape[0]
+        if hidden_rows != residual_rows:
+            self._emit(
+                rejection=(
+                    f"stage decode.{_PP_SENDER_STAGE} row mismatch "
+                    f"hidden_states={hidden_rows}, residual={residual_rows}"
+                )
+            )
+            return False
+
+        try:
+            snapshots = {}
+            cuda_devices = set()
+            for name, tensor in tensors.items():
+                value = tensor.detach()
+                if value.is_cuda:
+                    snapshot = torch.empty(
+                        value.shape, dtype=value.dtype, device="cpu", pin_memory=True
+                    )
+                    snapshot.copy_(value, non_blocking=True)
+                    value.record_stream(torch.cuda.current_stream(value.device))
+                    cuda_devices.add(value.device)
+                else:
+                    snapshot = value.clone()
+                snapshots[name] = snapshot
+            if len(cuda_devices) > 1:
+                raise RuntimeError(
+                    "PP sender tensors span multiple CUDA devices: "
+                    f"{sorted(map(str, cuda_devices))}"
+                )
+            completion_event = None
+            if cuda_devices:
+                device = next(iter(cuda_devices))
+                completion_event = torch.cuda.Event()
+                completion_event.record(torch.cuda.current_stream(device=device))
+        except (RuntimeError, TypeError, ValueError) as exc:
+            self._emit(
+                rejection=(
+                    f"failed to queue snapshot for decode.{_PP_SENDER_STAGE}: {exc}"
+                )
+            )
+            raise
+
+        parallel = get_parallel()
+        rank = _rank_payload() or {}
+        for name in (
+            "pp_size",
+            "tp_rank",
+            "tp_size",
+            "attn_tp_rank",
+            "attn_tp_size",
+            "attn_dp_size",
+        ):
+            value = getattr(parallel, name, None)
+            if value is not None:
+                rank[name] = value
+        self._pending = {
+            "snapshots": snapshots,
+            "logical_rows": hidden_rows,
+            "completion_event": completion_event,
+            "rank": rank,
+            "transport": {
+                "target_world_rank": target_world_rank,
+                "mode": (
+                    "send_slice_recv_allgather"
+                    if require_attn_tp_allgather
+                    else "direct_rank_local"
+                ),
+                "require_attn_tp_allgather": require_attn_tp_allgather,
+            },
+        }
+        return True
+
+    def finalize_target_verify_pp_output(self) -> None:
+        """Finalize only after the existing proxy-send commit."""
+        if self._pending is None:
+            return
+        pending, self._pending = self._pending, None
+        try:
+            if pending["completion_event"] is not None:
+                pending["completion_event"].synchronize()
+            fingerprints = {
+                name: _tensor_fingerprint(tensor, pending["logical_rows"])
+                for name, tensor in sorted(pending["snapshots"].items())
+            }
+            stage = {
+                "row_domain": _PP_RANK_LOCAL_TARGET_TREE_ROW_DOMAIN,
+                "logical_rows": pending["logical_rows"],
+                "tensors": fingerprints,
+            }
+        except (RuntimeError, TypeError, ValueError) as exc:
+            self._emit(
+                rejection=(
+                    f"failed to finalize snapshot for decode.{_PP_SENDER_STAGE}: {exc}"
+                ),
+                rank=pending["rank"],
+                transport=pending["transport"],
+            )
+            raise
+        self._emit(
+            stage=stage,
+            rank=pending["rank"],
+            transport=pending["transport"],
+        )
+
+    def _emit(
+        self,
+        *,
+        stage: Optional[dict] = None,
+        rejection: Optional[str] = None,
+        rank: Optional[dict] = None,
+        transport: Optional[dict] = None,
+    ) -> None:
+        payload = {
+            "rid": self.expected_rid,
+            "capture": self.capture,
+            "phase": "decode",
+            "role": "decode",
+            "status": "rejected" if rejection else "complete",
+            "rejection": rejection,
+            "stages": ({_PP_SENDER_STAGE: stage} if stage is not None else {}),
+        }
+        rank = _rank_payload() if rank is None else rank
+        if rank is not None:
+            payload["rank"] = rank
+        if transport is not None:
+            payload["transport"] = transport
+        logger.warning(
+            "EAGLE_PP_SENDER_PROBE_RESULT %s",
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
 
 
 def _rank_payload() -> Optional[dict[str, int]]:
