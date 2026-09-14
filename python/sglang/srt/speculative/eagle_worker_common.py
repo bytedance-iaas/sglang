@@ -562,6 +562,12 @@ def run_eagle_verify(
             draft_token_num=verify_input.draft_token_num,
         )
     )
+    if numerical_probe_active and target_worker.pp_group.world_size > 1:
+        numerical_probe.record_target_verify_pp_input(
+            pp_proxy_tensors=(
+                pp_proxy_tensors.tensors if pp_proxy_tensors is not None else None
+            ),
+        )
 
     # Must stay ahead of the target verify launch below.
     grammar_tree = (

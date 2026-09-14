@@ -20,12 +20,13 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 class TestEagleNumericalProbe(unittest.TestCase):
     @staticmethod
-    def probe(expected_rid="probe-rid"):
+    def probe(expected_rid="probe-rid", *, require_pp_input=False):
         return EagleNumericalProbe(
             expected_rid,
             capture_id="capture-test-generation" if expected_rid else None,
             pod_name="probe-pod" if expected_rid else None,
             pod_uid="probe-pod-uid" if expected_rid else None,
+            require_target_verify_pp_input=require_pp_input,
         )
 
     @staticmethod
@@ -48,6 +49,15 @@ class TestEagleNumericalProbe(unittest.TestCase):
             batch_size=batch_size,
             draft_token_num=draft_token_num,
         )
+        if "target_verify_pp_input" in probe._required_stage_set:
+            probe.record_target_verify_pp_input(
+                pp_proxy_tensors={
+                    "hidden_states": hidden + 10,
+                    "residual": hidden + 20,
+                    "topk_indices": torch.arange(rows * 2).reshape(rows, 2),
+                    "__msg_type__": "proxy",
+                },
+            )
         probe.record_target_verify_output(
             logits=torch.arange(rows * 6, dtype=torch.float32).reshape(rows, 6),
             hidden_states=hidden,
@@ -76,6 +86,13 @@ class TestEagleNumericalProbe(unittest.TestCase):
         self.assertFalse(probe.can_probe)
         self.assertFalse(probe.matches_schedule_batch(batch))
 
+    def test_non_pipeline_probe_keeps_original_stage_contract(self):
+        probe = self.probe()
+
+        self.assertNotIn("target_verify_pp_input", probe._required_stage_set)
+        self.assertEqual(probe._required_stages[0], "target_verify_input")
+        self.assertEqual(probe._required_stages[1], "target_verify_output")
+
     def test_capture_identity_is_required_exactly_when_probe_is_armed(self):
         identity = {
             "capture_id": "capture-test-generation",
@@ -93,7 +110,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
                     EagleNumericalProbe(None, **{key: identity[key]})
 
     def test_exact_rid_records_complete_decode_fingerprint(self):
-        probe = self.probe()
+        probe = self.probe(require_pp_input=True)
         forward_batch = SimpleNamespace(
             rids=["probe-rid"],
             _eagle_numerical_probe_callback=None,
@@ -156,6 +173,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
             [payload["stage"] for payload in stage_payloads],
             [
                 "target_verify_input",
+                "target_verify_pp_input",
                 "target_verify_output",
                 "target_verify_sample",
                 "target_verify_accept",
@@ -169,7 +187,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            [payload["ordinal"] for payload in stage_payloads], list(range(1, 12))
+            [payload["ordinal"] for payload in stage_payloads], list(range(1, 13))
         )
         self.assertTrue(
             all(
@@ -197,6 +215,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
             set(stages),
             {
                 "target_verify_input",
+                "target_verify_pp_input",
                 "target_verify_output",
                 "target_verify_sample",
                 "target_verify_accept",
@@ -213,6 +232,12 @@ class TestEagleNumericalProbe(unittest.TestCase):
             stages["target_verify_input"]["tensors"]["draft_token"]["values"],
             [10, 11],
         )
+        self.assertEqual(
+            stages["target_verify_pp_input"]["tensors"]["hidden_states"]["shape"],
+            [2, 4],
+        )
+        self.assertNotIn("topk_indices", stages["target_verify_pp_input"]["tensors"])
+        self.assertNotIn("__msg_type__", stages["target_verify_pp_input"]["tensors"])
         self.assertEqual(
             stages["target_verify_sample"]["tensors"]["predict"]["values"],
             [20, 21],
@@ -231,11 +256,16 @@ class TestEagleNumericalProbe(unittest.TestCase):
         )
         self.assertEqual(stages["draft_extend_input"]["logical_rows"], 2)
         self.assertEqual(stages["target_verify_input"]["logical_rows"], 2)
+        self.assertEqual(stages["target_verify_pp_input"]["logical_rows"], 2)
         self.assertEqual(stages["target_verify_accept"]["logical_rows"], 1)
         self.assertEqual(stages["proposed_token"]["logical_rows"], 1)
         self.assertEqual(
             stages["target_verify_input"]["row_domain"],
             "target_verify_tree_node",
+        )
+        self.assertEqual(
+            stages["target_verify_pp_input"]["row_domain"],
+            "pp_rank_local_target_verify_tree_node",
         )
         self.assertEqual(stages["target_verify_accept"]["row_domain"], "request")
         self.assertEqual(
@@ -414,6 +444,65 @@ class TestEagleNumericalProbe(unittest.TestCase):
             logits=torch.ones((1, 2)), hidden_states=None, logical_rows=1
         )
         self.assertFalse(probe.can_probe)
+
+    def test_pp_probe_requires_real_hidden_and_residual_inputs(self):
+        rows = 2
+        cases = {
+            "missing_proxy": None,
+            "missing_residual": {
+                "hidden_states": torch.ones((rows, 4)),
+            },
+            "missing_hidden_states": {
+                "residual": torch.ones((rows, 4)),
+            },
+        }
+        for case, pp_proxy_tensors in cases.items():
+            with self.subTest(case=case):
+                probe = self.probe(require_pp_input=True)
+                self.assertTrue(
+                    probe.record_target_verify_input(
+                        rids=["probe-rid"],
+                        draft_token=torch.ones(rows, dtype=torch.int64),
+                        positions=torch.ones(rows, dtype=torch.int64),
+                        retrieve_index=torch.arange(rows).reshape(1, rows),
+                        retrieve_next_token=torch.full(
+                            (1, rows), -1, dtype=torch.int64
+                        ),
+                        retrieve_next_sibling=torch.full(
+                            (1, rows), -1, dtype=torch.int64
+                        ),
+                        batch_size=1,
+                        draft_token_num=rows,
+                    )
+                )
+                probe.record_target_verify_pp_input(
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
+                self.assertFalse(probe.can_probe)
+
+    def test_pp_probe_uses_rank_local_rows_and_rejects_pair_mismatch(self):
+        probe = self.probe(require_pp_input=True)
+        self.assertTrue(
+            probe.record_target_verify_input(
+                rids=["probe-rid"],
+                draft_token=torch.ones(4, dtype=torch.int64),
+                positions=torch.ones(4, dtype=torch.int64),
+                retrieve_index=torch.arange(4).reshape(1, 4),
+                retrieve_next_token=torch.full((1, 4), -1, dtype=torch.int64),
+                retrieve_next_sibling=torch.full((1, 4), -1, dtype=torch.int64),
+                batch_size=1,
+                draft_token_num=4,
+            )
+        )
+        probe.record_target_verify_pp_input(
+            pp_proxy_tensors={
+                "hidden_states": torch.ones((1, 4)),
+                "residual": torch.ones((2, 4)),
+                "__msg_type__": "proxy",
+            },
+        )
+        self.assertFalse(probe.can_probe)
+        self.assertIn("row mismatch", probe._rejection)
 
     def test_out_of_order_target_verify_stage_fails_closed(self):
         probe = self.probe()

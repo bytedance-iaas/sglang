@@ -22,7 +22,7 @@ from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 
-_REQUIRED_STAGES = (
+_BASE_REQUIRED_STAGES = (
     "target_verify_input",
     "target_verify_output",
     "target_verify_sample",
@@ -35,7 +35,6 @@ _REQUIRED_STAGES = (
     "nextn_logits",
     "proposed_token",
 )
-_REQUIRED_STAGE_SET = frozenset(_REQUIRED_STAGES)
 _REQUIRED_TENSORS = {
     "target_verify_input": frozenset(
         {
@@ -46,6 +45,7 @@ _REQUIRED_TENSORS = {
             "retrieve_next_sibling",
         }
     ),
+    "target_verify_pp_input": frozenset({"hidden_states", "residual"}),
     "target_verify_output": frozenset({"logits", "hidden_states"}),
     "target_verify_sample": frozenset({"predict"}),
     "target_verify_accept": frozenset({"accept_lens", "accept_index"}),
@@ -60,6 +60,7 @@ _REQUIRED_TENSORS = {
 _DENSE_ROW_DOMAIN = "dense_request_major_prefix"
 _PROPOSAL_ROW_DOMAIN = "request_terminal"
 _TARGET_TREE_ROW_DOMAIN = "target_verify_tree_node"
+_PP_RANK_LOCAL_TARGET_TREE_ROW_DOMAIN = "pp_rank_local_target_verify_tree_node"
 _REQUEST_ROW_DOMAIN = "request"
 _PD_HANDOFF_STAGES = {
     "prefill": ("pp_output", "metadata_write"),
@@ -380,6 +381,7 @@ class EagleNumericalProbe:
         capture_id: Optional[str] = None,
         pod_name: Optional[str] = None,
         pod_uid: Optional[str] = None,
+        require_target_verify_pp_input: bool = False,
     ) -> None:
         self.expected_rid = expected_rid or None
         capture_values = (capture_id, pod_name, pod_uid)
@@ -404,6 +406,10 @@ class EagleNumericalProbe:
         self._records: dict[str, dict[str, dict]] = {}
         self._proposal_rows: dict[str, int] = {}
         self._next_ordinal = 1
+        self._required_stages = list(_BASE_REQUIRED_STAGES)
+        if require_target_verify_pp_input:
+            self._required_stages.insert(1, "target_verify_pp_input")
+        self._required_stage_set = frozenset(self._required_stages)
 
     @property
     def can_probe(self) -> bool:
@@ -506,7 +512,7 @@ class EagleNumericalProbe:
         if required is None:
             self._reject(f"unexpected stage {phase}.{stage}")
             return
-        expected_stage = _REQUIRED_STAGES[len(bucket)]
+        expected_stage = self._required_stages[len(bucket)]
         if stage != expected_stage:
             self._reject(
                 f"out-of-order stage {phase}.{stage}, expected {expected_stage}"
@@ -616,6 +622,52 @@ class EagleNumericalProbe:
             {"logits": logits, "hidden_states": hidden_states},
             logical_rows=logical_rows,
             row_domain=_TARGET_TREE_ROW_DOMAIN,
+        )
+
+    def record_target_verify_pp_input(
+        self,
+        *,
+        pp_proxy_tensors: Optional[dict[str, object]],
+    ) -> None:
+        """Fingerprint the PP-last target input before graph-buffer staging.
+
+        This runs outside CUDA Graph replay.  It observes the real PP proxy
+        tensors before ``DecodeCudaGraphRunner.load_batch`` copies them into
+        pointer-stable graph buffers, so it does not add request-conditioned
+        Python work to the captured graph or alter graph admission.
+        """
+        proxy = pp_proxy_tensors or {}
+        # The transport dictionary also carries non-tensor metadata such as
+        # ``__msg_type__``.  Keep that protocol envelope out of the numerical
+        # observer and admit only model inputs understood by this stage.
+        tensors = {
+            name: proxy.get(name)
+            for name in ("hidden_states", "residual")
+            if isinstance(proxy.get(name), torch.Tensor)
+        }
+        missing = sorted(
+            name
+            for name in _REQUIRED_TENSORS["target_verify_pp_input"]
+            if name not in tensors
+        )
+        if missing:
+            self._reject(
+                f"stage decode.target_verify_pp_input missing tensors {missing}"
+            )
+            return
+        hidden_rows = tensors["hidden_states"].shape[0]
+        residual_rows = tensors["residual"].shape[0]
+        if hidden_rows != residual_rows:
+            self._reject(
+                "stage decode.target_verify_pp_input row mismatch "
+                f"hidden_states={hidden_rows}, residual={residual_rows}"
+            )
+            return
+        self._record_explicit(
+            "target_verify_pp_input",
+            tensors,
+            logical_rows=hidden_rows,
+            row_domain=_PP_RANK_LOCAL_TARGET_TREE_ROW_DOMAIN,
         )
 
     def record_target_verify_sample(
@@ -750,7 +802,7 @@ class EagleNumericalProbe:
             self._rejection = "request did not complete normally"
         if self._rejection is None:
             for phase in ("decode",):
-                missing = _REQUIRED_STAGE_SET - self._records.get(phase, {}).keys()
+                missing = self._required_stage_set - self._records.get(phase, {}).keys()
                 if missing:
                     self._rejection = f"phase {phase} missing stages {sorted(missing)}"
                     break
