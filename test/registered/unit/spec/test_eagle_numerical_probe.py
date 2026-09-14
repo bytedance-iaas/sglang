@@ -79,6 +79,43 @@ class TestEagleNumericalProbe(unittest.TestCase):
         self.assertEqual(hashlib.sha256(raw).hexdigest(), payload["sha256"])
         return json.loads(raw)
 
+    def decode_atomic_probe_records(
+        self, lines, marker=b"EAGLE_PP_SENDER_PROBE_RESULT"
+    ):
+        if len(lines) == 1:
+            return self.decode_atomic_probe_record(lines[0], marker=marker)
+        envelopes = []
+        for line in lines:
+            self.assertTrue(line.endswith(b"\n"))
+            actual_marker, encoded = line[:-1].split(b" ", 1)
+            self.assertEqual(actual_marker, marker)
+            envelopes.append(json.loads(encoded))
+        self.assertEqual(
+            {item["__eagle_probe_encoding__"] for item in envelopes},
+            {"zlib+base64-chunk-v1"},
+        )
+        self.assertEqual(
+            {item["record_id"] for item in envelopes},
+            {envelopes[0]["record_id"]},
+        )
+        self.assertEqual(
+            {item["chunk_index"] for item in envelopes}, set(range(len(envelopes)))
+        )
+        self.assertEqual({item["chunks"] for item in envelopes}, {len(envelopes)})
+        encoded_payload = "".join(
+            item["payload"]
+            for item in sorted(envelopes, key=lambda item: item["chunk_index"])
+        )
+        packed = base64.b64decode(encoded_payload, validate=True)
+        self.assertEqual(len(packed), envelopes[0]["packed_bytes"])
+        self.assertEqual(
+            hashlib.sha256(packed).hexdigest(), envelopes[0]["packed_sha256"]
+        )
+        raw = zlib.decompress(packed)
+        self.assertEqual(len(raw), envelopes[0]["raw_bytes"])
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), envelopes[0]["sha256"])
+        return json.loads(raw)
+
     def test_small_probe_result_also_uses_one_atomic_write(self):
         payload = {"status": "complete"}
         with (
@@ -134,7 +171,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
         self.assertEqual(envelope["sha256"], hashlib.sha256(raw).hexdigest())
         self.assertEqual(json.loads(raw), payload)
 
-    def test_incompressible_probe_result_fails_before_write(self):
+    def test_incompressible_probe_result_uses_checksum_bound_atomic_chunks(self):
         payload = {
             "hashes": [hashlib.sha256(str(i).encode()).hexdigest() for i in range(200)]
         }
@@ -145,12 +182,80 @@ class TestEagleNumericalProbe(unittest.TestCase):
             ),
             mock.patch(
                 "sglang.srt.speculative.eagle_numerical_probe.os.fpathconf",
-                return_value=256,
+                return_value=4096,
+            ),
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.os.write",
+                side_effect=lambda _fd, value: len(value),
+            ) as write,
+        ):
+            _emit_json_record("EAGLE_PP_SENDER_PROBE_RESULT", payload)
+        lines = [call.args[1] for call in write.call_args_list]
+        self.assertGreater(len(lines), 1)
+        self.assertTrue(all(len(line) <= 4096 for line in lines))
+        self.assertEqual(self.decode_atomic_probe_records(lines), payload)
+
+    def test_probe_result_fails_when_chunk_metadata_cannot_fit(self):
+        payload = {
+            "hashes": [hashlib.sha256(str(i).encode()).hexdigest() for i in range(8)]
+        }
+        with (
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.os.fstat",
+                return_value=SimpleNamespace(st_mode=stat.S_IFIFO),
+            ),
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.os.fpathconf",
+                return_value=128,
             ),
             mock.patch(
                 "sglang.srt.speculative.eagle_numerical_probe.os.write"
             ) as write,
-            self.assertRaisesRegex(ValueError, "exceeding atomic pipe limit"),
+            self.assertRaisesRegex(ValueError, "chunk metadata exceeds"),
+        ):
+            _emit_json_record("EAGLE_PP_SENDER_PROBE_RESULT", payload)
+        write.assert_not_called()
+
+    def test_probe_result_fails_before_write_when_raw_record_exceeds_safety_limit(self):
+        payload = {"value": "x" * ((1 << 20) + 1)}
+        with (
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.os.fstat"
+            ) as fstat,
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.os.fpathconf"
+            ) as fpathconf,
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.os.write"
+            ) as write,
+            self.assertRaisesRegex(ValueError, "raw record.*safety limit"),
+        ):
+            _emit_json_record("EAGLE_PP_SENDER_PROBE_RESULT", payload)
+        fstat.assert_not_called()
+        fpathconf.assert_not_called()
+        write.assert_not_called()
+
+    def test_probe_result_fails_before_write_when_packed_record_exceeds_safety_limit(
+        self,
+    ):
+        payload = {"value": "x" * 4096}
+        with (
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.os.fstat",
+                return_value=SimpleNamespace(st_mode=stat.S_IFIFO),
+            ),
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.os.fpathconf",
+                return_value=4096,
+            ),
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.zlib.compress",
+                return_value=b"x" * ((1 << 20) + 1),
+            ),
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.os.write"
+            ) as write,
+            self.assertRaisesRegex(ValueError, "packed record.*safety limit"),
         ):
             _emit_json_record("EAGLE_PP_SENDER_PROBE_RESULT", payload)
         write.assert_not_called()

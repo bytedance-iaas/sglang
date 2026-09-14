@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -28,21 +29,29 @@ logger = logging.getLogger(__name__)
 
 _ATOMIC_LOG_FD = 2
 _COMPRESSED_RECORD_ENCODING = "zlib+base64"
+_CHUNKED_RECORD_ENCODING = "zlib+base64-chunk-v1"
 _COMPRESSED_RECORD_KEY = "__eagle_probe_encoding__"
+_CHUNKED_RECORD_SEQUENCE = itertools.count()
+_MAX_RECORD_BYTES = 1 << 20
 
 
 def _emit_json_record(marker: str, payload: dict) -> None:
-    """Emit a probe result as one atomic container-log write.
+    """Emit a probe result as checksum-bound atomic container-log chunks.
 
     Multiple TP workers share the container stderr pipe.  Python logging can
     split a record across writes, allowing two workers' JSON payloads to
     interleave even when the serialized record itself fits in ``PIPE_BUF``.
-    Emit every result in one syscall, compressing oversized records into a
-    checksum-bound envelope.  The comparator verifies the envelope checksum and
-    size before accepting its payload.
+    Emit every line in one syscall, compressing and chunking oversized records.
+    The comparator reassembles arbitrarily interleaved chunks and verifies their
+    lengths and checksums before accepting a payload.
     """
 
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    if len(raw) > _MAX_RECORD_BYTES:
+        raise ValueError(
+            f"encoded {marker} raw record is {len(raw)} bytes, exceeding "
+            f"safety limit {_MAX_RECORD_BYTES}"
+        )
     plain_line = marker.encode() + b" " + raw + b"\n"
     try:
         fd_mode = os.fstat(_ATOMIC_LOG_FD).st_mode
@@ -57,25 +66,74 @@ def _emit_json_record(marker: str, payload: dict) -> None:
             f"mode={fd_mode:o}, pipe_buf={pipe_buf}"
         )
     output_line = plain_line
+    packed = None
+    raw_sha256 = None
     if len(output_line) > pipe_buf:
+        packed = zlib.compress(raw, level=9)
+        if len(packed) > _MAX_RECORD_BYTES:
+            raise ValueError(
+                f"encoded {marker} packed record is {len(packed)} bytes, "
+                f"exceeding safety limit {_MAX_RECORD_BYTES}"
+            )
+        raw_sha256 = hashlib.sha256(raw).hexdigest()
         envelope = {
             _COMPRESSED_RECORD_KEY: _COMPRESSED_RECORD_ENCODING,
-            "payload": base64.b64encode(zlib.compress(raw, level=9)).decode("ascii"),
+            "payload": base64.b64encode(packed).decode("ascii"),
             "raw_bytes": len(raw),
-            "sha256": hashlib.sha256(raw).hexdigest(),
+            "sha256": raw_sha256,
         }
         encoded = json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode()
         output_line = marker.encode() + b" " + encoded + b"\n"
     if len(output_line) > pipe_buf:
-        raise ValueError(
-            f"encoded {marker} record is {len(output_line)} bytes, "
-            f"exceeding atomic pipe limit {pipe_buf}"
-        )
-    written = os.write(_ATOMIC_LOG_FD, output_line)
-    if written != len(output_line):
-        raise RuntimeError(
-            f"short atomic {marker} write: {written}/{len(output_line)} bytes"
-        )
+        assert packed is not None and raw_sha256 is not None
+        encoded_payload = base64.b64encode(packed).decode("ascii")
+        packed_sha256 = hashlib.sha256(packed).hexdigest()
+        record_id = f"{os.getpid()}-{next(_CHUNKED_RECORD_SEQUENCE)}-{raw_sha256[:16]}"
+
+        def build_chunk(index: int, chunks: int, value: str) -> bytes:
+            chunk = {
+                _COMPRESSED_RECORD_KEY: _CHUNKED_RECORD_ENCODING,
+                "chunk_index": index,
+                "chunks": chunks,
+                "packed_bytes": len(packed),
+                "packed_sha256": packed_sha256,
+                "payload": value,
+                "raw_bytes": len(raw),
+                "record_id": record_id,
+                "sha256": raw_sha256,
+            }
+            return (
+                marker.encode()
+                + b" "
+                + json.dumps(chunk, sort_keys=True, separators=(",", ":")).encode()
+                + b"\n"
+            )
+
+        # Size against the conservative one-character-per-chunk count. Actual
+        # index/count fields can only be shorter, so every resulting line is
+        # guaranteed to fit without depending on a platform-specific margin.
+        max_chunks = len(encoded_payload)
+        metadata_bytes = len(build_chunk(max_chunks - 1, max_chunks, ""))
+        chunk_chars = pipe_buf - metadata_bytes
+        if chunk_chars <= 0:
+            raise ValueError(
+                f"encoded {marker} chunk metadata exceeds atomic pipe limit "
+                f"{pipe_buf}"
+            )
+        chunks = (len(encoded_payload) + chunk_chars - 1) // chunk_chars
+        output_lines = [
+            build_chunk(index, chunks, encoded_payload[start : start + chunk_chars])
+            for index, start in enumerate(range(0, len(encoded_payload), chunk_chars))
+        ]
+    else:
+        output_lines = [output_line]
+
+    for output_line in output_lines:
+        written = os.write(_ATOMIC_LOG_FD, output_line)
+        if written != len(output_line):
+            raise RuntimeError(
+                f"short atomic {marker} write: {written}/{len(output_line)} bytes"
+            )
 
 
 _BASE_REQUIRED_STAGES = (
