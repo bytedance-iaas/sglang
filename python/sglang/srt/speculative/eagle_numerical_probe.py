@@ -10,10 +10,13 @@ proxy send is enqueued and finalizes at the scheduler's next safe boundary.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import hashlib
 import json
 import logging
+import os
+import zlib
 from typing import Optional
 
 import torch
@@ -21,6 +24,52 @@ import torch
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
+
+_ATOMIC_LOG_FD = 2
+_FALLBACK_PIPE_BUF = 4096
+_COMPRESSED_RECORD_ENCODING = "zlib+base64"
+_COMPRESSED_RECORD_KEY = "__eagle_probe_encoding__"
+
+
+def _emit_json_record(marker: str, payload: dict) -> None:
+    """Emit large probe results as one atomic container-log write.
+
+    Multiple TP workers share the container stderr pipe.  Python logging can
+    split records larger than ``PIPE_BUF``, allowing two workers' JSON payloads
+    to interleave.  Keep ordinary records on the logger, but compress oversized
+    records and write the complete envelope in one syscall.  The comparator
+    verifies the envelope checksum and size before accepting its payload.
+    """
+
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    plain_line = marker.encode() + b" " + raw + b"\n"
+    try:
+        pipe_buf = int(os.fpathconf(_ATOMIC_LOG_FD, "PC_PIPE_BUF"))
+    except (OSError, TypeError, ValueError):
+        pipe_buf = _FALLBACK_PIPE_BUF
+    if len(plain_line) <= pipe_buf:
+        logger.warning("%s %s", marker, raw.decode())
+        return
+
+    envelope = {
+        _COMPRESSED_RECORD_KEY: _COMPRESSED_RECORD_ENCODING,
+        "payload": base64.b64encode(zlib.compress(raw, level=9)).decode("ascii"),
+        "raw_bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    encoded = json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode()
+    compressed_line = marker.encode() + b" " + encoded + b"\n"
+    if len(compressed_line) > pipe_buf:
+        raise ValueError(
+            f"compressed {marker} record is {len(compressed_line)} bytes, "
+            f"exceeding atomic pipe limit {pipe_buf}"
+        )
+    written = os.write(_ATOMIC_LOG_FD, compressed_line)
+    if written != len(compressed_line):
+        raise RuntimeError(
+            f"short atomic {marker} write: {written}/{len(compressed_line)} bytes"
+        )
+
 
 _BASE_REQUIRED_STAGES = (
     "target_verify_input",
@@ -597,10 +646,7 @@ class EaglePPSenderProbe:
             payload["rank"] = rank
         if transport is not None:
             payload["transport"] = transport
-        logger.warning(
-            "EAGLE_PP_SENDER_PROBE_RESULT %s",
-            json.dumps(payload, sort_keys=True, separators=(",", ":")),
-        )
+        _emit_json_record("EAGLE_PP_SENDER_PROBE_RESULT", payload)
 
 
 def _rank_payload() -> Optional[dict[str, int]]:

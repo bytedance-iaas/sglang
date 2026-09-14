@@ -1,7 +1,10 @@
 """CPU contracts for the exact-request EAGLE numerical probe."""
 
+import base64
+import hashlib
 import json
 import unittest
+import zlib
 from types import SimpleNamespace
 from unittest import mock
 
@@ -13,6 +16,7 @@ from sglang.srt.speculative.eagle_numerical_probe import (
     EagleNumericalProbe,
     EaglePDHandoffProbe,
     EaglePPSenderProbe,
+    _emit_json_record,
     _PPTargetForwardDeviceObserver,
     _synchronize_cuda_tensors,
     maybe_record_eagle_numerical_stage,
@@ -23,6 +27,33 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestEagleNumericalProbe(unittest.TestCase):
+    def test_large_probe_result_uses_one_checksum_bound_atomic_write(self):
+        payload = {"stages": {"large": "x" * 16000}}
+        with (
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.os.fpathconf",
+                return_value=4096,
+            ),
+            mock.patch(
+                "sglang.srt.speculative.eagle_numerical_probe.os.write",
+                side_effect=lambda _fd, value: len(value),
+            ) as write,
+        ):
+            _emit_json_record("EAGLE_PP_SENDER_PROBE_RESULT", payload)
+
+        write.assert_called_once()
+        fd, line = write.call_args.args
+        self.assertEqual(fd, 2)
+        self.assertLessEqual(len(line), 4096)
+        marker, encoded = line.rstrip(b"\n").split(b" ", 1)
+        self.assertEqual(marker, b"EAGLE_PP_SENDER_PROBE_RESULT")
+        envelope = json.loads(encoded)
+        raw = zlib.decompress(base64.b64decode(envelope["payload"], validate=True))
+        self.assertEqual(envelope["__eagle_probe_encoding__"], "zlib+base64")
+        self.assertEqual(envelope["raw_bytes"], len(raw))
+        self.assertEqual(envelope["sha256"], hashlib.sha256(raw).hexdigest())
+        self.assertEqual(json.loads(raw), payload)
+
     def test_pp_target_forward_row_domain_uses_communicator_layout(self):
         self.assertEqual(
             _pp_target_forward_row_domain(ScatterMode.SCATTERED),
