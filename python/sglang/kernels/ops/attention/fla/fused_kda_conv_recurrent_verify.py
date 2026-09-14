@@ -12,9 +12,9 @@ two transpose copies the unfused path needs to feed the conv kernel.
 
 Scope (v1): chain speculation only (``speculative_eagle_topk == 1``, i.e.
 ``retrieve_next_token is None``). The tree path keeps the unfused reference
-kernels. Requires ``T >= kernel_width - 1`` (the rolled conv state is then
-exactly the last ``kernel_width - 1`` input tokens, matching the reference
-kernel's store).
+kernels. Supports every positive ``T``. When ``T < kernel_width - 1``, the
+rolled conv state intentionally retains the required suffix of the prior
+window before the current input tokens, matching the reference kernel's store.
 
 Numerics: deliberately bit-aligned with the unfused pair. The conv output is
 rounded to the activation dtype (bf16) before entering the recurrence —
@@ -324,9 +324,10 @@ def fused_kda_conv_gating_verify_kernel(
                 )
                 tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=mask_h)
 
-    # Rolled conv state after consuming T >= W-1 tokens is exactly the last
-    # W-1 input tokens — which are the current window registers. The verify
-    # pass never writes the ssm state back (rollback happens at commit).
+    # The current window registers are the exact rolled state after consuming
+    # T tokens. For T < W-1 they retain the required suffix of the old window;
+    # for T >= W-1 they contain only current input tokens. The verify pass
+    # never writes the ssm state back (rollback happens at commit).
     if is_qk_owner:
         tl.store(cs_base + q_ch + 0 * stride_cs_tok, q_c0, mask=mask_k)
         tl.store(cs_base + q_ch + 1 * stride_cs_tok, q_c1, mask=mask_k)
@@ -384,7 +385,7 @@ def fused_kda_conv_gating_verify(
     assert mixed_qkv.stride(-1) == 1, "mixed_qkv must be contiguous in dim"
     assert dim == 2 * H * K + HV * V, f"packed dim mismatch: {dim}"
     assert W == 4, "fused KDA verify supports conv width 4 only"
-    assert T >= W - 1, "fused KDA verify requires T >= conv width - 1"
+    assert T >= 1, "fused KDA verify requires at least one token"
     assert seq_len == B * T
     assert conv_state.stride(1) == 1, "conv_state must be dim-contiguous"
     assert conv_weight.stride(1) == 1

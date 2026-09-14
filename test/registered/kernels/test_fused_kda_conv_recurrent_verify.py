@@ -19,6 +19,10 @@ register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-large")
 _DEVICE = "cuda"
 
 _CASES = [
+    # Production GLM-5.3-Flash MTP 1/1/2 shape. T=2 must retain the newest
+    # prior conv-state column followed by both current tokens.
+    (1, 2, 4, 4, 128, 128, 4, False, None, False, 9),
+    (3, 2, 4, 4, 128, 128, 4, True, -5.0, True, 10),
     (1, 4, 4, 4, 128, 128, 4, False, None, False, 1),
     (1, 4, 4, 4, 128, 128, 4, True, None, False, 2),
     (1, 4, 4, 4, 128, 128, 4, True, 2.0, False, 3),

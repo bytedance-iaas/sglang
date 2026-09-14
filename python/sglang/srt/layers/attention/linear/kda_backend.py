@@ -1283,7 +1283,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             )
         ):
             return False
-        if draft_token_num < 3 or mixed_qkv.shape[0] % draft_token_num != 0:
+        if draft_token_num < 1 or mixed_qkv.shape[0] % draft_token_num != 0:
             return False
         if (
             not isinstance(layer.conv_weights, torch.Tensor)
