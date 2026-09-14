@@ -129,6 +129,17 @@ def _vpp_p2p_debug_event(
 ):
     if not envs.SGLANG_VPP_DEBUG_LOG.get():
         return
+    if torch.cuda.is_available():
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        data = {
+            "cuda_allocated_bytes": torch.cuda.memory_allocated(),
+            "cuda_reserved_bytes": torch.cuda.memory_reserved(),
+            "cuda_max_allocated_bytes": torch.cuda.max_memory_allocated(),
+            "cuda_max_reserved_bytes": torch.cuda.max_memory_reserved(),
+            "cuda_free_bytes": free_bytes,
+            "cuda_total_bytes": total_bytes,
+            **data,
+        }
     data = {
         "group": coordinator.unique_name,
         "group_rank": coordinator.rank_in_group,
@@ -1690,6 +1701,26 @@ class GroupCoordinator:
                 f"Expecting a dictionary, got {type(tensor_dict)}"
             )
             metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
+            # #region debug-point E:broadcast-tensor-allocation
+            _vpp_p2p_debug_event(
+                self,
+                "E",
+                "parallel_state.py:broadcast_tensor_dict",
+                "broadcast tensor source metadata ready",
+                {
+                    "src": self.ranks[src],
+                    "tensors": [
+                        {
+                            "shape": tuple(tensor.shape),
+                            "dtype": str(tensor.dtype),
+                            "device": str(tensor.device),
+                            "bytes": tensor.numel() * tensor.element_size(),
+                        }
+                        for tensor in tensor_list
+                    ],
+                },
+            )
+            # #endregion
             # `metadata_list` lives in CPU memory.
             # `broadcast_object_list` has serialization & deserialization,
             # all happening on CPU. Therefore, we can use the CPU group.
@@ -1715,6 +1746,26 @@ class GroupCoordinator:
 
         else:
             metadata_list = self.broadcast_object(None, src=src)
+            # #region debug-point E:broadcast-tensor-allocation
+            _vpp_p2p_debug_event(
+                self,
+                "E",
+                "parallel_state.py:broadcast_tensor_dict",
+                "broadcast tensor receiver allocation enter",
+                {
+                    "src": self.ranks[src],
+                    "tensors": [
+                        {
+                            "key": key,
+                            "shape": tuple(value.size),
+                            "dtype": str(value.dtype),
+                            "device": str(value.device),
+                        }
+                        for key, value in metadata_list
+                        if isinstance(value, TensorMetadata)
+                    ],
+                },
+            )
             tensor_dict = {}
             async_handles = []
             for key, value in metadata_list:
@@ -1745,6 +1796,14 @@ class GroupCoordinator:
                     tensor_dict[key] = value
             for async_handle in async_handles:
                 async_handle.wait()
+            _vpp_p2p_debug_event(
+                self,
+                "E",
+                "parallel_state.py:broadcast_tensor_dict",
+                "broadcast tensor receiver complete",
+                {"src": self.ranks[src]},
+            )
+            # #endregion
         return tensor_dict
 
     def send_tensor_dict(

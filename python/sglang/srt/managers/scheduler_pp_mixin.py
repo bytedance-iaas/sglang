@@ -50,6 +50,17 @@ def _vpp_debug_event(
 ):
     if not envs.SGLANG_VPP_DEBUG_LOG.get():
         return
+    if torch.cuda.is_available():
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        data = {
+            "cuda_allocated_bytes": torch.cuda.memory_allocated(),
+            "cuda_reserved_bytes": torch.cuda.memory_reserved(),
+            "cuda_max_allocated_bytes": torch.cuda.max_memory_allocated(),
+            "cuda_max_reserved_bytes": torch.cuda.max_memory_reserved(),
+            "cuda_free_bytes": free_bytes,
+            "cuda_total_bytes": total_bytes,
+            **data,
+        }
     data = {
         "pp_rank": scheduler.ps.pp_rank,
         "tp_rank": scheduler.ps.tp_rank,
@@ -600,10 +611,55 @@ class SchedulerPPMixin:
             output_event, output_proxy = last_rank_comm_queue.popleft()
             self.device_module.current_stream().wait_event(output_event)
             output_tensors = output_proxy.tensors
+        # #region debug-point E:final-output-broadcast
+        _vpp_debug_event(
+            self,
+            "E",
+            "scheduler_pp_mixin.py:_pp_vpp_broadcast_batch_result",
+            "final output broadcast enter",
+            {
+                "tensor_bytes": (
+                    None
+                    if output_tensors is None
+                    else sum(
+                        value.numel() * value.element_size()
+                        for value in output_tensors.values()
+                        if isinstance(value, torch.Tensor)
+                    )
+                ),
+                "tensor_shapes": (
+                    None
+                    if output_tensors is None
+                    else {
+                        key: tuple(value.shape)
+                        for key, value in output_tensors.items()
+                        if isinstance(value, torch.Tensor)
+                    }
+                ),
+            },
+        )
         output_tensors = self.pp_group.broadcast_tensor_dict(
             output_tensors,
             src=self.pp_group.world_size - 1,
         )
+        _vpp_debug_event(
+            self,
+            "E",
+            "scheduler_pp_mixin.py:_pp_vpp_broadcast_batch_result",
+            "final output broadcast complete",
+            {
+                "tensor_bytes": (
+                    None
+                    if output_tensors is None
+                    else sum(
+                        value.numel() * value.element_size()
+                        for value in output_tensors.values()
+                        if isinstance(value, torch.Tensor)
+                    )
+                ),
+            },
+        )
+        # #endregion
         if output_tensors is None:
             raise RuntimeError("the final VPP stage produced no output")
         with self.copy_stream_ctx:
@@ -1527,27 +1583,35 @@ class SchedulerPPMixin:
                     trace_only=True,
                 )
                 # #region debug-point E:first-stage-forward
-                _vpp_debug_event(
-                    self,
-                    "E",
-                    "scheduler_pp_mixin.py:_pp_launch_vpp_batch",
-                    "first stage forward enter",
-                    {
-                        "mb_id": mb_id,
-                        "input_stage_id": (
-                            None
-                            if pp_proxy_tensors is None
-                            else pp_proxy_tensors.tensors.get("vpp_stage_id")
-                        ),
-                    },
-                )
+                if envs.SGLANG_VPP_DEBUG_LOG.get():
+                    _vpp_debug_event(
+                        self,
+                        "A",
+                        "scheduler_pp_mixin.py:_pp_launch_vpp_batch",
+                        "first stage forward enter",
+                        {
+                            "mb_id": mb_id,
+                            "batch_size": len(cur_batch.reqs),
+                            "extend_num_tokens": cur_batch.extend_num_tokens,
+                            "seq_lens_sum": cur_batch.seq_lens_sum,
+                            "max_total_num_tokens": self.max_total_num_tokens,
+                            "kv_available_tokens": (
+                                self.token_to_kv_pool_allocator.available_size()
+                            ),
+                            "input_stage_id": (
+                                None
+                                if pp_proxy_tensors is None
+                                else pp_proxy_tensors.tensors.get("vpp_stage_id")
+                            ),
+                        },
+                    )
                 first_result = self.run_batch(cur_batch, pp_proxy_tensors)
                 first_proxy = first_result.pp_hidden_states_proxy_tensors
                 if first_proxy is None:
                     raise RuntimeError("the first VPP visit must produce an activation")
                 _vpp_debug_event(
                     self,
-                    "E",
+                    "A",
                     "scheduler_pp_mixin.py:_pp_launch_vpp_batch",
                     "first stage forward complete",
                     {
@@ -1590,18 +1654,23 @@ class SchedulerPPMixin:
                 # #region debug-point E:second-stage-forward
                 _vpp_debug_event(
                     self,
-                    "E",
+                    "D",
                     "scheduler_pp_mixin.py:_pp_launch_vpp_batch",
                     "second stage forward enter",
                     {
                         "mb_id": mb_id,
                         "stage_id": second_proxy.tensors.get("vpp_stage_id"),
+                        "proxy_tensor_bytes": sum(
+                            value.numel() * value.element_size()
+                            for value in second_proxy.tensors.values()
+                            if isinstance(value, torch.Tensor)
+                        ),
                     },
                 )
                 result = self.run_batch(cur_batch, second_proxy)
                 _vpp_debug_event(
                     self,
-                    "E",
+                    "D",
                     "scheduler_pp_mixin.py:_pp_launch_vpp_batch",
                     "second stage forward complete",
                     {
