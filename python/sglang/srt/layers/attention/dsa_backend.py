@@ -2253,6 +2253,7 @@ class DeepseekSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                topk_indices=topk_indices,
                 capture_target_forward=forward_batch.forward_mode.is_target_verify(),
             )
             return _restore_dsa_decode_dp_padding(output, num_extend_padding_rows)
@@ -2436,6 +2437,7 @@ class DeepseekSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                topk_indices=topk_indices,
                 capture_target_forward=forward_batch.forward_mode.is_target_verify(),
             )
         elif self.dsa_decode_impl == "tilelang":
@@ -2935,6 +2937,7 @@ class DeepseekSparseAttnBackend(
         layer,
         metadata: DSAMetadata,
         page_table_1,
+        topk_indices: torch.Tensor,
         capture_target_forward: bool,
     ) -> torch.Tensor:
         from sgl_kernel.flash_mla import flash_mla_with_kvcache
@@ -2960,7 +2963,8 @@ class DeepseekSparseAttnBackend(
             )
 
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
-        q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
+        logical_q = q_all.view(-1, layer.tp_q_head_num, layer.head_dim)
+        q_all = logical_q.unsqueeze(1)
         num_q_heads = q_all.shape[2]
         target_q_heads = self.flashmla_kv_num_q_heads
         if target_q_heads != num_q_heads:
@@ -2983,6 +2987,27 @@ class DeepseekSparseAttnBackend(
         assert (
             indices.shape[-1] == self.dsa_index_topk
         )  # requirement of FlashMLA decode kernel
+        if topk_indices is None:
+            raise RuntimeError(
+                "FlashMLA-KV requires the request-relative DSA top-k indices"
+            )
+
+        target_forward_probe = getattr(layer, "target_forward_probe", None)
+        if target_forward_probe is not None and capture_target_forward:
+            # All slots were allocated before graph capture. This call records
+            # only fixed D2D copies/fills; exact-RID selection and host hashing
+            # remain in the existing post-send lifecycle.
+            target_forward_probe.capture_flashmla_inputs(
+                layer_id=layer.layer_id,
+                q_nope=logical_q[:, :, : self.kv_lora_rank],
+                q_rope=logical_q[:, :, self.kv_lora_rank :],
+                q_input=q_input,
+                topk_indices=topk_indices,
+                indices=indices,
+                cache_seqlens=cache_seqlens,
+                num_splits=num_splits,
+                tile_scheduler_metadata=(metadata.flashmla_metadata.flashmla_metadata),
+            )
 
         o, _ = flash_mla_with_kvcache(
             q=q_input,
@@ -3003,7 +3028,6 @@ class DeepseekSparseAttnBackend(
         if target_q_heads != num_q_heads:
             o = o[:, :, :num_q_heads, :]
 
-        target_forward_probe = getattr(layer, "target_forward_probe", None)
         if target_forward_probe is not None and capture_target_forward:
             # Record after head-padding trim so the diagnostic hashes only the
             # logical FlashMLA-KV output. The observer performs fixed

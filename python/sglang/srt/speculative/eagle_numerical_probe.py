@@ -140,11 +140,23 @@ _PP_TARGET_FORWARD_BOUNDARIES = (
     "layer_return",
 )
 _PP_TARGET_FORWARD_TENSORS = ("hidden_states", "residual")
-_PP_TARGET_ATTENTION_BOUNDARIES = (
+_PP_TARGET_ATTENTION_OUTPUT_BOUNDARIES = (
     "flashmla_raw_output",
     "v_projection_output",
 )
 _PP_TARGET_ATTENTION_TENSOR = "output"
+_PP_FLASHMLA_INPUT_TENSORS = (
+    "q_nope",
+    "q_rope",
+    "q_input",
+    "topk_indices",
+    "indices",
+    "cache_seqlens",
+    "num_splits",
+    "tile_scheduler_metadata",
+)
+_FLASHMLA_QUERY_SPLIT_INDPTR_ROW_DOMAIN = "flashmla_query_split_indptr"
+_FLASHMLA_SCHEDULER_ROW_DOMAIN = "flashmla_scheduler_partition"
 
 
 class _PPTargetForwardDeviceObserver:
@@ -205,6 +217,8 @@ class _PPTargetForwardDeviceObserver:
         self._attention_buffers: dict[str, torch.Tensor] = {}
         self._attention_row_counts: dict[str, torch.Tensor] = {}
         self._attention_widths: dict[str, int] = {}
+        self._flashmla_input_buffers: dict[str, torch.Tensor] = {}
+        self._flashmla_input_row_counts: dict[str, torch.Tensor] = {}
         self.device = self.buffer.device
 
     def install_attention_boundaries(
@@ -214,13 +228,19 @@ class _PPTargetForwardDeviceObserver:
         raw_output_width: int,
         v_projection_width: int,
         row_domain: str,
+        num_q_heads: int,
+        padded_num_q_heads: int,
+        q_nope_head_dim: int,
+        q_rope_head_dim: int,
+        topk_width: int,
+        max_scheduler_rows: int,
     ) -> None:
         """Allocate first-attention cut buffers before CUDA graph capture."""
         widths = {
             "flashmla_raw_output": raw_output_width,
             "v_projection_output": v_projection_width,
         }
-        for boundary in _PP_TARGET_ATTENTION_BOUNDARIES:
+        for boundary in _PP_TARGET_ATTENTION_OUTPUT_BOUNDARIES:
             width = int(widths[boundary])
             if width <= 0:
                 raise ValueError(
@@ -240,6 +260,123 @@ class _PPTargetForwardDeviceObserver:
             )
             self._attention_widths[stage] = width
             self._row_domains[stage] = {_PP_TARGET_ATTENTION_TENSOR: row_domain}
+
+        input_stage = f"target_verify_layer_{layer_id:02d}_flashmla_inputs"
+        if self._flashmla_input_buffers:
+            raise RuntimeError("FlashMLA input observer is already installed")
+        shapes_and_dtypes = {
+            "q_nope": (
+                (self.max_rows, num_q_heads, q_nope_head_dim),
+                self.dtype,
+            ),
+            "q_rope": (
+                (self.max_rows, num_q_heads, q_rope_head_dim),
+                self.dtype,
+            ),
+            "q_input": (
+                (
+                    self.max_rows,
+                    1,
+                    padded_num_q_heads,
+                    q_nope_head_dim + q_rope_head_dim,
+                ),
+                self.dtype,
+            ),
+            "topk_indices": ((self.max_rows, topk_width), torch.int32),
+            "indices": ((self.max_rows, 1, topk_width), torch.int32),
+            "cache_seqlens": ((self.max_rows,), torch.int32),
+            "num_splits": ((self.max_rows + 1,), torch.int32),
+            "tile_scheduler_metadata": (
+                (max_scheduler_rows, 8),
+                torch.int32,
+            ),
+        }
+        for name, (shape, tensor_dtype) in shapes_and_dtypes.items():
+            if any(dim <= 0 for dim in shape):
+                raise ValueError(
+                    "FlashMLA input observer dimensions must be positive: "
+                    f"tensor={name}, shape={shape}"
+                )
+            self._flashmla_input_buffers[name] = torch.empty(
+                shape, dtype=tensor_dtype, device=self.device
+            )
+            self._flashmla_input_row_counts[name] = torch.zeros(
+                (1,), dtype=torch.int32, device=self.device
+            )
+        self._row_domains[input_stage] = {
+            **{
+                name: row_domain
+                for name in (
+                    "q_nope",
+                    "q_rope",
+                    "q_input",
+                    "topk_indices",
+                    "indices",
+                    "cache_seqlens",
+                )
+            },
+            "num_splits": _FLASHMLA_QUERY_SPLIT_INDPTR_ROW_DOMAIN,
+            "tile_scheduler_metadata": _FLASHMLA_SCHEDULER_ROW_DOMAIN,
+        }
+
+    def capture_flashmla_inputs(
+        self,
+        *,
+        layer_id: int,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        q_input: torch.Tensor,
+        topk_indices: torch.Tensor,
+        indices: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        num_splits: torch.Tensor,
+        tile_scheduler_metadata: torch.Tensor,
+    ) -> None:
+        """Copy the exact FlashMLA inputs into preallocated graph slots."""
+        stage = f"target_verify_layer_{layer_id:02d}_flashmla_inputs"
+        values = {
+            "q_nope": q_nope,
+            "q_rope": q_rope,
+            "q_input": q_input,
+            "topk_indices": topk_indices,
+            "indices": indices,
+            "cache_seqlens": cache_seqlens,
+            "num_splits": num_splits,
+            "tile_scheduler_metadata": tile_scheduler_metadata,
+        }
+        if not self._flashmla_input_buffers:
+            return
+        if set(values) != set(self._flashmla_input_buffers):
+            raise RuntimeError("FlashMLA input observer schema drift")
+        # Validate the complete schema before recording any copy/fill. A shape
+        # or dtype mismatch therefore cannot leave a partially credible stage.
+        for name in _PP_FLASHMLA_INPUT_TENSORS:
+            value = values[name]
+            buffer = self._flashmla_input_buffers[name]
+            if not isinstance(value, torch.Tensor) or value.ndim < 1:
+                raise TypeError(f"{stage}.{name} must be a rank >= 1 tensor")
+            rows = int(value.shape[0])
+            if (
+                rows <= 0
+                or rows > buffer.shape[0]
+                or tuple(value.shape[1:]) != tuple(buffer.shape[1:])
+            ):
+                raise ValueError(
+                    f"{stage}.{name} shape {tuple(value.shape)} does not fit "
+                    f"fixed slot {tuple(buffer.shape)}"
+                )
+            if value.dtype != buffer.dtype or value.device != buffer.device:
+                raise ValueError(
+                    f"{stage}.{name} identity changed: dtype={value.dtype}, "
+                    f"device={value.device}, expected dtype={buffer.dtype}, "
+                    f"device={buffer.device}"
+                )
+        for name in _PP_FLASHMLA_INPUT_TENSORS:
+            value = values[name]
+            buffer = self._flashmla_input_buffers[name]
+            rows = int(value.shape[0])
+            buffer[:rows].copy_(value)
+            self._flashmla_input_row_counts[name].fill_(rows)
 
     def capture_attention(
         self,
@@ -395,6 +532,21 @@ class _PPTargetForwardDeviceObserver:
                 for stage, buffer in self._attention_buffers.items()
             }
         )
+        if self._flashmla_input_buffers:
+            stage = f"target_verify_layer_{self.layer_ids[0]:02d}_flashmla_inputs"
+            stages[stage] = {
+                "tensor_metadata": {
+                    name: {
+                        "logical_rows": self._flashmla_input_row_counts[name],
+                        "row_domain": self._row_domains[stage][name],
+                    }
+                    for name in _PP_FLASHMLA_INPUT_TENSORS
+                },
+                "tensors": {
+                    name: self._flashmla_input_buffers[name]
+                    for name in _PP_FLASHMLA_INPUT_TENSORS
+                },
+            }
         return stages
 
 
@@ -533,6 +685,24 @@ class EaglePPSenderProbe:
             # Both cuts precede the rank-local o_proj partial and therefore
             # retain the attention-group target-tree row layout.
             row_domain=_PP_ATTN_GROUP_TARGET_TREE_ROW_DOMAIN,
+            num_q_heads=int(attention.num_local_heads),
+            padded_num_q_heads=(
+                64
+                if int(attention.num_local_heads) <= 64
+                else (
+                    128
+                    if int(attention.num_local_heads) <= 128
+                    else int(attention.num_local_heads)
+                )
+            ),
+            q_nope_head_dim=int(attention.kv_lora_rank),
+            q_rope_head_dim=int(attention.qk_rope_head_dim),
+            topk_width=int(model.config.index_topk),
+            max_scheduler_rows=(
+                int(torch.cuda.get_device_properties(device).multi_processor_count)
+                if device.type == "cuda"
+                else 1
+            ),
         )
         attention.target_forward_probe = observer
         radix_attention.target_forward_probe = observer

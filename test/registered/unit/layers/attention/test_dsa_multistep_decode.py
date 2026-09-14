@@ -356,6 +356,7 @@ class TestDSAMultiStepDecode(unittest.TestCase):
             kv_cache_dim=3,
             dsa_kv_cache_store_fp8=True,
             dsa_index_topk=2,
+            kv_lora_rank=2,
         )
         metadata = SimpleNamespace(
             dsa_cache_seqlens_int32=torch.tensor([8, 0, 0, 0], dtype=torch.int32),
@@ -388,6 +389,7 @@ class TestDSAMultiStepDecode(unittest.TestCase):
                 layer=layer,
                 metadata=metadata,
                 page_table_1=torch.zeros((1, 2), dtype=torch.int32),
+                topk_indices=torch.zeros((1, 2), dtype=torch.int32),
                 capture_target_forward=False,
             )
             target_forward_probe.capture_attention.assert_not_called()
@@ -400,6 +402,7 @@ class TestDSAMultiStepDecode(unittest.TestCase):
                 layer=layer,
                 metadata=metadata,
                 page_table_1=torch.zeros((1, 2), dtype=torch.int32),
+                topk_indices=torch.zeros((1, 2), dtype=torch.int32),
                 capture_target_forward=True,
             )
 
@@ -409,6 +412,19 @@ class TestDSAMultiStepDecode(unittest.TestCase):
         self.assertEqual(captured["num_splits"].shape[0], 2)
         self.assertEqual(output.shape, (1, 1, 2, 2))
         self.assertEqual(target_output.shape, (1, 1, 2, 2))
+        target_forward_probe.capture_flashmla_inputs.assert_called_once()
+        input_call = target_forward_probe.capture_flashmla_inputs.call_args.kwargs
+        self.assertEqual(input_call["q_nope"].shape, (1, 2, 2))
+        self.assertEqual(input_call["q_rope"].shape, (1, 2, 1))
+        self.assertEqual(input_call["q_input"].shape, (1, 1, 2, 3))
+        self.assertTrue(
+            torch.equal(
+                input_call["topk_indices"], torch.zeros((1, 2), dtype=torch.int32)
+            )
+        )
+        self.assertEqual(input_call["indices"].shape, (1, 1, 2))
+        self.assertEqual(input_call["cache_seqlens"].tolist(), [8])
+        self.assertEqual(input_call["num_splits"].shape, (2,))
         target_forward_probe.capture_attention.assert_called_once_with(
             layer_id=0,
             boundary="flashmla_raw_output",
@@ -512,6 +528,7 @@ class TestDSAMultiStepDecode(unittest.TestCase):
                 layer=SimpleNamespace(tp_q_head_num=2, head_dim=3),
                 metadata=metadata,
                 page_table_1=torch.zeros((1, 2), dtype=torch.int32),
+                topk_indices=torch.zeros((1, 2), dtype=torch.int32),
                 capture_target_forward=False,
             )
 
@@ -547,6 +564,7 @@ class TestDSAMultiStepDecode(unittest.TestCase):
                 layer=SimpleNamespace(tp_q_head_num=2, head_dim=3),
                 metadata=metadata,
                 page_table_1=torch.zeros((2, 2), dtype=torch.int32),
+                topk_indices=torch.zeros((2, 2), dtype=torch.int32),
                 capture_target_forward=False,
             )
 

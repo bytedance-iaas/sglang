@@ -544,6 +544,12 @@ class TestEagleNumericalProbe(unittest.TestCase):
             raw_output_width=6,
             v_projection_width=4,
             row_domain="pp_attn_group_target_verify_tree_node",
+            num_q_heads=2,
+            padded_num_q_heads=4,
+            q_nope_head_dim=2,
+            q_rope_head_dim=1,
+            topk_width=3,
+            max_scheduler_rows=2,
         )
         raw = torch.arange(12, dtype=torch.bfloat16).reshape(2, 2, 3)
         v_projection = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4)
@@ -589,6 +595,12 @@ class TestEagleNumericalProbe(unittest.TestCase):
             raw_output_width=6,
             v_projection_width=4,
             row_domain="pp_attn_group_target_verify_tree_node",
+            num_q_heads=2,
+            padded_num_q_heads=4,
+            q_nope_head_dim=2,
+            q_rope_head_dim=1,
+            topk_width=3,
+            max_scheduler_rows=2,
         )
         with self.assertRaisesRegex(ValueError, "width 8 does not match"):
             observer.capture_attention(
@@ -602,6 +614,143 @@ class TestEagleNumericalProbe(unittest.TestCase):
                 boundary="v_projection_output",
                 output=torch.ones((3, 4)),
             )
+
+    def test_pp_target_forward_observer_captures_flashmla_inputs(self):
+        observer = _PPTargetForwardDeviceObserver(
+            layer_ids=(0,),
+            max_rows=4,
+            hidden_size=3,
+            dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+        )
+        observer.install_attention_boundaries(
+            layer_id=0,
+            raw_output_width=6,
+            v_projection_width=4,
+            row_domain="pp_attn_group_target_verify_tree_node",
+            num_q_heads=2,
+            padded_num_q_heads=4,
+            q_nope_head_dim=2,
+            q_rope_head_dim=1,
+            topk_width=3,
+            max_scheduler_rows=2,
+        )
+        q_nope = torch.arange(8, dtype=torch.bfloat16).reshape(2, 2, 2)
+        q_rope = torch.arange(4, dtype=torch.bfloat16).reshape(2, 2, 1)
+        q_input = torch.arange(24, dtype=torch.bfloat16).reshape(2, 1, 4, 3)
+        topk = torch.arange(6, dtype=torch.int32).reshape(2, 3)
+        indices = (topk + 10).unsqueeze(1)
+        cache_seqlens = torch.tensor([3, 3], dtype=torch.int32)
+        num_splits = torch.tensor([0, 1, 2], dtype=torch.int32)
+        scheduler = torch.arange(16, dtype=torch.int32).reshape(2, 8)
+        pointers_before = {
+            name: tensor.data_ptr()
+            for name, tensor in observer._flashmla_input_buffers.items()
+        }
+
+        observer.capture_flashmla_inputs(
+            layer_id=0,
+            q_nope=q_nope,
+            q_rope=q_rope,
+            q_input=q_input,
+            topk_indices=topk,
+            indices=indices,
+            cache_seqlens=cache_seqlens,
+            num_splits=num_splits,
+            tile_scheduler_metadata=scheduler,
+        )
+        stage = observer.snapshot_stages()["target_verify_layer_00_flashmla_inputs"]
+        self.assertEqual(
+            set(stage["tensors"]),
+            {
+                "q_nope",
+                "q_rope",
+                "q_input",
+                "topk_indices",
+                "indices",
+                "cache_seqlens",
+                "num_splits",
+                "tile_scheduler_metadata",
+            },
+        )
+        self.assertTrue(torch.equal(stage["tensors"]["q_input"][:2], q_input))
+        self.assertTrue(torch.equal(stage["tensors"]["indices"][:2], indices))
+        self.assertEqual(stage["tensor_metadata"]["q_input"]["logical_rows"].item(), 2)
+        self.assertEqual(
+            stage["tensor_metadata"]["num_splits"]["logical_rows"].item(), 3
+        )
+        self.assertEqual(
+            stage["tensor_metadata"]["num_splits"]["row_domain"],
+            "flashmla_query_split_indptr",
+        )
+        self.assertEqual(
+            stage["tensor_metadata"]["tile_scheduler_metadata"]["row_domain"],
+            "flashmla_scheduler_partition",
+        )
+        self.assertEqual(
+            pointers_before,
+            {
+                name: tensor.data_ptr()
+                for name, tensor in observer._flashmla_input_buffers.items()
+            },
+        )
+
+    def test_pp_target_forward_observer_rejects_flashmla_input_drift_atomically(self):
+        observer = _PPTargetForwardDeviceObserver(
+            layer_ids=(0,),
+            max_rows=4,
+            hidden_size=3,
+            dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+        )
+        observer.install_attention_boundaries(
+            layer_id=0,
+            raw_output_width=6,
+            v_projection_width=4,
+            row_domain="pp_attn_group_target_verify_tree_node",
+            num_q_heads=2,
+            padded_num_q_heads=4,
+            q_nope_head_dim=2,
+            q_rope_head_dim=1,
+            topk_width=3,
+            max_scheduler_rows=2,
+        )
+        valid = {
+            "q_nope": torch.zeros((2, 2, 2), dtype=torch.bfloat16),
+            "q_rope": torch.zeros((2, 2, 1), dtype=torch.bfloat16),
+            "q_input": torch.zeros((2, 1, 4, 3), dtype=torch.bfloat16),
+            "topk_indices": torch.zeros((2, 3), dtype=torch.int32),
+            "indices": torch.zeros((2, 1, 3), dtype=torch.int32),
+            "cache_seqlens": torch.zeros((2,), dtype=torch.int32),
+            "num_splits": torch.zeros((3,), dtype=torch.int32),
+            "tile_scheduler_metadata": torch.zeros((2, 8), dtype=torch.int32),
+        }
+        invalid_cases = {
+            "scheduler capacity": (
+                "tile_scheduler_metadata",
+                torch.zeros((3, 8), dtype=torch.int32),
+            ),
+            "scheduler width": (
+                "tile_scheduler_metadata",
+                torch.zeros((2, 7), dtype=torch.int32),
+            ),
+            "length dtype": (
+                "cache_seqlens",
+                torch.zeros((2,), dtype=torch.int64),
+            ),
+        }
+        for label, (name, value) in invalid_cases.items():
+            with self.subTest(label=label):
+                inputs = dict(valid)
+                inputs[name] = value
+                with self.assertRaisesRegex(ValueError, rf"\.{name} "):
+                    observer.capture_flashmla_inputs(layer_id=0, **inputs)
+                self.assertTrue(
+                    all(
+                        count.item() == 0
+                        for count in observer._flashmla_input_row_counts.values()
+                    )
+                )
 
     def test_pp_target_forward_observer_tracks_replayed_bucket_rows(self):
         observer = _PPTargetForwardDeviceObserver(
@@ -685,6 +834,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
         layers[0].self_attn = SimpleNamespace(
             num_local_heads=2,
             kv_lora_rank=8,
+            qk_rope_head_dim=2,
             v_head_dim=4,
             attn_mqa=SimpleNamespace(),
         )
@@ -693,7 +843,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
             (),
             {
                 "model": SimpleNamespace(layers=layers, start_layer=0, end_layer=40),
-                "config": SimpleNamespace(hidden_size=16),
+                "config": SimpleNamespace(hidden_size=16, index_topk=3),
             },
         )()
 
@@ -716,6 +866,19 @@ class TestEagleNumericalProbe(unittest.TestCase):
             {
                 "target_verify_layer_00_flashmla_raw_output",
                 "target_verify_layer_00_v_projection_output",
+            },
+        )
+        self.assertEqual(
+            set(observer._flashmla_input_buffers),
+            {
+                "q_nope",
+                "q_rope",
+                "q_input",
+                "topk_indices",
+                "indices",
+                "cache_seqlens",
+                "num_splits",
+                "tile_scheduler_metadata",
             },
         )
         self.assertFalse(
