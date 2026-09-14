@@ -561,6 +561,7 @@ class TestEaglePPLastRankDraftOwnership(unittest.TestCase):
                 model=object(),
                 dtype=torch.bfloat16,
                 device=torch.device("cpu"),
+                req_to_token_pool=None,
                 max_decode_logits_rows=MagicMock(return_value=32),
             ),
         )
@@ -616,7 +617,7 @@ class TestEaglePPLastRankDraftOwnership(unittest.TestCase):
     @patch("sglang.srt.speculative.eagle_worker_v2.get_pp_group")
     @patch("sglang.srt.speculative.eagle_worker_v2.EagleDraftWorker")
     @patch("sglang.srt.speculative.eagle_worker_v2.EaglePPSenderProbe")
-    def test_pp0_installs_target_observer_during_worker_construction(
+    def test_pp0_installs_target_observer_after_target_pool_allocation(
         self, probe_cls, draft_worker_cls, get_pp_group, _get_plan_stream
     ):
         get_pp_group.return_value.is_last_rank = False
@@ -651,8 +652,14 @@ class TestEaglePPLastRankDraftOwnership(unittest.TestCase):
                 return_value=True,
             ),
         ):
-            EAGLEWorkerV2(
+            worker = EAGLEWorkerV2(
                 SimpleNamespace(pp_size=2), 0, object(), 1234, target_worker=target
+            )
+            probe.install_target_forward_observer.assert_not_called()
+            target.model_runner.req_to_token_pool = SimpleNamespace(size=8)
+            worker.alloc_memory_pool(
+                req_to_token_pool=target.model_runner.req_to_token_pool,
+                token_to_kv_pool_allocator=object(),
             )
 
         draft_worker_cls.assert_not_called()
@@ -662,6 +669,7 @@ class TestEaglePPLastRankDraftOwnership(unittest.TestCase):
             dtype=torch.bfloat16,
             device=torch.device("cpu"),
         )
+        target.model_runner.max_decode_logits_rows.assert_called_once_with()
 
     @patch(
         "sglang.srt.speculative.eagle_worker_v2.get_plan_stream",
@@ -704,11 +712,16 @@ class TestEaglePPLastRankDraftOwnership(unittest.TestCase):
                 "sglang.srt.speculative.eagle_worker_v2.check_cuda_graph_backend",
                 return_value=False,
             ),
-            self.assertRaisesRegex(ValueError, "requires explicit full Decode"),
         ):
-            EAGLEWorkerV2(
+            worker = EAGLEWorkerV2(
                 SimpleNamespace(pp_size=2), 0, object(), 1234, target_worker=target
             )
+            target.model_runner.req_to_token_pool = SimpleNamespace(size=8)
+            with self.assertRaisesRegex(ValueError, "requires explicit full Decode"):
+                worker.alloc_memory_pool(
+                    req_to_token_pool=target.model_runner.req_to_token_pool,
+                    token_to_kv_pool_allocator=object(),
+                )
 
         draft_worker_cls.assert_not_called()
         probe_cls.return_value.install_target_forward_observer.assert_not_called()

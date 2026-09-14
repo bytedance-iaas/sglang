@@ -1403,27 +1403,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
             if self._pp_enabled and not self._pp_is_last_rank
             else None
         )
-        # The scheduler captures target CUDA graphs before it initializes the
-        # speculative worker's own graphs.  Install this fixed side buffer now,
-        # after the target model exists but before memory-pool sizing and target
-        # graph capture, so every target-verify graph records the D2D copies.
-        if (
-            self.eagle_pp_sender_probe is not None
-            and self.eagle_pp_sender_probe.can_probe
-            and get_pp_group().is_first_rank
-        ):
-            if not check_cuda_graph_backend(Phase.DECODE, Backend.FULL):
-                raise ValueError(
-                    "PP target-forward observer requires explicit full Decode "
-                    "CUDA graphs"
-                )
-            target_model_runner = self._target_worker.model_runner
-            self.eagle_pp_sender_probe.install_target_forward_observer(
-                model=target_model_runner.model,
-                max_rows=target_model_runner.max_decode_logits_rows(),
-                dtype=target_model_runner.dtype,
-                device=target_model_runner.device,
-            )
+        # The fixed target-forward side buffer is installed by alloc_memory_pool:
+        # after the target request pool exists for exact graph-bucket sizing,
+        # but before attention-backend setup and target CUDA graph capture.
+
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
         if get_spec().speculative_adaptive and self._hosts_draft:
@@ -1439,6 +1422,40 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+
+    def alloc_memory_pool(
+        self,
+        memory_pool_config=None,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+    ):
+        super().alloc_memory_pool(
+            memory_pool_config=memory_pool_config,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        )
+        if (
+            self.eagle_pp_sender_probe is not None
+            and self.eagle_pp_sender_probe.can_probe
+            and get_pp_group().is_first_rank
+        ):
+            if not check_cuda_graph_backend(Phase.DECODE, Backend.FULL):
+                raise ValueError(
+                    "PP target-forward observer requires explicit full Decode "
+                    "CUDA graphs"
+                )
+            target_model_runner = self._target_worker.model_runner
+            if target_model_runner.req_to_token_pool is None:
+                raise RuntimeError(
+                    "PP target-forward observer requires the target request "
+                    "pool before sizing its graph side buffer"
+                )
+            self.eagle_pp_sender_probe.install_target_forward_observer(
+                model=target_model_runner.model,
+                max_rows=target_model_runner.max_decode_logits_rows(),
+                dtype=target_model_runner.dtype,
+                device=target_model_runner.device,
+            )
 
     @property
     def last_shared_read_runner(self):
