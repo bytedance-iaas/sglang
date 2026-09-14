@@ -61,6 +61,9 @@ _DENSE_ROW_DOMAIN = "dense_request_major_prefix"
 _PROPOSAL_ROW_DOMAIN = "request_terminal"
 _TARGET_TREE_ROW_DOMAIN = "target_verify_tree_node"
 _PP_RANK_LOCAL_TARGET_TREE_ROW_DOMAIN = "pp_rank_local_target_verify_tree_node"
+_PP_SCATTERED_TARGET_TREE_ROW_DOMAIN = "pp_scattered_target_verify_tree_node"
+_PP_ATTN_GROUP_TARGET_TREE_ROW_DOMAIN = "pp_attn_group_target_verify_tree_node"
+_PP_FULL_TARGET_TREE_ROW_DOMAIN = "pp_full_target_verify_tree_node"
 _REQUEST_ROW_DOMAIN = "request"
 _PD_HANDOFF_STAGES = {
     "prefill": ("pp_output", "metadata_write"),
@@ -128,8 +131,11 @@ class _PPTargetForwardDeviceObserver:
         # Zero is the fail-closed sentinel if a stage is not executed by a
         # captured path; successful capture/replay overwrites it in-graph.
         self.row_counts = torch.zeros(
-            (len(self.stage_names),), dtype=torch.int32, device=device
+            (len(self.stage_names), len(_PP_TARGET_FORWARD_TENSORS)),
+            dtype=torch.int32,
+            device=device,
         )
+        self._row_domains: dict[str, dict[str, str]] = {}
         self.device = self.buffer.device
 
     def capture(
@@ -139,21 +145,14 @@ class _PPTargetForwardDeviceObserver:
         boundary: str,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
+        hidden_row_domain: str,
+        residual_row_domain: str,
     ) -> None:
         stage = f"target_verify_layer_{layer_id:02d}_{boundary}"
         stage_index = self._stage_index.get(stage)
         if stage_index is None:
             return
         tensors = (hidden_states, residual)
-        if (
-            isinstance(hidden_states, torch.Tensor)
-            and isinstance(residual, torch.Tensor)
-            and hidden_states.shape[0] != residual.shape[0]
-        ):
-            raise ValueError(
-                f"{stage} row mismatch: hidden_states={hidden_states.shape[0]}, "
-                f"residual={residual.shape[0]}"
-            )
         for tensor_index, (tensor_name, tensor) in enumerate(
             zip(_PP_TARGET_FORWARD_TENSORS, tensors)
         ):
@@ -175,15 +174,61 @@ class _PPTargetForwardDeviceObserver:
                     f"dtype={tensor.dtype}, device={tensor.device}, "
                     f"expected dtype={self.dtype}, device={self.device}"
                 )
+        row_domains = {
+            "hidden_states": hidden_row_domain,
+            "residual": residual_row_domain,
+        }
+        self._validate_row_domains(stage, tensors, row_domains)
+        previous_domains = self._row_domains.setdefault(stage, row_domains)
+        if previous_domains != row_domains:
+            raise ValueError(
+                f"{stage} row-domain drift: {previous_domains} -> {row_domains}"
+            )
+        for tensor_index, tensor in enumerate(tensors):
             self.buffer[stage_index, tensor_index, : tensor.shape[0]].copy_(tensor)
-        # Each graph shape writes its own valid-row count during replay.  This
-        # keeps one shared side buffer safe across all captured buckets.
-        self.row_counts[stage_index].fill_(hidden_states.shape[0])
+            # Each graph shape writes each tensor's valid-row count during
+            # replay. The communicator may keep residual in TP_ATTN_FULL while
+            # hidden_states use FULL layout, so counts are not stage-level.
+            self.row_counts[stage_index, tensor_index].fill_(tensor.shape[0])
+
+    def _validate_row_domains(
+        self,
+        stage: str,
+        tensors: tuple[torch.Tensor, torch.Tensor],
+        row_domains: dict[str, str],
+    ) -> None:
+        allowed = {
+            _PP_RANK_LOCAL_TARGET_TREE_ROW_DOMAIN,
+            _PP_SCATTERED_TARGET_TREE_ROW_DOMAIN,
+            _PP_ATTN_GROUP_TARGET_TREE_ROW_DOMAIN,
+            _PP_FULL_TARGET_TREE_ROW_DOMAIN,
+        }
+        for name, tensor in zip(_PP_TARGET_FORWARD_TENSORS, tensors):
+            domain = row_domains[name]
+            rows = int(tensor.shape[0])
+            if domain not in allowed:
+                raise ValueError(f"{stage} unsupported {name} row domain: {domain!r}")
+            if rows <= 0:
+                raise ValueError(
+                    f"{stage} invalid {name} rows={rows} for " f"row_domain={domain}"
+                )
 
     def snapshot_stages(self) -> dict[str, dict]:
         return {
             stage: {
-                "logical_rows": self.row_counts[stage_index : stage_index + 1],
+                "tensor_metadata": {
+                    tensor_name: {
+                        "logical_rows": self.row_counts[
+                            stage_index, tensor_index : tensor_index + 1
+                        ],
+                        "row_domain": self._row_domains.get(stage, {}).get(
+                            tensor_name, _PP_RANK_LOCAL_TARGET_TREE_ROW_DOMAIN
+                        ),
+                    }
+                    for tensor_index, tensor_name in enumerate(
+                        _PP_TARGET_FORWARD_TENSORS
+                    )
+                },
                 "tensors": {
                     tensor_name: self.buffer[stage_index, tensor_index]
                     for tensor_index, tensor_name in enumerate(
@@ -349,34 +394,51 @@ class EaglePPSenderProbe:
 
         try:
             stage_sources = {
-                _PP_SENDER_STAGE: {"logical_rows": hidden_rows, "tensors": tensors}
+                _PP_SENDER_STAGE: {
+                    "tensor_metadata": {
+                        name: {
+                            "logical_rows": hidden_rows,
+                            "row_domain": _PP_RANK_LOCAL_TARGET_TREE_ROW_DOMAIN,
+                        }
+                        for name in tensors
+                    },
+                    "tensors": tensors,
+                }
             }
             if self._target_forward_observer is not None:
                 stage_sources.update(self._target_forward_observer.snapshot_stages())
             snapshots = {}
             cuda_devices = set()
             for stage_name, stage_source in stage_sources.items():
-                snapshots[stage_name] = {"tensors": {}}
-                logical_rows = stage_source["logical_rows"]
-                if isinstance(logical_rows, torch.Tensor):
-                    row_count = logical_rows.detach()
-                    if row_count.is_cuda:
-                        host_row_count = torch.empty(
-                            row_count.shape,
-                            dtype=row_count.dtype,
-                            device="cpu",
-                            pin_memory=True,
-                        )
-                        host_row_count.copy_(row_count, non_blocking=True)
-                        row_count.record_stream(
-                            torch.cuda.current_stream(row_count.device)
-                        )
-                        cuda_devices.add(row_count.device)
+                snapshots[stage_name] = {
+                    "tensor_metadata": {},
+                    "tensors": {},
+                }
+                for name, metadata in stage_source["tensor_metadata"].items():
+                    logical_rows = metadata["logical_rows"]
+                    if isinstance(logical_rows, torch.Tensor):
+                        row_count = logical_rows.detach()
+                        if row_count.is_cuda:
+                            host_row_count = torch.empty(
+                                row_count.shape,
+                                dtype=row_count.dtype,
+                                device="cpu",
+                                pin_memory=True,
+                            )
+                            host_row_count.copy_(row_count, non_blocking=True)
+                            row_count.record_stream(
+                                torch.cuda.current_stream(row_count.device)
+                            )
+                            cuda_devices.add(row_count.device)
+                        else:
+                            host_row_count = row_count.clone()
+                        logical_rows = host_row_count
                     else:
-                        host_row_count = row_count.clone()
-                    snapshots[stage_name]["logical_rows"] = host_row_count
-                else:
-                    snapshots[stage_name]["logical_rows"] = int(logical_rows)
+                        logical_rows = int(logical_rows)
+                    snapshots[stage_name]["tensor_metadata"][name] = {
+                        "logical_rows": logical_rows,
+                        "row_domain": metadata["row_domain"],
+                    }
                 for name, tensor in stage_source["tensors"].items():
                     value = tensor.detach()
                     if value.is_cuda:
@@ -467,27 +529,41 @@ class EaglePPSenderProbe:
         )
 
     def _finalize_stage_snapshot(self, stage_snapshot: dict) -> dict:
-        logical_rows = stage_snapshot["logical_rows"]
-        if isinstance(logical_rows, torch.Tensor):
-            if logical_rows.numel() != 1:
-                raise ValueError("target-forward row count must be scalar")
-            logical_rows = int(logical_rows.item())
-        tensor_rows = {
-            name: int(tensor.shape[0])
-            for name, tensor in stage_snapshot["tensors"].items()
-        }
-        if logical_rows <= 0 or any(
-            logical_rows > rows for rows in tensor_rows.values()
-        ):
-            raise ValueError(f"invalid target-forward logical_rows={logical_rows}")
-        return {
-            "row_domain": _PP_RANK_LOCAL_TARGET_TREE_ROW_DOMAIN,
-            "logical_rows": logical_rows,
-            "tensors": {
-                name: _tensor_fingerprint(tensor, logical_rows)
-                for name, tensor in sorted(stage_snapshot["tensors"].items())
-            },
-        }
+        tensor_metadata = stage_snapshot["tensor_metadata"]
+        if set(tensor_metadata) != set(stage_snapshot["tensors"]):
+            raise ValueError("target-forward tensor metadata does not match tensors")
+        fingerprints = {}
+        stage_metadata = set()
+        for name, tensor in sorted(stage_snapshot["tensors"].items()):
+            metadata = tensor_metadata[name]
+            logical_rows = metadata["logical_rows"]
+            if isinstance(logical_rows, torch.Tensor):
+                if logical_rows.numel() != 1:
+                    raise ValueError("target-forward row count must be scalar")
+                logical_rows = int(logical_rows.item())
+            row_domain = metadata.get("row_domain")
+            if (
+                not isinstance(row_domain, str)
+                or not row_domain
+                or logical_rows <= 0
+                or logical_rows > int(tensor.shape[0])
+            ):
+                raise ValueError(
+                    f"invalid target-forward metadata for {name}: "
+                    f"row_domain={row_domain!r}, logical_rows={logical_rows}"
+                )
+            fingerprints[name] = {
+                "row_domain": row_domain,
+                "logical_rows": logical_rows,
+                **_tensor_fingerprint(tensor, logical_rows),
+            }
+            stage_metadata.add((row_domain, logical_rows))
+        result = {"tensors": fingerprints}
+        # Preserve the stage-level fields for the ordinary PP sender boundary,
+        # while mixed-layout target-forward stages use tensor-level metadata.
+        if len(stage_metadata) == 1:
+            result["row_domain"], result["logical_rows"] = next(iter(stage_metadata))
+        return result
 
     def _emit(
         self,

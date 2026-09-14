@@ -75,6 +75,7 @@ from sglang.srt.layers.aux_hidden_states import (
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
+    ScatterMode,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
 )
@@ -2314,6 +2315,20 @@ class DeepseekV2AttentionMLA(
             return quant_config
 
 
+def _pp_target_forward_row_domain(scatter_mode: ScatterMode) -> str:
+    """Map the communicator's declared physical layout to probe metadata."""
+    if scatter_mode == ScatterMode.FULL:
+        return "pp_full_target_verify_tree_node"
+    if scatter_mode == ScatterMode.TP_ATTN_FULL:
+        return "pp_attn_group_target_verify_tree_node"
+    if scatter_mode == ScatterMode.SCATTERED:
+        return "pp_scattered_target_verify_tree_node"
+    raise ValueError(
+        "PP target-forward observer does not support communicator layout "
+        f"{scatter_mode.name}"
+    )
+
+
 class DeepseekV2DecoderLayer(nn.Module):
 
     def __init__(
@@ -2519,6 +2534,12 @@ class DeepseekV2DecoderLayer(nn.Module):
                 boundary="attn_input",
                 hidden_states=hidden_states,
                 residual=residual,
+                hidden_row_domain=_pp_target_forward_row_domain(
+                    self.layer_scatter_modes.attn_mode
+                ),
+                residual_row_domain=_pp_target_forward_row_domain(
+                    self.layer_scatter_modes.layer_input_mode
+                ),
             )
 
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
@@ -2555,6 +2576,12 @@ class DeepseekV2DecoderLayer(nn.Module):
                 boundary="mlp_input",
                 hidden_states=hidden_states,
                 residual=residual,
+                hidden_row_domain=_pp_target_forward_row_domain(
+                    self.layer_scatter_modes.mlp_mode
+                ),
+                residual_row_domain=_pp_target_forward_row_domain(
+                    self.layer_scatter_modes.middle_residual_mode
+                ),
             )
 
         fuse_mlp_allreduce = (
@@ -2615,6 +2642,16 @@ class DeepseekV2DecoderLayer(nn.Module):
                 boundary="layer_return",
                 hidden_states=hidden_states,
                 residual=residual,
+                hidden_row_domain=_pp_target_forward_row_domain(
+                    self.layer_scatter_modes.mlp_mode
+                    if fuse_mlp_allreduce
+                    else self.layer_scatter_modes.layer_output_mode
+                ),
+                residual_row_domain=_pp_target_forward_row_domain(
+                    self.layer_scatter_modes.middle_residual_mode
+                    if fuse_mlp_allreduce
+                    else self.layer_scatter_modes.layer_output_mode
+                ),
             )
 
         return hidden_states, residual, topk_indices

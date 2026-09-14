@@ -7,6 +7,8 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.layers.communicator import ScatterMode
+from sglang.srt.models.deepseek_v2 import _pp_target_forward_row_domain
 from sglang.srt.speculative.eagle_numerical_probe import (
     EagleNumericalProbe,
     EaglePDHandoffProbe,
@@ -21,6 +23,22 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestEagleNumericalProbe(unittest.TestCase):
+    def test_pp_target_forward_row_domain_uses_communicator_layout(self):
+        self.assertEqual(
+            _pp_target_forward_row_domain(ScatterMode.SCATTERED),
+            "pp_scattered_target_verify_tree_node",
+        )
+        self.assertEqual(
+            _pp_target_forward_row_domain(ScatterMode.TP_ATTN_FULL),
+            "pp_attn_group_target_verify_tree_node",
+        )
+        self.assertEqual(
+            _pp_target_forward_row_domain(ScatterMode.FULL),
+            "pp_full_target_verify_tree_node",
+        )
+        with self.assertRaisesRegex(ValueError, "MOE_FULL"):
+            _pp_target_forward_row_domain(ScatterMode.MOE_FULL)
+
     @staticmethod
     def probe(expected_rid="probe-rid", *, require_pp_input=False):
         return EagleNumericalProbe(
@@ -191,12 +209,16 @@ class TestEagleNumericalProbe(unittest.TestCase):
             boundary="attn_input",
             hidden_states=hidden,
             residual=hidden + 10,
+            hidden_row_domain="pp_attn_group_target_verify_tree_node",
+            residual_row_domain="pp_attn_group_target_verify_tree_node",
         )
         observer.capture(
             layer_id=1,
             boundary="attn_input",
             hidden_states=hidden + 20,
             residual=hidden + 30,
+            hidden_row_domain="pp_attn_group_target_verify_tree_node",
+            residual_row_domain="pp_attn_group_target_verify_tree_node",
         )
         snapshot = observer.snapshot_stages()
 
@@ -227,14 +249,16 @@ class TestEagleNumericalProbe(unittest.TestCase):
                 hidden + 10,
             )
         )
+        metadata = snapshot["target_verify_layer_00_attn_input"]["tensor_metadata"]
+        self.assertEqual(metadata["hidden_states"]["logical_rows"].item(), 2)
+        self.assertEqual(metadata["residual"]["logical_rows"].item(), 2)
         self.assertEqual(
-            snapshot["target_verify_layer_00_attn_input"]["logical_rows"].item(),
-            2,
+            metadata["hidden_states"]["row_domain"],
+            "pp_attn_group_target_verify_tree_node",
         )
-        self.assertEqual(
-            snapshot["target_verify_layer_03_attn_input"]["logical_rows"].item(),
-            0,
-        )
+        uncaptured = snapshot["target_verify_layer_03_attn_input"]["tensor_metadata"]
+        self.assertEqual(uncaptured["hidden_states"]["logical_rows"].item(), 0)
+        self.assertEqual(uncaptured["residual"]["logical_rows"].item(), 0)
 
     def test_pp_target_forward_observer_rejects_shape_or_capacity_drift(self):
         observer = _PPTargetForwardDeviceObserver(
@@ -250,6 +274,8 @@ class TestEagleNumericalProbe(unittest.TestCase):
                 boundary="attn_input",
                 hidden_states=torch.ones((1, 4)),
                 residual=torch.ones((1, 4)),
+                hidden_row_domain="pp_attn_group_target_verify_tree_node",
+                residual_row_domain="pp_attn_group_target_verify_tree_node",
             )
         with self.assertRaisesRegex(ValueError, "exceed fixed capacity"):
             observer.capture(
@@ -257,14 +283,70 @@ class TestEagleNumericalProbe(unittest.TestCase):
                 boundary="attn_input",
                 hidden_states=torch.ones((3, 3)),
                 residual=torch.ones((3, 3)),
+                hidden_row_domain="pp_attn_group_target_verify_tree_node",
+                residual_row_domain="pp_attn_group_target_verify_tree_node",
             )
-        with self.assertRaisesRegex(ValueError, "row mismatch"):
+        with self.assertRaisesRegex(ValueError, "invalid residual rows"):
             observer.capture(
                 layer_id=0,
                 boundary="attn_input",
                 hidden_states=torch.ones((2, 3)),
-                residual=torch.ones((1, 3)),
+                residual=torch.ones((0, 3)),
+                hidden_row_domain="pp_attn_group_target_verify_tree_node",
+                residual_row_domain="pp_attn_group_target_verify_tree_node",
             )
+
+    def test_pp_target_forward_observer_tracks_mixed_communicator_domains(self):
+        observer = _PPTargetForwardDeviceObserver(
+            layer_ids=(1,),
+            max_rows=32,
+            hidden_size=3,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        hidden = torch.arange(96, dtype=torch.float32).reshape(32, 3)
+        residual = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+
+        observer.capture(
+            layer_id=1,
+            boundary="attn_input",
+            hidden_states=hidden,
+            residual=residual,
+            hidden_row_domain="pp_full_target_verify_tree_node",
+            residual_row_domain="pp_attn_group_target_verify_tree_node",
+        )
+        snapshot = observer.snapshot_stages()["target_verify_layer_01_attn_input"]
+        metadata = snapshot["tensor_metadata"]
+        self.assertEqual(metadata["hidden_states"]["logical_rows"].item(), 32)
+        self.assertEqual(
+            metadata["hidden_states"]["row_domain"],
+            "pp_full_target_verify_tree_node",
+        )
+        self.assertEqual(metadata["residual"]["logical_rows"].item(), 4)
+        self.assertEqual(
+            metadata["residual"]["row_domain"],
+            "pp_attn_group_target_verify_tree_node",
+        )
+        self.assertTrue(torch.equal(snapshot["tensors"]["hidden_states"], hidden))
+        self.assertTrue(torch.equal(snapshot["tensors"]["residual"][:4], residual))
+
+        stage = EaglePPSenderProbe(
+            "probe-rid",
+            capture_id="capture-test-generation",
+            pod_name="probe-pod",
+            pod_uid="probe-pod-uid",
+        )._finalize_stage_snapshot(
+            {
+                "tensor_metadata": metadata,
+                "tensors": snapshot["tensors"],
+            }
+        )
+        self.assertNotIn("logical_rows", stage)
+        self.assertNotIn("row_domain", stage)
+        self.assertEqual(stage["tensors"]["hidden_states"]["shape"], [32, 3])
+        self.assertEqual(stage["tensors"]["hidden_states"]["logical_rows"], 32)
+        self.assertEqual(stage["tensors"]["residual"]["shape"], [4, 3])
+        self.assertEqual(stage["tensors"]["residual"]["logical_rows"], 4)
 
     def test_pp_target_forward_observer_tracks_replayed_bucket_rows(self):
         observer = _PPTargetForwardDeviceObserver(
@@ -280,16 +362,27 @@ class TestEagleNumericalProbe(unittest.TestCase):
             boundary="layer_return",
             hidden_states=torch.full((4, 3), 4.0),
             residual=torch.full((4, 3), 5.0),
+            hidden_row_domain="pp_attn_group_target_verify_tree_node",
+            residual_row_domain="pp_attn_group_target_verify_tree_node",
         )
         observer.capture(
             layer_id=0,
             boundary="layer_return",
             hidden_states=torch.full((2, 3), 2.0),
             residual=torch.full((2, 3), 3.0),
+            hidden_row_domain="pp_attn_group_target_verify_tree_node",
+            residual_row_domain="pp_attn_group_target_verify_tree_node",
         )
 
         snapshot = observer.snapshot_stages()[stage]
-        self.assertEqual(snapshot["logical_rows"].item(), 2)
+        self.assertEqual(
+            snapshot["tensor_metadata"]["hidden_states"]["logical_rows"].item(),
+            2,
+        )
+        self.assertEqual(
+            snapshot["tensor_metadata"]["residual"]["logical_rows"].item(),
+            2,
+        )
         self.assertTrue(
             torch.equal(
                 snapshot["tensors"]["hidden_states"][:2], torch.full((2, 3), 2.0)
@@ -298,6 +391,33 @@ class TestEagleNumericalProbe(unittest.TestCase):
         self.assertTrue(
             torch.equal(snapshot["tensors"]["residual"][:2], torch.full((2, 3), 3.0))
         )
+
+    def test_pp_target_forward_observer_rejects_cross_variant_domain_drift(self):
+        observer = _PPTargetForwardDeviceObserver(
+            layer_ids=(0,),
+            max_rows=4,
+            hidden_size=3,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        tensor = torch.ones((2, 3))
+        observer.capture(
+            layer_id=0,
+            boundary="attn_input",
+            hidden_states=tensor,
+            residual=tensor,
+            hidden_row_domain="pp_attn_group_target_verify_tree_node",
+            residual_row_domain="pp_attn_group_target_verify_tree_node",
+        )
+        with self.assertRaisesRegex(ValueError, "row-domain drift"):
+            observer.capture(
+                layer_id=0,
+                boundary="attn_input",
+                hidden_states=tensor,
+                residual=tensor,
+                hidden_row_domain="pp_full_target_verify_tree_node",
+                residual_row_domain="pp_attn_group_target_verify_tree_node",
+            )
 
     def test_pp_sender_probe_installs_expected_pp0_layer_anchors(self):
         probe = EaglePPSenderProbe(
@@ -361,6 +481,8 @@ class TestEagleNumericalProbe(unittest.TestCase):
                 boundary=boundary,
                 hidden_states=hidden + offset,
                 residual=hidden + offset + 1,
+                hidden_row_domain="pp_attn_group_target_verify_tree_node",
+                residual_row_domain="pp_attn_group_target_verify_tree_node",
             )
         probe._target_forward_observer = observer
         proxy = {"hidden_states": hidden, "residual": hidden + 1}
@@ -412,6 +534,12 @@ class TestEagleNumericalProbe(unittest.TestCase):
             set(payload["stages"]["target_verify_layer_00_mlp_input"]["tensors"]),
             {"hidden_states", "residual"},
         )
+        self.assertEqual(
+            payload["stages"]["target_verify_layer_00_mlp_input"]["tensors"][
+                "hidden_states"
+            ]["logical_rows"],
+            2,
+        )
 
     def test_pp_sender_probe_rejects_stage_rows_beyond_snapshot_capacity(self):
         probe = EaglePPSenderProbe(
@@ -420,10 +548,19 @@ class TestEagleNumericalProbe(unittest.TestCase):
             pod_name="probe-pod",
             pod_uid="probe-pod-uid",
         )
-        with self.assertRaisesRegex(ValueError, "invalid target-forward logical_rows"):
+        with self.assertRaisesRegex(ValueError, "invalid target-forward metadata"):
             probe._finalize_stage_snapshot(
                 {
-                    "logical_rows": 3,
+                    "tensor_metadata": {
+                        "hidden_states": {
+                            "logical_rows": 3,
+                            "row_domain": "pp_rank_local_target_verify_tree_node",
+                        },
+                        "residual": {
+                            "logical_rows": 2,
+                            "row_domain": "pp_rank_local_target_verify_tree_node",
+                        },
+                    },
                     "tensors": {
                         "hidden_states": torch.ones((2, 3)),
                         "residual": torch.ones((2, 3)),
