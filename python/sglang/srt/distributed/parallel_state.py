@@ -1702,6 +1702,7 @@ class GroupCoordinator:
         dst: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
         async_send: bool = False,
+        batch_p2p: bool = False,
     ) -> Optional[List[P2PWork]]:
         """Send the input tensor dictionary.
         NOTE: `dst` is the local rank of the source rank.
@@ -1736,6 +1737,22 @@ class GroupCoordinator:
         send_func = torch.distributed.isend if async_send else torch.distributed.send
         p2p_works = self.send_object(metadata_list, dst=dst, async_send=async_send)
 
+        if not batch_p2p:
+            for tensor in tensor_list:
+                if tensor.numel() == 0:
+                    continue
+                if (
+                    all_gather_group is not None
+                    and tensor.numel() % all_gather_size == 0
+                ):
+                    tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+                comm_group = metadata_group if tensor.is_cpu else group
+                work = send_func(tensor, self.ranks[dst], group=comm_group)
+                if async_send:
+                    p2p_works.append(P2PWork(work, tensor))
+            return p2p_works
+
+        tensors_to_send = []
         for tensor in tensor_list:
             if tensor.numel() == 0:
                 # Skip sending empty tensors.
@@ -1746,15 +1763,33 @@ class GroupCoordinator:
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
             comm_group = metadata_group if tensor.is_cpu else group
-            work = send_func(tensor, self.ranks[dst], group=comm_group)
+            tensors_to_send.append((tensor, comm_group))
+        if tensors_to_send:
+            ops = [
+                torch.distributed.P2POp(
+                    torch.distributed.isend,
+                    tensor,
+                    self.ranks[dst],
+                    group=comm_group,
+                )
+                for tensor, comm_group in tensors_to_send
+            ]
+            works = torch.distributed.batch_isend_irecv(ops)
             if async_send:
-                p2p_works.append(P2PWork(work, tensor))
+                p2p_works.extend(
+                    P2PWork(work, tensor)
+                    for work, (tensor, _) in zip(works, tensors_to_send)
+                )
+            else:
+                for work in works:
+                    work.wait()
         return p2p_works
 
     def recv_tensor_dict(
         self,
         src: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
+        batch_p2p: bool = False,
     ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
         """Recv the input tensor dictionary.
         NOTE: `src` is the local rank of the source rank.
@@ -1777,6 +1812,36 @@ class GroupCoordinator:
 
         recv_metadata_list = self.recv_object(src=src)
         tensor_dict: Dict[str, Any] = {}
+        if not batch_p2p:
+            for key, value in recv_metadata_list:
+                if isinstance(value, TensorMetadata):
+                    tensor = torch.empty(
+                        value.size, dtype=value.dtype, device=value.device
+                    )
+                    if tensor.numel() == 0:
+                        tensor_dict[key] = tensor
+                        continue
+                    use_all_gather = (
+                        all_gather_group is not None
+                        and tensor.numel() % all_gather_size == 0
+                    )
+                    if use_all_gather:
+                        orig_shape = tensor.shape
+                        tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+                    comm_group = metadata_group if tensor.is_cpu else group
+                    work = torch.distributed.irecv(
+                        tensor, src=self.ranks[src], group=comm_group
+                    )
+                    work.wait()
+                    if use_all_gather:
+                        tensor = all_gather_group.all_gather(tensor, dim=0)
+                        tensor = tensor.reshape(orig_shape)
+                    tensor_dict[key] = tensor
+                else:
+                    tensor_dict[key] = value
+            return tensor_dict
+
+        tensors_to_recv = []
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
                 tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
@@ -1791,24 +1856,33 @@ class GroupCoordinator:
                     and tensor.numel() % all_gather_size == 0
                 )
 
+                orig_shape = None
                 if use_all_gather:
                     orig_shape = tensor.shape
                     tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
-                # We have to use irecv here to make it work for both isend and send.
                 comm_group = metadata_group if tensor.is_cpu else group
-                work = torch.distributed.irecv(
-                    tensor, src=self.ranks[src], group=comm_group
-                )
-                work.wait()
-
-                if use_all_gather:
-                    tensor = all_gather_group.all_gather(tensor, dim=0)
-                    tensor = tensor.reshape(orig_shape)
-
-                tensor_dict[key] = tensor
+                tensors_to_recv.append((key, tensor, orig_shape, comm_group))
             else:
                 tensor_dict[key] = value
+        if tensors_to_recv:
+            ops = [
+                torch.distributed.P2POp(
+                    torch.distributed.irecv,
+                    tensor,
+                    self.ranks[src],
+                    group=comm_group,
+                )
+                for _, tensor, _, comm_group in tensors_to_recv
+            ]
+            works = torch.distributed.batch_isend_irecv(ops)
+            for work in works:
+                work.wait()
+        for key, tensor, orig_shape, _ in tensors_to_recv:
+            if orig_shape is not None:
+                tensor = all_gather_group.all_gather(tensor, dim=0)
+                tensor = tensor.reshape(orig_shape)
+            tensor_dict[key] = tensor
         return tensor_dict
 
     def barrier(self):

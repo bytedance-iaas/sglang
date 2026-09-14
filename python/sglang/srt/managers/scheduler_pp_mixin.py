@@ -842,6 +842,7 @@ class SchedulerPPMixin:
         tensor_dict: Dict[str, torch.Tensor],
         async_send: bool = True,
         msg_type: str = "default",
+        batch_p2p: bool = False,
     ):
         # Warn once if using default untyped messages
         if msg_type == "default":
@@ -856,6 +857,7 @@ class SchedulerPPMixin:
                 tensor_dict=tensor_dict,
                 all_gather_group=(self.attn_tp_group),
                 async_send=async_send,
+                batch_p2p=batch_p2p,
             )
         )
         return p2p_work
@@ -864,6 +866,7 @@ class SchedulerPPMixin:
         self: Scheduler,
         expected_kind: str = "default",
         all_gather_group: Optional = None,
+        batch_p2p: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """Receive a typed tensor dict, demultiplexing by msg_type.
 
@@ -877,7 +880,8 @@ class SchedulerPPMixin:
 
         while True:
             tensor_dict = self.pp_group.recv_tensor_dict(
-                all_gather_group=all_gather_group
+                all_gather_group=all_gather_group,
+                batch_p2p=batch_p2p,
             )
             received_kind = tensor_dict.get("__msg_type__", "default")
             if received_kind == expected_kind:
@@ -913,6 +917,7 @@ class SchedulerPPMixin:
             self._pp_recv_typed_dict(
                 expected_kind="vpp_proxy",
                 all_gather_group=self.attn_tp_group,
+                batch_p2p=True,
             )
         )
 
@@ -1198,6 +1203,7 @@ class SchedulerPPMixin:
                     first_proxy.tensors,
                     async_send=True,
                     msg_type="vpp_proxy",
+                    batch_p2p=True,
                 )
 
                 second_proxy = self._pp_recv_vpp_proxy_tensors(first_visit=False)
@@ -1217,6 +1223,7 @@ class SchedulerPPMixin:
                         proxy.tensors,
                         async_send=True,
                         msg_type="vpp_proxy",
+                        batch_p2p=True,
                     )
                     self._pp_commit_comm_work(second_send)
                 set_time_batch(

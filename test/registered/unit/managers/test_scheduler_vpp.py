@@ -111,6 +111,7 @@ class TestSchedulerVPP(unittest.TestCase):
         scheduler._pp_recv_typed_dict.assert_called_once_with(
             expected_kind="vpp_proxy",
             all_gather_group=scheduler.attn_tp_group,
+            batch_p2p=True,
         )
 
     @patch(
@@ -156,11 +157,13 @@ class TestSchedulerVPP(unittest.TestCase):
                     first_output.tensors,
                     async_send=True,
                     msg_type="vpp_proxy",
+                    batch_p2p=True,
                 ),
                 call(
                     second_output.tensors,
                     async_send=True,
                     msg_type="vpp_proxy",
+                    batch_p2p=True,
                 ),
             ],
         )
@@ -199,6 +202,7 @@ class TestSchedulerVPP(unittest.TestCase):
             first_output.tensors,
             async_send=True,
             msg_type="vpp_proxy",
+            batch_p2p=True,
         )
         scheduler._pp_prepare_tensor_dict.assert_called_once_with(final_result, batch)
         queued_event, queued_output = output_queue.pop()
