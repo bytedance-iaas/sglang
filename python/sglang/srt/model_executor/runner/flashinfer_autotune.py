@@ -30,6 +30,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_model,
+    get_parallel,
     get_schedule,
     get_spec,
     max_prefill_buffer_tokens,
@@ -58,6 +59,11 @@ def should_run_flashinfer_autotune(
     """Check if flashinfer autotune should be run."""
     mr = model_runner
     if mr.device != "cuda":
+        return False
+    if (
+        get_parallel().pp_virtual_stages > 1
+        and get_disagg().disaggregation_mode == "prefill"
+    ):
         return False
     if get_exec().kernel.disable_flashinfer_autotune:
         return False
