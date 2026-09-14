@@ -61,6 +61,21 @@ class SchedulerPPMixin:
     def _pp_vpp_enabled(self: Scheduler) -> bool:
         return get_parallel().pp_virtual_stages > 1
 
+    def _pp_prewarm_vpp_device_group(self: Scheduler) -> None:
+        if not self._pp_vpp_enabled():
+            return
+        warmup_tensor = torch.zeros(
+            1,
+            dtype=torch.int32,
+            device=self.pp_group.device,
+        )
+        torch.distributed.all_reduce(
+            warmup_tensor,
+            group=self.pp_group.device_group,
+        )
+        self.pp_group.device_module.synchronize()
+        logger.info("VPP pipeline device group prewarm completed")
+
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
         """

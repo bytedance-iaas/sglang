@@ -4,6 +4,8 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
+import torch
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
@@ -54,6 +56,46 @@ def _make_scheduler(*, is_first_rank=False, is_last_rank=False):
 
 
 class TestSchedulerVPP(unittest.TestCase):
+    def test_prewarm_initializes_full_vpp_device_group(self):
+        scheduler = SchedulerPPMixin()
+        device_group = object()
+        scheduler.pp_group = SimpleNamespace(
+            device="cuda",
+            device_group=device_group,
+            device_module=SimpleNamespace(synchronize=MagicMock()),
+        )
+        warmup_tensor = object()
+
+        with (
+            patch.object(scheduler, "_pp_vpp_enabled", return_value=True),
+            patch(
+                "sglang.srt.managers.scheduler_pp_mixin.torch.zeros",
+                return_value=warmup_tensor,
+            ) as zeros,
+            patch(
+                "sglang.srt.managers.scheduler_pp_mixin.torch.distributed.all_reduce"
+            ) as all_reduce,
+        ):
+            scheduler._pp_prewarm_vpp_device_group()
+
+        zeros.assert_called_once_with(1, dtype=torch.int32, device="cuda")
+        all_reduce.assert_called_once_with(warmup_tensor, group=device_group)
+        scheduler.pp_group.device_module.synchronize.assert_called_once_with()
+
+    def test_prewarm_is_noop_without_vpp(self):
+        scheduler = SchedulerPPMixin()
+        scheduler.pp_group = MagicMock()
+
+        with (
+            patch.object(scheduler, "_pp_vpp_enabled", return_value=False),
+            patch(
+                "sglang.srt.managers.scheduler_pp_mixin.torch.distributed.all_reduce"
+            ) as all_reduce,
+        ):
+            scheduler._pp_prewarm_vpp_device_group()
+
+        all_reduce.assert_not_called()
+
     def test_recv_first_visit_skips_only_on_first_physical_rank(self):
         scheduler = SchedulerPPMixin()
         scheduler.pp_group = SimpleNamespace(is_first_rank=True)
