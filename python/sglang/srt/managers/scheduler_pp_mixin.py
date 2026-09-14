@@ -127,6 +127,10 @@ class SchedulerPPMixin:
         self.pp_group.device_module.synchronize()
         logger.info("VPP pipeline device group prewarm completed")
 
+    def _pp_relay_vpp_control(self: Scheduler, data) -> None:
+        if self._pp_vpp_enabled() and not self.pp_group.is_last_rank:
+            self._pp_send_pyobj_to_next_stage(data, async_send=False)
+
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
         """
@@ -298,6 +302,7 @@ class SchedulerPPMixin:
         send_transfer_work = []
         send_consensus_bootstrapped_work = []
         send_release_work = []
+        vpp_enabled = self._pp_vpp_enabled()
 
         while True:
             server_is_idle = True
@@ -313,18 +318,51 @@ class SchedulerPPMixin:
                 d2h_event = None
                 next_batch_result = None
 
+                # #region debug-point C:control-request-relay
+                _vpp_debug_event(
+                    self,
+                    "C",
+                    "scheduler_pp_mixin.py:event_loop_pp_disagg_prefill",
+                    "request ingest enter",
+                    {"mb_id": mb_id},
+                )
                 recv_reqs = self.ingest_requests()
+                _vpp_debug_event(
+                    self,
+                    "C",
+                    "scheduler_pp_mixin.py:event_loop_pp_disagg_prefill",
+                    "request ingest complete",
+                    {"mb_id": mb_id, "request_count": len(recv_reqs)},
+                )
+                # #endregion
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
+                    self._pp_relay_vpp_control(recv_reqs)
 
                 bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
                 bmbs[mb_id] = bootstrapped_rids
                 self._pp_commit_comm_work(send_bootstrapped_work)
+                self._pp_relay_vpp_control(bootstrapped_rids)
 
                 transferred_rids = self._pp_pd_get_prefill_transferred_ids()
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
+                self._pp_relay_vpp_control(transferred_rids)
+                # #region debug-point C:control-relay-complete
+                _vpp_debug_event(
+                    self,
+                    "C",
+                    "scheduler_pp_mixin.py:event_loop_pp_disagg_prefill",
+                    "control relay complete",
+                    {
+                        "mb_id": mb_id,
+                        "request_count": len(recv_reqs),
+                        "bootstrapped_count": len(bootstrapped_rids),
+                        "transferred_count": len(transferred_rids),
+                    },
+                )
+                # #endregion
 
                 self.process_prefill_chunk(
                     last_batch=self.last_batch, running_batch=self.running_batch
@@ -417,15 +455,16 @@ class SchedulerPPMixin:
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
                 if not self.pp_group.is_last_rank:
-                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
-                    )
-                    send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
-                        bootstrapped_rids, async_send=True
-                    )
-                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
-                        transferred_rids, async_send=True
-                    )
+                    if not vpp_enabled:
+                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                            recv_reqs, async_send=True
+                        )
+                        send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
+                            bootstrapped_rids, async_send=True
+                        )
+                        send_transfer_work = self._pp_send_pyobj_to_next_stage(
+                            transferred_rids, async_send=True
+                        )
                     if cur_batch and not self._pp_vpp_enabled():
                         self.device_module.current_stream().wait_event(
                             self.launch_event

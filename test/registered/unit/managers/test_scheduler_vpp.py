@@ -96,6 +96,30 @@ class TestSchedulerVPP(unittest.TestCase):
 
         all_reduce.assert_not_called()
 
+    def test_vpp_control_is_relayed_synchronously_before_forward(self):
+        scheduler = SchedulerPPMixin()
+        scheduler.pp_group = SimpleNamespace(is_last_rank=False)
+        scheduler._pp_send_pyobj_to_next_stage = MagicMock()
+        payload = ["request"]
+
+        with patch.object(scheduler, "_pp_vpp_enabled", return_value=True):
+            scheduler._pp_relay_vpp_control(payload)
+
+        scheduler._pp_send_pyobj_to_next_stage.assert_called_once_with(
+            payload,
+            async_send=False,
+        )
+
+    def test_vpp_control_stops_at_last_physical_rank(self):
+        scheduler = SchedulerPPMixin()
+        scheduler.pp_group = SimpleNamespace(is_last_rank=True)
+        scheduler._pp_send_pyobj_to_next_stage = MagicMock()
+
+        with patch.object(scheduler, "_pp_vpp_enabled", return_value=True):
+            scheduler._pp_relay_vpp_control(["request"])
+
+        scheduler._pp_send_pyobj_to_next_stage.assert_not_called()
+
     def test_recv_first_visit_skips_only_on_first_physical_rank(self):
         scheduler = SchedulerPPMixin()
         scheduler.pp_group = SimpleNamespace(is_first_rank=True)
