@@ -89,6 +89,19 @@ class SidpManager:
         # segments (native DP8, 2xPP4, ... => unchanged behavior).
         self._pipeline_layers = 0
         self._tail_local_ids: set[int] = set()
+        # Explicit fetch-plan mode. When ``fetch_plan_path`` is set, the set of
+        # remotely-fetched layers is taken verbatim from a JSON plan (arbitrary
+        # spread from the offline planner) instead of "every non-owner layer".
+        # owner assignment (owner=lid%G within the segment) is unchanged, so every
+        # layer still has a resident source. The fetched layers ride the SAME
+        # depth-2 cycle pipeline by treating each fetched layer, in compute order,
+        # as its own single-member cycle (fetch index j -> cycle j, slot j%2), so
+        # ``_cycle_of_layer_map`` remaps the hot-path cycle formula. Requires the
+        # simple per-slot Event path (no flag/SM/dynamic backend) in this version.
+        self.fetch_plan_path = getattr(config, "fetch_plan_path", "")
+        self._plan_mode = bool(self.fetch_plan_path)
+        self._plan_fetch_layers: List[int] = []
+        self._cycle_of_layer_map: Dict[int, int] = {}
         self.coord_mode = config.coord_mode
         self.barrier_interval_cycles = config.barrier_interval_cycles
         # 0 means "all members"; otherwise a fixed subset of M members runs the
@@ -131,6 +144,23 @@ class SidpManager:
         self.slot_sync = config.slot_sync
         if self.slot_sync not in {mode.value for mode in SidpSlotSync}:
             raise ValueError(f"invalid SiDP slot_sync: {self.slot_sync}")
+        if self._plan_mode:
+            # First version of the explicit fetch-plan path rides the simple
+            # per-slot Event RAW/WAR ring (see _do_prefetch / _consume_events),
+            # which supports an arbitrary sparse set of fetched layers. The flag /
+            # SM / conditional-DMA backends encode the dense per-cycle layout and
+            # are not wired for arbitrary spreads yet, so force compute+dma+event.
+            if (
+                self.prefetch_policy != SidpPrefetchPolicy.COMPUTE.value
+                or self.copy_backend != SidpCopyBackend.DMA.value
+                or self.slot_sync != SidpSlotSync.EVENT.value
+            ):
+                raise ValueError(
+                    "SiDP fetch-plan mode currently requires --sidp-prefetch-policy "
+                    "compute, --sidp-copy-backend dma, and --sidp-slot-sync event "
+                    f"(got {self.prefetch_policy}/{self.copy_backend}/"
+                    f"{self.slot_sync})"
+                )
         self.dynamic_claim_order = config.dynamic_claim_order
         if self.dynamic_claim_order not in {
             order.value for order in SidpDynamicClaimOrder
@@ -433,18 +463,33 @@ class SidpManager:
         # from both the owner-publish set and the remote-fetch set.
         local_layers = []
         non_local_layers = []
-        for lid in sorted(layers.keys()):
-            local_lid = lid - self.layer_offset
-            if local_lid in self._tail_local_ids:
-                continue  # resident tail: not shared, not fetched
-            if is_local_layer(
-                local_lid, self.dp_rank, self.dp_size, self.k
-            ):
-                local_layers.append(lid)
-            else:
-                non_local_layers.append(lid)
+        if self._plan_mode:
+            # Explicit plan: the fetched set is exactly this rank's listed layers
+            # that fall in this stage's held segment. Everything else in the
+            # segment stays resident (including this rank's own owner layers).
+            fetch_set = self._load_plan_fetch_set(sorted(layers.keys()))
+            for lid in sorted(layers.keys()):
+                if lid in fetch_set:
+                    non_local_layers.append(lid)
+                else:
+                    local_layers.append(lid)
+        else:
+            for lid in sorted(layers.keys()):
+                local_lid = lid - self.layer_offset
+                if local_lid in self._tail_local_ids:
+                    continue  # resident tail: not shared, not fetched
+                if is_local_layer(
+                    local_lid, self.dp_rank, self.dp_size, self.k
+                ):
+                    local_layers.append(lid)
+                else:
+                    non_local_layers.append(lid)
         self._non_local_layers = non_local_layers
-        self._build_cycle_schedule()
+        if self._plan_mode:
+            self._build_plan_schedule(non_local_layers)
+            self._verify_plan_integrity(non_local_layers)
+        else:
+            self._build_cycle_schedule()
         if self.enable_graph_profiling:
             self._graph_profiler = SidpGraphProfiler(
                 dp_rank=self.dp_rank,
@@ -1084,8 +1129,8 @@ class SidpManager:
         slot = self._layer_to_slot[layer_id]
         compute_stream = torch.cuda.current_stream()
 
-        if self.enable_cycle_overlap and self.k < self.dp_size:
-            if (layer_id - self.layer_offset) // self.dp_size == 0:
+        if self.enable_cycle_overlap and (self._plan_mode or self.k < self.dp_size):
+            if self.cycle_of_layer(layer_id) == 0:
                 # The previous forward's tail (or setup for the first forward)
                 # established the cycle-0-resident invariant.
                 self._decode_weight_before_compute(layer_id, slot, compute_stream)
@@ -1126,7 +1171,7 @@ class SidpManager:
         else:
             self._consume_events[slot].record(torch.cuda.current_stream())
 
-        cycle = (layer_id - self.layer_offset) // self.dp_size
+        cycle = self.cycle_of_layer(layer_id)
         if self._last_non_local_in_cycle.get(cycle) == layer_id:
             next_cycle = cycle + self._cycle_cache_depth
             if next_cycle < self._num_cycles:
@@ -1559,6 +1604,137 @@ class SidpManager:
             )
         return pipeline_layers
 
+    def _load_plan_fetch_set(self, seg_layer_ids: List[int]) -> set:
+        """Read the JSON fetch-plan and return THIS rank's fetched layers.
+
+        The plan lists global decoder-layer ids per SiDP rank. This process keeps
+        only the ids that fall in the segment it actually holds (identity for
+        native/external single-stage; a sub-range per stage under cross-PP). The
+        result feeds the local/non-local split; owner assignment is unchanged, so
+        completeness is guaranteed by the integrity check once the whole group's
+        fetch sets are exchanged (``_verify_plan_integrity``).
+        """
+        import json
+
+        with open(self.fetch_plan_path) as f:
+            plan = json.load(f)
+        fetch_layers = plan.get("fetch_layers", {})
+        raw = fetch_layers.get(str(self.dp_rank), [])
+        seg = set(seg_layer_ids)
+        # Keep only layers this stage actually holds; a listed layer outside the
+        # segment is silently dropped (another stage owns it). A listed layer this
+        # rank owns is a plan bug -- caught loudly in _verify_plan_integrity.
+        fetch = {lid for lid in raw if lid in seg}
+        if self.enable_debug_logging:
+            logger.info(
+                f"[SiDP rank{self.dp_rank}] fetch-plan: {len(fetch)} fetched / "
+                f"{len(seg)} held (plan lists {len(raw)} for this rank)"
+            )
+        return fetch
+
+    def _build_plan_schedule(self, non_local_layers: List[int]) -> None:
+        """Schedule structures for plan mode: one fetched layer per pipeline cycle.
+
+        Each fetched layer (in compute order) is its own single-member cycle, so
+        the existing depth-2 rolling ring applies verbatim: cycle index = fetch
+        order j, slot = j % 2, prefetch(j) released by compute(j-2). Requires an
+        EVEN number of fetched layers so the next-forward cycle-0 refill (advances
+        by cache_depth=2) lands correctly, matching the modulo path's even-cycle
+        invariant.
+        """
+        self._plan_fetch_layers = sorted(non_local_layers)
+        n = len(self._plan_fetch_layers)
+        if n == 0:
+            # No remote fetch on this rank/stage: everything resident. Leave the
+            # pipeline empty; begin_forward's cycle-0 guard (_cycle_layers.get(0))
+            # is falsy so no prefetch is scheduled.
+            self._num_cycles = 0
+            self._cycle_cache_depth = 0
+            self._remote_positions = []
+            self._remote_position_to_index = {}
+            self._cycle_of_layer_map = {}
+            self._fetch_schedule = []
+            self._cycle_layers = {}
+            self._last_non_local_in_cycle = {}
+            return
+        if n % self.cache_cycles != 0:
+            raise ValueError(
+                f"SiDP fetch-plan rank {self.dp_rank} has {n} fetched layers in "
+                f"its segment; must be a multiple of cache_cycles "
+                f"({self.cache_cycles}) so the depth-{self.cache_cycles} ring "
+                "wraps cleanly across forwards. Adjust the plan (or pad with an "
+                "extra fetched layer)."
+            )
+        # fetch index j == cycle index; one member ("position 0") per cycle.
+        self._cycle_of_layer_map = {
+            lid: j for j, lid in enumerate(self._plan_fetch_layers)
+        }
+        self._num_cycles = n
+        self._cycle_cache_depth = min(self.cache_cycles, self._num_cycles)
+        self._remote_positions = [0]
+        self._remote_position_to_index = {0: 0}
+        self._fetch_schedule = list(self._plan_fetch_layers)
+        self._cycle_layers = {j: [lid] for j, lid in enumerate(self._plan_fetch_layers)}
+        self._last_non_local_in_cycle = {
+            j: lid for j, lid in enumerate(self._plan_fetch_layers)
+        }
+        if self.enable_debug_logging:
+            logger.info(
+                f"[SiDP rank{self.dp_rank}] plan schedule: {n} fetched layers, "
+                f"{self._num_cycles} pipeline cycles, depth={self._cycle_cache_depth}"
+            )
+
+    def _verify_plan_integrity(self, non_local_layers: List[int]) -> None:
+        """Cross-rank completeness check for plan mode (source existence).
+
+        Local invariant (checkable here): no rank may fetch a layer it owns, or
+        the owner would have released it and no source would exist. Cross-rank
+        invariant: for every fetched layer L, its owner rank must NOT also fetch L
+        (i.e. the owner keeps it resident). We exchange each rank's fetch set over
+        the same TCPStore used for IPC handles, BEFORE any publish/get, so an
+        orphan layer fails loudly here instead of hanging a later store.get().
+        """
+        # 1) local: never fetch a layer this rank owns.
+        for lid in non_local_layers:
+            if self.owner_of_layer(lid) == self.dp_rank:
+                raise ValueError(
+                    f"SiDP fetch-plan rank {self.dp_rank} fetches layer {lid} it "
+                    f"owns (owner_of_layer={self.dp_rank}); the owner must keep "
+                    "its layers resident so a source exists."
+                )
+        # 2) cross-rank: publish this rank's fetch set, read every rank's, and
+        #    assert each fetched layer's owner is not itself fetching it.
+        key = f"sidp/plan/{self.pp_stage}/fetch/{self.dp_rank}"
+        self.store.set(key, ",".join(str(x) for x in sorted(non_local_layers)))
+        all_keys = [
+            f"sidp/plan/{self.pp_stage}/fetch/{r}" for r in range(self.dp_size)
+        ]
+        try:
+            self.store.wait(all_keys)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"SiDP fetch-plan integrity exchange failed at rank "
+                f"{self.dp_rank} (stage {self.pp_stage})"
+            ) from exc
+        fetch_by_rank: Dict[int, set] = {}
+        for r in range(self.dp_size):
+            raw = self.store.get(f"sidp/plan/{self.pp_stage}/fetch/{r}")
+            text = raw.decode() if isinstance(raw, bytes) else raw
+            fetch_by_rank[r] = {int(x) for x in text.split(",") if x}
+        for lid in non_local_layers:
+            owner = self.owner_of_layer(lid)
+            if lid in fetch_by_rank.get(owner, set()):
+                raise RuntimeError(
+                    f"SiDP fetch-plan: layer {lid} has no resident source -- its "
+                    f"owner rank {owner} also fetches it. Fix the plan so each "
+                    "fetched layer's owner keeps it resident."
+                )
+        if self.enable_debug_logging:
+            logger.info(
+                f"[SiDP rank{self.dp_rank}] fetch-plan integrity OK "
+                f"({len(non_local_layers)} fetched, all sourced)"
+            )
+
     def _build_cycle_schedule(self):
         """Build compute-order cycle membership and stable slot identities.
 
@@ -1644,6 +1820,13 @@ class SidpManager:
         if self.enable_cycle_overlap:
             remote_count = len(self._remote_positions)
             for lid in non_local_layers:
+                if self._plan_mode:
+                    # Plan mode: one fetched layer per "cycle" (remote_count==1),
+                    # so the slot is just the fetch index modulo the ring depth.
+                    self._layer_to_slot[lid] = (
+                        self.cycle_of_layer(lid) % self._cycle_cache_depth
+                    )
+                    continue
                 local_lid = lid - self.layer_offset
                 cycle = local_lid // self.dp_size
                 position = local_lid % self.dp_size
@@ -1748,7 +1931,14 @@ class SidpManager:
         Owner/cycle/slot math uses segment-local ids so a cross-PP stage that
         holds a non-zero global layer range still cycles from 0. layer_offset is
         0 for native + external single-stage services (identity there).
+
+        In fetch-plan mode there is no dense modulo layout: each fetched layer, in
+        compute order, is its own single-member "cycle" (fetch index j), so the
+        pipeline's cycle/slot bookkeeping (slot = j % cache_depth, prefetch j+2)
+        applies unchanged. Resident (non-fetched) layers are never queried here.
         """
+        if self._plan_mode:
+            return self._cycle_of_layer_map[layer_id]
         return (layer_id - self.layer_offset) // self.dp_size
 
     def owner_of_layer(self, layer_id: int) -> int:

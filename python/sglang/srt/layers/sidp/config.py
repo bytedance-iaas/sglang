@@ -58,6 +58,11 @@ class SidpConfig:
     # fetch/copy data path is otherwise unchanged.
     cross_pp: bool = False
     pp_stage: int = 0
+    # Explicit fetch-plan: path to a JSON that lists, per SiDP rank, exactly which
+    # decoder layers this rank fetches remotely (the arbitrary spread from the
+    # offline planner). Empty = current behavior (fetch every non-owner layer).
+    # owner assignment is unchanged, so every layer still has a resident source.
+    fetch_plan_path: str = ""
     # Direction A Phase 2: coordinated_static GPU data plane. When True, a
     # cross-member device barrier (sense-reversing, host-free) is inserted every
     # ``barrier_interval_cycles`` prefetch cycles on the comm stream to correct

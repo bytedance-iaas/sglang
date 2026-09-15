@@ -1219,6 +1219,7 @@ class ModelRunner:
             external_mode=external_mode,
             cross_pp=cross_pp,
             pp_stage=pp_stage,
+            fetch_plan_path=getattr(self.server_args, "sidp_fetch_plan", ""),
             coord_mode=getattr(self.server_args, "sidp_coord_mode", False),
             barrier_interval_cycles=getattr(
                 self.server_args, "sidp_barrier_interval_cycles", 4

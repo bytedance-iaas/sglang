@@ -1304,6 +1304,20 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = "127.0.0.1"
+    sidp_fetch_plan: A[
+        str,
+        Arg(
+            help="Path to a JSON fetch-plan that explicitly lists which decoder "
+            "layers each SiDP rank fetches remotely (the rest stay resident). "
+            "Format: {\"meta\": {\"dp_size\", \"num_layers\", ...}, "
+            "\"fetch_layers\": {\"<rank>\": [global layer ids]}}. Layers are the "
+            "arbitrary spread produced by the offline planner; owner assignment "
+            "(owner=layer%dp_size, resident) is unchanged so every layer has a "
+            "source. Empty (default) reproduces the current behavior (fetch every "
+            "non-owner layer). See sidp_layer_distribution_dev_plan.md.",
+        ),
+        NS("parallel"),
+    ] = ""
     sidp_cross_pp: A[
         bool,
         Arg(
@@ -6834,12 +6848,18 @@ class ServerArgs:
         elif self.sidp_slot_sync == "auto":
             # Keep the old static-peak DMA behavior while switching the normal
             # fixed compute-order DMA path to the validated generation protocol.
-            self.sidp_slot_sync = (
-                "event"
-                if self.sidp_prefetch_policy == "static_peak"
-                and self.sidp_copy_backend == "dma"
-                else "flag"
-            )
+            # Explicit fetch-plan mode rides the simple per-slot Event ring (it
+            # supports an arbitrary sparse fetched set; the flag backend encodes
+            # the dense per-cycle layout), so resolve to event there.
+            if self.sidp_fetch_plan:
+                self.sidp_slot_sync = "event"
+            else:
+                self.sidp_slot_sync = (
+                    "event"
+                    if self.sidp_prefetch_policy == "static_peak"
+                    and self.sidp_copy_backend == "dma"
+                    else "flag"
+                )
         assert self.sidp_dma_slices >= 1, "sidp_dma_slices must be positive"
         assert self.sidp_dma_slice_groups >= 1, (
             "sidp_dma_slice_groups must be positive"
@@ -6911,6 +6931,7 @@ class ServerArgs:
         assert not (self.sidp_external_mode and self.sidp_cross_pp), (
             "SiDP external-worker mode and cross-PP mode are mutually exclusive"
         )
+        self._handle_sidp_fetch_plan()
         if self.sidp_cross_pp:
             # Cross-PP: G independent --pipeline-parallel-size services. The SiDP
             # member axis is the PP group (sidp_pp_group_id); the per-stage
@@ -7196,6 +7217,79 @@ class ServerArgs:
                 f"graph_profiling={self.sidp_enable_graph_profiling}, "
                 f"rdzv_port={self.sidp_rdzv_port}"
             )
+
+    def _handle_sidp_fetch_plan(self):
+        """Validate the optional explicit fetch-plan file (self-consistency only).
+
+        Empty path = current behavior (fetch every non-owner layer); nothing to
+        check. When a path is given, load it and verify the JSON is internally
+        consistent and matches the launched SiDP world size. Per-rank layer set
+        legality against each rank's ACTUAL held segment (cross-PP) and cross-rank
+        owner-residency (source existence) are validated later in the manager at
+        setup, where the real per-stage layer segment and owner map are known.
+        """
+        if not self.sidp_fetch_plan:
+            return
+        import json
+
+        # Plan mode rides the per-slot Event ring; the flag/SM backends encode the
+        # dense per-cycle layout and are not wired for an arbitrary spread yet.
+        assert self.sidp_slot_sync in ("auto", "event"), (
+            "SiDP fetch-plan mode requires --sidp-slot-sync event (or auto); "
+            f"got {self.sidp_slot_sync}"
+        )
+        assert self.sidp_copy_backend in ("auto", "dma"), (
+            "SiDP fetch-plan mode requires --sidp-copy-backend dma (or auto); "
+            f"got {self.sidp_copy_backend}"
+        )
+        assert self.sidp_prefetch_policy in ("auto", "compute"), (
+            "SiDP fetch-plan mode requires --sidp-prefetch-policy compute (or "
+            f"auto); got {self.sidp_prefetch_policy}"
+        )
+        assert os.path.isfile(self.sidp_fetch_plan), (
+            f"--sidp-fetch-plan file not found: {self.sidp_fetch_plan}"
+        )
+        with open(self.sidp_fetch_plan) as f:
+            plan = json.load(f)
+        assert isinstance(plan, dict) and "fetch_layers" in plan, (
+            "SiDP fetch-plan must be a JSON object with a 'fetch_layers' key"
+        )
+        meta = plan.get("meta", {})
+        plan_dp = meta.get("dp_size")
+        if plan_dp is not None:
+            assert plan_dp == self.sidp_size, (
+                f"SiDP fetch-plan meta.dp_size ({plan_dp}) != launched "
+                f"sidp_size ({self.sidp_size}); wrong plan file?"
+            )
+        fetch_layers = plan["fetch_layers"]
+        assert isinstance(fetch_layers, dict), (
+            "SiDP fetch-plan 'fetch_layers' must map rank -> [layer ids]"
+        )
+        # Every SiDP rank must have an entry (a rank with no remote fetch still
+        # needs an explicit empty list, so a missing key is a plan error).
+        for r in range(self.sidp_size):
+            assert str(r) in fetch_layers, (
+                f"SiDP fetch-plan is missing fetch_layers['{r}'] (all "
+                f"{self.sidp_size} ranks must have an entry, empty [] allowed)"
+            )
+        num_layers = meta.get("num_layers")
+        for key, layers in fetch_layers.items():
+            assert isinstance(layers, list), (
+                f"SiDP fetch-plan fetch_layers['{key}'] must be a list"
+            )
+            assert len(layers) == len(set(layers)), (
+                f"SiDP fetch-plan fetch_layers['{key}'] has duplicate layers"
+            )
+            for lid in layers:
+                assert isinstance(lid, int) and lid >= 0, (
+                    f"SiDP fetch-plan layer ids must be non-negative ints: "
+                    f"rank {key} has {lid!r}"
+                )
+                if num_layers is not None:
+                    assert lid < num_layers, (
+                        f"SiDP fetch-plan rank {key} layer {lid} >= "
+                        f"meta.num_layers ({num_layers})"
+                    )
 
     def _validate_sidp_graph_config(self):
         """SiDP checks that need final (not legacy bool) Graph configuration."""
