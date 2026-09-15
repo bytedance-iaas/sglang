@@ -294,6 +294,7 @@ def test_topk_v2_output_indices(batch: int, seq: int, k: int) -> None:
     [
         (8, 256, 512),  # trivial
         (8, 8192, 512),  # register
+        (8, 8192, 1536),  # register, non-power-of-two k
         (8, 8193, 512),  # register4
         (16, 65536, 512),  # streaming
         (8, 65537, 512),  # fused small-batch cluster
@@ -304,7 +305,7 @@ def test_topk_v2_output_indices(batch: int, seq: int, k: int) -> None:
 def test_topk_v2_paged_optional_raw_matches_same_selection(
     batch: int, seq: int, k: int
 ) -> None:
-    """The optional raw side output must invert the paged output exactly."""
+    """Paged and raw outputs must share one deterministic selected order."""
     torch.manual_seed(batch * 100003 + seq * 7 + k + 2)
     device = "cuda"
     width = (seq + 3) & ~3
@@ -320,9 +321,18 @@ def test_topk_v2_paged_optional_raw_matches_same_selection(
 
     paged, raw = _run_paged_with_raw(scores, seq_lens, page_table, k)
     for row in range(batch):
-        assert [v for v in raw[row] if v != -1] == _invert(paged[row], inv_cpu[row])
+        valid_raw = [v for v in raw[row] if v != -1]
+        assert valid_raw == sorted(valid_raw)
+        assert valid_raw == _invert(paged[row], inv_cpu[row])
     assert paged[0] == [-1] * k
     assert raw[0] == [-1] * k
+
+    paged_only_raw = _run(scores, seq_lens, page_table, inv_cpu, k)
+    assert paged_only_raw == [[v for v in row if v != -1] for row in raw]
+
+    paged_replay, raw_replay = _run_paged_with_raw(scores, seq_lens, page_table, k)
+    assert raw_replay == raw
+    assert paged_replay == paged
 
 
 # --- ragged entry point ------------------------------------------------------

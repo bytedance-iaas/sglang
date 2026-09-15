@@ -175,17 +175,59 @@ SGL_DEVICE void trivial_transform(const TopKProblem& problem, int32_t* raw_outpu
   });
 }
 
+SGL_DEVICE void sort_selected_indices(int32_t* indices, uint32_t topk) {
+  // Candidate collection uses shared-memory atomics, so its output slots do
+  // not have a stable order even when every selected member is identical.
+  // FlashMLA reduces in the supplied index order; canonicalize that order by
+  // sequence-relative index before applying the allocator-local page mapping.
+  // Pad a non-power-of-two width with INT_MAX so the first topk entries of
+  // the ascending bitonic result are exactly the selected non-negative indices.
+  uint32_t width = 1;
+  while (width < topk)
+    width <<= 1;
+  for (uint32_t index = threadIdx.x; index < width; index += kBlockSize) {
+    if (index >= topk) indices[index] = std::numeric_limits<int32_t>::max();
+  }
+  __syncthreads();
+
+  for (uint32_t size = 2; size <= width; size <<= 1) {
+    for (uint32_t stride = size >> 1; stride > 0; stride >>= 1) {
+      for (uint32_t index = threadIdx.x; index < width; index += kBlockSize) {
+        const uint32_t peer = index ^ stride;
+        if (peer > index) {
+          const int32_t left = indices[index];
+          const int32_t right = indices[peer];
+          const bool ascending = (index & size) == 0;
+          if ((left > right) == ascending) {
+            indices[index] = right;
+            indices[peer] = left;
+          }
+        }
+      }
+      __syncthreads();
+    }
+  }
+}
+
 template <TopKMode kMode>
-SGL_DEVICE void problem_transform(TopKProblem& problem, int32_t* output_ptr, int32_t* raw_output_ptr) {
+SGL_DEVICE void
+problem_transform(TopKProblem& problem, int32_t* staging_ptr, int32_t* output_ptr, int32_t* raw_output_ptr) {
   static_assert(kMode != TopKMode::INDICES, "problem_transform requires page-table output");
   static_assert(kMaxTopK % kBlockSize == 0);
   constexpr uint32_t kNumElems = kMaxTopK / kBlockSize;
   int32_t source_index[kNumElems];
   for_each_item(problem.topk, [&](uint32_t tx, uint32_t i) { source_index[i] = problem.out[tx]; });
+  // All reads must retire before writing when problem.out equals staging_ptr.
+  // The cluster-pool path instead copies its global output into this block's
+  // shared staging array. Both paths then use the identical canonicalization.
+  __syncthreads();
+  for_each_item(problem.topk, [&](uint32_t tx, uint32_t i) { staging_ptr[tx] = source_index[i]; });
+  sort_selected_indices(staging_ptr, problem.topk);
   problem.out = output_ptr;
   for_each_item(problem.topk, [&](uint32_t tx, uint32_t i) {
-    problem.transform_output(tx, source_index[i]);
-    if constexpr (kMode == TopKMode::DUAL_OUTPUT) raw_output_ptr[tx] = source_index[i];
+    const auto index = staging_ptr[tx];
+    problem.transform_output(tx, index);
+    if constexpr (kMode == TopKMode::DUAL_OUTPUT) raw_output_ptr[tx] = index;
   });
 }
 
@@ -322,7 +364,8 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params
   device::PDLTriggerSecondary<kPDL>();
   if constexpr (kNeedStaging) {
     __syncthreads();
-    problem_transform<kMode>(problem, params.get_output_ptr(blockIdx.x), params.get_raw_output_ptr(blockIdx.x));
+    problem_transform<kMode>(
+        problem, s_topk_indices, params.get_output_ptr(blockIdx.x), params.get_raw_output_ptr(blockIdx.x));
   }
 }
 
@@ -372,7 +415,8 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKPag
     // for sm_90a (issue #32830, previously worked around by copying `problem` in
     // #32910). Verified: dropping this line reproduces the crash on 13.1/13.2/13.3.
     __builtin_assume(problem.out == s_topk_indices);
-    problem_transform<kMode>(problem, params.get_output_ptr(blockIdx.x), params.get_raw_output_ptr(blockIdx.x));
+    problem_transform<kMode>(
+        problem, s_topk_indices, params.get_output_ptr(blockIdx.x), params.get_raw_output_ptr(blockIdx.x));
   }
 }
 #endif  // !USE_ROCM
