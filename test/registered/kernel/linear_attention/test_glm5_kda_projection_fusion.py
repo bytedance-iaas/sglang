@@ -44,8 +44,9 @@ def test_precision_gate_checks_every_projection(omitted):
     "tp_size,attn_size,attn_rank", [(4, 4, 0), (4, 4, 3), (8, 1, 0)]
 )
 @pytest.mark.parametrize("expert_quantized", [False, True])
+@pytest.mark.parametrize("fusion_mode", ["full", "a_only", "b_only"])
 def test_glm_kda_projection_loading_and_outputs(
-    monkeypatch, tp_size, attn_size, attn_rank, expert_quantized
+    monkeypatch, tp_size, attn_size, attn_rank, expert_quantized, fusion_mode
 ):
     import sglang.srt.models.glm5_next as glm
     from sglang.srt.configs.glm5_next import Glm5NextTextConfig
@@ -85,6 +86,9 @@ def test_glm_kda_projection_loading_and_outputs(
             glm.envs.SGLANG_OPT_GLM5_NEXT_KDA_PROJECTION_FUSION.override(
                 expert_quantized
             ),
+            glm.envs.SGLANG_OPT_GLM5_NEXT_KDA_PROJECTION_FUSION_MODE.override(
+                fusion_mode
+            ),
             glm.envs.SGLANG_DISABLE_KDA_PROJECTION_FUSION.override(False),
             torch.device("cuda"),
         ):
@@ -117,9 +121,16 @@ def test_glm_kda_projection_loading_and_outputs(
             weight = (
                 torch.randn(size, 256, device="cuda", generator=generator) * 0.025
             ).bfloat16()
-            fused.fused_qkvbfg_a_proj.weight_loader(
-                fused.fused_qkvbfg_a_proj.weight, weight, shard
-            )
+            if fused.fuse_qkvbfg_a:
+                fused.fused_qkvbfg_a_proj.weight_loader(
+                    fused.fused_qkvbfg_a_proj.weight, weight, shard
+                )
+            else:
+                module = getattr(fused, name)
+                if qkv_id is None:
+                    module.weight_loader(module.weight, weight)
+                else:
+                    module.weight_loader(module.weight, weight, qkv_id)
             module = getattr(unfused, name)
             if qkv_id is None:
                 module.weight_loader(module.weight, weight)
@@ -129,9 +140,13 @@ def test_glm_kda_projection_loading_and_outputs(
             weight = (
                 torch.randn(8192, 128, device="cuda", generator=generator) * 0.025
             ).bfloat16()
-            fused.fused_fg_b_proj.weight_loader(
-                fused.fused_fg_b_proj.weight, weight, shard
-            )
+            if fused.fuse_fg_b:
+                fused.fused_fg_b_proj.weight_loader(
+                    fused.fused_fg_b_proj.weight, weight, shard
+                )
+            else:
+                module = getattr(fused, name)
+                module.weight_loader(module.weight, weight)
             module = getattr(unfused, name)
             module.weight_loader(module.weight, weight)
         for tokens in (1, 2, 17):
@@ -148,4 +163,40 @@ def test_glm_kda_projection_loading_and_outputs(
         assert actual[2].shape[-1] == 8192 // attn_size
     finally:
         torch.set_default_dtype(old_dtype)
+        reset_context()
+
+
+def test_glm_kda_projection_invalid_mode_fails_closed(monkeypatch):
+    import sglang.srt.models.glm5_next as glm
+    from sglang.srt.configs.glm5_next import Glm5NextTextConfig
+
+    reset_context()
+    publish(ServerArgs(model_path="dummy"), role="tokenizer")
+    monkeypatch.setattr(
+        glm,
+        "get_parallel",
+        lambda: SimpleNamespace(
+            tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0
+        ),
+    )
+    config = Glm5NextTextConfig(
+        hidden_size=256,
+        dtype=torch.bfloat16,
+        linear_attn_config={
+            "num_heads": 64,
+            "head_dim": 128,
+            "short_conv_kernel_size": 4,
+            "kda_layers": [0],
+        },
+    )
+    try:
+        with (
+            glm.envs.SGLANG_OPT_GLM5_NEXT_KDA_PROJECTION_FUSION_MODE.override(
+                "invalid"
+            ),
+            torch.device("cuda"),
+            pytest.raises(ValueError, match="full, a_only, b_only"),
+        ):
+            glm.Glm5NextLinearAttention(0, 256, config, prefix=PREFIX)
+    finally:
         reset_context()

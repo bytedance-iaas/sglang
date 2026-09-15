@@ -1255,6 +1255,7 @@ class Envs:
     SGLANG_ENABLE_METADATA_GLUE_GRAPH = EnvBool(False)
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     SGLANG_OPT_GLM5_NEXT_KDA_PROJECTION_FUSION = EnvBool(False)
+    SGLANG_OPT_GLM5_NEXT_KDA_PROJECTION_FUSION_MODE = EnvStr("full")
     SGLANG_OPT_KDA_ACCEPTED_STATE = EnvBool(False)
     SGLANG_DISABLE_KDA_PROJECTION_FUSION = EnvBool(False)
     SGLANG_DSA_FP8_KV_LAYOUT = EnvStr("auto")
@@ -1414,7 +1415,7 @@ class Envs:
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
-    SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
+    SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
     # Per-rank local query rows (after DP-attention sharding when enabled),

@@ -32,7 +32,12 @@ from sglang.srt.layers.communicator import (
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
 )
-from sglang.srt.layers.communicator_mhc import MHCLayerCommunicator
+from sglang.kernels.ops.layernorm.mhc import mhc_fused_post_pre
+from sglang.srt.layers.communicator_mhc import (
+    MHCLayerCommunicator,
+    MHCPostPreResult,
+    MHCState,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
@@ -362,15 +367,38 @@ class Glm5NextLinearAttention(nn.Module):
                 ],
             )
         )
-        if self.do_fuse_qkvbfg:
-            self.qkvb_sizes = [
-                projection_size,
-                projection_size,
-                projection_size,
-                self.num_heads,
-            ]
-            self.fg_sizes = [self.head_dim, self.head_dim]
+        fusion_mode = (
+            envs.SGLANG_OPT_GLM5_NEXT_KDA_PROJECTION_FUSION_MODE.get()
+            if self.do_fuse_qkvbfg
+            else "off"
+        )
+        if fusion_mode not in {"off", "full", "a_only", "b_only"}:
+            raise ValueError(
+                "SGLANG_OPT_GLM5_NEXT_KDA_PROJECTION_FUSION_MODE must be "
+                "one of: full, a_only, b_only"
+            )
+        self.fuse_qkvbfg_a = fusion_mode in {"full", "a_only"}
+        self.fuse_fg_b = fusion_mode in {"full", "b_only"}
 
+        self.qkvb_sizes = [
+            projection_size,
+            projection_size,
+            projection_size,
+            self.num_heads,
+        ]
+        self.fg_sizes = [self.head_dim, self.head_dim]
+        self.split_sizes = [
+            3 * projection_size // head_shard_size,
+            self.num_heads // head_shard_size,
+            2 * self.head_dim,
+        ]
+        fused_dtype = (
+            getattr(config, "dtype", None)
+            or getattr(config, "torch_dtype", None)
+            or torch.get_default_dtype()
+        )
+
+        if self.fuse_qkvbfg_a:
             self.fused_qkvbfg_a_proj = MergedColumnParallelRepeatedLinear(
                 self.hidden_size,
                 self.qkvb_sizes,
@@ -382,24 +410,6 @@ class Glm5NextLinearAttention(nn.Module):
                 # layer whose source weights are BF16.
                 quant_config=None,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
-                tp_rank=head_shard_rank,
-                tp_size=head_shard_size,
-            )
-            self.split_sizes = [
-                3 * projection_size // head_shard_size,
-                self.num_heads // head_shard_size,
-                2 * self.head_dim,
-            ]
-            fused_dtype = (
-                getattr(config, "dtype", None)
-                or getattr(config, "torch_dtype", None)
-                or torch.get_default_dtype()
-            )
-            self.fused_fg_b_proj = ColumnParallelBatchedLinear(
-                2,
-                self.head_dim,
-                projection_size,
-                dtype=fused_dtype,
                 tp_rank=head_shard_rank,
                 tp_size=head_shard_size,
             )
@@ -415,7 +425,6 @@ class Glm5NextLinearAttention(nn.Module):
                 tp_size=head_shard_size,
                 prefix=f"{prefix}.qkv_proj",
             )
-
             self.f_a_proj = ReplicatedLinear(
                 self.hidden_size,
                 self.head_dim,
@@ -423,17 +432,6 @@ class Glm5NextLinearAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.f_a_proj",
             )
-
-            self.f_b_proj = ColumnParallelLinear(
-                self.head_dim,
-                projection_size,
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.f_b_proj",
-                tp_rank=head_shard_rank,
-                tp_size=head_shard_size,
-            )
-
             self.b_proj = ColumnParallelLinear(
                 self.hidden_size,
                 self.num_heads,
@@ -443,13 +441,32 @@ class Glm5NextLinearAttention(nn.Module):
                 tp_rank=head_shard_rank,
                 tp_size=head_shard_size,
             )
-
             self.g_a_proj = ReplicatedLinear(
                 self.hidden_size,
                 self.head_dim,
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.g_a_proj",
+            )
+
+        if self.fuse_fg_b:
+            self.fused_fg_b_proj = ColumnParallelBatchedLinear(
+                2,
+                self.head_dim,
+                projection_size,
+                dtype=fused_dtype,
+                tp_rank=head_shard_rank,
+                tp_size=head_shard_size,
+            )
+        else:
+            self.f_b_proj = ColumnParallelLinear(
+                self.head_dim,
+                projection_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.f_b_proj",
+                tp_rank=head_shard_rank,
+                tp_size=head_shard_size,
             )
             self.g_b_proj = ColumnParallelLinear(
                 self.head_dim,
@@ -541,13 +558,24 @@ class Glm5NextLinearAttention(nn.Module):
     def forward_qkvbfg_fused(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
-        fused_states = self.fused_qkvbfg_a_proj(hidden_states)
+        if self.fuse_qkvbfg_a:
+            fused_states = self.fused_qkvbfg_a_proj(hidden_states)
+            qkv, beta, fg_a_states = torch.split(
+                fused_states, self.split_sizes, dim=-1
+            )
+            f_a_states, g_a_states = fg_a_states.split(self.head_dim, dim=-1)
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+            beta = self.b_proj(hidden_states)[0]
+            f_a_states = self.f_a_proj(hidden_states)[0]
+            g_a_states = self.g_a_proj(hidden_states)[0]
 
-        qkv, beta, fg_a_states = torch.split(fused_states, self.split_sizes, dim=-1)
-
-        forget_gate, g_proj_states = self.fused_fg_b_proj(
-            fg_a_states.view(-1, 2, self.head_dim).transpose(0, 1)
-        )
+        if self.fuse_fg_b:
+            fg_a_states = torch.stack((f_a_states, g_a_states))
+            forget_gate, g_proj_states = self.fused_fg_b_proj(fg_a_states)
+        else:
+            forget_gate = self.f_b_proj(f_a_states)[0]
+            g_proj_states = self.g_b_proj(g_a_states)[0]
 
         return (
             qkv,
@@ -753,6 +781,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 hc_attn_pre=self.hc_attn_pre,
                 hc_ffn_pre=self.hc_ffn_pre,
                 hc_post=self.hc_post,
+                hc_post_attn_pre=self.hc_post_attn_pre,
             )
             self.layer_communicator = MHCLayerCommunicator(
                 **shared_kwargs,
@@ -809,6 +838,51 @@ class Glm5NextDecoderLayer(nn.Module):
             hc_mult=self.config.hc_mult,
         )
 
+    def hc_post_attn_pre(
+        self,
+        hidden_states,
+        residual,
+        h_res,
+        h_post,
+        out_norm_weight,
+        out_norm_eps,
+    ) -> Optional[MHCPostPreResult]:
+        if not (
+            _is_cuda
+            and envs.SGLANG_OPT_FUSE_MHC_POST_PRE.get()
+            and envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
+            and envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get()
+            and hidden_states.dtype == torch.bfloat16
+            and residual.dtype == torch.bfloat16
+        ):
+            return None
+
+        num_tokens, hidden_size = hidden_states.shape
+        hc_mult = self.config.hc_mult
+        residual, post, comb, hidden_states = mhc_fused_post_pre(
+            x=hidden_states,
+            residual=residual.view(num_tokens, hc_mult, hidden_size),
+            post_layer_mix=h_post.view(num_tokens, hc_mult),
+            comb_res_mix=h_res.view(num_tokens, hc_mult, hc_mult),
+            fn=self.hc_attn_fn,
+            hc_scale=self.hc_attn_scale,
+            hc_base=self.hc_attn_base,
+            rms_eps=self.config.rms_norm_eps,
+            hc_pre_eps=self.config.hc_eps,
+            hc_sinkhorn_eps=self.config.hc_eps,
+            hc_post_mult_value=2.0,
+            sinkhorn_repeat=self.config.hc_sinkhorn_iters,
+            norm_weight=out_norm_weight,
+            norm_eps=out_norm_eps,
+        )
+        return MHCPostPreResult(
+            hidden_states,
+            residual.view(num_tokens, hc_mult * hidden_size),
+            comb.view(num_tokens, hc_mult * hc_mult),
+            post.view(num_tokens, hc_mult),
+            out_norm_weight is not None,
+        )
+
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
         return is_nextn or (
             self.config.n_routed_experts is not None
@@ -825,14 +899,21 @@ class Glm5NextDecoderLayer(nn.Module):
         zero_allocator: Optional[BumpAllocator] = None,
         gemm_output_zero_allocator: BumpAllocator = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
+        previous_mhc: Optional[MHCState] = None,
+        defer_mhc_post: bool = False,
     ):
         hidden_states_orig = hidden_states
 
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states,
-            residual,
-            forward_batch,
-        )
+        if previous_mhc is None:
+            hidden_states, residual = self.layer_communicator.prepare_attn(
+                hidden_states, residual, forward_batch
+            )
+        else:
+            hidden_states, residual = self.layer_communicator.prepare_attn(
+                hidden_states, residual, forward_batch, previous_mhc=previous_mhc
+            )
+            # A deferred narrow tensor would accidentally qualify for MoE output reuse.
+            hidden_states_orig = residual
 
         hidden_states = self.self_attn(
             positions=positions,
@@ -892,7 +973,7 @@ class Glm5NextDecoderLayer(nn.Module):
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
 
-        if not should_allreduce_fusion:
+        if not should_allreduce_fusion and not defer_mhc_post:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states,
                 residual,
@@ -1018,6 +1099,27 @@ class Glm5NextModel(nn.Module):
             aux_hidden_state = hc_contract(aux_hidden_state, self.config.hc_mult)
         return aux_hidden_state
 
+    def _can_fuse_mhc_layers(self, hidden_states, forward_batch):
+        return (
+            _is_cuda
+            and _device_sm in (90, 103)
+            and self.config.mhc
+            and self.config.hc_mult == 4
+            and self.config.hidden_size == 4096
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.is_cuda
+            and 0 < hidden_states.shape[0] <= 32
+            and self.pp_group.world_size == 1
+            and get_parallel().attn_cp_size == 1
+            and not forward_batch.can_run_tbo
+            and not self.layers_to_capture
+            and not self.dflash_capture
+            and not torch.compiler.is_compiling()
+            and envs.SGLANG_OPT_FUSE_MHC_POST_PRE.get()
+            and envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
+            and envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get()
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1071,6 +1173,8 @@ class Glm5NextModel(nn.Module):
                 normal_end_layer = normal_start_layer
         aux_hidden_states = []
         topk_indices = None
+        previous_mhc = None
+        fuse_mhc_layers = self._can_fuse_mhc_layers(hidden_states, forward_batch)
         for i in range(normal_start_layer, normal_end_layer):
             # NOTE: torch dynamo does not support graph break in context manager
             ctx = (
@@ -1089,6 +1193,13 @@ class Glm5NextModel(nn.Module):
                         )
                     aux_hidden_states.append(aux_hidden_state)
                 layer = self.layers[i]
+                defer_mhc_post = (
+                    fuse_mhc_layers
+                    and i + 1 < normal_end_layer
+                    and layer.layer_communicator.can_fuse_mhc_boundary(
+                        self.layers[i + 1].layer_communicator
+                    )
+                )
                 hidden_states, residual, topk_indices = layer(
                     positions,
                     hidden_states,
@@ -1097,7 +1208,10 @@ class Glm5NextModel(nn.Module):
                     zero_allocator,
                     gemm_output_zero_allocator,
                     prev_topk_indices=topk_indices,
+                    previous_mhc=previous_mhc,
+                    defer_mhc_post=defer_mhc_post,
                 )
+                previous_mhc = layer.layer_communicator.mhc if defer_mhc_post else None
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(
