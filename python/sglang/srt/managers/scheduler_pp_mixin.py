@@ -13,8 +13,8 @@ from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.distributed.pipeline_layout import (
+    PipelineReadyQueueSchedule,
     PipelineWavefrontAction,
-    PipelineWavefrontSchedule,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -403,8 +403,12 @@ class SchedulerPPMixin:
                 self.on_idle()
 
     def _pp_vpp_ingest_requests(self: Scheduler):
-        recv_reqs = self.ingest_requests() if self.pp_group.is_first_rank else None
-        recv_reqs = self.pp_group.broadcast_object(recv_reqs, src=0)
+        is_control_source = self.world_group.rank_in_group == 0
+        local_reqs = self.ingest_requests() if self.pp_group.is_first_rank else None
+        recv_reqs = self.world_group.broadcast_object(
+            local_reqs if is_control_source else None,
+            src=0,
+        )
         if not self.pp_group.is_first_rank:
             if recv_reqs:
                 self.metrics_reporter.record_scheduler_active()
@@ -426,7 +430,7 @@ class SchedulerPPMixin:
         good_rids, bad_rids = self._route_aborts_to_bad(
             good_rids, bad_rids, aborted_rids
         )
-        gathered = self.pp_group.all_gather_object([good_rids, bad_rids])
+        gathered = self.world_group.all_gather_object([good_rids, bad_rids])
         consensus_good = set(gathered[0][0])
         consensus_bad = set()
         for rank_good, rank_bad in gathered:
@@ -441,7 +445,7 @@ class SchedulerPPMixin:
             True,
             [KVPoll.Success, KVPoll.Failed],
         )
-        gathered = self.pp_group.all_gather_object(local_rids)
+        gathered = self.world_group.all_gather_object(local_rids)
         consensus = set(gathered[0])
         for rank_rids in gathered[1:]:
             consensus.intersection_update(rank_rids)
@@ -454,14 +458,18 @@ class SchedulerPPMixin:
         mb_metadata: PPBatchMetadata,
         last_rank_comm_queue: deque,
     ) -> GenerationBatchResult:
+        output_source_rank = (self.ps.pp_size - 1) * self.ps.tp_size
         output_tensors = None
-        if self.pp_group.is_last_rank:
+        if self.world_group.rank_in_group == output_source_rank:
             output_event, output_proxy = last_rank_comm_queue.popleft()
-            self.device_module.current_stream().wait_event(output_event)
-            output_tensors = output_proxy.tensors
-        output_tensors = self.pp_group.broadcast_tensor_dict(
+            output_event.synchronize()
+            output_tensors = {
+                key: value.to("cpu") if isinstance(value, torch.Tensor) else value
+                for key, value in output_proxy.tensors.items()
+            }
+        output_tensors = self.world_group.broadcast_object(
             output_tensors,
-            src=self.pp_group.world_size - 1,
+            src=output_source_rank,
         )
         if output_tensors is None:
             raise RuntimeError("the final VPP stage produced no output")
@@ -471,6 +479,14 @@ class SchedulerPPMixin:
                 f"VPP output batch mismatch: expected {batch_seq}, "
                 f"got {output_batch_seq}"
             )
+        output_tensors = {
+            key: (
+                value.to(self.device, non_blocking=True)
+                if isinstance(value, torch.Tensor)
+                else value
+            )
+            for key, value in output_tensors.items()
+        }
         with self.copy_stream_ctx:
             self.copy_stream.wait_stream(self.schedule_stream)
             batch_result = self._pp_prep_batch_result(
@@ -531,7 +547,10 @@ class SchedulerPPMixin:
             )
         batch = self.mbs[action.slot_id]
         if batch is None:
-            return False, []
+            raise RuntimeError(
+                f"VPP action for batch {action.batch_seq} found an empty "
+                f"slot {action.slot_id}"
+            )
 
         self.running_batch = self.running_mbs[action.slot_id]
         self.last_batch = self.last_mbs[action.slot_id]
@@ -590,12 +609,15 @@ class SchedulerPPMixin:
 
     def _event_loop_pp_disagg_prefill_vpp(self: Scheduler):
         self.init_pp_loop_state()
-        schedule = PipelineWavefrontSchedule.build(
+        schedule = PipelineReadyQueueSchedule(
             physical_size=self.ps.pp_size,
             virtual_stages=get_parallel().pp_virtual_stages,
+            max_inflight=self.ps.pp_size,
         )
-        slot_batch_seqs: List[Optional[int]] = [None] * schedule.wave_size
-        first_batch_seq = 0
+        slot_batch_seqs: List[Optional[int]] = [None] * schedule.max_inflight
+        pending_send_work: Dict[int, List[P2PWork]] = defaultdict(list)
+        next_batch_seq = 0
+        tick = 0
 
         while True:
             server_is_idle = True
@@ -605,43 +627,47 @@ class SchedulerPPMixin:
             self.process_bootstrapped_queue(bootstrapped_rids)
             transferred_rids = self._pp_vpp_collect_transferred_ids()
 
-            wave_has_batch = False
-            for batch_seq in schedule.batch_seqs(first_batch_seq):
+            while schedule.can_admit(next_batch_seq):
+                slot_id = next_batch_seq % schedule.max_inflight
                 batch = self._pp_vpp_prepare_wavefront_batch(
-                    batch_seq,
+                    next_batch_seq,
                     slot_batch_seqs,
                 )
-                batch_presence = self.pp_group.all_gather_object(batch is not None)
+                batch_presence = self.world_group.all_gather_object(batch is not None)
                 if any(present != batch_presence[0] for present in batch_presence[1:]):
                     raise RuntimeError(
-                        "VPP ranks disagreed on wavefront batch admission for "
-                        f"batch {batch_seq}: {batch_presence}"
+                        "VPP ranks disagreed on ready-queue batch admission for "
+                        f"batch {next_batch_seq}: {batch_presence}"
                     )
-                wave_has_batch = wave_has_batch or batch is not None
-
-            pending_send_work: Dict[int, List[P2PWork]] = defaultdict(list)
-            if wave_has_batch:
-                server_is_idle = False
-                for tick in range(schedule.num_ticks):
-                    action = schedule.action(
-                        tick,
-                        self.ps.pp_rank,
-                        first_batch_seq,
-                    )
-                    _, send_work = self._pp_vpp_execute_wavefront_action(
-                        action,
-                        slot_batch_seqs,
-                    )
-                    if send_work:
-                        pending_send_work[tick + 1].extend(send_work)
-                    self._pp_commit_comm_work(pending_send_work.pop(tick, []))
-                if pending_send_work:
+                if batch is None:
+                    self.mbs[slot_id] = None
+                    self.mb_metadata[slot_id] = None
+                    slot_batch_seqs[slot_id] = None
+                    break
+                schedule.admit(next_batch_seq)
+                if schedule.slot_batch_seqs != tuple(slot_batch_seqs):
                     raise RuntimeError(
-                        "VPP wavefront finished with pending activation sends"
+                        "VPP scheduler and batch slots diverged after admitting "
+                        f"batch {next_batch_seq}"
                     )
-                self.pp_group.barrier()
+                next_batch_seq += 1
+                server_is_idle = False
 
-            for batch_seq in schedule.batch_seqs(first_batch_seq):
+            actions = schedule.actions(tick)
+            action = actions[self.ps.pp_rank]
+            action_executed, send_work = self._pp_vpp_execute_wavefront_action(
+                action,
+                slot_batch_seqs,
+            )
+            if send_work:
+                pending_send_work[tick + 1].extend(send_work)
+            if action_executed:
+                server_is_idle = False
+            self._pp_commit_comm_work(pending_send_work.pop(tick, []))
+            self.world_group.barrier()
+
+            completed_batch_seqs = schedule.complete(actions)
+            for batch_seq in completed_batch_seqs:
                 if self._pp_vpp_complete_wavefront_batch(
                     batch_seq,
                     slot_batch_seqs,
@@ -653,11 +679,11 @@ class SchedulerPPMixin:
 
             for running_batch in self.running_mbs:
                 running_batch.batch_is_full = False
-            if any(batch is not None for batch in self.mbs):
+            if schedule.inflight_count > 0:
                 server_is_idle = False
             if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
                 self.on_idle()
-            first_batch_seq += schedule.wave_size
+            tick += 1
 
     @DynamicGradMode()
     def event_loop_pp_disagg_decode(self: Scheduler):
@@ -1462,9 +1488,7 @@ class SchedulerPPMixin:
         return result, event
 
     def _pp_launch_vpp_batch(self: Scheduler, *args, **kwargs):
-        raise RuntimeError(
-            "VPP2 batches must run through the deterministic wavefront scheduler"
-        )
+        raise RuntimeError("VPP2 batches must run through the ready-queue scheduler")
 
     def _pp_launch_vpp_stage(
         self: Scheduler,
@@ -1538,7 +1562,7 @@ class SchedulerPPMixin:
                 )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())
-                if is_last_stage:
+                if is_last_stage and self.ps.tp_rank == 0:
                     output_tensors = self._pp_prepare_tensor_dict(result, cur_batch)
                     output_tensors["vpp_batch_seq"] = action.batch_seq
                     last_rank_comm_queue.append(

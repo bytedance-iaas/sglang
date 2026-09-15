@@ -2,6 +2,7 @@ import unittest
 
 from sglang.srt.distributed.pipeline_layout import (
     PipelineLayout,
+    PipelineReadyQueueSchedule,
     PipelineWavefrontSchedule,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -107,6 +108,62 @@ class TestPipelineLayout(unittest.TestCase):
             PipelineWavefrontSchedule.build(4, 2).batch_seqs(-1)
         with self.assertRaisesRegex(ValueError, "must be in"):
             PipelineWavefrontSchedule.build(4, 2).action(-1, 0)
+
+    def test_ready_queue_continuously_reuses_completed_slots(self):
+        schedule = PipelineReadyQueueSchedule(4, 2, max_inflight=4)
+        next_batch_seq = 0
+        for _ in range(4):
+            schedule.admit(next_batch_seq)
+            next_batch_seq += 1
+
+        actual = []
+        for tick in range(12):
+            actions = schedule.actions(tick)
+            actual.append(
+                tuple(
+                    None if action is None else (action.batch_seq, action.stage_id)
+                    for action in actions
+                )
+            )
+            completed = schedule.complete(actions)
+            for _ in completed:
+                self.assertTrue(schedule.can_admit(next_batch_seq))
+                schedule.admit(next_batch_seq)
+                next_batch_seq += 1
+
+        self.assertEqual(
+            actual,
+            [
+                ((0, 0), None, None, None),
+                ((1, 0), (0, 1), None, None),
+                ((2, 0), (1, 1), (0, 2), None),
+                ((3, 0), (2, 1), (1, 2), (0, 3)),
+                ((0, 4), (3, 1), (2, 2), (1, 3)),
+                ((1, 4), (0, 5), (3, 2), (2, 3)),
+                ((2, 4), (1, 5), (0, 6), (3, 3)),
+                ((3, 4), (2, 5), (1, 6), (0, 7)),
+                ((4, 0), (3, 5), (2, 6), (1, 7)),
+                ((5, 0), (4, 1), (3, 6), (2, 7)),
+                ((6, 0), (5, 1), (4, 2), (3, 7)),
+                ((7, 0), (6, 1), (5, 2), (4, 3)),
+            ],
+        )
+        self.assertEqual(schedule.inflight_count, 4)
+
+    def test_ready_queue_applies_backpressure_and_decode_priority(self):
+        schedule = PipelineReadyQueueSchedule(4, 2, max_inflight=5)
+        for batch_seq in range(5):
+            schedule.admit(batch_seq)
+        self.assertFalse(schedule.can_admit(5))
+
+        for tick in range(4):
+            schedule.complete(schedule.actions(tick))
+
+        actions = schedule.actions(4)
+        self.assertEqual(
+            (actions[0].batch_seq, actions[0].stage_id),
+            (0, 4),
+        )
 
 
 if __name__ == "__main__":

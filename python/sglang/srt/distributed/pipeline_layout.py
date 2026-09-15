@@ -104,6 +104,105 @@ class PipelineWavefrontSchedule:
         )
 
 
+class PipelineReadyQueueSchedule:
+    def __init__(
+        self,
+        physical_size: int,
+        virtual_stages: int,
+        max_inflight: int,
+    ):
+        if physical_size < 1:
+            raise ValueError("physical pipeline size must be positive")
+        if virtual_stages != 2:
+            raise ValueError("the ready-queue scheduler supports VPP2 only")
+        if max_inflight < 1:
+            raise ValueError("max inflight batches must be positive")
+        self.physical_size = physical_size
+        self.virtual_stages = virtual_stages
+        self.max_inflight = max_inflight
+        self._ready: list[list[tuple[int, int]]] = [[] for _ in range(physical_size)]
+        self._slot_batch_seqs: list[Optional[int]] = [None] * max_inflight
+
+    @property
+    def logical_size(self) -> int:
+        return self.physical_size * self.virtual_stages
+
+    @property
+    def inflight_count(self) -> int:
+        return sum(batch_seq is not None for batch_seq in self._slot_batch_seqs)
+
+    @property
+    def slot_batch_seqs(self) -> Tuple[Optional[int], ...]:
+        return tuple(self._slot_batch_seqs)
+
+    def can_admit(self, batch_seq: int) -> bool:
+        if batch_seq < 0:
+            return False
+        slot_id = batch_seq % self.max_inflight
+        return (
+            self.inflight_count < self.max_inflight
+            and self._slot_batch_seqs[slot_id] is None
+        )
+
+    def admit(self, batch_seq: int) -> None:
+        if not self.can_admit(batch_seq):
+            raise RuntimeError(f"cannot admit VPP batch {batch_seq}")
+        slot_id = batch_seq % self.max_inflight
+        self._slot_batch_seqs[slot_id] = batch_seq
+        self._ready[0].append((batch_seq, 0))
+
+    def actions(self, tick: int) -> Tuple[Optional[PipelineWavefrontAction], ...]:
+        if tick < 0:
+            raise ValueError("ready-queue tick must be non-negative")
+        actions = []
+        for physical_rank, ready in enumerate(self._ready):
+            if not ready:
+                actions.append(None)
+                continue
+            decode = [item for item in ready if item[1] >= self.physical_size]
+            candidates = decode if decode else ready
+            batch_seq, stage_id = min(candidates)
+            ready.remove((batch_seq, stage_id))
+            actions.append(
+                PipelineWavefrontAction(
+                    tick=tick,
+                    batch_seq=batch_seq,
+                    slot_id=batch_seq % self.max_inflight,
+                    stage_id=stage_id,
+                    physical_rank=physical_rank,
+                )
+            )
+        return tuple(actions)
+
+    def complete(
+        self,
+        actions: Tuple[Optional[PipelineWavefrontAction], ...],
+    ) -> Tuple[int, ...]:
+        if len(actions) != self.physical_size:
+            raise ValueError("one action is required for every physical PP rank")
+        completed = []
+        for physical_rank, action in enumerate(actions):
+            if action is None:
+                continue
+            if action.physical_rank != physical_rank:
+                raise ValueError(
+                    f"action for PP rank {action.physical_rank} was submitted "
+                    f"at position {physical_rank}"
+                )
+            if self._slot_batch_seqs[action.slot_id] != action.batch_seq:
+                raise RuntimeError(
+                    f"VPP batch {action.batch_seq} does not own slot {action.slot_id}"
+                )
+            next_stage_id = action.stage_id + 1
+            if next_stage_id == self.logical_size:
+                self._slot_batch_seqs[action.slot_id] = None
+                completed.append(action.batch_seq)
+                continue
+            next_rank = next_stage_id % self.physical_size
+            self._ready[next_rank].append((action.batch_seq, next_stage_id))
+        return tuple(sorted(completed))
+
+
 @dataclass(frozen=True)
 class PipelineLayout:
     num_hidden_layers: int
