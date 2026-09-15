@@ -19,6 +19,7 @@ the base), theirs = the patch (replay only its EIC addition). Do not rebase a
 alignments when a function moved into a different module.
 
 Last full refresh: 2026-09-15, 8ab9652e7c -> f4c61f324b (1525 commits).
+Every merged EIC PR (#481..#768, incl. the #709 deploy check) is present; see EIC_PATCH.md.
 19 hunks conflicted; resolution rules are per file below.
 
 ## Files
@@ -33,6 +34,7 @@ Last full refresh: 2026-09-15, 8ab9652e7c -> f4c61f324b (1525 commits).
 | `mem_cache/eic_chunk_cache.py` | `EICChunkCache`/`EICSWAChunkCache` for `--disable-radix-cache` (PD decode-save) |
 | `mem_cache/eic_pp_reconcile.py` | cross-PP load-length reconciler |
 | `test/registered/unit/mem_cache/test_eic_hicache_regression.py` | EIC regression suite |
+| `scripts/eic_integration_check.py` | post-deploy EIC integration check (#709); standalone ops script, no runtime import |
 | `benchmark/hicache/eic_snapshots/2026-09-12-...md` | serving benchmark record |
 
 ### ep_main-owned touch points (these are the only files that conflict)
