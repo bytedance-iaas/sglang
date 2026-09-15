@@ -1453,7 +1453,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
             self.eagle_pp_sender_probe.install_target_forward_observer(
                 model=target_model_runner.model,
                 max_rows=target_model_runner.max_decode_logits_rows(),
-                max_indexer_columns=target_model_runner.max_total_num_tokens,
+                # Paged DSA logits use the fixed req-to-token row width, which
+                # includes speculative/page-alignment headroom beyond the
+                # physical KV-token capacity.
+                max_indexer_columns=int(
+                    target_model_runner.req_to_token_pool.req_to_token.shape[1]
+                ),
                 dtype=target_model_runner.dtype,
                 device=target_model_runner.device,
             )

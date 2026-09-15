@@ -657,7 +657,12 @@ class TestEaglePPLastRankDraftOwnership(unittest.TestCase):
                 SimpleNamespace(pp_size=2), 0, object(), 1234, target_worker=target
             )
             probe.install_target_forward_observer.assert_not_called()
-            target.model_runner.req_to_token_pool = SimpleNamespace(size=8)
+            target.model_runner.req_to_token_pool = SimpleNamespace(
+                size=8,
+                # The request table can be wider than the physical token pool
+                # because speculative decode adds page-aligned headroom.
+                req_to_token=torch.empty((9, 4224), dtype=torch.int32),
+            )
             worker.alloc_memory_pool(
                 req_to_token_pool=target.model_runner.req_to_token_pool,
                 token_to_kv_pool_allocator=object(),
@@ -667,7 +672,7 @@ class TestEaglePPLastRankDraftOwnership(unittest.TestCase):
         probe.install_target_forward_observer.assert_called_once_with(
             model=target.model_runner.model,
             max_rows=32,
-            max_indexer_columns=4096,
+            max_indexer_columns=4224,
             dtype=torch.bfloat16,
             device=torch.device("cpu"),
         )
