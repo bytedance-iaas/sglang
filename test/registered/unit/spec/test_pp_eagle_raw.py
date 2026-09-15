@@ -563,6 +563,7 @@ class TestEaglePPLastRankDraftOwnership(unittest.TestCase):
                 device=torch.device("cpu"),
                 req_to_token_pool=None,
                 max_total_num_tokens=4096,
+                page_size=64,
                 max_decode_logits_rows=MagicMock(return_value=32),
             ),
         )
@@ -661,7 +662,7 @@ class TestEaglePPLastRankDraftOwnership(unittest.TestCase):
                 size=8,
                 # The request table can be wider than the physical token pool
                 # because speculative decode adds page-aligned headroom.
-                req_to_token=torch.empty((9, 4224), dtype=torch.int32),
+                req_to_token=torch.empty((9, 4161), dtype=torch.int32),
             )
             worker.alloc_memory_pool(
                 req_to_token_pool=target.model_runner.req_to_token_pool,

@@ -1456,8 +1456,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # Paged DSA logits use the fixed req-to-token row width, which
                 # includes speculative/page-alignment headroom beyond the
                 # physical KV-token capacity.
-                max_indexer_columns=int(
-                    target_model_runner.req_to_token_pool.req_to_token.shape[1]
+                max_indexer_columns=(
+                    (
+                        int(target_model_runner.req_to_token_pool.req_to_token.shape[1])
+                        + int(target_model_runner.page_size)
+                        - 1
+                    )
+                    // int(target_model_runner.page_size)
+                    * int(target_model_runner.page_size)
                 ),
                 dtype=target_model_runner.dtype,
                 device=target_model_runner.device,
