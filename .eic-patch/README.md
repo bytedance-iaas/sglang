@@ -84,3 +84,21 @@ Every merged EIC PR (#481..#768, incl. the #709 deploy check) is present; see EI
 - MTP (#750-equivalent on new base) EIC page layout not run.
 - Real-model e2e and throughput not rerun; the 2026-09-12 snapshot is from the
   older base.
+
+## Refactor-contract fixes (2026-09-15 review, f4c61f324b)
+
+The 1525-commit refresh crossed two large refactors; text resolution was not
+enough. These runtime crashes were caught by reading the merged code, not the
+compiler:
+
+- DSv4 `device_backup`/`device_writeback` must iterate
+  `host_pool_group.get_entry(name)` and call per-pool
+  `backup_from_device_all_layer`/`load_to_device_per_layer` (new signatures:
+  no `pool_transfers=`, load uses `entry.layer_mapper`). The old group-level
+  methods no longer exist.
+- `req.req_pool_idx`/`req.cache_protected_len` -> `req.kv.*`; `req.fill_ids` ->
+  `req.get_fill_ids()`.
+- Test imports moved under `unified_cache/`.
+
+These are why in-pod tests are required after every large refresh even when the
+diff applies and lints clean.

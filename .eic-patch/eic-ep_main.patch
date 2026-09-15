@@ -1031,10 +1031,10 @@ index bccbf46ad9..70dc07dbfa 100644
              if self.disaggregation_mode == DisaggregationMode.DECODE:
 diff --git a/python/sglang/srt/mem_cache/EIC_PATCH.md b/python/sglang/srt/mem_cache/EIC_PATCH.md
 new file mode 100644
-index 0000000000..8908e5bc1e
+index 0000000000..3dad5f1888
 --- /dev/null
 +++ b/python/sglang/srt/mem_cache/EIC_PATCH.md
-@@ -0,0 +1,154 @@
+@@ -0,0 +1,172 @@
 +# EIC patch ledger
 +
 +ep_main is periodically rebuilt from upstream and drops downstream merges, so EIC
@@ -1091,6 +1091,24 @@ index 0000000000..8908e5bc1e
 +  `device_writeback` repeats that move, or the load kernel rejects CPU indices.
 +- `Req.extend_range` is None until `PrefillAdder.add_one_req` sets it from
 +  `prefix_indices`; `_finalize_load_admit` must not read or set it.
++
++
++## Refresh fixes for the pool/ServerArgs refactor (f4c61f324b)
++
++The 2026-09-15 refresh crossed the host-pool and ServerArgs refactors; these were
++not text conflicts but API-contract breaks found by review, all in EIC-owned files:
++
++- DSv4 load/backup drives pools per entry. `HostPoolGroup` no longer has
++  `load_to_device_per_layer`/`backup_from_device_all_layer`, and the per-pool
++  methods take no `pool_transfers=`. `EICDeepSeekV4TokenToKVPoolHost` iterates
++  `_build_pool_transfers` and calls each `entry.host_pool.{backup,load}` with the
++  entry's device pool and `layer_mapper`, matching `l2_transfer.py`.
++- Req fields moved into `ReqKvInfo`: use `req.kv.req_pool_idx` and
++  `req.kv.cache_protected_len` (no top-level forwarding properties).
++- `req.fill_ids` is now `req.get_fill_ids()` (bounded by `extend_range.end`).
++- `last_matched_prefix_len` was removed upstream; the EIC finalize no longer sets it.
++- Test imports updated: `unified_cache.component_type.ComponentType`,
++  `unified_cache.unified_tree_core.UnifiedTreeNode`.
 +
 +## Touch points in ep_main files
 +
@@ -1269,7 +1287,7 @@ index b1497c6f5c..ad8294424f 100644
          from sglang.srt.mem_cache.multi_ended_allocator import (
 diff --git a/python/sglang/srt/mem_cache/eic_chunk_cache.py b/python/sglang/srt/mem_cache/eic_chunk_cache.py
 new file mode 100644
-index 0000000000..d791cae74c
+index 0000000000..2fb872e854
 --- /dev/null
 +++ b/python/sglang/srt/mem_cache/eic_chunk_cache.py
 @@ -0,0 +1,230 @@
@@ -1402,7 +1420,7 @@ index 0000000000..d791cae74c
 +
 +    def write_backup(self, req: Req, save_decode_cache: bool = True):
 +        kv_indices = self.req_to_token_pool.req_to_token[
-+            req.req_pool_idx,
++            req.kv.req_pool_idx,
 +            : len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0),
 +        ]
 +        if (
@@ -1452,7 +1470,7 @@ index 0000000000..d791cae74c
 +        # finished request, which is what dropping the term would do.
 +        save_cache = is_insert and self.save_decode_cache
 +        self.write_backup(req, save_decode_cache=save_cache)
-+        self.req_to_token_pool.free(req.req_pool_idx)
++        self.req_to_token_pool.free(req.kv.req_pool_idx)
 +
 +    def writing_check(self):
 +        while not self.cache_controller.ack_write_queue.empty():
@@ -1505,10 +1523,10 @@ index 0000000000..d791cae74c
 +        return EvictResult()
 diff --git a/python/sglang/srt/mem_cache/eic_hiradix_cache.py b/python/sglang/srt/mem_cache/eic_hiradix_cache.py
 new file mode 100644
-index 0000000000..ad7deda06e
+index 0000000000..dda9756513
 --- /dev/null
 +++ b/python/sglang/srt/mem_cache/eic_hiradix_cache.py
-@@ -0,0 +1,1924 @@
+@@ -0,0 +1,1923 @@
 +import hashlib
 +import heapq
 +import logging
@@ -1944,14 +1962,14 @@ index 0000000000..ad7deda06e
 +        kv_committed_len = kv_len_to_handle
 +        if self.disable:
 +            kv_indices = self.req_to_token_pool.req_to_token[
-+                req.req_pool_idx, :kv_committed_len
++                req.kv.req_pool_idx, :kv_committed_len
 +            ]
 +            self.token_to_kv_pool_allocator.free(kv_indices)
 +            return
 +
 +        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
 +        kv_indices = self.req_to_token_pool.req_to_token[
-+            req.req_pool_idx, : len(token_ids)
++            req.kv.req_pool_idx, : len(token_ids)
 +        ]
 +
 +        radix_key = RadixKey(
@@ -1966,14 +1984,14 @@ index 0000000000..ad7deda06e
 +                InsertParams(key=radix_key, value=values, priority=priority)
 +            )
 +            self.token_to_kv_pool_allocator.free(
-+                kv_indices[req.cache_protected_len : result.prefix_len]
++                kv_indices[req.kv.cache_protected_len : result.prefix_len]
 +            )
 +
 +            match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
 +            self._backup_unbacked_path(match_result.last_device_node)
 +        else:
 +            self.token_to_kv_pool_allocator.free(
-+                kv_indices[req.cache_protected_len : key_len]
++                kv_indices[req.kv.cache_protected_len : key_len]
 +            )
 +            if req.last_node is not None:
 +                self._backup_unbacked_path(req.last_node)
@@ -1997,13 +2015,13 @@ index 0000000000..ad7deda06e
 +                        [
 +                            req.prefix_indices[_swa_lo:_prefix_len],
 +                            self.req_to_token_pool.req_to_token[
-+                                req.req_pool_idx, _prefix_len:_swa_hi
++                                req.kv.req_pool_idx, _prefix_len:_swa_hi
 +                            ],
 +                        ]
 +                    )
 +                else:
 +                    _swa_slots = self.req_to_token_pool.req_to_token[
-+                        req.req_pool_idx, _swa_lo:_swa_hi
++                        req.kv.req_pool_idx, _swa_lo:_swa_hi
 +                    ]
 +                self.token_to_kv_pool_allocator.free_swa(_swa_slots)
 +
@@ -2012,14 +2030,14 @@ index 0000000000..ad7deda06e
 +
 +    def cache_unfinished_req(self, req: Req, chunked=False):
 +        if self.ongoing_load_back:
-+            key = RadixKey(req.fill_ids, req.extra_key, is_bigram=self.is_eagle)
++            key = RadixKey(req.get_fill_ids(), req.extra_key, is_bigram=self.is_eagle)
 +            match = self.match_prefix(MatchPrefixParams(key=key))
 +            if self.prefix_loading(match.last_device_node):
 +                # Inserting now would swap this req's own KV for slots still
 +                # landing from EIC; keep it private, as ChunkCache does, until
 +                # the load settles.
 +                req.prefix_indices = self.req_to_token_pool.req_to_token[
-+                    req.req_pool_idx, : len(req.fill_ids)
++                    req.kv.req_pool_idx, : len(req.get_fill_ids())
 +                ].to(dtype=torch.int64, copy=True)
 +                return
 +        super().cache_unfinished_req(req, chunked=chunked)
@@ -2815,8 +2833,7 @@ index 0000000000..ad7deda06e
 +        # PrefillAdder.add_one_req also sets extend_range from prefix_indices;
 +        # extend_range is still None here.
 +        req.host_hit_length = req.storage_hit_length = max(0, prefix_len - d)
-+        req.cache_protected_len = prefix_len
-+        req.last_matched_prefix_len = prefix_len
++        req.kv.cache_protected_len = prefix_len
 +        return True
 +
 +    def release_load_admit(self, rid):
@@ -3435,10 +3452,10 @@ index 0000000000..ad7deda06e
 +        return device_indices
 diff --git a/python/sglang/srt/mem_cache/eic_memory_pool.py b/python/sglang/srt/mem_cache/eic_memory_pool.py
 new file mode 100644
-index 0000000000..ed5063bd5c
+index 0000000000..ab95918867
 --- /dev/null
 +++ b/python/sglang/srt/mem_cache/eic_memory_pool.py
-@@ -0,0 +1,2119 @@
+@@ -0,0 +1,2126 @@
 +import json
 +import logging
 +import os
@@ -5352,13 +5369,16 @@ index 0000000000..ed5063bd5c
 +        full_host_indices, swa_host_indices, transfers = self._build_pool_transfers(
 +            device_indices
 +        )
-+        self.host_pool_group.backup_from_device_all_layer(
-+            self.device_pool,
-+            full_host_indices,
-+            device_indices,
-+            self.io_backend,
-+            pool_transfers=transfers,
-+        )
++        # Per-pool backup: the new host-pool API removed the group-level
++        # backup_from_device_all_layer(..., pool_transfers=) entry point.
++        for transfer in transfers:
++            entry = self.host_pool_group.get_entry(transfer.name)
++            entry.host_pool.backup_from_device_all_layer(
++                entry.device_pool,
++                transfer.host_indices,
++                transfer.device_indices,
++                self.io_backend,
++            )
 +        torch.cuda.current_stream().synchronize()
 +
 +        for page_id in range(page_count):
@@ -5410,27 +5430,31 @@ index 0000000000..ed5063bd5c
 +        torch.cuda.current_stream().synchronize()
 +
 +        # load_to_device_per_layer takes indices as given (backup normalizes,
-+        # load does not); mirror HiCacheController.move_indices for "kernel".
++        # load does not), so move host indices to the device for the kernel
++        # backend. The new API is per-pool: the group-level entry point is gone.
 +        if self.io_backend == "kernel":
-+            full_host_indices = full_host_indices.to(device_indices.device)
-+            transfers = [
-+                PoolTransfer(
-+                    name=t.name,
-+                    host_indices=t.host_indices.to(t.device_indices.device),
-+                    device_indices=t.device_indices,
++            for transfer in transfers:
++                transfer.host_indices = transfer.host_indices.to(
++                    transfer.device_indices.device
 +                )
-+                for t in transfers
-+            ]
 +
 +        for layer_id in range(self.transfer_layer_num):
-+            self.host_pool_group.load_to_device_per_layer(
-+                self.device_pool,
-+                full_host_indices,
-+                device_indices,
-+                layer_id,
-+                self.io_backend,
-+                pool_transfers=transfers,
-+            )
++            for transfer in transfers:
++                entry = self.host_pool_group.get_entry(transfer.name)
++                local_layer_id = (
++                    entry.layer_mapper(layer_id)
++                    if entry.layer_mapper is not None
++                    else layer_id
++                )
++                if local_layer_id is None:
++                    continue
++                entry.host_pool.load_to_device_per_layer(
++                    entry.device_pool,
++                    transfer.host_indices,
++                    transfer.device_indices,
++                    local_layer_id,
++                    self.io_backend,
++                )
 +        torch.cuda.current_stream().synchronize()
 +
 +    def assign_page_data(self, content_hashes, flat_data, device_indices=None):
@@ -6443,7 +6467,7 @@ index 0000000000..2d48e5fd76
 +        os._exit(code)
 diff --git a/test/registered/unit/mem_cache/test_eic_hicache_regression.py b/test/registered/unit/mem_cache/test_eic_hicache_regression.py
 new file mode 100644
-index 0000000000..a0794d9e9f
+index 0000000000..0a96730620
 --- /dev/null
 +++ b/test/registered/unit/mem_cache/test_eic_hicache_regression.py
 @@ -0,0 +1,1654 @@
@@ -6466,8 +6490,8 @@ index 0000000000..a0794d9e9f
 +from sglang.srt.mem_cache.eic_hiradix_cache import EICPagedHiRadixCache
 +from sglang.srt.mem_cache.eic_pp_reconcile import EICPPReconciler
 +from sglang.srt.mem_cache.radix_cache import RadixKey, TreeNode
-+from sglang.srt.mem_cache.unified_cache.components import ComponentType
-+from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
++from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
++from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeNode
 +from sglang.test.ci.ci_register import register_cpu_ci
 +
 +register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
