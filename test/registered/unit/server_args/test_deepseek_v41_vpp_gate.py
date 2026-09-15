@@ -26,6 +26,7 @@ def _config(**overrides):
         "language_model_only": False,
         "enable_hierarchical_cache": False,
         "pp_async_batch_depth": 0,
+        "disable_overlap_schedule": False,
         "enable_encoder_swa_bounded_replay": False,
         "enable_decoder_swa_bounded_replay": False,
         "cuda_graph_config": SimpleNamespace(
@@ -78,6 +79,10 @@ class TestDeepSeekV41VPPGate(unittest.TestCase):
             with self.subTest(config=config):
                 with self.assertRaisesRegex(ValueError, "context parallelism"):
                     _validate(config)
+
+    def test_vpp2_requires_overlap_scheduler(self):
+        with self.assertRaisesRegex(ValueError, "disabled overlap scheduling"):
+            _validate(_config(disable_overlap_schedule=True))
 
 
 if __name__ == "__main__":

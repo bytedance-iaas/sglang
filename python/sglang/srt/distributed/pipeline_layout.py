@@ -14,6 +14,97 @@ class PipelineStage:
 
 
 @dataclass(frozen=True)
+class PipelineWavefrontAction:
+    tick: int
+    batch_seq: int
+    slot_id: int
+    stage_id: int
+    physical_rank: int
+
+
+@dataclass(frozen=True)
+class PipelineWavefrontSchedule:
+    physical_size: int
+    virtual_stages: int
+    wave_size: int
+
+    @classmethod
+    def build(
+        cls,
+        physical_size: int,
+        virtual_stages: int,
+        wave_size: Optional[int] = None,
+    ) -> "PipelineWavefrontSchedule":
+        if physical_size < 1:
+            raise ValueError("physical pipeline size must be positive")
+        if virtual_stages != 2:
+            raise ValueError("the deterministic wavefront supports VPP2 only")
+        if wave_size is None:
+            wave_size = physical_size
+        if wave_size != physical_size:
+            raise ValueError(
+                "the deterministic wavefront requires one slot per PP rank"
+            )
+        return cls(
+            physical_size=physical_size,
+            virtual_stages=virtual_stages,
+            wave_size=wave_size,
+        )
+
+    @property
+    def logical_size(self) -> int:
+        return self.physical_size * self.virtual_stages
+
+    @property
+    def num_ticks(self) -> int:
+        return self.wave_size + self.logical_size - 1
+
+    def batch_seqs(self, first_batch_seq: int) -> range:
+        if first_batch_seq < 0:
+            raise ValueError("first wavefront batch sequence must be non-negative")
+        return range(first_batch_seq, first_batch_seq + self.wave_size)
+
+    def completion_batch_seq(
+        self, tick: int, first_batch_seq: int = 0
+    ) -> Optional[int]:
+        action = self.action(tick, self.physical_size - 1, first_batch_seq)
+        if action is None or action.stage_id != self.logical_size - 1:
+            return None
+        return action.batch_seq
+
+    def action(
+        self,
+        tick: int,
+        physical_rank: int,
+        first_batch_seq: int = 0,
+    ) -> Optional[PipelineWavefrontAction]:
+        if not 0 <= physical_rank < self.physical_size:
+            raise ValueError(f"invalid physical pipeline rank {physical_rank}")
+        if first_batch_seq < 0:
+            raise ValueError("first wavefront batch sequence must be non-negative")
+        if not 0 <= tick < self.num_ticks:
+            raise ValueError(
+                f"wavefront tick must be in [0, {self.num_ticks}), got {tick}"
+            )
+
+        batch_offset = tick - physical_rank
+        stage_id = physical_rank
+        if not 0 <= batch_offset < self.wave_size:
+            batch_offset = tick - physical_rank - self.physical_size
+            stage_id += self.physical_size
+        if not 0 <= batch_offset < self.wave_size:
+            return None
+        batch_seq = first_batch_seq + batch_offset
+        return PipelineWavefrontAction(
+            tick=tick,
+            batch_seq=batch_seq,
+            slot_id=batch_seq % self.wave_size,
+            stage_id=stage_id,
+            physical_rank=physical_rank,
+        )
+
+
+@dataclass(frozen=True)
 class PipelineLayout:
     num_hidden_layers: int
     physical_size: int

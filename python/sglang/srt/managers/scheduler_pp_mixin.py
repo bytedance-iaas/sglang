@@ -12,6 +12,10 @@ from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
+from sglang.srt.distributed.pipeline_layout import (
+    PipelineWavefrontAction,
+    PipelineWavefrontSchedule,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import RelayPayload
@@ -445,6 +449,7 @@ class SchedulerPPMixin:
 
     def _pp_vpp_broadcast_batch_result(
         self: Scheduler,
+        batch_seq: int,
         batch: ScheduleBatch,
         mb_metadata: PPBatchMetadata,
         last_rank_comm_queue: deque,
@@ -460,6 +465,12 @@ class SchedulerPPMixin:
         )
         if output_tensors is None:
             raise RuntimeError("the final VPP stage produced no output")
+        output_batch_seq = int(output_tensors.get("vpp_batch_seq", -1))
+        if output_batch_seq != batch_seq:
+            raise RuntimeError(
+                f"VPP output batch mismatch: expected {batch_seq}, "
+                f"got {output_batch_seq}"
+            )
         with self.copy_stream_ctx:
             self.copy_stream.wait_stream(self.schedule_stream)
             batch_result = self._pp_prep_batch_result(
@@ -472,10 +483,119 @@ class SchedulerPPMixin:
         d2h_event.synchronize()
         return batch_result
 
+    def _pp_vpp_prepare_wavefront_batch(
+        self: Scheduler,
+        batch_seq: int,
+        slot_batch_seqs: List[Optional[int]],
+    ) -> Optional[ScheduleBatch]:
+        slot_id = batch_seq % len(self.mbs)
+        if slot_batch_seqs[slot_id] is not None:
+            raise RuntimeError(
+                f"VPP wavefront slot {slot_id} is still owned by batch "
+                f"{slot_batch_seqs[slot_id]}"
+            )
+
+        self.running_batch = self.running_mbs[slot_id]
+        self.last_batch = self.last_mbs[slot_id]
+        self.process_prefill_chunk(
+            last_batch=self.last_batch,
+            running_batch=self.running_batch,
+        )
+        prefill_plan = self.get_new_batch_prefill(self.running_batch)
+        batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+            prefill_plan.batch_to_run
+        )
+        if batch is not None and batch.chunked_req is not None:
+            req = batch.chunked_req
+            batch.disagg_prefill_chunk_end_by_rid = {
+                req.rid: min(req.extend_range.end, len(req.origin_input_ids))
+            }
+        self.running_batch = prefill_plan.running_batch
+        self.running_mbs[slot_id] = self.running_batch
+        self.mbs[slot_id] = batch
+        self.mb_metadata[slot_id] = None
+        slot_batch_seqs[slot_id] = batch_seq
+        return batch
+
+    def _pp_vpp_execute_wavefront_action(
+        self: Scheduler,
+        action: Optional[PipelineWavefrontAction],
+        slot_batch_seqs: List[Optional[int]],
+    ) -> Tuple[bool, List[P2PWork]]:
+        if action is None:
+            return False, []
+        if slot_batch_seqs[action.slot_id] != action.batch_seq:
+            raise RuntimeError(
+                f"VPP wavefront batch {action.batch_seq} does not own "
+                f"slot {action.slot_id}"
+            )
+        batch = self.mbs[action.slot_id]
+        if batch is None:
+            return False, []
+
+        self.running_batch = self.running_mbs[action.slot_id]
+        self.last_batch = self.last_mbs[action.slot_id]
+        self.cur_batch_for_debug = batch
+        pp_proxy_tensors = None
+        if action.stage_id > 0:
+            pp_proxy_tensors = self._pp_recv_vpp_proxy_tensors(
+                first_visit=action.stage_id < self.ps.pp_size,
+                expected_batch_seq=action.batch_seq,
+                expected_stage_id=action.stage_id,
+            )
+        if self.enable_staging and action.stage_id < self.ps.pp_size:
+            self.maybe_prefetch_staging_for_batch(batch)
+        _, _, send_work = self._pp_launch_vpp_stage(
+            action,
+            batch,
+            pp_proxy_tensors,
+            self.mb_metadata,
+            self.last_rank_comm_queue,
+        )
+        return True, send_work
+
+    def _pp_vpp_complete_wavefront_batch(
+        self: Scheduler,
+        batch_seq: int,
+        slot_batch_seqs: List[Optional[int]],
+    ) -> bool:
+        slot_id = batch_seq % len(self.mbs)
+        if slot_batch_seqs[slot_id] != batch_seq:
+            raise RuntimeError(
+                f"VPP completion for batch {batch_seq} found slot "
+                f"{slot_id} owned by {slot_batch_seqs[slot_id]}"
+            )
+        batch = self.mbs[slot_id]
+        if batch is None:
+            slot_batch_seqs[slot_id] = None
+            return False
+        metadata = self.mb_metadata[slot_id]
+        if metadata is None:
+            raise RuntimeError(
+                f"VPP batch {batch_seq} completed without pipeline metadata"
+            )
+
+        batch_result = self._pp_vpp_broadcast_batch_result(
+            batch_seq,
+            batch,
+            metadata,
+            self.last_rank_comm_queue,
+        )
+        self._pp_process_batch_result(batch, batch_result)
+        self.last_mbs[slot_id] = batch
+        self.mbs[slot_id] = None
+        self.mb_metadata[slot_id] = None
+        slot_batch_seqs[slot_id] = None
+        return True
+
     def _event_loop_pp_disagg_prefill_vpp(self: Scheduler):
         self.init_pp_loop_state()
-        self.running_batch = self.running_mbs[0]
-        self.last_batch = self.last_mbs[0]
+        schedule = PipelineWavefrontSchedule.build(
+            physical_size=self.ps.pp_size,
+            virtual_stages=get_parallel().pp_virtual_stages,
+        )
+        slot_batch_seqs: List[Optional[int]] = [None] * schedule.wave_size
+        first_batch_seq = 0
 
         while True:
             server_is_idle = True
@@ -485,49 +605,59 @@ class SchedulerPPMixin:
             self.process_bootstrapped_queue(bootstrapped_rids)
             transferred_rids = self._pp_vpp_collect_transferred_ids()
 
-            self.process_prefill_chunk(
-                last_batch=self.last_batch,
-                running_batch=self.running_batch,
-            )
-            prefill_plan = self.get_new_batch_prefill(self.running_batch)
-            batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
-                prefill_plan.batch_to_run
-            )
-            self.running_batch = prefill_plan.running_batch
-            self.running_mbs[0] = self.running_batch
-            self.mbs[0] = batch
-            self.cur_batch_for_debug = batch
+            wave_has_batch = False
+            for batch_seq in schedule.batch_seqs(first_batch_seq):
+                batch = self._pp_vpp_prepare_wavefront_batch(
+                    batch_seq,
+                    slot_batch_seqs,
+                )
+                batch_presence = self.pp_group.all_gather_object(batch is not None)
+                if any(present != batch_presence[0] for present in batch_presence[1:]):
+                    raise RuntimeError(
+                        "VPP ranks disagreed on wavefront batch admission for "
+                        f"batch {batch_seq}: {batch_presence}"
+                    )
+                wave_has_batch = wave_has_batch or batch is not None
 
-            if batch is not None:
+            pending_send_work: Dict[int, List[P2PWork]] = defaultdict(list)
+            if wave_has_batch:
                 server_is_idle = False
-                pp_proxy_tensors = self._pp_recv_vpp_proxy_tensors(first_visit=True)
-                if self.enable_staging:
-                    self.maybe_prefetch_staging_for_batch(batch)
-                self._pp_launch_vpp_batch(
-                    0,
-                    batch,
-                    pp_proxy_tensors,
-                    self.mb_metadata,
-                    self.last_rank_comm_queue,
-                )
-                metadata = self.mb_metadata[0]
-                if metadata is None:
-                    raise RuntimeError("the VPP batch produced no pipeline metadata")
-                batch_result = self._pp_vpp_broadcast_batch_result(
-                    batch,
-                    metadata,
-                    self.last_rank_comm_queue,
-                )
-                self._pp_process_batch_result(batch, batch_result)
-                self.last_batch = batch
-                self.last_mbs[0] = batch
+                for tick in range(schedule.num_ticks):
+                    action = schedule.action(
+                        tick,
+                        self.ps.pp_rank,
+                        first_batch_seq,
+                    )
+                    _, send_work = self._pp_vpp_execute_wavefront_action(
+                        action,
+                        slot_batch_seqs,
+                    )
+                    if send_work:
+                        pending_send_work[tick + 1].extend(send_work)
+                    self._pp_commit_comm_work(pending_send_work.pop(tick, []))
+                if pending_send_work:
+                    raise RuntimeError(
+                        "VPP wavefront finished with pending activation sends"
+                    )
+                self.pp_group.barrier()
+
+            for batch_seq in schedule.batch_seqs(first_batch_seq):
+                if self._pp_vpp_complete_wavefront_batch(
+                    batch_seq,
+                    slot_batch_seqs,
+                ):
+                    server_is_idle = False
 
             if transferred_rids:
                 self.process_disagg_prefill_inflight_queue(transferred_rids)
 
-            self.running_batch.batch_is_full = False
+            for running_batch in self.running_mbs:
+                running_batch.batch_is_full = False
+            if any(batch is not None for batch in self.mbs):
+                server_is_idle = False
             if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
                 self.on_idle()
+            first_batch_seq += schedule.wave_size
 
     @DynamicGradMode()
     def event_loop_pp_disagg_decode(self: Scheduler):
@@ -1043,7 +1173,11 @@ class SchedulerPPMixin:
         return pp_proxy_tensors
 
     def _pp_recv_vpp_proxy_tensors(
-        self: Scheduler, *, first_visit: bool
+        self: Scheduler,
+        *,
+        first_visit: bool,
+        expected_batch_seq: Optional[int] = None,
+        expected_stage_id: Optional[int] = None,
     ) -> Optional[PPProxyTensors]:
         if first_visit and self.pp_group.is_first_rank:
             return None
@@ -1054,6 +1188,22 @@ class SchedulerPPMixin:
                 batch_p2p=True,
             )
         )
+        if (
+            expected_batch_seq is not None
+            and int(proxy.tensors.get("vpp_batch_seq", -1)) != expected_batch_seq
+        ):
+            raise RuntimeError(
+                "VPP activation batch mismatch: expected "
+                f"{expected_batch_seq}, got {proxy.tensors.get('vpp_batch_seq')}"
+            )
+        if (
+            expected_stage_id is not None
+            and int(proxy.tensors.get("vpp_stage_id", -1)) != expected_stage_id
+        ):
+            raise RuntimeError(
+                "VPP activation stage mismatch: expected "
+                f"{expected_stage_id}, got {proxy.tensors.get('vpp_stage_id')}"
+            )
         return proxy
 
     def _pp_recv_dict_from_prev_stage(
@@ -1311,9 +1461,14 @@ class SchedulerPPMixin:
                     )
         return result, event
 
-    def _pp_launch_vpp_batch(
+    def _pp_launch_vpp_batch(self: Scheduler, *args, **kwargs):
+        raise RuntimeError(
+            "VPP2 batches must run through the deterministic wavefront scheduler"
+        )
+
+    def _pp_launch_vpp_stage(
         self: Scheduler,
-        mb_id: int,
+        action: PipelineWavefrontAction,
         cur_batch: ScheduleBatch,
         pp_proxy_tensors: Optional[PPProxyTensors],
         mb_metadata: List[Optional[PPBatchMetadata]],
@@ -1321,31 +1476,34 @@ class SchedulerPPMixin:
     ):
         if get_parallel().pp_virtual_stages != 2:
             raise RuntimeError("the VPP scheduler currently supports VPP2 only")
+        if action.physical_rank != self.ps.pp_rank:
+            raise RuntimeError(
+                f"wavefront action for PP rank {action.physical_rank} "
+                f"cannot run on PP rank {self.ps.pp_rank}"
+            )
+        if action.stage_id == 0:
+            if pp_proxy_tensors is not None:
+                raise RuntimeError("the first VPP stage must use local model inputs")
+        elif pp_proxy_tensors is None:
+            raise RuntimeError(
+                f"logical stage {action.stage_id} requires an activation"
+            )
 
-        with torch.profiler.record_function("run_vpp_batch"):
+        send_work = []
+        with torch.profiler.record_function(f"run_vpp_stage_{action.stage_id}"):
             with self.forward_stream_ctx:
                 self.forward_stream.wait_stream(self.schedule_stream)
-                set_time_batch(
-                    cur_batch.reqs,
-                    "set_run_batch_cpu_start_time",
-                    trace_only=True,
+                if action.stage_id < self.ps.pp_size:
+                    set_time_batch(
+                        cur_batch.reqs,
+                        "set_run_batch_cpu_start_time",
+                        trace_only=True,
+                    )
+                result = self.run_batch(cur_batch, pp_proxy_tensors)
+                is_last_stage = action.stage_id == (
+                    self.ps.pp_size * get_parallel().pp_virtual_stages - 1
                 )
-                first_result = self.run_batch(cur_batch, pp_proxy_tensors)
-                first_proxy = first_result.pp_hidden_states_proxy_tensors
-                if first_proxy is None:
-                    raise RuntimeError("the first VPP visit must produce an activation")
-                first_send = self._pp_send_dict_to_next_stage(
-                    first_proxy.tensors,
-                    async_send=True,
-                    msg_type="vpp_proxy",
-                    batch_p2p=True,
-                )
-
-                second_proxy = self._pp_recv_vpp_proxy_tensors(first_visit=False)
-                self._pp_commit_comm_work(first_send)
-                result = self.run_batch(cur_batch, second_proxy)
-
-                if self.pp_group.is_last_rank:
+                if is_last_stage:
                     if result.pp_hidden_states_proxy_tensors is not None:
                         raise RuntimeError("the final VPP stage did not produce logits")
                 else:
@@ -1354,35 +1512,42 @@ class SchedulerPPMixin:
                         raise RuntimeError(
                             "a non-final VPP stage produced no activation"
                         )
-                    second_send = self._pp_send_dict_to_next_stage(
+                    output_stage_id = int(proxy.tensors.get("vpp_stage_id", -1))
+                    if output_stage_id != action.stage_id + 1:
+                        raise RuntimeError(
+                            "VPP stage produced an unexpected successor: "
+                            f"stage {action.stage_id} produced {output_stage_id}"
+                        )
+                    proxy.tensors["vpp_batch_seq"] = action.batch_seq
+                    send_work = self._pp_send_dict_to_next_stage(
                         proxy.tensors,
                         async_send=True,
                         msg_type="vpp_proxy",
                         batch_p2p=True,
                     )
-                    self._pp_commit_comm_work(second_send)
-                set_time_batch(
-                    cur_batch.reqs,
-                    "set_run_batch_cpu_end_time",
-                    trace_only=True,
-                    attrs={"pp_mb_id": mb_id},
-                )
+                if action.stage_id >= self.ps.pp_size:
+                    set_time_batch(
+                        cur_batch.reqs,
+                        "set_run_batch_cpu_end_time",
+                        trace_only=True,
+                        attrs={"pp_mb_id": action.slot_id},
+                    )
 
-                mb_metadata[mb_id] = PPBatchMetadata(
+                mb_metadata[action.slot_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
                 )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())
-                if self.pp_group.is_last_rank:
+                if is_last_stage:
+                    output_tensors = self._pp_prepare_tensor_dict(result, cur_batch)
+                    output_tensors["vpp_batch_seq"] = action.batch_seq
                     last_rank_comm_queue.append(
                         (
                             event,
-                            PPProxyTensors(
-                                self._pp_prepare_tensor_dict(result, cur_batch)
-                            ),
+                            PPProxyTensors(output_tensors),
                         )
                     )
-        return result, event
+        return result, event, send_work
 
     def get_rids(
         self: Scheduler, req_queue: List[Req], is_send: bool, *poll_statuses_group

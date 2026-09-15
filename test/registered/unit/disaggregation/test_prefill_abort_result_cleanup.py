@@ -72,6 +72,7 @@ def _batch(req):
         spec_info=None,
         prefill_stats=None,
         dp_cooperation_info=None,
+        disagg_prefill_chunk_end_by_rid=None,
     )
 
 
@@ -137,6 +138,27 @@ def test_aborted_middle_result_waits_for_inflight_chunk(release_kv_cache):
 
     release_kv_cache.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
     scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
+
+
+def test_middle_chunk_uses_batch_scoped_transfer_boundary():
+    scheduler = _Scheduler()
+    scheduler.enable_overlap = True
+    req = _Req(inflight_middle_chunks=1)
+    req.to_finish = None
+    req.pending_bootstrap = False
+    req.extend_range = SimpleNamespace(end=100)
+    req.tmp_end_idx = 100
+    scheduler.chunked_req = req
+    batch = _batch(req)
+    batch.disagg_prefill_chunk_end_by_rid = {req.rid: 50}
+
+    scheduler.process_batch_result_disagg_prefill(batch, _result())
+
+    scheduler.send_kv_chunk.assert_called_once_with(
+        req,
+        last_chunk=False,
+        end_idx=50,
+    )
 
 
 @patch("sglang.srt.disaggregation.prefill.release_kv_cache")

@@ -2219,6 +2219,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     chunked_req: Optional[Req] = None
     chunked_req_next_prompt_token: Optional[int] = None
     contains_last_prefill_chunk: bool = True
+    disagg_prefill_chunk_end_by_rid: Optional[Dict[str, int]] = None
 
     # For DP attention
     inner_idle_batch: Optional[ScheduleBatch] = None
@@ -3664,6 +3665,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             launch_ts=self.launch_ts,
             after_idle_gap=self.after_idle_gap,
             extend_num_tokens=self.extend_num_tokens,
+            disagg_prefill_chunk_end_by_rid=self.disagg_prefill_chunk_end_by_rid,
         )
 
     def maybe_evict_swa(self):

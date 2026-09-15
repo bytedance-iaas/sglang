@@ -880,7 +880,14 @@ class SchedulerDisaggregationPrefillMixin:
                     assert req.metadata_buffer_index >= 0, (
                         f"Req {req.rid} does not have metadata buffer allocated"
                     )
-                    self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
+                    chunk_end_by_rid = batch.disagg_prefill_chunk_end_by_rid
+                    end_idx = (
+                        chunk_end_by_rid[req.rid]
+                        if chunk_end_by_rid is not None
+                        and req.rid in chunk_end_by_rid
+                        else req.tmp_end_idx
+                    )
+                    self.send_kv_chunk(req, last_chunk=False, end_idx=end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
         if auxiliary_output is not None:

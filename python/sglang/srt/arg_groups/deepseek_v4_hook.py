@@ -245,6 +245,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             ),
             ("HiCache", cfg.enable_hierarchical_cache),
             ("pipeline async batch depth", cfg.pp_async_batch_depth != 0),
+            ("disabled overlap scheduling", cfg.disable_overlap_schedule),
             ("encoder SWA bounded replay", cfg.enable_encoder_swa_bounded_replay),
             (
                 "prefill CUDA graphs",

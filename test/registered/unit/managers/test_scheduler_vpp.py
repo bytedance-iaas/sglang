@@ -2,10 +2,11 @@ import unittest
 from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 import torch
 
+from sglang.srt.distributed.pipeline_layout import PipelineWavefrontAction
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
@@ -30,14 +31,20 @@ class _Event:
 
 def _make_scheduler(*, is_first_rank=False, is_last_rank=False):
     scheduler = SchedulerPPMixin()
+    scheduler.ps = SimpleNamespace(
+        pp_rank=3 if is_last_rank else 1,
+        pp_size=4,
+    )
     scheduler.pp_group = SimpleNamespace(
         is_first_rank=is_first_rank,
         is_last_rank=is_last_rank,
     )
     scheduler.attn_tp_group = object()
+    scheduler.device = "cpu"
     scheduler.forward_stream_ctx = nullcontext()
     scheduler.forward_stream = MagicMock()
     scheduler.schedule_stream = object()
+    scheduler.last_rank_comm_queue = deque()
     scheduler.device_module = SimpleNamespace(
         Event=_Event,
         current_stream=lambda: "forward-stream",
@@ -139,7 +146,10 @@ class TestSchedulerVPP(unittest.TestCase):
 
     def test_vpp_output_is_broadcast_from_last_physical_rank(self):
         scheduler = SchedulerPPMixin()
-        output_tensors = {"next_token_ids": torch.tensor([1])}
+        output_tensors = {
+            "next_token_ids": torch.tensor([1]),
+            "vpp_batch_seq": 4,
+        }
         scheduler.pp_group = SimpleNamespace(
             is_last_rank=True,
             world_size=4,
@@ -158,6 +168,7 @@ class TestSchedulerVPP(unittest.TestCase):
         output_proxy = PPProxyTensors(output_tensors)
 
         result = scheduler._pp_vpp_broadcast_batch_result(
+            4,
             SimpleNamespace(),
             PPBatchMetadata(can_run_cuda_graph=False),
             deque([(output_event, output_proxy)]),
@@ -165,7 +176,10 @@ class TestSchedulerVPP(unittest.TestCase):
 
         self.assertIs(result, expected)
         scheduler.pp_group.broadcast_tensor_dict.assert_called_once_with(
-            output_tensors,
+            {
+                "next_token_ids": output_tensors["next_token_ids"],
+                "vpp_batch_seq": 4,
+            },
             src=3,
         )
         scheduler.device_module.current_stream().wait_event.assert_called_once_with(
@@ -230,102 +244,331 @@ class TestSchedulerVPP(unittest.TestCase):
             batch_p2p=True,
         )
 
+    def test_vpp_proxy_rejects_wrong_batch_identity(self):
+        scheduler = SchedulerPPMixin()
+        scheduler.pp_group = SimpleNamespace(is_first_rank=False)
+        scheduler.attn_tp_group = object()
+        scheduler._pp_recv_typed_dict = MagicMock(
+            return_value={"vpp_batch_seq": 3, "vpp_stage_id": 5}
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "batch mismatch"):
+            scheduler._pp_recv_vpp_proxy_tensors(
+                first_visit=False,
+                expected_batch_seq=4,
+                expected_stage_id=5,
+            )
+
+    def test_prepare_wavefront_batch_claims_slot(self):
+        scheduler = _make_scheduler()
+        scheduler.mbs = [None] * 4
+        scheduler.last_mbs = [None] * 4
+        scheduler.running_mbs = [SimpleNamespace() for _ in range(4)]
+        scheduler.mb_metadata = [None] * 4
+        scheduler.process_prefill_chunk = MagicMock()
+        batch = SimpleNamespace(chunked_req=None)
+        next_running = SimpleNamespace()
+        scheduler.get_new_batch_prefill = MagicMock(
+            return_value=SimpleNamespace(
+                batch_to_run=batch,
+                running_batch=next_running,
+            )
+        )
+        scheduler.dp_attn_adapter = SimpleNamespace(
+            maybe_prepare_mlp_sync_batch=MagicMock(return_value=batch)
+        )
+        slot_batch_seqs = [None] * 4
+
+        result = scheduler._pp_vpp_prepare_wavefront_batch(5, slot_batch_seqs)
+
+        self.assertIs(result, batch)
+        self.assertEqual(slot_batch_seqs, [None, 5, None, None])
+        self.assertIs(scheduler.mbs[1], batch)
+        self.assertIs(scheduler.running_mbs[1], next_running)
+        scheduler.process_prefill_chunk.assert_called_once_with(
+            last_batch=None,
+            running_batch=ANY,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "still owned"):
+            scheduler._pp_vpp_prepare_wavefront_batch(9, slot_batch_seqs)
+
+    def test_prepare_wavefront_batch_snapshots_chunk_end(self):
+        scheduler = _make_scheduler()
+        scheduler.mbs = [None] * 4
+        scheduler.last_mbs = [None] * 4
+        scheduler.running_mbs = [SimpleNamespace() for _ in range(4)]
+        scheduler.mb_metadata = [None] * 4
+        scheduler.process_prefill_chunk = MagicMock()
+        req = SimpleNamespace(
+            rid="r0",
+            extend_range=SimpleNamespace(end=4096),
+            origin_input_ids=list(range(8192)),
+        )
+        batch = SimpleNamespace(chunked_req=req)
+        scheduler.get_new_batch_prefill = MagicMock(
+            return_value=SimpleNamespace(
+                batch_to_run=batch,
+                running_batch=SimpleNamespace(),
+            )
+        )
+        scheduler.dp_attn_adapter = SimpleNamespace(
+            maybe_prepare_mlp_sync_batch=MagicMock(return_value=batch)
+        )
+
+        scheduler._pp_vpp_prepare_wavefront_batch(0, [None] * 4)
+        req.extend_range.end = 8192
+
+        self.assertEqual(batch.disagg_prefill_chunk_end_by_rid, {"r0": 4096})
+
+    def test_execute_wavefront_action_routes_expected_batch_and_stage(self):
+        scheduler = _make_scheduler()
+        batch = SimpleNamespace()
+        scheduler.mbs = [batch, None, None, None]
+        scheduler.last_mbs = [None] * 4
+        scheduler.running_mbs = [SimpleNamespace() for _ in range(4)]
+        scheduler.mb_metadata = [None] * 4
+        scheduler.enable_staging = False
+        proxy = PPProxyTensors({"vpp_batch_seq": 4, "vpp_stage_id": 5})
+        scheduler._pp_recv_vpp_proxy_tensors = MagicMock(return_value=proxy)
+        send_work = [object()]
+        scheduler._pp_launch_vpp_stage = MagicMock(
+            return_value=(object(), object(), send_work)
+        )
+        action = PipelineWavefrontAction(
+            tick=13,
+            batch_seq=4,
+            slot_id=0,
+            stage_id=5,
+            physical_rank=1,
+        )
+
+        executed, result_send_work = scheduler._pp_vpp_execute_wavefront_action(
+            action,
+            [4, None, None, None],
+        )
+
+        self.assertTrue(executed)
+        self.assertIs(result_send_work, send_work)
+        scheduler._pp_recv_vpp_proxy_tensors.assert_called_once_with(
+            first_visit=False,
+            expected_batch_seq=4,
+            expected_stage_id=5,
+        )
+        scheduler._pp_launch_vpp_stage.assert_called_once_with(
+            action,
+            batch,
+            proxy,
+            scheduler.mb_metadata,
+            scheduler.last_rank_comm_queue,
+        )
+
+    def test_complete_wavefront_batch_releases_slot(self):
+        scheduler = _make_scheduler()
+        batch = SimpleNamespace()
+        metadata = PPBatchMetadata(can_run_cuda_graph=False)
+        scheduler.mbs = [batch, None, None, None]
+        scheduler.last_mbs = [None] * 4
+        scheduler.mb_metadata = [metadata, None, None, None]
+        scheduler.last_rank_comm_queue = deque()
+        batch_result = object()
+        scheduler._pp_vpp_broadcast_batch_result = MagicMock(return_value=batch_result)
+        scheduler._pp_process_batch_result = MagicMock()
+        slot_batch_seqs = [4, None, None, None]
+
+        completed = scheduler._pp_vpp_complete_wavefront_batch(
+            4,
+            slot_batch_seqs,
+        )
+
+        self.assertTrue(completed)
+        scheduler._pp_process_batch_result.assert_called_once_with(batch, batch_result)
+        self.assertIs(scheduler.last_mbs[0], batch)
+        self.assertIsNone(scheduler.mbs[0])
+        self.assertIsNone(scheduler.mb_metadata[0])
+        self.assertIsNone(slot_batch_seqs[0])
+
+    def test_wavefront_loop_runs_deterministic_injection_and_completion_order(self):
+        scheduler = _make_scheduler()
+        scheduler.pp_group.all_gather_object = MagicMock(return_value=[True] * 4)
+        scheduler.pp_group.barrier = MagicMock()
+        scheduler.disagg_prefill_inflight_queue = []
+        scheduler._pp_vpp_collect_bootstrapped_ids = MagicMock(return_value=[[], []])
+        scheduler.process_bootstrapped_queue = MagicMock()
+        scheduler._pp_vpp_collect_transferred_ids = MagicMock(return_value=[])
+        scheduler.process_disagg_prefill_inflight_queue = MagicMock()
+        scheduler.on_idle = MagicMock()
+        scheduler._pp_vpp_prepare_wavefront_batch = MagicMock(return_value=object())
+        scheduler._pp_vpp_complete_wavefront_batch = MagicMock(return_value=True)
+        scheduler._pp_commit_comm_work = MagicMock()
+        actions = []
+        send_work = {}
+        wave_count = 0
+
+        def init_loop_state():
+            scheduler.mbs = [None] * 4
+            scheduler.last_mbs = [None] * 4
+            scheduler.running_mbs = [
+                SimpleNamespace(batch_is_full=True) for _ in range(4)
+            ]
+            scheduler.mb_metadata = [None] * 4
+            scheduler.last_rank_comm_queue = deque()
+
+        def ingest_requests():
+            nonlocal wave_count
+            if wave_count == 1:
+                raise StopIteration
+            wave_count += 1
+
+        def execute_action(action, _slot_batch_seqs):
+            actions.append(action)
+            if action is None:
+                return False, []
+            work = [object()]
+            send_work[action.tick] = work
+            return True, work
+
+        scheduler.init_pp_loop_state = init_loop_state
+        scheduler._pp_vpp_ingest_requests = ingest_requests
+        scheduler._pp_vpp_execute_wavefront_action = execute_action
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
+                return_value=SimpleNamespace(pp_virtual_stages=2),
+            ),
+            self.assertRaises(StopIteration),
+        ):
+            scheduler._event_loop_pp_disagg_prefill_vpp()
+
+        self.assertEqual(
+            [
+                call.args[0]
+                for call in scheduler._pp_vpp_prepare_wavefront_batch.call_args_list
+            ],
+            list(range(4)),
+        )
+        self.assertEqual(
+            [
+                call.args[0]
+                for call in scheduler._pp_vpp_complete_wavefront_batch.call_args_list
+            ],
+            list(range(4)),
+        )
+        self.assertEqual(
+            [
+                (action.batch_seq, action.stage_id) if action else None
+                for action in actions
+            ],
+            [
+                None,
+                (0, 1),
+                (1, 1),
+                (2, 1),
+                (3, 1),
+                (0, 5),
+                (1, 5),
+                (2, 5),
+                (3, 5),
+                None,
+                None,
+            ],
+        )
+        self.assertEqual(
+            scheduler._pp_commit_comm_work.call_args_list[2],
+            call(send_work[1]),
+        )
+        scheduler.pp_group.barrier.assert_called_once_with()
+
     @patch(
         "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
         return_value=SimpleNamespace(pp_virtual_stages=2),
     )
     @patch("sglang.srt.managers.scheduler_pp_mixin.set_time_batch")
-    def test_non_final_rank_runs_two_visits_and_forwards_both(
+    def test_non_final_wavefront_action_runs_one_stage(
         self, _set_time_batch, _get_parallel
     ):
         scheduler = _make_scheduler()
-        first_input = PPProxyTensors({"stage": 1})
-        first_output = PPProxyTensors({"stage": 2})
-        second_input = scheduler._pp_recv_vpp_proxy_tensors.return_value
-        second_output = PPProxyTensors({"stage": 5})
-        first_result = SimpleNamespace(
-            pp_hidden_states_proxy_tensors=first_output,
+        stage_input = PPProxyTensors({"vpp_stage_id": 1, "vpp_batch_seq": 4})
+        stage_output = PPProxyTensors({"vpp_stage_id": 2})
+        stage_result = SimpleNamespace(
+            pp_hidden_states_proxy_tensors=stage_output,
             can_run_cuda_graph=False,
         )
-        second_result = SimpleNamespace(
-            pp_hidden_states_proxy_tensors=second_output,
-            can_run_cuda_graph=False,
-        )
-        scheduler.run_batch = MagicMock(side_effect=[first_result, second_result])
+        scheduler.run_batch = MagicMock(return_value=stage_result)
         batch = SimpleNamespace(reqs=[])
-        metadata = [None]
-
-        result, event = scheduler._pp_launch_vpp_batch(
-            0, batch, first_input, metadata, deque()
+        metadata = [None] * 4
+        action = PipelineWavefrontAction(
+            tick=9,
+            batch_seq=4,
+            slot_id=0,
+            stage_id=1,
+            physical_rank=1,
         )
 
-        self.assertIs(result, second_result)
+        result, event, send_work = scheduler._pp_launch_vpp_stage(
+            action,
+            batch,
+            stage_input,
+            metadata,
+            deque(),
+        )
+
+        self.assertIs(result, stage_result)
         self.assertEqual(event.recorded_stream, "forward-stream")
-        self.assertEqual(metadata, [PPBatchMetadata(can_run_cuda_graph=False)])
-        self.assertEqual(
-            scheduler.run_batch.call_args_list,
-            [call(batch, first_input), call(batch, second_input)],
-        )
-        self.assertEqual(
-            scheduler._pp_send_dict_to_next_stage.call_args_list,
-            [
-                call(
-                    first_output.tensors,
-                    async_send=True,
-                    msg_type="vpp_proxy",
-                    batch_p2p=True,
-                ),
-                call(
-                    second_output.tensors,
-                    async_send=True,
-                    msg_type="vpp_proxy",
-                    batch_p2p=True,
-                ),
-            ],
-        )
-        self.assertEqual(scheduler._pp_commit_comm_work.call_count, 2)
-
-    @patch(
-        "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
-        return_value=SimpleNamespace(pp_virtual_stages=2),
-    )
-    @patch("sglang.srt.managers.scheduler_pp_mixin.set_time_batch")
-    def test_final_rank_queues_second_visit_output(
-        self, _set_time_batch, _get_parallel
-    ):
-        scheduler = _make_scheduler(is_last_rank=True)
-        first_output = PPProxyTensors({"stage": 4})
-        first_result = SimpleNamespace(
-            pp_hidden_states_proxy_tensors=first_output,
-            can_run_cuda_graph=False,
-        )
-        final_result = SimpleNamespace(
-            pp_hidden_states_proxy_tensors=None,
-            can_run_cuda_graph=True,
-        )
-        scheduler.run_batch = MagicMock(side_effect=[first_result, final_result])
-        batch = SimpleNamespace(reqs=[])
-        metadata = [None]
-        output_queue = deque()
-
-        result, event = scheduler._pp_launch_vpp_batch(
-            0, batch, PPProxyTensors({"stage": 3}), metadata, output_queue
-        )
-
-        self.assertIs(result, final_result)
-        self.assertEqual(metadata, [PPBatchMetadata(can_run_cuda_graph=True)])
+        self.assertEqual(len(send_work), 1)
+        self.assertEqual(metadata[0], PPBatchMetadata(can_run_cuda_graph=False))
+        scheduler.run_batch.assert_called_once_with(batch, stage_input)
         scheduler._pp_send_dict_to_next_stage.assert_called_once_with(
-            first_output.tensors,
+            {"vpp_stage_id": 2, "vpp_batch_seq": 4},
             async_send=True,
             msg_type="vpp_proxy",
             batch_p2p=True,
         )
+        scheduler._pp_commit_comm_work.assert_not_called()
+
+    @patch(
+        "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
+        return_value=SimpleNamespace(pp_virtual_stages=2),
+    )
+    @patch("sglang.srt.managers.scheduler_pp_mixin.set_time_batch")
+    def test_final_wavefront_action_queues_output(self, _set_time_batch, _get_parallel):
+        scheduler = _make_scheduler(is_last_rank=True)
+        final_result = SimpleNamespace(
+            pp_hidden_states_proxy_tensors=None,
+            can_run_cuda_graph=True,
+        )
+        scheduler.run_batch = MagicMock(return_value=final_result)
+        batch = SimpleNamespace(reqs=[])
+        metadata = [None] * 4
+        output_queue = deque()
+        action = PipelineWavefrontAction(
+            tick=7,
+            batch_seq=0,
+            slot_id=0,
+            stage_id=7,
+            physical_rank=3,
+        )
+        stage_input = PPProxyTensors({"vpp_stage_id": 7, "vpp_batch_seq": 0})
+
+        result, event, send_work = scheduler._pp_launch_vpp_stage(
+            action,
+            batch,
+            stage_input,
+            metadata,
+            output_queue,
+        )
+
+        self.assertIs(result, final_result)
+        self.assertEqual(send_work, [])
+        self.assertEqual(metadata[0], PPBatchMetadata(can_run_cuda_graph=True))
+        scheduler._pp_send_dict_to_next_stage.assert_not_called()
         scheduler._pp_prepare_tensor_dict.assert_called_once_with(final_result, batch)
         queued_event, queued_output = output_queue.pop()
         self.assertIs(queued_event, event)
         self.assertEqual(
             queued_output.tensors,
-            {"next_token_ids": "tokens"},
+            {"next_token_ids": "tokens", "vpp_batch_seq": 0},
         )
 
     @patch(
@@ -334,13 +577,20 @@ class TestSchedulerVPP(unittest.TestCase):
     )
     def test_launch_rejects_non_vpp2_layout(self, _get_parallel):
         scheduler = _make_scheduler()
+        action = PipelineWavefrontAction(
+            tick=0,
+            batch_seq=0,
+            slot_id=0,
+            stage_id=1,
+            physical_rank=1,
+        )
 
         with self.assertRaisesRegex(RuntimeError, "supports VPP2 only"):
-            scheduler._pp_launch_vpp_batch(
-                0,
+            scheduler._pp_launch_vpp_stage(
+                action,
                 SimpleNamespace(reqs=[]),
-                None,
-                [None],
+                PPProxyTensors({"vpp_stage_id": 1, "vpp_batch_seq": 0}),
+                [None] * 4,
                 deque(),
             )
 
