@@ -26,6 +26,7 @@ from sglang.srt.speculative.eagle_numerical_probe import (
     _emit_json_record,
     _PPTargetForwardDeviceObserver,
     _synchronize_cuda_tensors,
+    _tensor_fingerprint,
     maybe_record_eagle_numerical_stage,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -34,6 +35,34 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestEagleNumericalProbe(unittest.TestCase):
+    def test_integer_row_multiset_fingerprint_is_order_independent(self):
+        left = torch.tensor([[3, 1, 2], [6, 4, 5]], dtype=torch.int32)
+        reordered = torch.tensor([[2, 3, 1], [5, 6, 4]], dtype=torch.int32)
+        changed = torch.tensor([[2, 3, 0], [5, 6, 4]], dtype=torch.int32)
+
+        left_fp = _tensor_fingerprint(left, 2, include_row_multiset=True)
+        reordered_fp = _tensor_fingerprint(reordered, 2, include_row_multiset=True)
+        changed_fp = _tensor_fingerprint(changed, 2, include_row_multiset=True)
+
+        self.assertNotEqual(left_fp["sha256"], reordered_fp["sha256"])
+        self.assertEqual(
+            left_fp["row_multiset_sha256"],
+            reordered_fp["row_multiset_sha256"],
+        )
+        self.assertNotEqual(
+            left_fp["row_multiset_sha256"],
+            changed_fp["row_multiset_sha256"],
+        )
+
+    def test_row_multiset_fingerprint_rejects_wrong_tensor_kind(self):
+        for tensor in (
+            torch.zeros(2, dtype=torch.int32),
+            torch.zeros((2, 3), dtype=torch.float32),
+        ):
+            with self.subTest(shape=tuple(tensor.shape), dtype=tensor.dtype):
+                with self.assertRaisesRegex(ValueError, "rank-2 integer tensor"):
+                    _tensor_fingerprint(tensor, 1, include_row_multiset=True)
+
     @contextlib.contextmanager
     def capture_atomic_probe_records(self):
         records = []

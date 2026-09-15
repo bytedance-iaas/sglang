@@ -1069,7 +1069,11 @@ class EaglePPSenderProbe:
             fingerprints[name] = {
                 "row_domain": row_domain,
                 "logical_rows": logical_rows,
-                **_tensor_fingerprint(tensor, logical_rows),
+                **_tensor_fingerprint(
+                    tensor,
+                    logical_rows,
+                    include_row_multiset=(name == "logical_topk_indices"),
+                ),
             }
             stage_metadata.add((row_domain, logical_rows))
         result = {"tensors": fingerprints}
@@ -1135,7 +1139,12 @@ def _synchronize_cuda_tensors(
         torch.cuda.current_stream(device=device).synchronize()
 
 
-def _tensor_fingerprint(tensor: torch.Tensor, logical_rows: int) -> dict:
+def _tensor_fingerprint(
+    tensor: torch.Tensor,
+    logical_rows: int,
+    *,
+    include_row_multiset: bool = False,
+) -> dict:
     value = tensor.detach()
     if logical_rows <= 0:
         raise ValueError(f"logical_rows must be positive, got {logical_rows}")
@@ -1153,6 +1162,21 @@ def _tensor_fingerprint(tensor: torch.Tensor, logical_rows: int) -> dict:
         "shape": list(cpu.shape),
         "sha256": hashlib.sha256(raw).hexdigest(),
     }
+    if include_row_multiset:
+        if cpu.ndim != 2 or cpu.dtype not in {
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+            torch.uint8,
+        }:
+            raise ValueError(
+                "row-multiset fingerprint requires a rank-2 integer tensor, "
+                f"got shape={tuple(cpu.shape)}, dtype={cpu.dtype}"
+            )
+        canonical = torch.sort(cpu, dim=1).values.contiguous()
+        canonical_raw = canonical.reshape(-1).view(torch.uint8).numpy().tobytes()
+        result["row_multiset_sha256"] = hashlib.sha256(canonical_raw).hexdigest()
     if cpu.numel() == 0:
         result.update({"finite": True, "sum": 0.0, "abs_max": 0.0})
         return result
