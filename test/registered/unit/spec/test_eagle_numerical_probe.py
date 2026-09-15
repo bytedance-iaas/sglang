@@ -1311,6 +1311,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
             return tensor
 
         snapshots = []
+        fingerprint_options = []
 
         def empty(*_args, **kwargs):
             self.assertEqual(kwargs["device"], "cpu")
@@ -1359,7 +1360,11 @@ class TestEagleNumericalProbe(unittest.TestCase):
             ),
             mock.patch(
                 "sglang.srt.speculative.eagle_numerical_probe._tensor_fingerprint",
-                side_effect=lambda *_args: events.append("fingerprint") or {},
+                side_effect=lambda *_args, **kwargs: (
+                    fingerprint_options.append(kwargs),
+                    events.append("fingerprint"),
+                    {},
+                )[2],
             ),
             self.capture_atomic_probe_records() as records,
         ):
@@ -1383,6 +1388,10 @@ class TestEagleNumericalProbe(unittest.TestCase):
             self.decode_atomic_probe_record(records[0])["status"], "complete"
         )
         self.assertEqual(events.count(("copy", True)), 2)
+        self.assertEqual(
+            sum(bool(item.get("include_row_multiset")) for item in fingerprint_options),
+            0,
+        )
         self.assertLess(events.index("record"), events.index("synchronize"))
         self.assertLess(events.index("synchronize"), events.index("fingerprint"))
 
