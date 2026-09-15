@@ -956,6 +956,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             target_forward_probe is not None
             and forward_batch.forward_mode.is_target_verify()
         ):
+            target_forward_probe.capture_indexer_logits(
+                layer_id=layer_id,
+                logits=logits,
+                seq_lens=seqlens_32,
+            )
             if envs.SGLANG_DSA_TOPK_BROADCAST.get():
                 raise RuntimeError(
                     "logical TopK observer does not support post-selection "

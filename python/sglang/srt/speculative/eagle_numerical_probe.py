@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import stat
+import struct
 import zlib
 from typing import Optional
 
@@ -203,6 +204,7 @@ _PP_TARGET_ATTENTION_OUTPUT_BOUNDARIES = (
     "v_projection_output",
 )
 _PP_TARGET_ATTENTION_TENSOR = "output"
+_PP_INDEXER_LOGITS_TENSORS = ("logits", "seq_lens")
 _PP_FLASHMLA_INPUT_TENSORS = (
     "q_nope",
     "q_rope",
@@ -279,6 +281,8 @@ class _PPTargetForwardDeviceObserver:
         self._flashmla_input_buffers: dict[int, dict[str, torch.Tensor]] = {}
         self._flashmla_input_row_counts: dict[int, dict[str, torch.Tensor]] = {}
         self._logical_topk_kernel_rows: dict[int, int] = {}
+        self._indexer_logits_buffers: dict[int, dict[str, torch.Tensor]] = {}
+        self._indexer_logits_row_counts: dict[int, torch.Tensor] = {}
         self.device = self.buffer.device
 
     def install_attention_boundaries(
@@ -389,6 +393,71 @@ class _PPTargetForwardDeviceObserver:
             "num_splits": _FLASHMLA_QUERY_SPLIT_INDPTR_ROW_DOMAIN,
             "tile_scheduler_metadata": _FLASHMLA_SCHEDULER_ROW_DOMAIN,
         }
+
+    def install_indexer_logits(self, *, layer_id: int, max_columns: int) -> None:
+        """Allocate a graph-stable copy of one layer's direct TopK inputs."""
+        if layer_id in self._indexer_logits_buffers:
+            raise RuntimeError(
+                f"indexer-logits observer is already installed for layer {layer_id}"
+            )
+        if max_columns <= 0:
+            raise ValueError(
+                f"indexer-logits observer width must be positive: {max_columns}"
+            )
+        stage = f"target_verify_layer_{layer_id:02d}_indexer_logits"
+        self._indexer_logits_buffers[layer_id] = {
+            "logits": torch.empty(
+                (self.max_rows, max_columns),
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            "seq_lens": torch.empty(
+                (self.max_rows,), dtype=torch.int32, device=self.device
+            ),
+        }
+        self._indexer_logits_row_counts[layer_id] = torch.zeros(
+            (1,), dtype=torch.int32, device=self.device
+        )
+        self._row_domains[stage] = {
+            name: _PP_ATTN_GROUP_TARGET_TREE_ROW_DOMAIN
+            for name in _PP_INDEXER_LOGITS_TENSORS
+        }
+
+    def capture_indexer_logits(
+        self, *, layer_id: int, logits: torch.Tensor, seq_lens: torch.Tensor
+    ) -> None:
+        """Copy post-mask logits and their valid per-row lengths in-graph."""
+        buffers = self._indexer_logits_buffers.get(layer_id)
+        if buffers is None:
+            return
+        stage = f"target_verify_layer_{layer_id:02d}_indexer_logits"
+        if (
+            logits.ndim != 2
+            or logits.dtype != torch.float32
+            or logits.device != self.device
+        ):
+            raise ValueError(
+                f"{stage}.logits identity changed: shape={tuple(logits.shape)}, "
+                f"dtype={logits.dtype}, device={logits.device}"
+            )
+        rows, columns = map(int, logits.shape)
+        if rows <= 0 or rows > self.max_rows or columns > buffers["logits"].shape[1]:
+            raise ValueError(
+                f"{stage}.logits shape {tuple(logits.shape)} does not fit "
+                f"fixed slot {tuple(buffers['logits'].shape)}"
+            )
+        if (
+            seq_lens.shape != (rows,)
+            or seq_lens.dtype != torch.int32
+            or seq_lens.device != self.device
+        ):
+            raise ValueError(
+                f"{stage}.seq_lens identity changed: shape={tuple(seq_lens.shape)}, "
+                f"dtype={seq_lens.dtype}, device={seq_lens.device}"
+            )
+        buffers["logits"][:rows, :columns].copy_(logits)
+        buffers["seq_lens"][:rows].copy_(seq_lens)
+        self._indexer_logits_row_counts[layer_id].fill_(rows)
 
     def logical_topk_kernel_output(
         self,
@@ -691,6 +760,18 @@ class _PPTargetForwardDeviceObserver:
                     name: input_buffers[name] for name in _PP_FLASHMLA_INPUT_TENSORS
                 },
             }
+        for layer_id, buffers in self._indexer_logits_buffers.items():
+            stage = f"target_verify_layer_{layer_id:02d}_indexer_logits"
+            stages[stage] = {
+                "tensor_metadata": {
+                    name: {
+                        "logical_rows": self._indexer_logits_row_counts[layer_id],
+                        "row_domain": self._row_domains[stage][name],
+                    }
+                    for name in _PP_INDEXER_LOGITS_TENSORS
+                },
+                "tensors": buffers,
+            }
         return stages
 
 
@@ -740,6 +821,7 @@ class EaglePPSenderProbe:
         *,
         model,
         max_rows: int,
+        max_indexer_columns: int,
         dtype: torch.dtype,
         device: torch.device | str,
     ) -> None:
@@ -862,6 +944,10 @@ class EaglePPSenderProbe:
                     if observer_device.type == "cuda"
                     else 1
                 ),
+            )
+            observer.install_indexer_logits(
+                layer_id=layer_id,
+                max_columns=max_indexer_columns,
             )
             attention.target_forward_probe = observer
             indexer.target_forward_probe = observer
@@ -1055,6 +1141,11 @@ class EaglePPSenderProbe:
             raise ValueError("target-forward tensor metadata does not match tensors")
         fingerprints = {}
         stage_metadata = set()
+        indexer_lengths = (
+            stage_snapshot["tensors"].get("seq_lens")
+            if set(stage_snapshot["tensors"]) == set(_PP_INDEXER_LOGITS_TENSORS)
+            else None
+        )
         for name, tensor in sorted(stage_snapshot["tensors"].items()):
             metadata = tensor_metadata[name]
             logical_rows = metadata["logical_rows"]
@@ -1073,14 +1164,19 @@ class EaglePPSenderProbe:
                     f"invalid target-forward metadata for {name}: "
                     f"row_domain={row_domain!r}, logical_rows={logical_rows}"
                 )
-            fingerprints[name] = {
-                "row_domain": row_domain,
-                "logical_rows": logical_rows,
-                **_tensor_fingerprint(
+            fingerprint = (
+                _ragged_rows_fingerprint(tensor, indexer_lengths, logical_rows)
+                if name == "logits" and indexer_lengths is not None
+                else _tensor_fingerprint(
                     tensor,
                     logical_rows,
                     include_row_multiset=(name == "logical_topk_indices"),
-                ),
+                )
+            )
+            fingerprints[name] = {
+                "row_domain": row_domain,
+                "logical_rows": logical_rows,
+                **fingerprint,
             }
             stage_metadata.add((row_domain, logical_rows))
         result = {"tensors": fingerprints}
@@ -1201,6 +1297,56 @@ def _tensor_fingerprint(
     if cpu.numel() <= 16:
         result["values"] = cpu.reshape(-1).tolist()
     return result
+
+
+def _ragged_rows_fingerprint(
+    tensor: torch.Tensor, row_lengths: torch.Tensor, logical_rows: int
+) -> dict:
+    """Fingerprint only each row's valid prefix, excluding uninitialized tail."""
+    if tensor.ndim != 2 or tensor.dtype != torch.float32:
+        raise ValueError(
+            "ragged-row fingerprint requires a rank-2 float32 tensor, "
+            f"got shape={tuple(tensor.shape)}, dtype={tensor.dtype}"
+        )
+    lengths = row_lengths.detach()[:logical_rows].contiguous().cpu()
+    if (
+        lengths.ndim != 1
+        or lengths.dtype != torch.int32
+        or len(lengths) != logical_rows
+    ):
+        raise ValueError(
+            "ragged-row fingerprint lengths must be int32 with one value per row"
+        )
+    cpu = tensor.detach()[:logical_rows].contiguous().cpu()
+    digest_state = hashlib.sha256()
+    finite = True
+    total = 0.0
+    abs_max = 0.0
+    valid_elements = 0
+    for row, length_value in enumerate(lengths.tolist()):
+        length = int(length_value)
+        if length < 0 or length > cpu.shape[1]:
+            raise ValueError(f"ragged-row length {length} is outside 0..{cpu.shape[1]}")
+        values = cpu[row, :length]
+        digest_state.update(struct.pack("<Q", length))
+        digest_state.update(values.view(torch.uint8).numpy().tobytes())
+        finite_values = values.to(torch.float64)
+        finite_mask = torch.isfinite(finite_values)
+        finite = finite and bool(finite_mask.all())
+        if bool(finite_mask.any()):
+            selected = finite_values[finite_mask]
+            total += float(selected.sum())
+            abs_max = max(abs_max, float(selected.abs().max()))
+        valid_elements += length
+    return {
+        "dtype": str(cpu.dtype),
+        "shape": list(cpu.shape),
+        "sha256": digest_state.hexdigest(),
+        "valid_elements": valid_elements,
+        "finite": finite,
+        "sum": total,
+        "abs_max": abs_max,
+    }
 
 
 class EaglePDHandoffProbe:

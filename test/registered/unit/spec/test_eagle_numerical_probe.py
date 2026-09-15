@@ -25,6 +25,7 @@ from sglang.srt.speculative.eagle_numerical_probe import (
     EaglePPSenderProbe,
     _emit_json_record,
     _PPTargetForwardDeviceObserver,
+    _ragged_rows_fingerprint,
     _synchronize_cuda_tensors,
     _tensor_fingerprint,
     maybe_record_eagle_numerical_stage,
@@ -35,6 +36,20 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestEagleNumericalProbe(unittest.TestCase):
+    def test_ragged_rows_fingerprint_ignores_invalid_tail(self):
+        left = torch.tensor([[1.0, 2.0, 90.0], [3.0, 80.0, 70.0]])
+        changed_tail = torch.tensor([[1.0, 2.0, -9.0], [3.0, -8.0, -7.0]])
+        changed_prefix = torch.tensor([[1.0, 4.0, 90.0], [3.0, 80.0, 70.0]])
+        lengths = torch.tensor([2, 1], dtype=torch.int32)
+
+        left_fp = _ragged_rows_fingerprint(left, lengths, 2)
+        tail_fp = _ragged_rows_fingerprint(changed_tail, lengths, 2)
+        prefix_fp = _ragged_rows_fingerprint(changed_prefix, lengths, 2)
+
+        self.assertEqual(left_fp["sha256"], tail_fp["sha256"])
+        self.assertNotEqual(left_fp["sha256"], prefix_fp["sha256"])
+        self.assertEqual(left_fp["valid_elements"], 3)
+
     def test_integer_row_multiset_fingerprint_is_order_independent(self):
         left = torch.tensor([[3, 1, 2], [6, 4, 5]], dtype=torch.int32)
         reordered = torch.tensor([[2, 3, 1], [5, 6, 4]], dtype=torch.int32)
@@ -897,6 +912,12 @@ class TestEagleNumericalProbe(unittest.TestCase):
                 boundary="flashmla_raw_output",
                 output=torch.full((1, 2, 3), layer_id, dtype=torch.bfloat16),
             )
+            observer.install_indexer_logits(layer_id=layer_id, max_columns=7)
+            observer.capture_indexer_logits(
+                layer_id=layer_id,
+                logits=torch.full((1, 7), layer_id, dtype=torch.float32),
+                seq_lens=torch.tensor([5], dtype=torch.int32),
+            )
 
         snapshot = observer.snapshot_stages()
         for layer_id in (0, 1):
@@ -905,6 +926,13 @@ class TestEagleNumericalProbe(unittest.TestCase):
                 torch.equal(
                     stage["tensors"]["logical_topk_indices"][:1],
                     torch.tensor([[layer_id + 2, layer_id + 1, layer_id]]),
+                )
+            )
+            indexer = snapshot[f"target_verify_layer_{layer_id:02d}_indexer_logits"]
+            self.assertTrue(
+                torch.equal(
+                    indexer["tensors"]["logits"][:1, :7],
+                    torch.full((1, 7), layer_id, dtype=torch.float32),
                 )
             )
             self.assertEqual(
@@ -916,6 +944,34 @@ class TestEagleNumericalProbe(unittest.TestCase):
                     raw["tensors"]["output"][:1],
                     torch.full((1, 6), layer_id, dtype=torch.bfloat16),
                 )
+            )
+
+    def test_pp_target_forward_observer_captures_indexer_logits(self):
+        observer = _PPTargetForwardDeviceObserver(
+            layer_ids=(0, 1),
+            max_rows=4,
+            hidden_size=3,
+            dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+        )
+        observer.install_indexer_logits(layer_id=1, max_columns=7)
+        logits = torch.arange(14, dtype=torch.float32).reshape(2, 7)
+        seq_lens = torch.tensor([5, 7], dtype=torch.int32)
+        observer.capture_indexer_logits(layer_id=1, logits=logits, seq_lens=seq_lens)
+
+        snapshot = observer.snapshot_stages()["target_verify_layer_01_indexer_logits"]
+        self.assertEqual(set(snapshot["tensors"]), {"logits", "seq_lens"})
+        self.assertTrue(torch.equal(snapshot["tensors"]["logits"][:2], logits))
+        self.assertTrue(torch.equal(snapshot["tensors"]["seq_lens"][:2], seq_lens))
+        self.assertEqual(
+            snapshot["tensor_metadata"]["logits"]["logical_rows"].item(), 2
+        )
+
+        with self.assertRaisesRegex(ValueError, "does not fit"):
+            observer.capture_indexer_logits(
+                layer_id=1,
+                logits=torch.zeros((2, 8), dtype=torch.float32),
+                seq_lens=seq_lens,
             )
 
     def test_pp_target_forward_observer_rejects_logical_topk_output_drift(self):
@@ -1160,6 +1216,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
         probe.install_target_forward_observer(
             model=model,
             max_rows=32,
+            max_indexer_columns=128,
             dtype=torch.bfloat16,
             # ModelRunner.device is a string in the serving runtime. Keep this
             # contract covered instead of relying only on torch.device fixtures.

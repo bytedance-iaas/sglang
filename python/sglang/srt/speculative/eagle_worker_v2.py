@@ -1453,6 +1453,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             self.eagle_pp_sender_probe.install_target_forward_observer(
                 model=target_model_runner.model,
                 max_rows=target_model_runner.max_decode_logits_rows(),
+                max_indexer_columns=target_model_runner.max_total_num_tokens,
                 dtype=target_model_runner.dtype,
                 device=target_model_runner.device,
             )
