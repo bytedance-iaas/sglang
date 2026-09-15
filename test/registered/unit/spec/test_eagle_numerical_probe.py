@@ -792,7 +792,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
         scheduler = torch.arange(16, dtype=torch.int32).reshape(2, 8)
         pointers_before = {
             name: tensor.data_ptr()
-            for name, tensor in observer._flashmla_input_buffers.items()
+            for name, tensor in observer._flashmla_input_buffers[0].items()
         }
 
         observer.capture_flashmla_inputs(
@@ -843,9 +843,80 @@ class TestEagleNumericalProbe(unittest.TestCase):
             pointers_before,
             {
                 name: tensor.data_ptr()
-                for name, tensor in observer._flashmla_input_buffers.items()
+                for name, tensor in observer._flashmla_input_buffers[0].items()
             },
         )
+
+    def test_pp_target_forward_observer_keeps_attention_layers_independent(self):
+        observer = _PPTargetForwardDeviceObserver(
+            layer_ids=(0, 1),
+            max_rows=2,
+            hidden_size=3,
+            dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+        )
+        for layer_id in (0, 1):
+            observer.install_attention_boundaries(
+                layer_id=layer_id,
+                raw_output_width=6,
+                v_projection_width=4,
+                row_domain="pp_attn_group_target_verify_tree_node",
+                num_q_heads=2,
+                padded_num_q_heads=4,
+                q_nope_head_dim=2,
+                q_rope_head_dim=1,
+                topk_width=3,
+                max_scheduler_rows=2,
+            )
+            logical_topk = observer.logical_topk_kernel_output(
+                layer_id=layer_id,
+                rows=1,
+                dtype=torch.int32,
+                device=torch.device("cpu"),
+            )
+            logical_topk.copy_(torch.tensor([[layer_id + 2, layer_id + 1, layer_id]]))
+            observer.capture_flashmla_inputs(
+                layer_id=layer_id,
+                q_nope=torch.full((1, 2, 2), layer_id, dtype=torch.bfloat16),
+                q_rope=torch.full((1, 2, 1), layer_id, dtype=torch.bfloat16),
+                q_input=torch.full((1, 1, 4, 3), layer_id, dtype=torch.bfloat16),
+                topk_indices=torch.full((1, 3), layer_id, dtype=torch.int32),
+                indices=torch.full((1, 1, 3), layer_id, dtype=torch.int32),
+                logical_topk_indices=observer.logical_topk_flashmla_input(
+                    layer_id=layer_id,
+                    rows=1,
+                    dtype=torch.int32,
+                    device=torch.device("cpu"),
+                ),
+                cache_seqlens=torch.full((1,), layer_id, dtype=torch.int32),
+                num_splits=torch.full((2,), layer_id, dtype=torch.int32),
+                tile_scheduler_metadata=torch.full((2, 8), layer_id, dtype=torch.int32),
+            )
+            observer.capture_attention(
+                layer_id=layer_id,
+                boundary="flashmla_raw_output",
+                output=torch.full((1, 2, 3), layer_id, dtype=torch.bfloat16),
+            )
+
+        snapshot = observer.snapshot_stages()
+        for layer_id in (0, 1):
+            stage = snapshot[f"target_verify_layer_{layer_id:02d}_flashmla_inputs"]
+            self.assertTrue(
+                torch.equal(
+                    stage["tensors"]["logical_topk_indices"][:1],
+                    torch.tensor([[layer_id + 2, layer_id + 1, layer_id]]),
+                )
+            )
+            self.assertEqual(
+                stage["tensor_metadata"]["q_input"]["logical_rows"].item(), 1
+            )
+            raw = snapshot[f"target_verify_layer_{layer_id:02d}_flashmla_raw_output"]
+            self.assertTrue(
+                torch.equal(
+                    raw["tensors"]["output"][:1],
+                    torch.full((1, 6), layer_id, dtype=torch.bfloat16),
+                )
+            )
 
     def test_pp_target_forward_observer_rejects_logical_topk_output_drift(self):
         observer = _PPTargetForwardDeviceObserver(
@@ -855,7 +926,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
             dtype=torch.bfloat16,
             device=torch.device("cpu"),
         )
-        with self.assertRaisesRegex(ValueError, "wrong layer"):
+        with self.assertRaisesRegex(ValueError, "uninstalled layer"):
             observer.logical_topk_kernel_output(
                 layer_id=0, rows=1, dtype=torch.int32, device=torch.device("cpu")
             )
@@ -873,7 +944,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
             max_scheduler_rows=2,
         )
         invalid_output_cases = (
-            ("wrong layer", dict(layer_id=1, rows=2, dtype=torch.int32)),
+            ("uninstalled layer", dict(layer_id=1, rows=2, dtype=torch.int32)),
             ("outside fixed capacity", dict(layer_id=0, rows=0, dtype=torch.int32)),
             ("outside fixed capacity", dict(layer_id=0, rows=5, dtype=torch.int32)),
             ("identity changed", dict(layer_id=0, rows=2, dtype=torch.int64)),
@@ -985,7 +1056,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
                 self.assertTrue(
                     all(
                         count.item() == 0
-                        for count in observer._flashmla_input_row_counts.values()
+                        for count in observer._flashmla_input_row_counts[0].values()
                     )
                 )
 
@@ -1068,14 +1139,15 @@ class TestEagleNumericalProbe(unittest.TestCase):
             pod_uid="probe-pod-uid",
         )
         layers = [SimpleNamespace() for _ in range(78)]
-        layers[0].self_attn = SimpleNamespace(
-            num_local_heads=2,
-            kv_lora_rank=8,
-            qk_rope_head_dim=2,
-            v_head_dim=4,
-            indexer=SimpleNamespace(),
-            attn_mqa=SimpleNamespace(),
-        )
+        for layer_id in (0, 1):
+            layers[layer_id].self_attn = SimpleNamespace(
+                num_local_heads=2,
+                kv_lora_rank=8,
+                qk_rope_head_dim=2,
+                v_head_dim=4,
+                indexer=SimpleNamespace(),
+                attn_mqa=SimpleNamespace(),
+            )
         model = type(
             "GlmMoeDsaForCausalLM",
             (),
@@ -1102,15 +1174,24 @@ class TestEagleNumericalProbe(unittest.TestCase):
         self.assertIs(layers[0].self_attn.target_forward_probe, observer)
         self.assertIs(layers[0].self_attn.indexer.target_forward_probe, observer)
         self.assertIs(layers[0].self_attn.attn_mqa.target_forward_probe, observer)
+        self.assertIs(layers[1].self_attn.target_forward_probe, observer)
+        self.assertIs(layers[1].self_attn.indexer.target_forward_probe, observer)
+        self.assertIs(layers[1].self_attn.attn_mqa.target_forward_probe, observer)
         self.assertEqual(
             set(observer._attention_buffers),
             {
                 "target_verify_layer_00_flashmla_raw_output",
                 "target_verify_layer_00_v_projection_output",
+                "target_verify_layer_01_flashmla_raw_output",
+                "target_verify_layer_01_v_projection_output",
             },
         )
         self.assertEqual(
             set(observer._flashmla_input_buffers),
+            {0, 1},
+        )
+        self.assertEqual(
+            set(observer._flashmla_input_buffers[1]),
             {
                 "q_nope",
                 "q_rope",

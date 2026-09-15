@@ -276,10 +276,9 @@ class _PPTargetForwardDeviceObserver:
         self._attention_buffers: dict[str, torch.Tensor] = {}
         self._attention_row_counts: dict[str, torch.Tensor] = {}
         self._attention_widths: dict[str, int] = {}
-        self._flashmla_input_buffers: dict[str, torch.Tensor] = {}
-        self._flashmla_input_row_counts: dict[str, torch.Tensor] = {}
-        self._flashmla_layer_id: Optional[int] = None
-        self._logical_topk_kernel_rows: Optional[int] = None
+        self._flashmla_input_buffers: dict[int, dict[str, torch.Tensor]] = {}
+        self._flashmla_input_row_counts: dict[int, dict[str, torch.Tensor]] = {}
+        self._logical_topk_kernel_rows: dict[int, int] = {}
         self.device = self.buffer.device
 
     def install_attention_boundaries(
@@ -323,9 +322,10 @@ class _PPTargetForwardDeviceObserver:
             self._row_domains[stage] = {_PP_TARGET_ATTENTION_TENSOR: row_domain}
 
         input_stage = f"target_verify_layer_{layer_id:02d}_flashmla_inputs"
-        if self._flashmla_input_buffers:
-            raise RuntimeError("FlashMLA input observer is already installed")
-        self._flashmla_layer_id = int(layer_id)
+        if layer_id in self._flashmla_input_buffers:
+            raise RuntimeError(
+                f"FlashMLA input observer is already installed for layer {layer_id}"
+            )
         shapes_and_dtypes = {
             "q_nope": (
                 (self.max_rows, num_q_heads, q_nope_head_dim),
@@ -357,18 +357,22 @@ class _PPTargetForwardDeviceObserver:
                 torch.int32,
             ),
         }
+        input_buffers = {}
+        input_row_counts = {}
         for name, (shape, tensor_dtype) in shapes_and_dtypes.items():
             if any(dim <= 0 for dim in shape):
                 raise ValueError(
                     "FlashMLA input observer dimensions must be positive: "
                     f"tensor={name}, shape={shape}"
                 )
-            self._flashmla_input_buffers[name] = torch.empty(
+            input_buffers[name] = torch.empty(
                 shape, dtype=tensor_dtype, device=self.device
             )
-            self._flashmla_input_row_counts[name] = torch.zeros(
+            input_row_counts[name] = torch.zeros(
                 (1,), dtype=torch.int32, device=self.device
             )
+        self._flashmla_input_buffers[layer_id] = input_buffers
+        self._flashmla_input_row_counts[layer_id] = input_row_counts
         self._row_domains[input_stage] = {
             **{
                 name: row_domain
@@ -400,7 +404,7 @@ class _PPTargetForwardDeviceObserver:
         )
         # This is capture-time host state only. Each graph records a fixed-shape
         # TopK write to the shared slot; replay does not execute this assignment.
-        self._logical_topk_kernel_rows = rows
+        self._logical_topk_kernel_rows[layer_id] = rows
         return output
 
     def logical_topk_flashmla_input(
@@ -412,10 +416,10 @@ class _PPTargetForwardDeviceObserver:
         device: torch.device,
     ) -> torch.Tensor:
         """Return the same logical rows previously written by fused TopK v2."""
-        if self._logical_topk_kernel_rows != rows:
+        if self._logical_topk_kernel_rows.get(layer_id) != rows:
             raise RuntimeError(
                 "logical TopK producer/consumer row mismatch: "
-                f"kernel_rows={self._logical_topk_kernel_rows}, "
+                f"kernel_rows={self._logical_topk_kernel_rows.get(layer_id)}, "
                 f"flashmla_rows={rows}"
             )
         return self._logical_topk_buffer_view(
@@ -430,12 +434,13 @@ class _PPTargetForwardDeviceObserver:
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
-        if self._flashmla_layer_id != layer_id:
+        input_buffers = self._flashmla_input_buffers.get(layer_id)
+        if input_buffers is None:
             raise ValueError(
-                "logical TopK output requested for the wrong layer: "
-                f"requested={layer_id}, installed={self._flashmla_layer_id}"
+                "logical TopK output requested for an uninstalled layer: "
+                f"requested={layer_id}, installed={sorted(self._flashmla_input_buffers)}"
             )
-        buffer = self._flashmla_input_buffers.get("logical_topk_indices")
+        buffer = input_buffers.get("logical_topk_indices")
         if buffer is None:
             raise RuntimeError("logical TopK output requested before observer install")
         if rows <= 0 or rows > buffer.shape[0]:
@@ -478,15 +483,17 @@ class _PPTargetForwardDeviceObserver:
             "num_splits": num_splits,
             "tile_scheduler_metadata": tile_scheduler_metadata,
         }
-        if not self._flashmla_input_buffers:
+        input_buffers = self._flashmla_input_buffers.get(layer_id)
+        input_row_counts = self._flashmla_input_row_counts.get(layer_id)
+        if input_buffers is None or input_row_counts is None:
             return
-        if set(values) != set(self._flashmla_input_buffers):
+        if set(values) != set(input_buffers):
             raise RuntimeError("FlashMLA input observer schema drift")
         # Validate the complete schema before recording any copy/fill. A shape
         # or dtype mismatch therefore cannot leave a partially credible stage.
         for name in _PP_FLASHMLA_INPUT_TENSORS:
             value = values[name]
-            buffer = self._flashmla_input_buffers[name]
+            buffer = input_buffers[name]
             if not isinstance(value, torch.Tensor) or value.ndim < 1:
                 raise TypeError(f"{stage}.{name} must be a rank >= 1 tensor")
             rows = int(value.shape[0])
@@ -507,14 +514,14 @@ class _PPTargetForwardDeviceObserver:
                 )
         for name in _PP_FLASHMLA_INPUT_TENSORS:
             value = values[name]
-            buffer = self._flashmla_input_buffers[name]
+            buffer = input_buffers[name]
             rows = int(value.shape[0])
             # The fused v2 TopK kernel writes the logical selection directly to
             # this preallocated slot. Do not add a redundant graph node when
             # capture receives that exact view back from the attention path.
             if value.data_ptr() != buffer.data_ptr():
                 buffer[:rows].copy_(value)
-            self._flashmla_input_row_counts[name].fill_(rows)
+            input_row_counts[name].fill_(rows)
 
     def capture_attention(
         self,
@@ -670,19 +677,18 @@ class _PPTargetForwardDeviceObserver:
                 for stage, buffer in self._attention_buffers.items()
             }
         )
-        if self._flashmla_input_buffers:
-            stage = f"target_verify_layer_{self.layer_ids[0]:02d}_flashmla_inputs"
+        for layer_id, input_buffers in self._flashmla_input_buffers.items():
+            stage = f"target_verify_layer_{layer_id:02d}_flashmla_inputs"
             stages[stage] = {
                 "tensor_metadata": {
                     name: {
-                        "logical_rows": self._flashmla_input_row_counts[name],
+                        "logical_rows": self._flashmla_input_row_counts[layer_id][name],
                         "row_domain": self._row_domains[stage][name],
                     }
                     for name in _PP_FLASHMLA_INPUT_TENSORS
                 },
                 "tensors": {
-                    name: self._flashmla_input_buffers[name]
-                    for name in _PP_FLASHMLA_INPUT_TENSORS
+                    name: input_buffers[name] for name in _PP_FLASHMLA_INPUT_TENSORS
                 },
             }
         return stages
@@ -794,71 +800,72 @@ class EaglePPSenderProbe:
                     f"target-forward observer already installed on layer {layer_id}"
                 )
             layer.target_forward_probe = observer
-        first_layer = layers[start_layer]
-        attention = getattr(first_layer, "self_attn", None)
-        if attention is None:
-            raise TypeError(
-                "PP target-attention observer requires self_attn on the first layer"
-            )
-        if getattr(attention, "target_forward_probe", None) is not None:
-            raise RuntimeError(
-                f"target-attention observer already installed on layer {start_layer}"
-            )
-        indexer = getattr(attention, "indexer", None)
-        if indexer is None:
-            raise TypeError(
-                "PP target-attention observer requires an indexer on the first layer"
-            )
-        if getattr(indexer, "target_forward_probe", None) is not None:
-            raise RuntimeError(
-                f"TopK observer already installed on layer {start_layer}"
-            )
-        radix_attention = getattr(attention, "attn_mqa", None)
-        if radix_attention is None:
-            raise TypeError(
-                "PP target-attention observer requires attn_mqa on the first layer"
-            )
-        if getattr(radix_attention, "target_forward_probe", None) is not None:
-            raise RuntimeError(
-                f"FlashMLA observer already installed on layer {start_layer}"
-            )
-        observer.install_attention_boundaries(
-            layer_id=start_layer,
-            raw_output_width=(
-                int(attention.num_local_heads) * int(attention.kv_lora_rank)
-            ),
-            v_projection_width=(
-                int(attention.num_local_heads) * int(attention.v_head_dim)
-            ),
-            # Both cuts precede the rank-local o_proj partial and therefore
-            # retain the attention-group target-tree row layout.
-            row_domain=_PP_ATTN_GROUP_TARGET_TREE_ROW_DOMAIN,
-            num_q_heads=int(attention.num_local_heads),
-            padded_num_q_heads=(
-                64
-                if int(attention.num_local_heads) <= 64
-                else (
-                    128
-                    if int(attention.num_local_heads) <= 128
-                    else int(attention.num_local_heads)
+        for layer_id in layer_ids[:2]:
+            layer = layers[layer_id]
+            attention = getattr(layer, "self_attn", None)
+            if attention is None:
+                raise TypeError(
+                    f"PP target-attention observer requires self_attn on layer {layer_id}"
                 )
-            ),
-            q_nope_head_dim=int(attention.kv_lora_rank),
-            q_rope_head_dim=int(attention.qk_rope_head_dim),
-            topk_width=int(model.config.index_topk),
-            max_scheduler_rows=(
-                int(
-                    torch.cuda.get_device_properties(
-                        observer_device
-                    ).multi_processor_count
+            if getattr(attention, "target_forward_probe", None) is not None:
+                raise RuntimeError(
+                    f"target-attention observer already installed on layer {layer_id}"
                 )
-                if observer_device.type == "cuda"
-                else 1
-            ),
-        )
-        attention.target_forward_probe = observer
-        indexer.target_forward_probe = observer
-        radix_attention.target_forward_probe = observer
+            indexer = getattr(attention, "indexer", None)
+            if indexer is None:
+                raise TypeError(
+                    f"PP target-attention observer requires an indexer on layer {layer_id}"
+                )
+            if getattr(indexer, "target_forward_probe", None) is not None:
+                raise RuntimeError(
+                    f"TopK observer already installed on layer {layer_id}"
+                )
+            radix_attention = getattr(attention, "attn_mqa", None)
+            if radix_attention is None:
+                raise TypeError(
+                    f"PP target-attention observer requires attn_mqa on layer {layer_id}"
+                )
+            if getattr(radix_attention, "target_forward_probe", None) is not None:
+                raise RuntimeError(
+                    f"FlashMLA observer already installed on layer {layer_id}"
+                )
+            observer.install_attention_boundaries(
+                layer_id=layer_id,
+                raw_output_width=(
+                    int(attention.num_local_heads) * int(attention.kv_lora_rank)
+                ),
+                v_projection_width=(
+                    int(attention.num_local_heads) * int(attention.v_head_dim)
+                ),
+                # Both cuts precede the rank-local o_proj partial and therefore
+                # retain the attention-group target-tree row layout.
+                row_domain=_PP_ATTN_GROUP_TARGET_TREE_ROW_DOMAIN,
+                num_q_heads=int(attention.num_local_heads),
+                padded_num_q_heads=(
+                    64
+                    if int(attention.num_local_heads) <= 64
+                    else (
+                        128
+                        if int(attention.num_local_heads) <= 128
+                        else int(attention.num_local_heads)
+                    )
+                ),
+                q_nope_head_dim=int(attention.kv_lora_rank),
+                q_rope_head_dim=int(attention.qk_rope_head_dim),
+                topk_width=int(model.config.index_topk),
+                max_scheduler_rows=(
+                    int(
+                        torch.cuda.get_device_properties(
+                            observer_device
+                        ).multi_processor_count
+                    )
+                    if observer_device.type == "cuda"
+                    else 1
+                ),
+            )
+            attention.target_forward_probe = observer
+            indexer.target_forward_probe = observer
+            radix_attention.target_forward_probe = observer
         self._target_forward_observer = observer
 
     @property
