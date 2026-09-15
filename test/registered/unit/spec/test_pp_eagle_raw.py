@@ -562,6 +562,7 @@ class TestEaglePPLastRankDraftOwnership(unittest.TestCase):
                 dtype=torch.bfloat16,
                 device=torch.device("cpu"),
                 req_to_token_pool=None,
+                max_total_num_tokens=4096,
                 max_decode_logits_rows=MagicMock(return_value=32),
             ),
         )
@@ -666,6 +667,7 @@ class TestEaglePPLastRankDraftOwnership(unittest.TestCase):
         probe.install_target_forward_observer.assert_called_once_with(
             model=target.model_runner.model,
             max_rows=32,
+            max_indexer_columns=4096,
             dtype=torch.bfloat16,
             device=torch.device("cpu"),
         )
