@@ -71,6 +71,10 @@ class TestDSAMultiStepDecode(unittest.TestCase):
             )
             return torch.zeros((q.shape[0], max_len), dtype=torch.float32)
 
+        def fake_topk_transform(logits, _topk, *, out_raw_indices=None):
+            captured["out_raw_indices"] = out_raw_indices
+            return logits
+
         indexer = SimpleNamespace(
             paged_mqa_logits_backend=SimpleNamespace(
                 is_aiter=lambda: False,
@@ -95,7 +99,7 @@ class TestDSAMultiStepDecode(unittest.TestCase):
             get_seqlens_expanded=lambda: context_lens.flatten(),
             get_seqlens_int32=lambda: torch.tensor([13], dtype=torch.int32),
             get_dsa_extend_len_cpu=lambda: [draft_tokens],
-            topk_transform=lambda logits, _topk: logits,
+            topk_transform=fake_topk_transform,
         )
         forward_batch = SimpleNamespace(forward_mode=ForwardMode.DRAFT_EXTEND_V2)
         deep_gemm = SimpleNamespace(
@@ -130,6 +134,7 @@ class TestDSAMultiStepDecode(unittest.TestCase):
                 "context_rows": total_rows,
                 "block_table_rows": total_rows,
                 "clean_logits": False,
+                "out_raw_indices": None,
             },
         )
 
@@ -224,6 +229,10 @@ class TestDSAMultiStepDecode(unittest.TestCase):
             )
             return torch.zeros((q.shape[0], max_len), dtype=torch.float32)
 
+        def fake_topk_transform(logits, _topk, *, out_raw_indices=None):
+            captured["out_raw_indices"] = out_raw_indices
+            return logits
+
         indexer_metadata = SimpleNamespace(
             paged_mqa_schedule_metadata=torch.empty((1,), dtype=torch.int32),
             paged_mqa_ctx_lens_2d=None,
@@ -231,7 +240,7 @@ class TestDSAMultiStepDecode(unittest.TestCase):
             get_seqlens_expanded=lambda: metadata.dsa_seqlens_expanded,
             get_seqlens_int32=lambda: metadata.cache_seqlens_int32,
             get_dsa_extend_len_cpu=lambda: metadata.dsa_extend_seq_lens_list,
-            topk_transform=lambda logits, _topk: logits,
+            topk_transform=fake_topk_transform,
         )
         indexer = SimpleNamespace(
             paged_mqa_logits_backend=SimpleNamespace(
@@ -279,7 +288,12 @@ class TestDSAMultiStepDecode(unittest.TestCase):
         self.assertEqual(metadata.real_page_table.shape[0], draft_tokens)
         self.assertEqual(
             captured,
-            {"q_rows": 4, "block_table_rows": 4, "clean_logits": False},
+            {
+                "q_rows": 4,
+                "block_table_rows": 4,
+                "clean_logits": False,
+                "out_raw_indices": None,
+            },
         )
 
     def test_eager_flashmla_scheduler_stays_on_live_query_axis(self):
