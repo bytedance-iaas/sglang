@@ -116,6 +116,7 @@ class TestEagleDraftDPPadding(unittest.TestCase):
             model_config=SimpleNamespace(hf_config=SimpleNamespace()),
             is_draft_worker=True,
             enable_elastic_ep=False,
+            attn_tp_sequence_sharded=lambda _num_tokens: False,
             attn_backend=SimpleNamespace(get_cuda_graph_seq_len_fill_value=lambda: 1),
         )
         parallel = SimpleNamespace(attn_tp_size=1, attn_dp_rank=1)
