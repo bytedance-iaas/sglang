@@ -1,0 +1,131 @@
+{
+  "framework": "SGLang",
+  "model": "GLM-5.3-Flash",
+  "hardware": "2 x 8 NVIDIA H20 96GB, same nodes/devices across arms",
+  "source": {
+    "prefill": {
+      "baseline": {
+        "commit": "17ba2c2e7c7b81f31a8a9e693e7435ab262c16b4",
+        "wheel_sha256": "2f354bb1ea59687c82be5846f2cffbba783593c97e7f2625f36d119a73102552",
+        "source_file_hashes": {
+          "srt/models/glm5_next.py": "12c5157b07fb7c6d93f34e84c43a37866d2e382e703729e2205aed9f8961f9c2",
+          "srt/layers/linear.py": "4d6cda3bf7b69403c3a4d11d6884eb825e474b4bc49277cf02f42b79f0f4cc47",
+          "srt/layers/quantization/utils.py": "a5c45d9e5a35b996d254e59ecefedaae04cf3fee48b85082d4f23539741f93e2",
+          "srt/layers/quantization/fp8.py": "c0ab0bf283c048b87e4b561dd3290d362e72223a128315bf4fa31755ff3b88c7",
+          "srt/runtime_context.py": "e504f6c6b712e2c4bd47f3d566129542659088d3d529852e74bb7256376251e8"
+        }
+      },
+      "candidate": {
+        "commit": "8c7eaa69254416e0872ca093416b4bc08b32fbbb",
+        "wheel_sha256": "c57ad2296326d1bed126511ee9c85c7b8742ace0923eeb50586689efd1f90f26",
+        "source_file_hashes": {
+          "srt/models/glm5_next.py": "4a8e9587a32986ea3304f9fb4c31fe2d6204512b534a795165ec71f54fafe8de",
+          "srt/layers/linear.py": "4d6cda3bf7b69403c3a4d11d6884eb825e474b4bc49277cf02f42b79f0f4cc47",
+          "srt/layers/quantization/utils.py": "a5c45d9e5a35b996d254e59ecefedaae04cf3fee48b85082d4f23539741f93e2",
+          "srt/layers/quantization/fp8.py": "c0ab0bf283c048b87e4b561dd3290d362e72223a128315bf4fa31755ff3b88c7",
+          "srt/runtime_context.py": "e504f6c6b712e2c4bd47f3d566129542659088d3d529852e74bb7256376251e8"
+        }
+      }
+    },
+    "decode": {
+      "baseline": {
+        "commit": "17ba2c2e7c7b81f31a8a9e693e7435ab262c16b4",
+        "wheel_sha256": "63ab8c01a5116bcf3853ec03a7d2069a5b9c63de256293c96fbf43a72924add0",
+        "source_file_hashes": {
+          "srt/models/glm5_next.py": "12c5157b07fb7c6d93f34e84c43a37866d2e382e703729e2205aed9f8961f9c2",
+          "srt/layers/linear.py": "4d6cda3bf7b69403c3a4d11d6884eb825e474b4bc49277cf02f42b79f0f4cc47",
+          "srt/layers/quantization/utils.py": "a5c45d9e5a35b996d254e59ecefedaae04cf3fee48b85082d4f23539741f93e2",
+          "srt/layers/quantization/fp8.py": "c0ab0bf283c048b87e4b561dd3290d362e72223a128315bf4fa31755ff3b88c7",
+          "srt/runtime_context.py": "e504f6c6b712e2c4bd47f3d566129542659088d3d529852e74bb7256376251e8"
+        }
+      },
+      "candidate": {
+        "commit": "8c7eaa69254416e0872ca093416b4bc08b32fbbb",
+        "wheel_sha256": "d7a53813b1104880595da1b1bca8b9e84087d174149a8f88d052f617ebe2fe10",
+        "source_file_hashes": {
+          "srt/models/glm5_next.py": "4a8e9587a32986ea3304f9fb4c31fe2d6204512b534a795165ec71f54fafe8de",
+          "srt/layers/linear.py": "4d6cda3bf7b69403c3a4d11d6884eb825e474b4bc49277cf02f42b79f0f4cc47",
+          "srt/layers/quantization/utils.py": "a5c45d9e5a35b996d254e59ecefedaae04cf3fee48b85082d4f23539741f93e2",
+          "srt/layers/quantization/fp8.py": "c0ab0bf283c048b87e4b561dd3290d362e72223a128315bf4fa31755ff3b88c7",
+          "srt/runtime_context.py": "e504f6c6b712e2c4bd47f3d566129542659088d3d529852e74bb7256376251e8"
+        }
+      }
+    }
+  },
+  "model_inventory_sha256": "69b071f4dd62be45c6e5ef007a41fdf071ea1ff57cc40deb00d3ed3713950da5",
+  "requests": {
+    "warmup-0": {
+      "payload_sha256": "344e00553c8d3ba4116f7ff90495aaf23cc7426d049a4976b9debbdf872a97c9",
+      "prompt_tokens": 49181,
+      "output_tokens": 64
+    },
+    "warmup-1": {
+      "payload_sha256": "58d425b86376a05ee7a9d6ee5305695b69e042f2cd0d847a167c236ab6500865",
+      "prompt_tokens": 49181,
+      "output_tokens": 64
+    },
+    "profile-prefill": {
+      "payload_sha256": "a0ac4fc6ba5af3cfbc1f1c098ffda674cce238845df7e512664c419718e7f007",
+      "prompt_tokens": 49181,
+      "output_tokens": 64
+    },
+    "profile-decode": {
+      "payload_sha256": "06b6026d55e2f4119bf0178d1ebe3d21f7e687ccafbb9ad17198daafaf18499a",
+      "prompt_tokens": 49180,
+      "output_tokens": 64
+    }
+  },
+  "profiler": {
+    "CPU": true,
+    "GPU": true,
+    "with_stack": false,
+    "record_shapes": true,
+    "num_steps": 5,
+    "separate_PD": true
+  },
+  "warmup": "Two long requests per arm provide at least10prefill/decode steps; KV caches flushed before each role capture.",
+  "selection": "KDA layer0, third of5complete matching-shape steps; means use all5. P TP0/eager/M8192, D TP7/DP7/full CUDA Graph/M1.",
+  "display": "Paths aligned at their first projection compute kernel; all original durations and offsets retained. Projection guide rows are annotations. Raw full traces retained locally, SHA256 below.",
+  "mapping": {
+    "prefill-baseline": "Actual request CPU mm/bmm input shapes and BF16 types \u2192 CUPTI External IDs; 34 KDA groups per step, select first layer.",
+    "prefill-candidate": "Actual request CPU mm/bmm input shapes and BF16 types \u2192 CUPTI External IDs; 34 KDA groups per step, select first layer.",
+    "decode-baseline": "Actual request active DP step labels and complete CUDA Graph kernel sequence: 34 identical ordered KDA signatures per step. Labels/shapes from fixed-source forward order and independently verified BF16 eager mapping; timings solely from this real request trace.",
+    "decode-candidate": "Actual request active DP step labels and complete CUDA Graph kernel sequence: 34 identical ordered KDA signatures per step. Labels/shapes from fixed-source forward order and independently verified BF16 eager mapping; timings solely from this real request trace."
+  },
+  "raw_trace_sha256": {
+    "raw/candidate/prefill/candidate-prefill-1789585641.355409-TP-5-EP-5.trace.json.gz": "7fbf9f5e3310c29c9ab1d1fc5e4ac818528f08365c5f63639138a6619f30d504",
+    "raw/candidate/prefill/candidate-prefill-1789585641.355409-TP-0-EP-0.trace.json.gz": "777429b9aa856cbd7de0fa290d4e6f309cbba810cd726ed21ac28d65f6f0b954",
+    "raw/candidate/prefill/candidate-prefill-1789585641.355409-TP-3-EP-3.trace.json.gz": "d9c6bd280df5db7ad07fa1040a98578069d29c64febeb176ff605f07317a0c46",
+    "raw/candidate/prefill/candidate-prefill-1789585641.355409-TP-2-EP-2.trace.json.gz": "fb41071a8ea1c5333b374709df7f4ded2512e86eaf9275d328cfc795039df050",
+    "raw/candidate/prefill/candidate-prefill-1789585641.355409-TP-1-EP-1.trace.json.gz": "95dcd511846e43438b586e15278ccff3be8fbeebbf207afc9ce7353528550167",
+    "raw/candidate/prefill/candidate-prefill-1789585641.355409-TP-4-EP-4.trace.json.gz": "baac247f1e7a234cebc2cd6f100f88e9f5187aa00fbc7147b17b38f4fe91feba",
+    "raw/candidate/prefill/candidate-prefill-1789585641.355409-TP-6-EP-6.trace.json.gz": "347387351c3cb7da9018f35a2636e6ac362a90afda0f04c48db6114d95eb6af7",
+    "raw/candidate/prefill/candidate-prefill-1789585641.355409-TP-7-EP-7.trace.json.gz": "2c23ea3d0ffe4fef06872c45a8afc20dc96f827a450d1b638763a7bb189a8b65",
+    "raw/candidate/decode/candidate-decode-1789585654.065437-TP-6-DP-6-EP-6.trace.json.gz": "ada296b2e2da0652471bab6eea7a4ad2e20878befb9cd247e707133d51e55f9f",
+    "raw/candidate/decode/candidate-decode-1789585654.065437-TP-2-DP-2-EP-2.trace.json.gz": "e7f8369dda0f986c8b6fdbe49584920949727af05f7608d931d347592b8b5103",
+    "raw/candidate/decode/candidate-decode-1789585654.065437-TP-4-DP-4-EP-4.trace.json.gz": "740c04de42985361dc9bbe3dc6d4ff30359803175df448f377cadf22d9f18799",
+    "raw/candidate/decode/candidate-decode-1789585654.065437-TP-3-DP-3-EP-3.trace.json.gz": "4e7c4a075ebe725c5902e192b60ab53b3f4cffe84b7eff388553dccc3bae76fa",
+    "raw/candidate/decode/candidate-decode-1789585654.065437-TP-5-DP-5-EP-5.trace.json.gz": "82f680a96ed290920cef2a870b19346726829274e062523286c8f6bbf7eeb865",
+    "raw/candidate/decode/candidate-decode-1789585654.065437-TP-7-DP-7-EP-7.trace.json.gz": "666ae0d66ef4d456eaddfc83b0c2ba20f39e00f96193e0cb69a81640cf0ff9ba",
+    "raw/candidate/decode/candidate-decode-1789585654.065437-TP-1-DP-1-EP-1.trace.json.gz": "e4c221d0308acf8c8e0dd54eafb4fe32904c0e0e5bf0aed0fa5e0b07e69445b3",
+    "raw/candidate/decode/candidate-decode-1789585654.065437-TP-0-DP-0-EP-0.trace.json.gz": "9a9e099685b676504a8a068222a2d4ab84f043a4dd16bbfaf3b02576b5364f10",
+    "raw/baseline/prefill/baseline-prefill-1789585234.631419-TP-4-EP-4.trace.json.gz": "ba0f4a921a8d436665a2830dd072a69b5045199024849f66167a7750fe055a3a",
+    "raw/baseline/prefill/baseline-prefill-1789585234.631419-TP-6-EP-6.trace.json.gz": "df9798c81a903570b4501767160412f95a6dd9523dde63c3b09b0fd9890717aa",
+    "raw/baseline/prefill/baseline-prefill-1789585234.631419-TP-5-EP-5.trace.json.gz": "fea8c860ea579cbb3cfa0007ce85c75f07f922e4bced5cfec01477be8c259b75",
+    "raw/baseline/prefill/baseline-prefill-1789585234.631419-TP-1-EP-1.trace.json.gz": "89182154fd09be9b423c669b2f8e53000ee5d49f1517bc0c8ab4db4962fa2362",
+    "raw/baseline/prefill/baseline-prefill-1789585234.631419-TP-2-EP-2.trace.json.gz": "36f20a2744e9ea57aec726b6edf81591318559a5aef3190dc5cf7de959e2a1fb",
+    "raw/baseline/prefill/baseline-prefill-1789585234.631419-TP-3-EP-3.trace.json.gz": "9af8be61a5befd446df00ec92842742a49a14903032cea6d1470158b282d1b3e",
+    "raw/baseline/prefill/baseline-prefill-1789585234.631419-TP-0-EP-0.trace.json.gz": "b2dd9f8e384fca2f1a9211021bee78c72fb986dc0dc05ffe58d7bda6005b06fc",
+    "raw/baseline/prefill/baseline-prefill-1789585234.631419-TP-7-EP-7.trace.json.gz": "dfb21dc04fc4171ac0d585a4555dd511d18e01b7ac7afe4a6b9ed73f368aefeb",
+    "raw/baseline/decode/baseline-decode-1789585247.6273081-TP-5-DP-5-EP-5.trace.json.gz": "0ccb9efe08fd0ba1fc99abc09959d6b5ded7a4b83331ec19852835d359635660",
+    "raw/baseline/decode/baseline-decode-1789585247.6273081-TP-3-DP-3-EP-3.trace.json.gz": "3715d89e689c93790d62837d2310b209c88d310ea042b004486b0ce5624355fb",
+    "raw/baseline/decode/baseline-decode-1789585247.6273081-TP-2-DP-2-EP-2.trace.json.gz": "96b253aed3b892b35809a149db00a7a6fb9f97c18afa6d357dd9a7ba71bb8da0",
+    "raw/baseline/decode/baseline-decode-1789585247.6273081-TP-7-DP-7-EP-7.trace.json.gz": "a37dec8af50fcb3dd230460f2531c1755d33e240894d673097950b2166c3f385",
+    "raw/baseline/decode/baseline-decode-1789585247.6273081-TP-1-DP-1-EP-1.trace.json.gz": "77cb24a3fd80dc687f915d1caeee36dc33e06776bf0c02f0de7f8fb7721a4665",
+    "raw/baseline/decode/baseline-decode-1789585247.6273081-TP-4-DP-4-EP-4.trace.json.gz": "addd432a22c44454e7317a08cbbe7e87d82ee57f84c683e3270730a390fc469e",
+    "raw/baseline/decode/baseline-decode-1789585247.6273081-TP-6-DP-6-EP-6.trace.json.gz": "907cba765f912544c4e92239361c18b7359715647a83bccad6dcd9012fa74299",
+    "raw/baseline/decode/baseline-decode-1789585247.6273081-TP-0-DP-0-EP-0.trace.json.gz": "9a58134e4593b469bc85378e5e8935c4c2ec058a07957c55f9566f048f1ab7e1"
+  },
+  "bringup": "An initial baseline stack-enabled long-prefill diagnostic captured JIT and incurred excessive export time/health timeouts; intentionally aborted, never included in these formal results.",
+  "limits": "Projection kernel sums exclude memory ops/gaps and are not full-model latency/speedup. No numerical equivalence or quality approval is inferred from these profiles."
+}
