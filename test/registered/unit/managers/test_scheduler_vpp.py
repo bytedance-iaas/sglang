@@ -23,6 +23,7 @@ from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
     PPBatchMetadata,
     SchedulerPPMixin,
 )
+from sglang.srt.managers.schedule_batch import Req  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -441,6 +442,44 @@ class TestSchedulerVPP(unittest.TestCase):
         self.assertEqual(manifest["generation"], 1)
         self.assertEqual(manifest["requests"], (("r0", 1024, 4096),))
 
+    def test_vpp_bootstrap_uses_minimum_prefix_boundary_across_pp_ranks(self):
+        scheduler = _make_scheduler()
+        req = SimpleNamespace(
+            rid="r0",
+            prefix_indices=torch.arange(7936),
+            vpp_prefix_limit=None,
+            init_next_round_input=MagicMock(),
+        )
+        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[req])
+        scheduler.tree_cache = object()
+        payload = {
+            "good": ["r0"],
+            "bad": [],
+            "prefix_boundaries": {"r0": 0},
+        }
+
+        scheduler._pp_vpp_merge_bootstrap_status(payload, ["r0"], [])
+        req.init_next_round_input.side_effect = lambda _cache: setattr(
+            req, "prefix_indices", torch.empty(0, dtype=torch.int64)
+        )
+        scheduler._pp_vpp_apply_bootstrap_prefix_boundaries(
+            payload["prefix_boundaries"],
+            {"r0"},
+        )
+
+        self.assertEqual(payload["prefix_boundaries"], {"r0": 0})
+        self.assertEqual(req.vpp_prefix_limit, 0)
+        self.assertEqual(len(req.prefix_indices), 0)
+        req.init_next_round_input.assert_called_once_with(scheduler.tree_cache)
+
+    def test_vpp_prefix_limit_caps_next_prefix_match(self):
+        req = Req.__new__(Req)
+        req.return_logprob = False
+        req.logprob_start_len = -1
+        req.vpp_prefix_limit = 4096
+
+        self.assertEqual(req._compute_max_prefix_len(8184), 4096)
+
     def test_prepare_wavefront_batch_claims_slot(self):
         scheduler = _make_scheduler()
         scheduler.mbs = [None] * 4
@@ -486,6 +525,7 @@ class TestSchedulerVPP(unittest.TestCase):
             rid="r0",
             extend_range=SimpleNamespace(end=4096),
             origin_input_ids=list(range(8192)),
+            vpp_prefix_limit=0,
         )
         batch = SimpleNamespace(chunked_req=req)
         scheduler.get_new_batch_prefill = MagicMock(
@@ -502,6 +542,7 @@ class TestSchedulerVPP(unittest.TestCase):
         req.extend_range.end = 8192
 
         self.assertEqual(batch.disagg_prefill_chunk_end_by_rid, {"r0": 4096})
+        self.assertIsNone(req.vpp_prefix_limit)
 
     def test_execute_wavefront_action_routes_expected_batch_and_stage(self):
         scheduler = _make_scheduler()
@@ -748,8 +789,15 @@ class TestSchedulerVPP(unittest.TestCase):
             num_hidden_layers=40,
             hf_config=SimpleNamespace(hc_mult=1),
         )
+        bootstrap_req = SimpleNamespace(
+            rid="bootstrap-rid",
+            finished_reason=None,
+            prefix_indices=torch.empty(0, dtype=torch.int64),
+            vpp_prefix_limit=None,
+            init_next_round_input=MagicMock(),
+        )
         scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
-            queue=[SimpleNamespace(rid="bootstrap-rid", finished_reason=None)]
+            queue=[bootstrap_req]
         )
         scheduler.disagg_prefill_inflight_queue = [SimpleNamespace(rid="transfer-rid")]
         scheduler.waiting_queue = []

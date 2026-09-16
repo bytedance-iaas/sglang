@@ -760,6 +760,55 @@ class SchedulerPPMixin:
             return self.chunked_req
         return None
 
+    def _pp_vpp_bootstrap_prefix_boundaries(
+        self: Scheduler,
+        rids: List[str],
+    ) -> Dict[str, int]:
+        wanted = set(rids)
+        return {
+            req.rid: len(req.prefix_indices)
+            for req in self.disagg_prefill_bootstrap_queue.queue
+            if req.rid in wanted
+        }
+
+    def _pp_vpp_merge_bootstrap_status(
+        self: Scheduler,
+        payload: Dict[str, object],
+        local_good: List[str],
+        local_bad: List[str],
+    ) -> None:
+        payload["good"] = sorted(set(payload["good"]).intersection(local_good))
+        payload["bad"] = sorted(set(payload["bad"]).union(local_bad))
+        local_boundaries = self._pp_vpp_bootstrap_prefix_boundaries(payload["good"])
+        payload["prefix_boundaries"] = {
+            rid: min(
+                int(payload["prefix_boundaries"][rid]),
+                local_boundaries[rid],
+            )
+            for rid in payload["good"]
+        }
+
+    def _pp_vpp_apply_bootstrap_prefix_boundaries(
+        self: Scheduler,
+        boundaries: Dict[str, int],
+        rids: set[str],
+    ) -> None:
+        for req in self.disagg_prefill_bootstrap_queue.queue:
+            if req.rid not in rids:
+                continue
+            boundary = int(boundaries[req.rid])
+            already_applied = (
+                req.vpp_prefix_limit == boundary and len(req.prefix_indices) <= boundary
+            )
+            req.vpp_prefix_limit = boundary
+            if not already_applied and len(req.prefix_indices) > boundary:
+                req.init_next_round_input(self.tree_cache)
+            if len(req.prefix_indices) > boundary:
+                raise RuntimeError(
+                    f"VPP prefix cap failed for {req.rid}: "
+                    f"expected <= {boundary}, got {len(req.prefix_indices)}"
+                )
+
     def _pp_vpp_register_prefix_batch(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -857,6 +906,8 @@ class SchedulerPPMixin:
                 for req in reqs
                 if req.extend_range is not None
             }
+            for req in reqs:
+                req.vpp_prefix_limit = None
         self.running_batch = prefill_plan.running_batch
         self.running_mbs[slot_id] = self.running_batch
         self.mbs[slot_id] = batch
@@ -1074,6 +1125,10 @@ class SchedulerPPMixin:
             remaining_good: set[str],
             remaining_bad: set[str],
         ) -> bool:
+            self._pp_vpp_apply_bootstrap_prefix_boundaries(
+                envelope.payload["prefix_boundaries"],
+                remaining_good,
+            )
             applied_good, applied_bad = self.process_bootstrapped_queue(
                 [sorted(remaining_good), sorted(remaining_bad)]
             )
@@ -1273,6 +1328,10 @@ class SchedulerPPMixin:
                                 "phase": "apply",
                                 "good": final_status[0],
                                 "bad": final_status[1],
+                                "prefix_boundaries": {
+                                    rid: int(payload["prefix_boundaries"][rid])
+                                    for rid in final_status[0]
+                                },
                             },
                         )
                         apply_wire = apply_envelope.to_dict()
@@ -1309,10 +1368,11 @@ class SchedulerPPMixin:
                         local_bad,
                         aborted,
                     )
-                    payload["good"] = sorted(
-                        set(payload["good"]).intersection(local_good)
+                    self._pp_vpp_merge_bootstrap_status(
+                        payload,
+                        local_good,
+                        local_bad,
                     )
-                    payload["bad"] = sorted(set(payload["bad"]).union(local_bad))
                     forward_control(envelope, wire)
                     return
                 if phase != "apply":
@@ -1580,6 +1640,9 @@ class SchedulerPPMixin:
                                 "phase": "collect",
                                 "good": sorted(good),
                                 "bad": sorted(bad),
+                                "prefix_boundaries": (
+                                    self._pp_vpp_bootstrap_prefix_boundaries(good)
+                                ),
                             },
                         ).forwarded()
                     )
