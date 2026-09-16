@@ -37,6 +37,18 @@ class TestPipelineLayout(unittest.TestCase):
             [0, 1, 2, 3, 0, 1, 2, 3],
         )
 
+    def test_pp2_vpp2_maps_two_ten_layer_chunks_per_rank(self):
+        layout = PipelineLayout.build(40, 2, 2)
+
+        self.assertEqual(
+            layout.layer_ids_for_rank(0),
+            tuple(range(0, 10)) + tuple(range(20, 30)),
+        )
+        self.assertEqual(
+            layout.layer_ids_for_rank(1),
+            tuple(range(10, 20)) + tuple(range(30, 40)),
+        )
+
     def test_digest_is_stable_and_changes_with_partition(self):
         default = PipelineLayout.build(40, 4, 2)
         same = PipelineLayout.build(40, 4, 2)

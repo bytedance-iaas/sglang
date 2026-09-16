@@ -65,6 +65,9 @@ class TestDeepSeekV41VPPGate(unittest.TestCase):
     def test_pp4_tp2_vpp2_without_cp_is_supported(self):
         _validate(_config())
 
+    def test_pp2_tp4_vpp2_without_cp_is_supported(self):
+        _validate(_config(pp_size=2, tp_size=4))
+
     def test_pp4_tp2_vpp2_supports_multimodal_loading(self):
         _validate(_config(language_only=False, language_model_only=False))
 
@@ -83,6 +86,10 @@ class TestDeepSeekV41VPPGate(unittest.TestCase):
     def test_vpp2_requires_overlap_scheduler(self):
         with self.assertRaisesRegex(ValueError, "disabled overlap scheduling"):
             _validate(_config(disable_overlap_schedule=True))
+
+    def test_vpp2_rejects_unvalidated_pp_tp_layout(self):
+        with self.assertRaisesRegex(ValueError, "PP4 x TP2 or PP2 x TP4"):
+            _validate(_config(pp_size=2, tp_size=2))
 
 
 if __name__ == "__main__":
