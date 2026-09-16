@@ -1,0 +1,57 @@
+{
+  "source_commit": "8d3f42a6a9f0a23cc223e45ee07cd3cbac862d55",
+  "delivery_commit": "8c7eaa69254416e0872ca093416b4bc08b32fbbb",
+  "model_source_unchanged": true,
+  "selection": [
+    [
+      {
+        "path": "unfused",
+        "source_trace": "attn-tp1-m4-graph-unfused.trace.json",
+        "iteration": 3,
+        "start_us": 6595442292174.518,
+        "compute_kernels": 9,
+        "sum_kernel_us": 79.84100000000001,
+        "span_us": 84.384765625
+      },
+      {
+        "path": "fused",
+        "source_trace": "attn-tp1-m4-graph-fused.trace.json",
+        "iteration": 3,
+        "start_us": 6595442299531.696,
+        "compute_kernels": 2,
+        "sum_kernel_us": 60.608,
+        "span_us": 61.248046875
+      }
+    ],
+    [
+      {
+        "path": "unfused",
+        "source_trace": "attn-tp8-m8192-eager-unfused.trace.json",
+        "iteration": 3,
+        "start_us": 6595443592504.231,
+        "compute_kernels": 7,
+        "sum_kernel_us": 1702.8930000000003,
+        "span_us": 1718.7958984375
+      },
+      {
+        "path": "fused",
+        "source_trace": "attn-tp8-m8192-eager-fused.trace.json",
+        "iteration": 3,
+        "start_us": 6595443644576.361,
+        "compute_kernels": 2,
+        "sum_kernel_us": 1679.4679999999998,
+        "span_us": 1683.7236328125
+      }
+    ]
+  ],
+  "sha256": {
+    "README.md": "17a2dbcfe5ed19e5544e75db185ff200f83db1a16adcf8f659e932a570d4a676",
+    "decode-profile.png": "3d482491e8c19e92290d9cdb1a2afb1f8f55e9dc2731de48b65b1213e3902895",
+    "prefill-profile.png": "d96f9eec586dc3bdf1d2c9f0596a8fa22b574c46d89208935900203a2b64d6ef",
+    "decode-full.png": "1ab1c55b95663722df0e40051faa463de2d22f30b2090a782bd5e2c46cdd6274",
+    "prefill-full.png": "9739e843ae258e0ceb45a405f05698c49829df4066d571b9b072816d33a96b8f",
+    "decode.trace.json": "23cf8c8a54976cb6d343c9af1edb5df1aee852633eb93000f6c1b82ad36461b6",
+    "prefill.trace.json": "13f365652238ef11928da6722ae2c755664646719b52297797734b769db3f032",
+    "profile-data.json": "22f6620941c6321f0f79cd62de4b4c3b8e04b4089ee6ebbb1f807651efabb1fb"
+  }
+}

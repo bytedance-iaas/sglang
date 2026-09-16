@@ -1,0 +1,886 @@
+{
+  "cases": [
+    {
+      "label": "attn-tp1-m1",
+      "attention_tp": 1,
+      "tokens": 1,
+      "stage": "decode",
+      "correctness": "PASS",
+      "max_abs_error": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "timings_us": {
+        "eager": {
+          "unfused": 99.41200256347656,
+          "fused": 65.46160221099854
+        },
+        "graph": {
+          "unfused": 85.42112350463867,
+          "fused": 64.78079795837402
+        }
+      },
+      "traces": {
+        "eager-unfused": {
+          "file": "attn-tp1-m1-eager-unfused.trace.json",
+          "compute_kernels_per_call": 9.0,
+          "gpu_memory_ops_per_call": 1.0,
+          "gpu_compute_us_per_call": 78.2028,
+          "gpu_memory_us_per_call": 0.7424,
+          "kernel_counts": {
+            "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT": 5,
+            "nvjet_sm90_tst_64x8_64x16_1x1_h_bz_splitK_TNT": 5,
+            "void cublasLt::splitKreduce_kernel<32, 16, int, float, __nv_bfloat16, float, __nv_bfloat16, false, float, __nv_bfloat16, __nv_bfloat16, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, __nv_bfloat16 const*, float*, __nv_bfloat16*, float const*, float const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)": 15,
+            "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_splitK_TNT": 10,
+            "nvjet_sm90_tst_128x8_64x12_2x1_v_bz_TNT": 10
+          },
+          "operators": {
+            "qkv": {
+              "cpu_op": "aten::mm",
+              "input_shapes": [
+                [
+                  1,
+                  4096
+                ],
+                [
+                  4096,
+                  24576
+                ]
+              ],
+              "compute_kernels_per_call": 1.0,
+              "gpu_us_per_call": 55.6996,
+              "kernel_names": [
+                "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT"
+              ]
+            },
+            "b": {
+              "cpu_op": "aten::mm",
+              "input_shapes": [
+                [
+                  1,
+                  4096
+                ],
+                [
+                  4096,
+                  64
+                ]
+              ],
+              "compute_kernels_per_call": 2.0,
+              "gpu_us_per_call": 5.613000000000001,
+              "kernel_names": [
+                "nvjet_sm90_tst_64x8_64x16_1x1_h_bz_splitK_TNT",
+                "void cublasLt::splitKreduce_kernel<32, 16, int, float, __nv_bfloat16, float, __nv_bfloat16, false, float, __nv_bfloat16, __nv_bfloat16, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, __nv_bfloat16 const*, float*, __nv_bfloat16*, float const*, float const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)"
+              ]
+            },
+            "f_a": {
+              "cpu_op": "aten::mm",
+              "input_shapes": [
+                [
+                  1,
+                  4096
+                ],
+                [
+                  4096,
+                  128
+                ]
+              ],
+              "compute_kernels_per_call": 2.0,
+              "gpu_us_per_call": 5.5618,
+              "kernel_names": [
+                "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_splitK_TNT",
+                "void cublasLt::splitKreduce_kernel<32, 16, int, float, __nv_bfloat16, float, __nv_bfloat16, false, float, __nv_bfloat16, __nv_bfloat16, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, __nv_bfloat16 const*, float*, __nv_bfloat16*, float const*, float const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)"
+              ]
+            },
+            "f_b": {
+              "cpu_op": "aten::mm",
+              "input_shapes": [
+                [
+                  1,
+                  128
+                ],
+                [
+                  128,
+                  8192
+                ]
+              ],
+              "compute_kernels_per_call": 1.0,
+              "gpu_us_per_call": 2.9631999999999996,
+              "kernel_names": [
+                "nvjet_sm90_tst_128x8_64x12_2x1_v_bz_TNT"
+              ]
+            },
+            "g_a": {
+              "cpu_op": "aten::mm",
+              "input_shapes": [
+                [
+                  1,
+                  4096
+                ],
+                [
+                  4096,
+                  128
+                ]
+              ],
+              "compute_kernels_per_call": 2.0,
+              "gpu_us_per_call": 5.427200000000001,
+              "kernel_names": [
+                "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_splitK_TNT",
+                "void cublasLt::splitKreduce_kernel<32, 16, int, float, __nv_bfloat16, float, __nv_bfloat16, false, float, __nv_bfloat16, __nv_bfloat16, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, __nv_bfloat16 const*, float*, __nv_bfloat16*, float const*, float const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)"
+              ]
+            },
+            "g_b": {
+              "cpu_op": "aten::mm",
+              "input_shapes": [
+                [
+                  1,
+                  128
+                ],
+                [
+                  128,
+                  8192
+                ]
+              ],
+              "compute_kernels_per_call": 1.0,
+              "gpu_us_per_call": 2.9379999999999997,
+              "kernel_names": [
+                "nvjet_sm90_tst_128x8_64x12_2x1_v_bz_TNT"
+              ]
+            }
+          }
+        },
+        "eager-fused": {
+          "file": "attn-tp1-m1-eager-fused.trace.json",
+          "compute_kernels_per_call": 2.0,
+          "gpu_memory_ops_per_call": 1.0,
+          "gpu_compute_us_per_call": 62.278800000000004,
+          "gpu_memory_us_per_call": 0.7424,
+          "kernel_counts": {
+            "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT": 5,
+            "nvjet_sm90_tst_256x8_64x6_2x1_v_bz_TNT": 5
+          },
+          "operators": {
+            "qkv+b+f_a+g_a": {
+              "cpu_op": "aten::mm",
+              "input_shapes": [
+                [
+                  1,
+                  4096
+                ],
+                [
+                  4096,
+                  24896
+                ]
+              ],
+              "compute_kernels_per_call": 1.0,
+              "gpu_us_per_call": 58.5092,
+              "kernel_names": [
+                "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT"
+              ]
+            },
+            "batched f_b+g_b": {
+              "cpu_op": "aten::bmm",
+              "input_shapes": [
+                [
+                  2,
+                  1,
+                  128
+                ],
+                [
+                  2,
+                  128,
+                  8192
+                ]
+              ],
+              "compute_kernels_per_call": 1.0,
+              "gpu_us_per_call": 3.7695999999999996,
+              "kernel_names": [
+                "nvjet_sm90_tst_256x8_64x6_2x1_v_bz_TNT"
+              ]
+            }
+          }
+        },
+        "graph-unfused": {
+          "file": "attn-tp1-m1-graph-unfused.trace.json",
+          "compute_kernels_per_call": 9.0,
+          "gpu_memory_ops_per_call": 1.0,
+          "gpu_compute_us_per_call": 78.44480000000001,
+          "gpu_memory_us_per_call": 1.0368,
+          "kernel_counts": {
+            "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT": 5,
+            "nvjet_sm90_tst_64x8_64x16_1x1_h_bz_splitK_TNT": 5,
+            "void cublasLt::splitKreduce_kernel<32, 16, int, float, __nv_bfloat16, float, __nv_bfloat16, false, float, __nv_bfloat16, __nv_bfloat16, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, __nv_bfloat16 const*, float*, __nv_bfloat16*, float const*, float const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)": 15,
+            "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_splitK_TNT": 10,
+            "nvjet_sm90_tst_128x8_64x12_2x1_v_bz_TNT": 10
+          }
+        },
+        "graph-fused": {
+          "file": "attn-tp1-m1-graph-fused.trace.json",
+          "compute_kernels_per_call": 2.0,
+          "gpu_memory_ops_per_call": 1.0,
+          "gpu_compute_us_per_call": 60.9794,
+          "gpu_memory_us_per_call": 0.8960000000000001,
+          "kernel_counts": {
+            "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT": 5,
+            "nvjet_sm90_tst_256x8_64x6_2x1_v_bz_TNT": 5
+          }
+        }
+      }
+    },
+    {
+      "label": "attn-tp1-m4",
+      "attention_tp": 1,
+      "tokens": 4,
+      "stage": "decode",
+      "correctness": "PASS",
+      "max_abs_error": [
+        0.0,
+        0.0,
+        0.0078125,
+        0.0078125
+      ],
+      "timings_us": {
+        "eager": {
+          "unfused": 121.48063659667969,
+          "fused": 66.63856029510498
+        },
+        "graph": {
+          "unfused": 85.74543952941895,
+          "fused": 64.90064144134521
+        }
+      },
+      "traces": {
+        "eager-unfused": {
+          "file": "attn-tp1-m4-eager-unfused.trace.json",
+          "compute_kernels_per_call": 9.0,
+          "gpu_memory_ops_per_call": 1.0,
+          "gpu_compute_us_per_call": 78.63079999999997,
+          "gpu_memory_us_per_call": 0.7424,
+          "kernel_counts": {
+            "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT": 5,
+            "nvjet_sm90_tst_64x8_64x16_1x1_h_bz_splitK_TNT": 5,
+            "void cublasLt::splitKreduce_kernel<32, 16, int, float, __nv_bfloat16, float, __nv_bfloat16, false, float, __nv_bfloat16, __nv_bfloat16, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, __nv_bfloat16 const*, float*, __nv_bfloat16*, float const*, float const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)": 15,
+            "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_splitK_TNT": 10,
+            "nvjet_sm90_tst_128x8_64x12_2x1_v_bz_TNT": 10
+          },
+          "operators": {
+            "qkv": {
+              "cpu_op": "aten::mm",
+              "input_shapes": [
+                [
+                  4,
+                  4096
+                ],
+                [
+                  4096,
+                  24576
+                ]
+              ],
+              "compute_kernels_per_call": 1.0,
+              "gpu_us_per_call": 56.0774,
+              "kernel_names": [
+                "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT"
+              ]
+            },
+            "b": {
+              "cpu_op": "aten::mm",
+              "input_shapes": [
+                [
+                  4,
+                  4096
+                ],
+                [
+                  4096,
+                  64
+                ]
+              ],
+              "compute_kernels_per_call": 2.0,
+              "gpu_us_per_call": 5.5360000000000005,
+              "kernel_names": [
+                "nvjet_sm90_tst_64x8_64x16_1x1_h_bz_splitK_TNT",
+                "void cublasLt::splitKreduce_kernel<32, 16, int, float, __nv_bfloat16, float, __nv_bfloat16, false, float, __nv_bfloat16, __nv_bfloat16, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, __nv_bfloat16 const*, float*, __nv_bfloat16*, float const*, float const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)"
+              ]
+            },
+            "f_a": {
+              "cpu_op": "aten::mm",
+              "input_shapes": [
+                [
+                  4,
+                  4096
+                ],
+                [
+                  4096,
+                  128
+                ]
+              ],
+              "compute_kernels_per_call": 2.0,
+              "gpu_us_per_call": 5.574000000000001,
+              "kernel_names": [
+                "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_splitK_TNT",
+                "void cublasLt::splitKreduce_kernel<32, 16, int, float, __nv_bfloat16, float, __nv_bfloat16, false, float, __nv_bfloat16, __nv_bfloat16, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, __nv_bfloat16 const*, float*, __nv_bfloat16*, float const*, float const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)"
+              ]
+            },
+            "f_b": {
+              "cpu_op": "aten::mm",
+              "input_shapes": [
+                [
+                  4,
+                  128
+                ],
+                [
+                  128,
+                  8192
+                ]
+              ],
+              "compute_kernels_per_call": 1.0,
+              "gpu_us_per_call": 2.9565999999999995,
+              "kernel_names": [
+                "nvjet_sm90_tst_128x8_64x12_2x1_v_bz_TNT"
+              ]
+            },
+            "g_a": {
+              "cpu_op": "aten::mm",
+              "input_shapes": [
+                [
+                  4,
+                  4096
+                ],
+                [
+                  4096,
+                  128
+                ]
+              ],
+              "compute_kernels_per_call": 2.0,
+              "gpu_us_per_call": 5.5040000000000004,
+              "kernel_names": [
+                "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_splitK_TNT",
+                "void cublasLt::splitKreduce_kernel<32, 16, int, float, __nv_bfloat16, float, __nv_bfloat16, false, float, __nv_bfloat16, __nv_bfloat16, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, __nv_bfloat16 const*, float*, __nv_bfloat16*, float const*, float const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)"
+              ]
+            },
+            "g_b": {
+              "cpu_op": "aten::mm",
+              "input_shapes": [
+                [
+                  4,
+                  128
+                ],
+                [
+                  128,
+                  8192
+                ]
+              ],
+              "compute_kernels_per_call": 1.0,
+              "gpu_us_per_call": 2.9828,
+              "kernel_names": [
+                "nvjet_sm90_tst_128x8_64x12_2x1_v_bz_TNT"
+              ]
+            }
+          }
+        },
+        "eager-fused": {
+          "file": "attn-tp1-m4-eager-fused.trace.json",
+          "compute_kernels_per_call": 2.0,
+          "gpu_memory_ops_per_call": 1.0,
+          "gpu_compute_us_per_call": 61.888400000000004,
+          "gpu_memory_us_per_call": 0.742,
+          "kernel_counts": {
+            "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT": 5,
+            "nvjet_sm90_tst_256x8_64x6_2x1_v_bz_TNT": 5
+          },
+          "operators": {
+            "qkv+b+f_a+g_a": {
+              "cpu_op": "aten::mm",
+              "input_shapes": [
+                [
+                  4,
+                  4096
+                ],
+                [
+                  4096,
+                  24896
+                ]
+              ],
+              "compute_kernels_per_call": 1.0,
+              "gpu_us_per_call": 58.04200000000001,
+              "kernel_names": [
+                "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT"
+              ]
+            },
+            "batched f_b+g_b": {
+              "cpu_op": "aten::bmm",
+              "input_shapes": [
+                [
+                  2,
+                  4,
+                  128
+                ],
+                [
+                  2,
+                  128,
+                  8192
+                ]
+              ],
+              "compute_kernels_per_call": 1.0,
+              "gpu_us_per_call": 3.8464,
+              "kernel_names": [
+                "nvjet_sm90_tst_256x8_64x6_2x1_v_bz_TNT"
+              ]
+            }
+          }
+        },
+        "graph-unfused": {
+          "file": "attn-tp1-m4-graph-unfused.trace.json",
+          "compute_kernels_per_call": 9.0,
+          "gpu_memory_ops_per_call": 1.0,
+          "gpu_compute_us_per_call": 79.7072,
+          "gpu_memory_us_per_call": 0.8768,
+          "kernel_counts": {
+            "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT": 5,
+            "nvjet_sm90_tst_64x8_64x16_1x1_h_bz_splitK_TNT": 5,
+            "void cublasLt::splitKreduce_kernel<32, 16, int, float, __nv_bfloat16, float, __nv_bfloat16, false, float, __nv_bfloat16, __nv_bfloat16, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, __nv_bfloat16 const*, float*, __nv_bfloat16*, float const*, float const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)": 15,
+            "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_splitK_TNT": 10,
+            "nvjet_sm90_tst_128x8_64x12_2x1_v_bz_TNT": 10
+          }
+        },
+        "graph-fused": {
+          "file": "attn-tp1-m4-graph-fused.trace.json",
+          "compute_kernels_per_call": 2.0,
+          "gpu_memory_ops_per_call": 1.0,
+          "gpu_compute_us_per_call": 61.43399999999999,
+          "gpu_memory_us_per_call": 0.8064,
+          "kernel_counts": {
+            "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT": 5,
+            "nvjet_sm90_tst_256x8_64x6_2x1_v_bz_TNT": 5
+          }
+        }
+      }
+    },
+    {
+      "label": "attn-tp1-m16",
+      "attention_tp": 1,
+      "tokens": 16,
+      "stage": "decode",
+      "correctness": "PASS",
+      "max_abs_error": [
+        0.0,
+        0.00390625,
+        0.0009765625,
+        0.0078125
+      ],
+      "timings_us": {
+        "eager": {
+          "unfused": 120.14543533325195,
+          "fused": 82.64047622680664
+        },
+        "graph": {
+          "unfused": 88.38512420654297,
+          "fused": 67.77440071105957
+        }
+      },
+      "traces": {
+        "eager-unfused": {
+          "file": "attn-tp1-m16-eager-unfused.trace.json",
+          "compute_kernels_per_call": 9.0,
+          "gpu_memory_ops_per_call": 1.0,
+          "gpu_compute_us_per_call": 80.88400000000003,
+          "gpu_memory_us_per_call": 0.7428000000000001,
+          "kernel_counts": {
+            "nvjet_sm90_tst_64x16_64x16_2x1_v_bz_TNT": 5,
+            "nvjet_sm90_tst_64x16_64x16_1x1_h_bz_splitK_TNT": 5,
+            "void cublasLt::splitKreduce_kernel<32, 16, int, float, __nv_bfloat16, float, __nv_bfloat16, false, float, __nv_bfloat16, __nv_bfloat16, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, __nv_bfloat16 const*, float*, __nv_bfloat16*, float const*, float const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)": 15,
+            "nvjet_sm90_tst_64x16_64x16_2x1_v_bz_splitK_TNT": 10,
+            "nvjet_sm90_tst_128x16_64x11_2x1_v_bz_TNT": 10
+          },
+          "operators": {
+            "qkv": {
+              "cpu_op": "aten::mm",
+              "input_shapes": [
+                [
+                  16,
+                  4096
+                ],
+                [
+                  4096,
+                  24576
+                ]
+              ],
+              "compute_kernels_per_call": 1.0,
+              "gpu_us_per_call": 57.485400000000006,
+              "kernel_names": [
+                "nvjet_sm90_tst_64x16_64x16_2x1_v_bz_TNT"
+              ]
+            },
+            "b": {
+              "cpu_op": "aten::mm",
+              "input_shapes": [
+                [
+                  16,
+                  4096
+                ],
+                [
+                  4096,
+                  64
+                ]
+              ],
+              "compute_kernels_per_call": 2.0,
+              "gpu_us_per_call": 5.849600000000001,
+              "kernel_names": [
+                "nvjet_sm90_tst_64x16_64x16_1x1_h_bz_splitK_TNT",
+                "void cublasLt::splitKreduce_kernel<32, 16, int, float, __nv_bfloat16, float, __nv_bfloat16, false, float, __nv_bfloat16, __nv_bfloat16, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, __nv_bfloat16 const*, float*, __nv_bfloat16*, float const*, float const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)"
+              ]
+            },
+            "f_a": {
+              "cpu_op": "aten::mm",
+              "input_shapes": [
+                [
+                  16,
+                  4096
+                ],
+                [
+                  4096,
+                  128
+                ]
+              ],
+              "compute_kernels_per_call": 2.0,
+              "gpu_us_per_call": 5.779400000000001,
+              "kernel_names": [
+                "nvjet_sm90_tst_64x16_64x16_2x1_v_bz_splitK_TNT",
+                "void cublasLt::splitKreduce_kernel<32, 16, int, float, __nv_bfloat16, float, __nv_bfloat16, false, float, __nv_bfloat16, __nv_bfloat16, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, __nv_bfloat16 const*, float*, __nv_bfloat16*, float const*, float const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)"
+              ]
+            },
+            "f_b": {
+              "cpu_op": "aten::mm",
+              "input_shapes": [
+                [
+                  16,
+                  128
+                ],
+                [
+                  128,
+                  8192
+                ]
+              ],
+              "compute_kernels_per_call": 1.0,
+              "gpu_us_per_call": 3.0589999999999997,
+              "kernel_names": [
+                "nvjet_sm90_tst_128x16_64x11_2x1_v_bz_TNT"
+              ]
+            },
+            "g_a": {
+              "cpu_op": "aten::mm",
+              "input_shapes": [
+                [
+                  16,
+                  4096
+                ],
+                [
+                  4096,
+                  128
+                ]
+              ],
+              "compute_kernels_per_call": 2.0,
+              "gpu_us_per_call": 5.619400000000001,
+              "kernel_names": [
+                "nvjet_sm90_tst_64x16_64x16_2x1_v_bz_splitK_TNT",
+                "void cublasLt::splitKreduce_kernel<32, 16, int, float, __nv_bfloat16, float, __nv_bfloat16, false, float, __nv_bfloat16, __nv_bfloat16, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, __nv_bfloat16 const*, float*, __nv_bfloat16*, float const*, float const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)"
+              ]
+            },
+            "g_b": {
+              "cpu_op": "aten::mm",
+              "input_shapes": [
+                [
+                  16,
+                  128
+                ],
+                [
+                  128,
+                  8192
+                ]
+              ],
+              "compute_kernels_per_call": 1.0,
+              "gpu_us_per_call": 3.0912,
+              "kernel_names": [
+                "nvjet_sm90_tst_128x16_64x11_2x1_v_bz_TNT"
+              ]
+            }
+          }
+        },
+        "eager-fused": {
+          "file": "attn-tp1-m16-eager-fused.trace.json",
+          "compute_kernels_per_call": 2.0,
+          "gpu_memory_ops_per_call": 1.0,
+          "gpu_compute_us_per_call": 64.3518,
+          "gpu_memory_us_per_call": 0.736,
+          "kernel_counts": {
+            "nvjet_sm90_tst_64x16_64x16_2x1_v_bz_TNT": 5,
+            "nvjet_sm90_tst_256x16_64x6_2x1_v_bz_TNT": 5
+          },
+          "operators": {
+            "qkv+b+f_a+g_a": {
+              "cpu_op": "aten::mm",
+              "input_shapes": [
+                [
+                  16,
+                  4096
+                ],
+                [
+                  4096,
+                  24896
+                ]
+              ],
+              "compute_kernels_per_call": 1.0,
+              "gpu_us_per_call": 60.2688,
+              "kernel_names": [
+                "nvjet_sm90_tst_64x16_64x16_2x1_v_bz_TNT"
+              ]
+            },
+            "batched f_b+g_b": {
+              "cpu_op": "aten::bmm",
+              "input_shapes": [
+                [
+                  2,
+                  16,
+                  128
+                ],
+                [
+                  2,
+                  128,
+                  8192
+                ]
+              ],
+              "compute_kernels_per_call": 1.0,
+              "gpu_us_per_call": 4.083,
+              "kernel_names": [
+                "nvjet_sm90_tst_256x16_64x6_2x1_v_bz_TNT"
+              ]
+            }
+          }
+        },
+        "graph-unfused": {
+          "file": "attn-tp1-m16-graph-unfused.trace.json",
+          "compute_kernels_per_call": 9.0,
+          "gpu_memory_ops_per_call": 1.0,
+          "gpu_compute_us_per_call": 82.04219999999998,
+          "gpu_memory_us_per_call": 0.8897999999999999,
+          "kernel_counts": {
+            "nvjet_sm90_tst_64x16_64x16_2x1_v_bz_TNT": 5,
+            "nvjet_sm90_tst_64x16_64x16_1x1_h_bz_splitK_TNT": 5,
+            "void cublasLt::splitKreduce_kernel<32, 16, int, float, __nv_bfloat16, float, __nv_bfloat16, false, float, __nv_bfloat16, __nv_bfloat16, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, __nv_bfloat16 const*, float*, __nv_bfloat16*, float const*, float const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)": 15,
+            "nvjet_sm90_tst_64x16_64x16_2x1_v_bz_splitK_TNT": 10,
+            "nvjet_sm90_tst_128x16_64x11_2x1_v_bz_TNT": 10
+          }
+        },
+        "graph-fused": {
+          "file": "attn-tp1-m16-graph-fused.trace.json",
+          "compute_kernels_per_call": 2.0,
+          "gpu_memory_ops_per_call": 1.0,
+          "gpu_compute_us_per_call": 64.47439999999999,
+          "gpu_memory_us_per_call": 0.8064,
+          "kernel_counts": {
+            "nvjet_sm90_tst_64x16_64x16_2x1_v_bz_TNT": 5,
+            "nvjet_sm90_tst_256x16_64x6_2x1_v_bz_TNT": 5
+          }
+        }
+      }
+    },
+    {
+      "label": "attn-tp8-m8192",
+      "attention_tp": 8,
+      "tokens": 8192,
+      "stage": "extend",
+      "correctness": "PASS",
+      "max_abs_error": [
+        0.0,
+        0.015625,
+        0.0,
+        0.0
+      ],
+      "timings_us": {
+        "eager": {
+          "unfused": 1714.449462890625,
+          "fused": 1686.0920715332031
+        }
+      },
+      "traces": {
+        "eager-unfused": {
+          "file": "attn-tp8-m8192-eager-unfused.trace.json",
+          "compute_kernels_per_call": 7.0,
+          "gpu_memory_ops_per_call": 4.0,
+          "gpu_compute_us_per_call": 1702.817199999999,
+          "gpu_memory_us_per_call": 3.8076000000000008,
+          "kernel_counts": {
+            "nvjet_sm90_tst_192x192_64x4_2x1_v_bz_coopB_TNN": 5,
+            "nvjet_sm90_tst_8x64_64x16_1x2_h_bz_splitK_TNN": 5,
+            "void cublasLt::splitKreduce_kernel<32, 16, int, float, __nv_bfloat16, float, __nv_bfloat16, false, float, __nv_bfloat16, __nv_bfloat16, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, __nv_bfloat16 const*, float*, __nv_bfloat16*, float const*, float const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)": 5,
+            "nvjet_sm90_tst_128x128_64x6_1x2_h_bz_TNT": 10,
+            "nvjet_sm90_tst_176x128_64x5_1x2_h_bz_TNN": 10
+          },
+          "operators": {
+            "qkv": {
+              "cpu_op": "aten::mm",
+              "input_shapes": [
+                [
+                  8192,
+                  4096
+                ],
+                [
+                  4096,
+                  3072
+                ]
+              ],
+              "compute_kernels_per_call": 1.0,
+              "gpu_us_per_call": 1483.532,
+              "kernel_names": [
+                "nvjet_sm90_tst_192x192_64x4_2x1_v_bz_coopB_TNN"
+              ]
+            },
+            "b": {
+              "cpu_op": "aten::mm",
+              "input_shapes": [
+                [
+                  8192,
+                  4096
+                ],
+                [
+                  4096,
+                  8
+                ]
+              ],
+              "compute_kernels_per_call": 2.0,
+              "gpu_us_per_call": 27.769599999999997,
+              "kernel_names": [
+                "nvjet_sm90_tst_8x64_64x16_1x2_h_bz_splitK_TNN",
+                "void cublasLt::splitKreduce_kernel<32, 16, int, float, __nv_bfloat16, float, __nv_bfloat16, false, float, __nv_bfloat16, __nv_bfloat16, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, __nv_bfloat16 const*, float*, __nv_bfloat16*, float const*, float const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)"
+              ]
+            },
+            "f_a": {
+              "cpu_op": "aten::mm",
+              "input_shapes": [
+                [
+                  8192,
+                  4096
+                ],
+                [
+                  4096,
+                  128
+                ]
+              ],
+              "compute_kernels_per_call": 1.0,
+              "gpu_us_per_call": 76.9802,
+              "kernel_names": [
+                "nvjet_sm90_tst_128x128_64x6_1x2_h_bz_TNT"
+              ]
+            },
+            "f_b": {
+              "cpu_op": "aten::mm",
+              "input_shapes": [
+                [
+                  8192,
+                  128
+                ],
+                [
+                  128,
+                  1024
+                ]
+              ],
+              "compute_kernels_per_call": 1.0,
+              "gpu_us_per_call": 19.0274,
+              "kernel_names": [
+                "nvjet_sm90_tst_176x128_64x5_1x2_h_bz_TNN"
+              ]
+            },
+            "g_a": {
+              "cpu_op": "aten::mm",
+              "input_shapes": [
+                [
+                  8192,
+                  4096
+                ],
+                [
+                  4096,
+                  128
+                ]
+              ],
+              "compute_kernels_per_call": 1.0,
+              "gpu_us_per_call": 76.615,
+              "kernel_names": [
+                "nvjet_sm90_tst_128x128_64x6_1x2_h_bz_TNT"
+              ]
+            },
+            "g_b": {
+              "cpu_op": "aten::mm",
+              "input_shapes": [
+                [
+                  8192,
+                  128
+                ],
+                [
+                  128,
+                  1024
+                ]
+              ],
+              "compute_kernels_per_call": 1.0,
+              "gpu_us_per_call": 18.893,
+              "kernel_names": [
+                "nvjet_sm90_tst_176x128_64x5_1x2_h_bz_TNN"
+              ]
+            }
+          }
+        },
+        "eager-fused": {
+          "file": "attn-tp8-m8192-eager-fused.trace.json",
+          "compute_kernels_per_call": 2.0,
+          "gpu_memory_ops_per_call": 2.0,
+          "gpu_compute_us_per_call": 1680.6329999999998,
+          "gpu_memory_us_per_call": 1.7406,
+          "kernel_counts": {
+            "nvjet_sm90_tst_160x256_64x4_1x2_h_bz_coopA_TNN": 5,
+            "nvjet_sm90_tst_128x192_64x5_2x1_v_bz_coopB_TNN": 5
+          },
+          "operators": {
+            "qkv+b+f_a+g_a": {
+              "cpu_op": "aten::mm",
+              "input_shapes": [
+                [
+                  8192,
+                  4096
+                ],
+                [
+                  4096,
+                  3336
+                ]
+              ],
+              "compute_kernels_per_call": 1.0,
+              "gpu_us_per_call": 1645.5608,
+              "kernel_names": [
+                "nvjet_sm90_tst_160x256_64x4_1x2_h_bz_coopA_TNN"
+              ]
+            },
+            "batched f_b+g_b": {
+              "cpu_op": "aten::bmm",
+              "input_shapes": [
+                [
+                  2,
+                  8192,
+                  128
+                ],
+                [
+                  2,
+                  128,
+                  1024
+                ]
+              ],
+              "compute_kernels_per_call": 1.0,
+              "gpu_us_per_call": 35.072199999999995,
+              "kernel_names": [
+                "nvjet_sm90_tst_128x192_64x5_2x1_v_bz_coopB_TNN"
+              ]
+            }
+          }
+        }
+      }
+    }
+  ],
+  "precision_evidence": "BF16 in CPU Input type and installed UnquantizedLinearMethod; nvjet name alone does not imply FP8"
+}
