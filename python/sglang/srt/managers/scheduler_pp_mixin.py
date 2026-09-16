@@ -1263,7 +1263,7 @@ class SchedulerPPMixin:
             build_tree_kernel_efficient,
             default_tree_mask_mode,
         )
-        from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
+        from sglang.srt.speculative.pp_spec_relay import normalize_pp_spec_relay
 
         spec = get_spec()
         steps = spec.speculative_num_steps
@@ -1280,15 +1280,14 @@ class SchedulerPPMixin:
             )
             return
 
-        relay: PPSpecRelayInput = batch.spec_info
-        # The rows track the batch through filter / merge, but a recomposition
-        # that bypasses those hooks would leave them labelled for a different
-        # order, and the rebuild reads them positionally. Relabel rather than
-        # hand the verify kernel another request's bonus token.
+        # Regular PP carries a PPSpecRelayInput between rounds. Disaggregated
+        # Decode enters its first round with the Prefill-produced
+        # EagleDraftInput, whose bonus token roots a degenerate first tree.
         live_rids = [req.rid for req in batch.reqs]
-        if relay.rids != live_rids:
-            relay = relay.reindex(live_rids)
-            batch.spec_info = relay
+        relay = normalize_pp_spec_relay(
+            batch.spec_info, rids=live_rids, num_draft_tokens=num_draft_tokens
+        )
+        batch.spec_info = relay
         tree_rows = relay.tokens.to(device=device, dtype=torch.int64)
         bonus_tokens = tree_rows[:, 0].contiguous()
         draft_tokens = tree_rows[:, 1:].contiguous()

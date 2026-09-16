@@ -176,3 +176,36 @@ class PPSpecRelayInput(SpecInput):
         return torch.arange(width, dtype=torch.long, device=self.tokens.device).repeat(
             len(self.rids), 1
         )
+
+
+def normalize_pp_spec_relay(
+    spec_info: SpecInput, *, rids: List[str], num_draft_tokens: int
+) -> PPSpecRelayInput:
+    """Normalize the state entering a PP verify round.
+
+    A regular PP prefill installs ``PPSpecRelayInput`` through the output ring.
+    Disaggregated Decode instead receives the Prefill-produced
+    ``EagleDraftInput`` directly, so its first verify round must turn the bonus
+    token into the same degenerate relay before rebuilding the verify tree.
+    """
+    if isinstance(spec_info, PPSpecRelayInput):
+        return spec_info if spec_info.rids == rids else spec_info.reindex(rids)
+
+    from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+    if isinstance(spec_info, EagleDraftInput) and spec_info.bonus_tokens is not None:
+        if spec_info.bonus_tokens.shape[0] != len(rids):
+            raise RuntimeError(
+                "PP speculative first-round bonus-token rows do not match "
+                f"the live batch: {spec_info.bonus_tokens.shape[0]} != {len(rids)}"
+            )
+        return PPSpecRelayInput.degenerate(
+            rids=rids,
+            bonus_tokens=spec_info.bonus_tokens,
+            num_draft_tokens=num_draft_tokens,
+        )
+
+    raise TypeError(
+        "PP speculative verify requires PPSpecRelayInput or a first-round "
+        f"EagleDraftInput with bonus tokens, got {type(spec_info).__name__}"
+    )
