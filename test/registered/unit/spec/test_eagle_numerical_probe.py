@@ -974,6 +974,72 @@ class TestEagleNumericalProbe(unittest.TestCase):
                 seq_lens=seq_lens,
             )
 
+    def test_pp_target_forward_observer_captures_indexer_inputs(self):
+        observer = _PPTargetForwardDeviceObserver(
+            layer_ids=(0, 1),
+            max_rows=4,
+            hidden_size=3,
+            dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+        )
+        observer.install_indexer_inputs(
+            layer_id=1,
+            num_heads=2,
+            head_dim=8,
+            max_page_table_columns=5,
+            page_size=4,
+        )
+        q_fp8 = torch.arange(32, dtype=torch.uint8).reshape(2, 2, 8)
+        weights = torch.arange(4, dtype=torch.float32).reshape(2, 2, 1)
+        block_tables = torch.tensor([[4, 7, 9, 999, 999]], dtype=torch.int32)
+        seq_lens = torch.tensor([[11, 12]], dtype=torch.int32)
+        observer.capture_indexer_inputs(
+            layer_id=1,
+            q_fp8=q_fp8,
+            weights=weights,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+        )
+
+        snapshot = observer.snapshot_stages()["target_verify_layer_01_indexer_inputs"]
+        self.assertEqual(
+            set(snapshot["tensors"]),
+            {"q_fp8", "weights", "block_tables", "seq_lens"},
+        )
+        self.assertTrue(torch.equal(snapshot["tensors"]["q_fp8"][:2], q_fp8))
+        self.assertTrue(
+            torch.equal(snapshot["tensors"]["weights"][:2], weights.squeeze(-1))
+        )
+        self.assertTrue(
+            torch.equal(
+                snapshot["tensors"]["block_tables"][:1],
+                torch.tensor([[4, 7, 9, 0, 0]], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(snapshot["tensors"]["seq_lens"][:2], seq_lens.reshape(-1))
+        )
+        metadata = snapshot["tensor_metadata"]
+        self.assertEqual(metadata["q_fp8"]["logical_rows"].item(), 2)
+        self.assertEqual(metadata["weights"]["logical_rows"].item(), 2)
+        self.assertEqual(metadata["block_tables"]["logical_rows"].item(), 1)
+        self.assertEqual(metadata["seq_lens"]["logical_rows"].item(), 2)
+        self.assertTrue(
+            torch.equal(
+                snapshot["tensors"]["block_tables"][1:],
+                torch.zeros((3, 5), dtype=torch.int32),
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "does not fit"):
+            observer.capture_indexer_inputs(
+                layer_id=1,
+                q_fp8=q_fp8,
+                weights=weights,
+                block_tables=torch.zeros((1, 6), dtype=torch.int32),
+                seq_lens=seq_lens,
+            )
+
     def test_pp_target_forward_observer_rejects_logical_topk_output_drift(self):
         observer = _PPTargetForwardDeviceObserver(
             layer_ids=(0,),
@@ -1201,7 +1267,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
                 kv_lora_rank=8,
                 qk_rope_head_dim=2,
                 v_head_dim=4,
-                indexer=SimpleNamespace(),
+                indexer=SimpleNamespace(n_heads=2, head_dim=8),
                 attn_mqa=SimpleNamespace(),
             )
         model = type(
@@ -1217,6 +1283,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
             model=model,
             max_rows=32,
             max_indexer_columns=128,
+            indexer_page_size=64,
             dtype=torch.bfloat16,
             # ModelRunner.device is a string in the serving runtime. Keep this
             # contract covered instead of relying only on torch.device fixtures.

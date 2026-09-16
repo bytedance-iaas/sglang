@@ -889,6 +889,21 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
         )
         assert len(weights.shape) == 3
+        target_forward_probe = getattr(self, "target_forward_probe", None)
+        if (
+            target_forward_probe is not None
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            effective_block_tables = (
+                block_tables[::next_n] if use_dg_native else block_tables
+            )
+            target_forward_probe.capture_indexer_inputs(
+                layer_id=layer_id,
+                q_fp8=q_fp8[:q_offset],
+                weights=weights[:q_offset],
+                block_tables=effective_block_tables,
+                seq_lens=seqlens_32_2d,
+            )
         weights = weights.squeeze(2)
 
         if self.paged_mqa_logits_backend.is_aiter():
@@ -951,7 +966,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # NOTE(dark): logits should be cleaned in topk_transform
         self._mask_init_and_local_tokens(logits, seqlens_32)
         logical_topk_output = None
-        target_forward_probe = getattr(self, "target_forward_probe", None)
         if (
             target_forward_probe is not None
             and forward_batch.forward_mode.is_target_verify()

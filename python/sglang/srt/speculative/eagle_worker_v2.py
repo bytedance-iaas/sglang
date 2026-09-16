@@ -1465,6 +1465,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     // int(target_model_runner.page_size)
                     * int(target_model_runner.page_size)
                 ),
+                indexer_page_size=int(target_model_runner.page_size),
                 dtype=target_model_runner.dtype,
                 device=target_model_runner.device,
             )

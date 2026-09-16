@@ -674,6 +674,7 @@ class TestEaglePPLastRankDraftOwnership(unittest.TestCase):
             model=target.model_runner.model,
             max_rows=32,
             max_indexer_columns=4224,
+            indexer_page_size=64,
             dtype=torch.bfloat16,
             device=torch.device("cpu"),
         )

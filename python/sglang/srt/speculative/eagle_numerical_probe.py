@@ -204,6 +204,7 @@ _PP_TARGET_ATTENTION_OUTPUT_BOUNDARIES = (
     "v_projection_output",
 )
 _PP_TARGET_ATTENTION_TENSOR = "output"
+_PP_INDEXER_INPUT_TENSORS = ("q_fp8", "weights", "block_tables", "seq_lens")
 _PP_INDEXER_LOGITS_TENSORS = ("logits", "seq_lens")
 _PP_FLASHMLA_INPUT_TENSORS = (
     "q_nope",
@@ -281,6 +282,10 @@ class _PPTargetForwardDeviceObserver:
         self._flashmla_input_buffers: dict[int, dict[str, torch.Tensor]] = {}
         self._flashmla_input_row_counts: dict[int, dict[str, torch.Tensor]] = {}
         self._logical_topk_kernel_rows: dict[int, int] = {}
+        self._indexer_input_buffers: dict[int, dict[str, torch.Tensor]] = {}
+        self._indexer_input_row_counts: dict[int, dict[str, torch.Tensor]] = {}
+        self._indexer_input_page_sizes: dict[int, int] = {}
+        self._indexer_page_columns: dict[int, torch.Tensor] = {}
         self._indexer_logits_buffers: dict[int, dict[str, torch.Tensor]] = {}
         self._indexer_logits_row_counts: dict[int, torch.Tensor] = {}
         self.device = self.buffer.device
@@ -393,6 +398,141 @@ class _PPTargetForwardDeviceObserver:
             "num_splits": _FLASHMLA_QUERY_SPLIT_INDPTR_ROW_DOMAIN,
             "tile_scheduler_metadata": _FLASHMLA_SCHEDULER_ROW_DOMAIN,
         }
+
+    def install_indexer_inputs(
+        self,
+        *,
+        layer_id: int,
+        num_heads: int,
+        head_dim: int,
+        max_page_table_columns: int,
+        page_size: int,
+    ) -> None:
+        """Allocate graph-stable copies of paged-MQA score inputs."""
+        if layer_id in self._indexer_input_buffers:
+            raise RuntimeError(
+                f"indexer-input observer is already installed for layer {layer_id}"
+            )
+        dimensions = (num_heads, head_dim, max_page_table_columns, page_size)
+        if any(value <= 0 for value in dimensions):
+            raise ValueError(f"indexer-input dimensions must be positive: {dimensions}")
+        stage = f"target_verify_layer_{layer_id:02d}_indexer_inputs"
+        self._indexer_input_buffers[layer_id] = {
+            "q_fp8": torch.zeros(
+                (self.max_rows, num_heads, head_dim),
+                dtype=torch.uint8,
+                device=self.device,
+            ),
+            "weights": torch.zeros(
+                (self.max_rows, num_heads),
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            "block_tables": torch.zeros(
+                (self.max_rows, max_page_table_columns),
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            "seq_lens": torch.zeros(
+                (self.max_rows * self.max_rows,),
+                dtype=torch.int32,
+                device=self.device,
+            ),
+        }
+        self._indexer_input_row_counts[layer_id] = {
+            name: torch.zeros((1,), dtype=torch.int32, device=self.device)
+            for name in _PP_INDEXER_INPUT_TENSORS
+        }
+        self._indexer_input_page_sizes[layer_id] = page_size
+        self._indexer_page_columns[layer_id] = torch.arange(
+            max_page_table_columns, dtype=torch.int32, device=self.device
+        )
+        self._row_domains[stage] = {
+            "q_fp8": _PP_ATTN_GROUP_TARGET_TREE_ROW_DOMAIN,
+            "weights": _PP_ATTN_GROUP_TARGET_TREE_ROW_DOMAIN,
+            "block_tables": "paged_mqa_block_table",
+            "seq_lens": "paged_mqa_context_length",
+        }
+
+    def capture_indexer_inputs(
+        self,
+        *,
+        layer_id: int,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> None:
+        """Copy the exact paged-MQA inputs used by one graph replay."""
+        buffers = self._indexer_input_buffers.get(layer_id)
+        if buffers is None:
+            return
+        stage = f"target_verify_layer_{layer_id:02d}_indexer_inputs"
+        q_bytes = q_fp8.view(torch.uint8)
+        if block_tables.ndim != 2 or seq_lens.numel() % block_tables.shape[0] != 0:
+            raise ValueError(
+                f"{stage} invalid block-table/context layout: "
+                f"block_tables={tuple(block_tables.shape)}, "
+                f"seq_lens={tuple(seq_lens.shape)}"
+            )
+        if any(
+            actual > limit
+            for actual, limit in zip(block_tables.shape, buffers["block_tables"].shape)
+        ):
+            raise ValueError(
+                f"{stage}.block_tables shape {tuple(block_tables.shape)} does not fit "
+                f"fixed slot {tuple(buffers['block_tables'].shape)}"
+            )
+        page_size = self._indexer_input_page_sizes[layer_id]
+        context_lens = seq_lens.reshape(block_tables.shape[0], -1)
+        valid_pages = (context_lens.max(dim=1).values + page_size - 1) // page_size
+        valid_page_mask = self._indexer_page_columns[layer_id][
+            : block_tables.shape[1]
+        ].unsqueeze(0) < valid_pages.unsqueeze(1)
+        logical_block_tables = torch.where(
+            valid_page_mask, block_tables, torch.zeros_like(block_tables)
+        )
+        values = {
+            "q_fp8": q_bytes,
+            "weights": weights,
+            "block_tables": logical_block_tables,
+            "seq_lens": seq_lens.reshape(-1),
+        }
+        expected_dtypes = {
+            "q_fp8": torch.uint8,
+            "weights": torch.float32,
+            "block_tables": torch.int32,
+            "seq_lens": torch.int32,
+        }
+        normalized = {}
+        for name, value in values.items():
+            if value.device != self.device or value.dtype != expected_dtypes[name]:
+                raise ValueError(
+                    f"{stage}.{name} identity changed: shape={tuple(value.shape)}, "
+                    f"dtype={value.dtype}, device={value.device}"
+                )
+            if name == "weights" and value.ndim == 3 and value.shape[-1] == 1:
+                value = value.squeeze(-1)
+            if value.ndim != buffers[name].ndim:
+                raise ValueError(
+                    f"{stage}.{name} rank changed: shape={tuple(value.shape)}, "
+                    f"slot={tuple(buffers[name].shape)}"
+                )
+            if any(
+                actual > limit
+                for actual, limit in zip(value.shape, buffers[name].shape)
+            ):
+                raise ValueError(
+                    f"{stage}.{name} shape {tuple(value.shape)} does not fit "
+                    f"fixed slot {tuple(buffers[name].shape)}"
+                )
+            normalized[name] = value
+        if q_fp8.shape[0] <= 0 or q_fp8.shape[0] != weights.shape[0]:
+            raise ValueError(f"{stage} invalid q/weights rows")
+        for name, value in normalized.items():
+            slices = tuple(slice(0, int(size)) for size in value.shape)
+            buffers[name][slices].copy_(value)
+            self._indexer_input_row_counts[layer_id][name].fill_(value.shape[0])
 
     def install_indexer_logits(self, *, layer_id: int, max_columns: int) -> None:
         """Allocate a graph-stable copy of one layer's direct TopK inputs."""
@@ -772,6 +912,18 @@ class _PPTargetForwardDeviceObserver:
                 },
                 "tensors": buffers,
             }
+        for layer_id, buffers in self._indexer_input_buffers.items():
+            stage = f"target_verify_layer_{layer_id:02d}_indexer_inputs"
+            stages[stage] = {
+                "tensor_metadata": {
+                    name: {
+                        "logical_rows": self._indexer_input_row_counts[layer_id][name],
+                        "row_domain": self._row_domains[stage][name],
+                    }
+                    for name in _PP_INDEXER_INPUT_TENSORS
+                },
+                "tensors": buffers,
+            }
         return stages
 
 
@@ -822,6 +974,7 @@ class EaglePPSenderProbe:
         model,
         max_rows: int,
         max_indexer_columns: int,
+        indexer_page_size: int,
         dtype: torch.dtype,
         device: torch.device | str,
     ) -> None:
@@ -948,6 +1101,14 @@ class EaglePPSenderProbe:
             observer.install_indexer_logits(
                 layer_id=layer_id,
                 max_columns=max_indexer_columns,
+            )
+            observer.install_indexer_inputs(
+                layer_id=layer_id,
+                num_heads=int(indexer.n_heads),
+                head_dim=int(indexer.head_dim),
+                max_page_table_columns=(max_indexer_columns + indexer_page_size - 1)
+                // indexer_page_size,
+                page_size=indexer_page_size,
             )
             attention.target_forward_probe = observer
             indexer.target_forward_probe = observer
