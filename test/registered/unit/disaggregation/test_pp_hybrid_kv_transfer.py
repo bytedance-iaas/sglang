@@ -208,6 +208,7 @@ def _dsa_pool(
     pool.start_layer = start_layer
     pool.end_layer = end_layer
     pool.layer_num = end_layer - start_layer
+    pool.kpool_use_compress = False
     count = pool.layer_num
     pool.get_state_buf_infos = lambda: (
         list(range(ptr_base, ptr_base + count)),
