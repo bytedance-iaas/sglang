@@ -1697,6 +1697,7 @@ class SchedulerPPMixin:
                 )
                 if (
                     pending_admit is None
+                    and not bootstrap_round_active
                     and not pending_chunk_batches
                     and rank_schedule.can_admit(next_batch_seq)
                     and resource_gate.can_admit(

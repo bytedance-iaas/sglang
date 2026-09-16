@@ -11,6 +11,7 @@ from sglang.srt.distributed.pipeline_layout import (
     PipelineControlKind,
     PipelinePrefixRegistry,
     PipelineRankSchedule,
+    PipelineResourceGate,
     PipelineResourceSnapshot,
     PipelineWavefrontAction,
 )
@@ -817,8 +818,9 @@ class TestSchedulerVPP(unittest.TestCase):
         scheduler._pp_vpp_poll_receiver_tp_consensus = MagicMock(return_value=False)
         scheduler._pp_vpp_reap_send_work = MagicMock()
         scheduler._pp_vpp_select_tp_action = MagicMock(return_value=None)
+        scheduler._pp_vpp_prepare_wavefront_batch = MagicMock(return_value=None)
         scheduler._pp_vpp_resource_snapshot = MagicMock(
-            return_value=PipelineResourceSnapshot(0, 8192, 0, 0)
+            return_value=PipelineResourceSnapshot(1, 8192, 0, 0)
         )
         scheduler.get_rids = MagicMock(
             side_effect=lambda queue, _is_send, *statuses: (
@@ -888,6 +890,7 @@ class TestSchedulerVPP(unittest.TestCase):
                 "sglang.srt.managers.scheduler_pp_mixin.max_prefill_buffer_tokens",
                 return_value=128,
             ),
+            patch.object(PipelineResourceGate, "can_admit", return_value=True),
             self.assertRaises(StopIteration),
         ):
             scheduler._event_loop_pp_disagg_prefill_vpp_rank_local()
@@ -898,6 +901,7 @@ class TestSchedulerVPP(unittest.TestCase):
         scheduler.process_disagg_prefill_inflight_queue.assert_called_once_with(
             ["transfer-rid"]
         )
+        scheduler._pp_vpp_prepare_wavefront_batch.assert_not_called()
         self.assertLess(
             sent_kinds.index(PipelineControlKind.REQUEST),
             sent_kinds.index(PipelineControlKind.BOOTSTRAP_STATUS),
