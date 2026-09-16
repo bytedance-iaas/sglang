@@ -2620,7 +2620,13 @@ def get_moe_tp_group() -> GroupCoordinator:
 get_tensor_model_parallel_group = get_tp_group
 
 _PP: Optional[GroupCoordinator] = None
+_VPP_PP_REVERSE: Optional[GroupCoordinator] = None
 _SELF_PP: Optional[GroupCoordinator] = None
+
+
+def get_vpp_pp_reverse_group() -> GroupCoordinator:
+    assert _VPP_PP_REVERSE is not None, "VPP reverse pipeline group is not initialized"
+    return _VPP_PP_REVERSE
 
 
 def get_self_pp_group() -> GroupCoordinator:
@@ -2921,6 +2927,7 @@ def initialize_model_parallel(
     recovered_rank: bool = False,
     rank_offset: int = 0,
     max_world_size: Optional[int] = None,
+    duplicate_pp_group: bool = False,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -3278,6 +3285,23 @@ def initialize_model_parallel(
         max_world_size=max_world_size,
     )
 
+    global _VPP_PP_REVERSE
+    assert _VPP_PP_REVERSE is None, "VPP reverse pipeline group is already initialized"
+    if duplicate_pp_group:
+        if pipeline_model_parallel_size != 2:
+            raise ValueError("duplicate PP transport is only valid for PP2")
+        _VPP_PP_REVERSE = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_pynccl=False,
+            use_custom_allreduce=False,
+            group_name="vpp_pp_reverse",
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
+        )
+
     # The one-layer draft uses a singleton PP group; every rank creates all groups
     # because new_group is collective.
     global _SELF_PP
@@ -3555,6 +3579,11 @@ def destroy_model_parallel():
     if _PP:
         _PP.destroy()
     _PP = None
+
+    global _VPP_PP_REVERSE
+    if _VPP_PP_REVERSE:
+        _VPP_PP_REVERSE.destroy()
+    _VPP_PP_REVERSE = None
 
     global _DCP
     if _DCP:

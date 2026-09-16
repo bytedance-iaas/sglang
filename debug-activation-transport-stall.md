@@ -24,5 +24,28 @@ Instrumentation added:
 - Per-TP-lane send work completion, payload bytes, and `(batch, src_stage, dst_stage)` identity.
 - Focused CPU tests verify snapshots do not call `wait()` or advance transport state.
 
+Multi-node reproduction at 2026-09-16 14:47:53:
+- All eight PP/TP lanes completed metadata receive and remained in `recv.state=payload` with `payload_works=(False,)`.
+- PP0 receives batch 7 stage 1->2 while its pending send is batch 6 stage 2->3.
+- PP1 receives batch 6 stage 2->3 while its pending send is batch 7 stage 1->2.
+- Send and receive identities match across peers, but both GPU send works and both matching GPU receive works remain incomplete for at least 20 seconds.
+- No traceback, NCCL timeout, control backlog, bootstrap round, or TP-lane divergence is present.
+
 ## Verification Conclusion
-Instrumentation verification: 38 focused tests passed. Root cause remains pending a multi-node reproduction.
+H1 rejected: metadata size and body are complete.
+H2 confirmed: all lanes are blocked in GPU payload P2P.
+H3 rejected: no lane reaches TP all-gather.
+H4 refined: message identities match, but opposite-direction sends are launched before
+their matching receives on the shared PP NCCL communicator, creating a symmetric
+cross-send ordering deadlock.
+
+Minimal fix:
+- Create a second PP transport group only for PP2 + VPP.
+- Route PP0->PP1 activation traffic through the base PP group.
+- Route PP1->PP0 activation traffic through the duplicate PP group.
+- Keep the control ring and PP4 activation traffic unchanged.
+
+Post-fix verification:
+- Local focused tests pass, including PP2 directional routing and duplicate group
+  rank construction.
+- Multi-node post-fix evidence is pending.

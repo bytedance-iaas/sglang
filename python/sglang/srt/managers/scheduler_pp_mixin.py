@@ -18,6 +18,7 @@ from sglang.srt.distributed.parallel_state import (
     P2PWork,
     P2PWorkGroup,
     TensorDictRecvHandle,
+    get_vpp_pp_reverse_group,
 )
 from sglang.srt.distributed.pipeline_layout import (
     PipelineControlEnvelope,
@@ -449,10 +450,17 @@ class SchedulerPPMixin:
             "requests": tuple(requests),
         }
 
+    def _pp_vpp_activation_group(self: Scheduler, source_rank: int):
+        if self.ps.pp_size == 2 and source_rank == 1:
+            return get_vpp_pp_reverse_group()
+        return self.pp_group
+
     def _pp_vpp_start_receiver(self: Scheduler) -> None:
         if self._pp_vpp_pending_recv is not None:
             return
-        self._pp_vpp_pending_recv = self.pp_group.recv_tensor_dict_async(
+        source_rank = (self.ps.pp_rank - 1) % self.ps.pp_size
+        activation_group = self._pp_vpp_activation_group(source_rank)
+        self._pp_vpp_pending_recv = activation_group.recv_tensor_dict_async(
             all_gather_group=self.attn_tp_group,
             batch_p2p=True,
             tag=_VPP_ACTIVATION_TAG,
@@ -2519,8 +2527,13 @@ class SchedulerPPMixin:
             )
         tensor_dict["__msg_type__"] = msg_type
         p2p_work = []
+        pp_group = (
+            self._pp_vpp_activation_group(self.ps.pp_rank)
+            if msg_type == "vpp_proxy"
+            else self.pp_group
+        )
         p2p_work.extend(
-            self.pp_group.send_tensor_dict(
+            pp_group.send_tensor_dict(
                 tensor_dict=tensor_dict,
                 all_gather_group=(self.attn_tp_group),
                 async_send=async_send,

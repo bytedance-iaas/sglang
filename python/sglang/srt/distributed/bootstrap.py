@@ -292,6 +292,7 @@ def _init_parallel_groups(
         moe_data_model_parallel_size=moe_dp_size,
         decode_context_parallel_size=dcp_size,
         duplicate_tp_group=get_disagg().enable_pdmux,
+        duplicate_pp_group=(pp_size == 2 and get_parallel().pp_virtual_stages > 1),
         enable_symm_mem=get_exec().comm.enable_symm_mem,
         recovered_rank=is_ep_joiner,
         rank_offset=rank_offset,

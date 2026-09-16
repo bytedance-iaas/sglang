@@ -91,6 +91,58 @@ def _make_scheduler(*, is_first_rank=False, is_last_rank=False):
 
 
 class TestSchedulerVPP(unittest.TestCase):
+    @patch("sglang.srt.managers.scheduler_pp_mixin.get_vpp_pp_reverse_group")
+    def test_pp2_activation_transport_separates_peer_directions(
+        self, get_reverse_group
+    ):
+        scheduler = _make_scheduler()
+        scheduler.ps.pp_size = 2
+        reverse_group = SimpleNamespace(
+            recv_tensor_dict_async=MagicMock(return_value=object()),
+            send_tensor_dict=MagicMock(return_value=[object()]),
+        )
+        get_reverse_group.return_value = reverse_group
+
+        scheduler.ps.pp_rank = 0
+        scheduler._pp_vpp_pending_recv = None
+        scheduler._pp_vpp_start_receiver()
+        reverse_group.recv_tensor_dict_async.assert_called_once_with(
+            all_gather_group=scheduler.attn_tp_group,
+            batch_p2p=True,
+            tag=1,
+        )
+
+        scheduler.ps.pp_rank = 1
+        send_work = SchedulerPPMixin._pp_send_dict_to_next_stage(
+            scheduler,
+            {"hidden_states": torch.arange(2)},
+            msg_type="vpp_proxy",
+            batch_p2p=True,
+            tag=1,
+        )
+        self.assertEqual(len(send_work), 1)
+        reverse_group.send_tensor_dict.assert_called_once()
+
+    @patch("sglang.srt.managers.scheduler_pp_mixin.get_vpp_pp_reverse_group")
+    def test_pp2_activation_transport_keeps_pp0_to_pp1_on_base_group(
+        self, get_reverse_group
+    ):
+        scheduler = _make_scheduler()
+        scheduler.ps.pp_size = 2
+        scheduler.ps.pp_rank = 0
+        scheduler.pp_group.send_tensor_dict = MagicMock(return_value=[object()])
+
+        SchedulerPPMixin._pp_send_dict_to_next_stage(
+            scheduler,
+            {"hidden_states": torch.arange(2)},
+            msg_type="vpp_proxy",
+            batch_p2p=True,
+            tag=1,
+        )
+
+        scheduler.pp_group.send_tensor_dict.assert_called_once()
+        get_reverse_group.assert_not_called()
+
     def test_vpp_event_loop_defaults_to_rank_local_scheduler(self):
         scheduler = SchedulerPPMixin()
         scheduler._event_loop_pp_disagg_prefill_vpp_rank_local = MagicMock(
