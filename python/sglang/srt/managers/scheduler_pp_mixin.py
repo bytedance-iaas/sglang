@@ -779,6 +779,15 @@ class SchedulerPPMixin:
     ) -> None:
         payload["good"] = sorted(set(payload["good"]).intersection(local_good))
         payload["bad"] = sorted(set(payload["bad"]).union(local_bad))
+        local_metadata_slots = min(
+            self.attn_tp_group.all_gather_object(
+                int(self.req_to_metadata_buffer_idx_allocator.available_size())
+            )
+        )
+        payload["metadata_slots"] = min(
+            int(payload["metadata_slots"]),
+            local_metadata_slots,
+        )
         local_boundaries = self._pp_vpp_bootstrap_prefix_boundaries(payload["good"])
         payload["prefix_boundaries"] = {
             rid: min(
@@ -787,6 +796,17 @@ class SchedulerPPMixin:
             )
             for rid in payload["good"]
         }
+
+    def _pp_vpp_bootstrap_apply_status(
+        self: Scheduler,
+        payload: Dict[str, object],
+    ) -> List[List[str]]:
+        good = sorted(set(payload["good"]))
+        metadata_slots = max(0, int(payload["metadata_slots"]))
+        return [
+            good[:metadata_slots],
+            sorted(set(payload["bad"])),
+        ]
 
     def _pp_vpp_apply_bootstrap_prefix_boundaries(
         self: Scheduler,
@@ -1330,10 +1350,10 @@ class SchedulerPPMixin:
                 phase = str(payload["phase"])
                 if phase == "collect":
                     if returned_to_source:
-                        final_status = [
-                            sorted(set(payload["good"])),
-                            sorted(set(payload["bad"])),
-                        ]
+                        final_status = self._pp_vpp_bootstrap_apply_status(payload)
+                        if not final_status[0] and not final_status[1]:
+                            bootstrap_round_active = False
+                            return
                         apply_envelope = self._pp_vpp_new_control(
                             PipelineControlKind.BOOTSTRAP_STATUS,
                             payload={
@@ -1650,6 +1670,13 @@ class SchedulerPPMixin:
                         if isinstance(req.finished_reason, FINISH_ABORT)
                     }
                     good, bad = self._route_aborts_to_bad(good, bad, aborted)
+                    metadata_slots = min(
+                        self.attn_tp_group.all_gather_object(
+                            int(
+                                self.req_to_metadata_buffer_idx_allocator.available_size()
+                            )
+                        )
+                    )
                     bootstrap_round_active = True
                     self._pp_vpp_queue_control(
                         self._pp_vpp_new_control(
@@ -1661,6 +1688,7 @@ class SchedulerPPMixin:
                                 "prefix_boundaries": (
                                     self._pp_vpp_bootstrap_prefix_boundaries(good)
                                 ),
+                                "metadata_slots": metadata_slots,
                             },
                         ).forwarded()
                     )
@@ -1966,7 +1994,8 @@ class SchedulerPPMixin:
                     "pending_chunks=%s pending_first_pass=%s "
                     "slots=%s ready=%s running=%s "
                     "waiting=%s bootstrap=%s inflight=%s "
-                    "bootstrap_applies=%s materialized=%s replica_updates=%s "
+                    "metadata_slots=%s bootstrap_applies=%s "
+                    "materialized=%s replica_updates=%s "
                     "control_outbox=%s control_sends=%s activation_sends=%s "
                     "ready_proxies=%s arrivals=%s resource_ranks=%s blocked_ranks=%s "
                     "local_resource=%s",
@@ -1989,6 +2018,7 @@ class SchedulerPPMixin:
                     len(self.waiting_queue),
                     len(self.disagg_prefill_bootstrap_queue.queue),
                     len(self.disagg_prefill_inflight_queue),
+                    self.req_to_metadata_buffer_idx_allocator.available_size(),
                     len(pending_bootstrap_applies),
                     len(self._pp_vpp_pending_materialized),
                     len(self._pp_vpp_pending_replica_updates),

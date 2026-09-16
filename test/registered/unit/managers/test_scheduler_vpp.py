@@ -452,11 +452,16 @@ class TestSchedulerVPP(unittest.TestCase):
             init_next_round_input=MagicMock(),
         )
         scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[req])
+        scheduler.req_to_metadata_buffer_idx_allocator = SimpleNamespace(
+            available_size=MagicMock(return_value=8)
+        )
+        scheduler.attn_tp_group.all_gather_object = MagicMock(return_value=[8, 6])
         scheduler.tree_cache = object()
         payload = {
             "good": ["r0"],
             "bad": [],
             "prefix_boundaries": {"r0": 0},
+            "metadata_slots": 16,
         }
 
         scheduler._pp_vpp_merge_bootstrap_status(payload, ["r0"], [])
@@ -469,9 +474,28 @@ class TestSchedulerVPP(unittest.TestCase):
         )
 
         self.assertEqual(payload["prefix_boundaries"], {"r0": 0})
+        self.assertEqual(payload["metadata_slots"], 6)
         self.assertEqual(req.vpp_prefix_limit, 0)
         self.assertEqual(len(req.prefix_indices), 0)
         req.init_next_round_input.assert_called_once_with(scheduler.tree_cache)
+
+    def test_vpp_bootstrap_apply_is_bounded_by_common_metadata_capacity(self):
+        scheduler = _make_scheduler()
+        payload = {
+            "good": [f"r{i}" for i in range(48)],
+            "bad": ["bad"],
+            "metadata_slots": 2,
+        }
+
+        good, bad = scheduler._pp_vpp_bootstrap_apply_status(payload)
+
+        self.assertEqual(good, ["r0", "r1"])
+        self.assertEqual(bad, ["bad"])
+        payload["metadata_slots"] = 0
+        self.assertEqual(
+            scheduler._pp_vpp_bootstrap_apply_status(payload),
+            [[], ["bad"]],
+        )
 
     def test_vpp_prefix_limit_caps_next_prefix_match(self):
         req = Req.__new__(Req)
@@ -804,6 +828,9 @@ class TestSchedulerVPP(unittest.TestCase):
         scheduler.waiting_queue = []
         scheduler.req_to_token_pool = SimpleNamespace(
             available_size=MagicMock(return_value=0)
+        )
+        scheduler.req_to_metadata_buffer_idx_allocator = SimpleNamespace(
+            available_size=MagicMock(return_value=1)
         )
         scheduler.token_to_kv_pool_allocator = SimpleNamespace(
             available_size=MagicMock(return_value=8192)
