@@ -489,13 +489,27 @@ class EICKVClient:
         exist_option.ns = self.eic_namespace
 
         status_code, exist_outcome = self.connection.mexist(keys_vec, exist_option)
-        if status_code != eic.StatusCode.SUCCESS:
+        if status_code == eic.StatusCode.SUCCESS:
+            return [c == eic.StatusCode.SUCCESS for c in exist_outcome.status_codes]
+        if status_code != eic.StatusCode.PARTIAL_FAILED:
             logger.error(f"eic exists {len(keys)} failed, status_code {status_code}")
             return [False] * len(keys)
-        res = []
-        for err_code in exist_outcome.status_codes:
-            res.append(err_code == eic.StatusCode.SUCCESS)
-        return res
+
+        codes = list(exist_outcome.status_codes)
+        failed = [i for i, c in enumerate(codes) if c != eic.StatusCode.SUCCESS]
+        retry_keys = eic.StringVector()
+        for i in failed:
+            retry_keys.append(keys[i])
+        retry_status, retry_outcome = self.connection.mexist(
+            retry_keys, exist_option
+        )
+        retry_codes = list(retry_outcome.status_codes)
+        for j, i in enumerate(failed):
+            if retry_status == eic.StatusCode.SUCCESS or (
+                j < len(retry_codes) and retry_codes[j] == eic.StatusCode.SUCCESS
+            ):
+                codes[i] = eic.StatusCode.SUCCESS
+        return [c == eic.StatusCode.SUCCESS for c in codes]
 
     def allocate_eic_read_buffer(self, count):
         registered = True
@@ -515,18 +529,10 @@ class EICKVClient:
         return tensors, host_memory_pool, indices, registered
 
     def _refetch_failed(self, keys, objs, registered, get_option, outcome):
-        # Partial mget failures are per-key RPC timeouts on a loaded backend, and
-        # the load keeps only the prefix before the first failed key. Re-getting
-        # just the failed keys once, into their own buffers, saves the rest from
-        # recompute. A missing status counts as failed. ponytail: one retry, only
-        # when at most half failed; per-key backoff if the backend flaps.
+        # Per-key RPC timeouts; re-get the failed keys once into their own buffers.
         codes = list(outcome.status_codes)[: len(keys)]
         codes += [None] * (len(keys) - len(codes))
         failed = [i for i, c in enumerate(codes) if c != eic.StatusCode.SUCCESS]
-        if 2 * len(failed) > len(keys):
-            # Most keys failing means the backend itself is down; a retry would
-            # only stall the serial load thread for another timeout round.
-            return eic.StatusCode.PARTIAL_FAILED, SimpleNamespace(status_codes=codes)
         retry_keys, retry_vals = eic.StringVector(), eic.IOBuffers()
         for i in failed:
             retry_keys.append(keys[i])
@@ -725,8 +731,13 @@ class EICKVClient:
         set_option.ttl_second = self.kv_set_ttl_option
         status_code, set_outcome = self.connection.mset(keys_vec, vals_vec, set_option)
 
-        # Free slots before any early exit: the write mempool never refills, so an
-        # mset-error bail leaks them permanently.
+        if status_code != eic.StatusCode.SUCCESS:
+            # kv set is idempotent: retry once on per-key RPC timeout.
+            status_code, set_outcome = self.connection.mset(
+                keys_vec, vals_vec, set_option
+            )
+
+        # Write slots outlive the retry DMA; release them after.
         if registered:
             for item in objs:
                 self.kv_cache_write_mem_pool.free_to_mempool(item.data_ptr())
@@ -734,8 +745,6 @@ class EICKVClient:
         if status_code != eic.StatusCode.SUCCESS:
             logger.error(f"eic mset {len(keys)} failed, status_code {status_code}")
             return False
-        else:
-            logger.debug(f"eic mset {len(keys)} success")
 
         failed = [
             (i, err_code)
