@@ -904,6 +904,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 block_tables=effective_block_tables,
                 seq_lens=seqlens_32_2d,
             )
+            target_forward_probe.capture_indexer_cache(
+                layer_id=layer_id,
+                kv_cache_fp8=kv_cache_fp8,
+                block_tables=effective_block_tables,
+                seq_lens=seqlens_32_2d,
+                page_size=page_size,
+            )
         weights = weights.squeeze(2)
 
         if self.paged_mqa_logits_backend.is_aiter():

@@ -205,6 +205,12 @@ _PP_TARGET_ATTENTION_OUTPUT_BOUNDARIES = (
 )
 _PP_TARGET_ATTENTION_TENSOR = "output"
 _PP_INDEXER_INPUT_TENSORS = ("q_fp8", "weights", "block_tables", "seq_lens")
+_PP_INDEXER_CACHE_TENSORS = (
+    "page_ids",
+    "index_k_bytes",
+    "index_k_scale_bytes",
+    "row_mapping_valid",
+)
 _PP_INDEXER_LOGITS_TENSORS = ("logits", "seq_lens")
 _PP_FLASHMLA_INPUT_TENSORS = (
     "q_nope",
@@ -286,6 +292,10 @@ class _PPTargetForwardDeviceObserver:
         self._indexer_input_row_counts: dict[int, dict[str, torch.Tensor]] = {}
         self._indexer_input_page_sizes: dict[int, int] = {}
         self._indexer_page_columns: dict[int, torch.Tensor] = {}
+        self._indexer_cache_buffers: dict[int, dict[str, torch.Tensor]] = {}
+        self._indexer_cache_row_counts: dict[int, dict[str, torch.Tensor]] = {}
+        self._indexer_cache_head_dims: dict[int, int] = {}
+        self._indexer_cache_token_positions: dict[int, torch.Tensor] = {}
         self._indexer_logits_buffers: dict[int, dict[str, torch.Tensor]] = {}
         self._indexer_logits_row_counts: dict[int, torch.Tensor] = {}
         self.device = self.buffer.device
@@ -533,6 +543,130 @@ class _PPTargetForwardDeviceObserver:
             slices = tuple(slice(0, int(size)) for size in value.shape)
             buffers[name][slices].copy_(value)
             self._indexer_input_row_counts[layer_id][name].fill_(value.shape[0])
+
+    def install_indexer_cache(
+        self,
+        *,
+        layer_id: int,
+        max_pages: int,
+        page_size: int,
+        head_dim: int,
+        scale_bytes: int,
+    ) -> None:
+        """Allocate a graph-stable snapshot of logically referenced index-K pages."""
+        if layer_id in self._indexer_cache_buffers:
+            raise RuntimeError(
+                f"indexer-cache observer is already installed for layer {layer_id}"
+            )
+        dimensions = (max_pages, page_size, head_dim, scale_bytes)
+        if any(value <= 0 for value in dimensions):
+            raise ValueError(f"indexer-cache dimensions must be positive: {dimensions}")
+        packed = torch.zeros(
+            (max_pages, page_size, head_dim + scale_bytes),
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        self._indexer_cache_buffers[layer_id] = {
+            "packed": packed,
+            "page_ids": torch.zeros(
+                (max_pages,), dtype=torch.int32, device=self.device
+            ),
+            "row_mapping_valid": torch.zeros(
+                (1,), dtype=torch.int32, device=self.device
+            ),
+        }
+        page_rows = torch.zeros((1,), dtype=torch.int32, device=self.device)
+        self._indexer_cache_row_counts[layer_id] = {
+            "page_ids": page_rows,
+            "index_k_bytes": page_rows,
+            "index_k_scale_bytes": page_rows,
+            "row_mapping_valid": torch.ones(
+                (1,), dtype=torch.int32, device=self.device
+            ),
+        }
+        self._indexer_cache_head_dims[layer_id] = head_dim
+        self._indexer_cache_token_positions[layer_id] = torch.arange(
+            max_pages * page_size, dtype=torch.int32, device=self.device
+        ).reshape(max_pages, page_size)
+        stage = f"target_verify_layer_{layer_id:02d}_indexer_cache"
+        self._row_domains[stage] = {
+            "page_ids": "paged_mqa_logical_page",
+            "index_k_bytes": "paged_mqa_logical_page",
+            "index_k_scale_bytes": "paged_mqa_logical_page",
+            "row_mapping_valid": "paged_mqa_cache_mapping_check",
+        }
+
+    def capture_indexer_cache(
+        self,
+        *,
+        layer_id: int,
+        kv_cache_fp8: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        page_size: int,
+    ) -> None:
+        """Copy packed index-K bytes/scales in logical page-table order."""
+        buffers = self._indexer_cache_buffers.get(layer_id)
+        if buffers is None:
+            return
+        stage = f"target_verify_layer_{layer_id:02d}_indexer_cache"
+        packed = buffers["packed"]
+        if self._indexer_input_page_sizes.get(layer_id) != page_size:
+            raise ValueError(
+                f"{stage}.page_size changed: expected="
+                f"{self._indexer_input_page_sizes.get(layer_id)}, actual={page_size}"
+            )
+        if (
+            kv_cache_fp8.ndim != 4
+            or kv_cache_fp8.dtype != torch.uint8
+            or kv_cache_fp8.device != self.device
+            or kv_cache_fp8.shape[1] != page_size
+            or kv_cache_fp8.shape[2] != 1
+            or kv_cache_fp8.shape[3] != packed.shape[2]
+        ):
+            raise ValueError(
+                f"{stage}.kv_cache_fp8 identity changed: "
+                f"shape={tuple(kv_cache_fp8.shape)}, dtype={kv_cache_fp8.dtype}, "
+                f"device={kv_cache_fp8.device}"
+            )
+        if (
+            block_tables.ndim != 2
+            or block_tables.dtype != torch.int32
+            or block_tables.device != self.device
+            or seq_lens.numel() % block_tables.shape[0] != 0
+            or block_tables.shape[1] != packed.shape[0]
+        ):
+            raise ValueError(
+                f"{stage} invalid block-table/context layout: "
+                f"block_tables={tuple(block_tables.shape)}, "
+                f"seq_lens={tuple(seq_lens.shape)}"
+            )
+        context_lens = seq_lens.reshape(block_tables.shape[0], -1)
+        valid_pages = (context_lens.max(dim=1).values + page_size - 1) // page_size
+        page_columns = self._indexer_page_columns[layer_id][: block_tables.shape[1]]
+        logical_block_tables = torch.where(
+            page_columns.unsqueeze(0) < valid_pages.unsqueeze(1),
+            block_tables,
+            torch.zeros_like(block_tables),
+        )
+        page_ids = logical_block_tables[0]
+        buffers["page_ids"].copy_(page_ids)
+        torch.index_select(kv_cache_fp8.squeeze(2), 0, page_ids, out=packed)
+        max_context_len = context_lens.max()
+        valid_token_mask = (
+            self._indexer_cache_token_positions[layer_id] < max_context_len
+        )
+        packed.mul_(valid_token_mask.unsqueeze(-1))
+        row_mapping_valid = (
+            logical_block_tables.eq(logical_block_tables[:1])
+            .all()
+            .to(torch.int32)
+            .reshape(1)
+        )
+        buffers["row_mapping_valid"].copy_(row_mapping_valid)
+        self._indexer_cache_row_counts[layer_id]["page_ids"].copy_(
+            valid_pages.max().reshape(1) * row_mapping_valid
+        )
 
     def install_indexer_logits(self, *, layer_id: int, max_columns: int) -> None:
         """Allocate a graph-stable copy of one layer's direct TopK inputs."""
@@ -924,6 +1058,26 @@ class _PPTargetForwardDeviceObserver:
                 },
                 "tensors": buffers,
             }
+        for layer_id, buffers in self._indexer_cache_buffers.items():
+            stage = f"target_verify_layer_{layer_id:02d}_indexer_cache"
+            packed = buffers["packed"]
+            head_dim = self._indexer_cache_head_dims[layer_id]
+            tensors = {
+                "page_ids": buffers["page_ids"],
+                "index_k_bytes": packed[..., :head_dim],
+                "index_k_scale_bytes": packed[..., head_dim:],
+                "row_mapping_valid": buffers["row_mapping_valid"],
+            }
+            stages[stage] = {
+                "tensor_metadata": {
+                    name: {
+                        "logical_rows": self._indexer_cache_row_counts[layer_id][name],
+                        "row_domain": self._row_domains[stage][name],
+                    }
+                    for name in _PP_INDEXER_CACHE_TENSORS
+                },
+                "tensors": tensors,
+            }
         return stages
 
 
@@ -1110,6 +1264,15 @@ class EaglePPSenderProbe:
                 // indexer_page_size,
                 page_size=indexer_page_size,
             )
+            if layer_id == layer_ids[1]:
+                observer.install_indexer_cache(
+                    layer_id=layer_id,
+                    max_pages=(max_indexer_columns + indexer_page_size - 1)
+                    // indexer_page_size,
+                    page_size=indexer_page_size,
+                    head_dim=int(indexer.head_dim),
+                    scale_bytes=4,
+                )
             attention.target_forward_probe = observer
             indexer.target_forward_probe = observer
             radix_attention.target_forward_probe = observer

@@ -1040,6 +1040,91 @@ class TestEagleNumericalProbe(unittest.TestCase):
                 seq_lens=seq_lens,
             )
 
+    def test_pp_target_forward_observer_captures_logical_indexer_cache(self):
+        observer = _PPTargetForwardDeviceObserver(
+            layer_ids=(0, 1),
+            max_rows=4,
+            hidden_size=3,
+            dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+        )
+        observer.install_indexer_inputs(
+            layer_id=1,
+            num_heads=2,
+            head_dim=8,
+            max_page_table_columns=3,
+            page_size=2,
+        )
+        observer.install_indexer_cache(
+            layer_id=1,
+            max_pages=3,
+            page_size=2,
+            head_dim=4,
+            scale_bytes=2,
+        )
+        cache = torch.arange(5 * 2 * 6, dtype=torch.uint8).reshape(5, 2, 1, 6)
+        block_tables = torch.tensor([[3, 1, 4], [3, 1, 4]], dtype=torch.int32)
+        seq_lens = torch.tensor([[5, 4], [5, 4]], dtype=torch.int32)
+        observer.capture_indexer_cache(
+            layer_id=1,
+            kv_cache_fp8=cache,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            page_size=2,
+        )
+
+        stage = observer.snapshot_stages()["target_verify_layer_01_indexer_cache"]
+        self.assertEqual(
+            set(stage["tensors"]),
+            {
+                "page_ids",
+                "index_k_bytes",
+                "index_k_scale_bytes",
+                "row_mapping_valid",
+            },
+        )
+        self.assertTrue(
+            torch.equal(stage["tensors"]["page_ids"], torch.tensor([3, 1, 4]))
+        )
+        expected = cache[[3, 1, 4]].squeeze(2).clone()
+        expected[-1, 1].zero_()
+        self.assertTrue(
+            torch.equal(stage["tensors"]["index_k_bytes"], expected[..., :4])
+        )
+        self.assertTrue(
+            torch.equal(stage["tensors"]["index_k_scale_bytes"], expected[..., 4:])
+        )
+        self.assertEqual(stage["tensors"]["row_mapping_valid"].item(), 1)
+        self.assertEqual(
+            stage["tensor_metadata"]["index_k_bytes"]["logical_rows"].item(),
+            3,
+        )
+
+        with self.assertRaisesRegex(ValueError, "invalid block-table/context layout"):
+            observer.capture_indexer_cache(
+                layer_id=1,
+                kv_cache_fp8=cache,
+                block_tables=torch.tensor([[3, 1]], dtype=torch.int32),
+                seq_lens=torch.tensor([[4]], dtype=torch.int32),
+                page_size=2,
+            )
+
+        observer.capture_indexer_cache(
+            layer_id=1,
+            kv_cache_fp8=cache,
+            block_tables=torch.tensor([[3, 1, 4], [3, 2, 4]], dtype=torch.int32),
+            seq_lens=seq_lens,
+            page_size=2,
+        )
+        inconsistent = observer.snapshot_stages()[
+            "target_verify_layer_01_indexer_cache"
+        ]
+        self.assertEqual(inconsistent["tensors"]["row_mapping_valid"].item(), 0)
+        self.assertEqual(
+            inconsistent["tensor_metadata"]["index_k_bytes"]["logical_rows"].item(),
+            0,
+        )
+
     def test_pp_target_forward_observer_rejects_logical_topk_output_drift(self):
         observer = _PPTargetForwardDeviceObserver(
             layer_ids=(0,),
