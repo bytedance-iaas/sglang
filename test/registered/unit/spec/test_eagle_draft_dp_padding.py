@@ -107,8 +107,10 @@ class TestEagleDraftDPPadding(unittest.TestCase):
             global_num_tokens_gpu=torch.tensor([1, 0]),
             global_num_tokens_for_logprob_cpu=[1, 0],
             num_token_non_padded=torch.tensor(0),
-            num_token_non_padded_cpu=0,
         )
+        # This legacy host mirror is populated during MLP-sync preparation,
+        # not accepted as a ForwardBatch constructor field.
+        forward_batch.num_token_non_padded_cpu = 0
         model_runner = SimpleNamespace(
             model=SimpleNamespace(supports_symmetric_spec_megamoe_dummy=True),
             model_config=SimpleNamespace(hf_config=SimpleNamespace()),

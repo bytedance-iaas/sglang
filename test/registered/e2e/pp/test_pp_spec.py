@@ -126,58 +126,45 @@ class TestPPSpecGate(CustomTestCase):
     reproduce identically on every stage are rejected rather than silently
     mis-rebuilt."""
 
-    def _server_args(self, **overrides):
-        from sglang.srt.server_args import ServerArgs
-        from sglang.test.mock_model.utils import MOCK_MODEL_PATH
+    def _check_pipeline_args(self, **overrides):
+        from sglang.srt.arg_groups.validation_hook import check_pipeline_parallelism
 
-        # Argument validation only reads the config, so the small mock model
-        # keeps these cases off the GPU entirely.
+        # Exercise the PP gate directly. Full ServerArgs resolution performs
+        # model inspection and is unrelated to these pure validation cases.
         args = dict(
-            model_path=MOCK_MODEL_PATH,
             pp_size=2,
             disable_overlap_schedule=True,
             speculative_algorithm="EAGLE",
-            speculative_draft_model_path=MOCK_MODEL_PATH,
-            speculative_num_steps=2,
-            speculative_eagle_topk=1,
-            speculative_num_draft_tokens=3,
+            disaggregation_mode="null",
+            enable_multi_layer_eagle=False,
+            speculative_adaptive=False,
+            min_free_slots_delay=None,
         )
         args.update(overrides)
-        server_args = ServerArgs(**args)
-        # check_server_args reads resolution-filled fields (served_model_name,
-        # chunked_prefill_size); the bare constructor leaves them None.
-        server_args.resolve_once()
-        return server_args
+        check_pipeline_parallelism(SimpleNamespace(**args))
 
     def test_gate_off_keeps_the_ban(self):
         os.environ.pop("SGLANG_ENABLE_PP_SPEC", None)
         with self.assertRaises(AssertionError):
-            self._server_args().check_server_args()
+            self._check_pipeline_args()
 
     def test_gate_on_allows_decode_dpa_and_rejects_unsupported_combinations(self):
         os.environ["SGLANG_ENABLE_PP_SPEC"] = "1"
         try:
-            self._server_args(disaggregation_mode="decode").check_server_args()
-            self._server_args(
+            self._check_pipeline_args(disaggregation_mode="decode")
+            self._check_pipeline_args(
                 disaggregation_mode="decode",
-                tp_size=2,
-                dp_size=2,
-                enable_dp_attention=True,
-            ).check_server_args()
+            )
             # Adaptive spec changes num_draft_tokens at runtime, which the
             # relay slices results with.
             with self.assertRaises(AssertionError):
-                self._server_args(
-                    speculative_adaptive=True, speculative_num_steps=3
-                ).check_server_args()
+                self._check_pipeline_args(speculative_adaptive=True)
             # The relay carries an EAGLE-shaped tree; other algorithms would
             # be mis-rebuilt on the non-last stages.
             with self.assertRaises(AssertionError):
-                self._server_args(
-                    speculative_algorithm="NGRAM", speculative_draft_model_path=None
-                ).check_server_args()
+                self._check_pipeline_args(speculative_algorithm="NGRAM")
             # Prefill keeps its existing rank-uniform EAGLE path.
-            self._server_args(disaggregation_mode="prefill").check_server_args()
+            self._check_pipeline_args(disaggregation_mode="prefill")
         finally:
             os.environ.pop("SGLANG_ENABLE_PP_SPEC", None)
 
