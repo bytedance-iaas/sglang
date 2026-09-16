@@ -604,12 +604,18 @@ class TestEICHiCacheRegression(unittest.TestCase):
         def mget_mostly_down(keys, option, vals):
             calls.append(list(keys))
             codes = [S.SUCCESS, S.FAILED, S.FAILED, S.FAILED]
-            return S.PARTIAL_FAILED, vals, SimpleNamespace(status_codes=codes)
+            if len(keys) == 4:
+                return S.PARTIAL_FAILED, vals, SimpleNamespace(status_codes=codes)
+            # Even when most keys fail, they are retried once; this backend is
+            # really down and the retry fails too.
+            return S.PARTIAL_FAILED, vals, SimpleNamespace(
+                status_codes=[S.FAILED] * len(keys)
+            )
 
         client.connection = SimpleNamespace(mget=mget_mostly_down)
         with mock.patch.object(pool_mod, "eic", fake_eic):
             _, mask = client.batch_get(["k0", "k1", "k2", "k3"])
-        self.assertEqual(len(calls), 1)  # backend down: no retry round
+        self.assertEqual(len(calls), 2)
         self.assertEqual(mask, [True, False, False, False])
 
     def test_match_stops_at_resident_node_under_evicted_gap(self):
