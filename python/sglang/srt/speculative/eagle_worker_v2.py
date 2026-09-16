@@ -1304,7 +1304,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     capture_hidden_mode=capture_mode,
                     vocab_size=self.target_worker.model_config.vocab_size,
                 )
-            if self.speculative_num_steps == 0:
+            if batch.spec_info is not None and batch.spec_info.is_verify_input():
+                # PP+spec: the scheduler rebuilt this round's verify input from
+                # the relayed per-request tree. The last stage must verify the
+                # same tree as earlier stages instead of drafting a new one.
+                verify_input = batch.spec_info
+            elif self.speculative_num_steps == 0:
                 # Drafting disabled (high batch size). _draft_extend below still
                 # runs, keeping draft KV warm for when the batch shrinks.
                 verify_input = self._build_trivial_verify_input(batch)
@@ -1340,11 +1345,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
-            if (
-                self.server_args.pp_size > 1
-                and not batch.forward_mode.is_idle()
-                and self.speculative_num_steps > 0
-            ):
+            if self.server_args.pp_size > 1 and self.speculative_num_steps > 0:
                 # PP tail-draft: draft the NEXT round's chain now — earlier
                 # stages must have the tokens before running their half of the
                 # next verify forward, so drafting cannot wait for the next
@@ -1353,15 +1354,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # the chain rides out on batch_output.
                 batch.spec_info = batch_output.next_draft_input
                 batch.seq_lens = batch_output.new_seq_lens
-                batch.forward_mode = ForwardMode.DECODE
+                # Active ranks draft a real next tree. Idle DPA companions keep
+                # IDLE so draft_forward executes only collective participation.
+                if not batch.forward_mode.is_idle():
+                    batch.forward_mode = ForwardMode.DECODE
                 # eagle_prepare_for_verify left the verify tokens here; the
                 # head-of-iteration draft always sees None (the scheduler
                 # clears it), so mirror that state.
                 batch.input_ids = None
                 # Attention metadata planning reads the CPU copies; one D2H
                 # per round (TODO: async or upper-bound estimate).
-                batch.seq_lens_cpu = batch_output.new_seq_lens.to("cpu")
-                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                if not batch.forward_mode.is_idle():
+                    batch.seq_lens_cpu = batch_output.new_seq_lens.to("cpu")
+                    batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
                 with (
                     self.draft_worker.draft_tp_context(
                         self.draft_worker.draft_runner.tp_group
@@ -1373,13 +1378,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     next_verify_input, parent_list, top_scores_index = (
                         self.draft_worker.draft(batch, with_topology=True)
                     )
-                batch_output.next_verify_chain = next_verify_input.draft_token
-                # The tree shape is data-dependent once topk > 1, so the other
-                # stages cannot re-derive it; relay it alongside the tokens.
-                # clone(): both come out of cuda-graph-owned buffers under
-                # decode replay and would be overwritten before the relay.
-                batch_output.next_verify_parent_list = parent_list.clone()
-                batch_output.next_verify_top_scores_index = top_scores_index.clone()
+                if not batch.forward_mode.is_idle():
+                    batch_output.next_verify_chain = next_verify_input.draft_token
+                    # The tree shape is data-dependent once topk > 1, so the other
+                    # stages cannot re-derive it; relay it alongside the tokens.
+                    # clone(): both come out of cuda-graph-owned buffers under
+                    # decode replay and would be overwritten before the relay.
+                    batch_output.next_verify_parent_list = parent_list.clone()
+                    batch_output.next_verify_top_scores_index = top_scores_index.clone()
 
             return batch_output
 

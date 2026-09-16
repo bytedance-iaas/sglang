@@ -1137,6 +1137,10 @@ class Glm5NextModel(nn.Module):
 
 
 class Glm5NextForConditionalGeneration(nn.Module):
+    # Idle DPA ranks may carry collective-only rows for MegaMoE. The inherited
+    # DeepseekV2AttentionMLA path explicitly bypasses attention for these rows.
+    supports_symmetric_spec_megamoe_dummy = True
+
     packed_modules_mapping = {
         "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
         "fused_qkvbfg_a_proj": [

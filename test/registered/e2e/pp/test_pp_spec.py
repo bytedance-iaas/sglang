@@ -154,16 +154,16 @@ class TestPPSpecGate(CustomTestCase):
         with self.assertRaises(AssertionError):
             self._server_args().check_server_args()
 
-    def test_gate_on_rejects_unsupported_combinations(self):
+    def test_gate_on_allows_decode_dpa_and_rejects_unsupported_combinations(self):
         os.environ["SGLANG_ENABLE_PP_SPEC"] = "1"
         try:
-            self._server_args().check_server_args()
-            # DP attention partitions the batch per DP rank, so the stages
-            # would no longer rebuild the same verify tree.
-            with self.assertRaises(AssertionError):
-                self._server_args(
-                    tp_size=2, dp_size=2, enable_dp_attention=True
-                ).check_server_args()
+            self._server_args(disaggregation_mode="decode").check_server_args()
+            self._server_args(
+                disaggregation_mode="decode",
+                tp_size=2,
+                dp_size=2,
+                enable_dp_attention=True,
+            ).check_server_args()
             # Adaptive spec changes num_draft_tokens at runtime, which the
             # relay slices results with.
             with self.assertRaises(AssertionError):
@@ -176,10 +176,8 @@ class TestPPSpecGate(CustomTestCase):
                 self._server_args(
                     speculative_algorithm="NGRAM", speculative_draft_model_path=None
                 ).check_server_args()
-            # PD prefill needs the RelayPayload draft fields the gated flow
-            # does not carry.
-            with self.assertRaises(AssertionError):
-                self._server_args(disaggregation_mode="prefill").check_server_args()
+            # Prefill keeps its existing rank-uniform EAGLE path.
+            self._server_args(disaggregation_mode="prefill").check_server_args()
         finally:
             os.environ.pop("SGLANG_ENABLE_PP_SPEC", None)
 

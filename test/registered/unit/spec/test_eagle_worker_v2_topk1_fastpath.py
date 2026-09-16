@@ -160,6 +160,106 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         self.assertEqual(result, (None, None, None, None))
         self.assertEqual(worker.draft_runner.forward.call_count, 2)
 
+    @staticmethod
+    def _pp_worker_and_batch(*, idle: bool):
+        verify_input = SimpleNamespace(is_verify_input=lambda: True)
+        next_verify = SimpleNamespace(draft_token=torch.tensor([7, 8]))
+        parent_list = torch.tensor([[-1]])
+        top_scores = torch.tensor([[0]])
+        output = SimpleNamespace(
+            new_seq_lens=torch.empty(0, dtype=torch.int64)
+            if idle
+            else torch.tensor([9], dtype=torch.int64),
+            next_draft_input=SimpleNamespace(),
+        )
+        draft_worker = SimpleNamespace(
+            draft_runner=SimpleNamespace(tp_group=object()),
+            draft_tp_context=lambda _group: contextlib.nullcontext(),
+            _draft_extend_for_decode=MagicMock(),
+            draft=MagicMock(return_value=(next_verify, parent_list, top_scores)),
+        )
+        worker = object.__new__(EAGLEWorkerV2)
+        worker.server_args = SimpleNamespace(pp_size=2)
+        worker.speculative_num_steps = 2
+        worker.speculative_num_draft_tokens = 3
+        worker.adaptive_controller = None
+        worker._draft_worker = draft_worker
+        seen_verify_inputs = []
+
+        def _verify(current_batch, **_kwargs):
+            seen_verify_inputs.append(current_batch.spec_info)
+            return output
+
+        worker.verify = MagicMock(side_effect=_verify)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.IDLE if idle else ForwardMode.DECODE,
+            is_extend_in_batch=False,
+            seq_lens=torch.empty(0, dtype=torch.int64)
+            if idle
+            else torch.tensor([8], dtype=torch.int64),
+            seq_lens_cpu=torch.empty(0, dtype=torch.int64)
+            if idle
+            else torch.tensor([8], dtype=torch.int64),
+            seq_lens_sum=0 if idle else 8,
+            spec_info=verify_input,
+            input_ids=torch.empty(0, dtype=torch.int64),
+        )
+        return worker, batch, verify_input, output, draft_worker, seen_verify_inputs
+
+    def test_pp_relayed_verify_is_not_redrafted_before_verify(self):
+        worker, batch, verify_input, output, draft_worker, seen_verify_inputs = (
+            self._pp_worker_and_batch(idle=False)
+        )
+
+        with (
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.speculative_moe_backend_context",
+                return_value=contextlib.nullcontext(),
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.speculative_moe_a2a_backend_context",
+                return_value=contextlib.nullcontext(),
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.spec_stage_span",
+                return_value=contextlib.nullcontext(),
+            ),
+        ):
+            result = EAGLEWorkerV2.forward_batch_generation(worker, batch)
+
+        self.assertIs(result, output)
+        worker.verify.assert_called_once()
+        self.assertEqual(seen_verify_inputs, [verify_input])
+        # One call is the post-verify tail draft. A second call would mean the
+        # last PP stage replaced the scheduler-relayed verify tree.
+        draft_worker.draft.assert_called_once_with(batch, with_topology=True)
+        self.assertEqual(output.next_verify_chain.tolist(), [7, 8])
+
+    def test_pp_idle_rank_participates_in_tail_draft_without_publishing_tree(self):
+        worker, batch, _verify_input, output, draft_worker, _seen_verify_inputs = (
+            self._pp_worker_and_batch(idle=True)
+        )
+
+        with (
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.speculative_moe_backend_context",
+                return_value=contextlib.nullcontext(),
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.speculative_moe_a2a_backend_context",
+                return_value=contextlib.nullcontext(),
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.spec_stage_span",
+                return_value=contextlib.nullcontext(),
+            ),
+        ):
+            EAGLEWorkerV2.forward_batch_generation(worker, batch)
+
+        draft_worker.draft.assert_called_once_with(batch, with_topology=True)
+        self.assertEqual(batch.forward_mode, ForwardMode.IDLE)
+        self.assertFalse(hasattr(output, "next_verify_chain"))
+
 
 class TestEagleWorkerV2BackendFallback(CustomTestCase):
     def setUp(self):
