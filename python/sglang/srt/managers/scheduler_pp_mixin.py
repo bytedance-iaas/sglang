@@ -747,6 +747,9 @@ class SchedulerPPMixin:
             kv_tokens=kv_tokens,
             activation_bytes=activation_bytes,
             pending_sends=pending_send_count,
+            metadata_slots=int(
+                self.req_to_metadata_buffer_idx_allocator.available_size()
+            ),
         )
 
     def _pp_vpp_find_req(self: Scheduler, rid: str) -> Optional[Req]:
@@ -1636,6 +1639,7 @@ class SchedulerPPMixin:
                                 "kv_tokens": snapshot.kv_tokens,
                                 "activation_bytes": snapshot.activation_bytes,
                                 "pending_sends": snapshot.pending_sends,
+                                "metadata_slots": snapshot.metadata_slots,
                             },
                         )
                     )
@@ -1654,6 +1658,7 @@ class SchedulerPPMixin:
                 start_bootstrap_round = all(
                     self.attn_tp_group.all_gather_object(
                         not bootstrap_round_active
+                        and resource_gate.can_bootstrap()
                         and bool(self.disagg_prefill_bootstrap_queue.queue)
                     )
                 )

@@ -260,6 +260,7 @@ class PipelineResourceSnapshot:
     kv_tokens: int
     activation_bytes: int
     pending_sends: int
+    metadata_slots: int = 0
 
 
 class PipelineResourceGate:
@@ -320,6 +321,11 @@ class PipelineResourceGate:
             and snapshot.pending_sends < self.max_pending_sends
             and snapshot.activation_bytes + activation_bytes
             <= self.activation_high_watermark
+        )
+
+    def can_bootstrap(self) -> bool:
+        return len(self._snapshots) == len(self._ranks) and all(
+            snapshot.metadata_slots > 0 for snapshot in self._snapshots.values()
         )
 
 

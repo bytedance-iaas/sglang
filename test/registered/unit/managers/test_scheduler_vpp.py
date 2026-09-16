@@ -367,6 +367,9 @@ class TestSchedulerVPP(unittest.TestCase):
         scheduler.req_to_token_pool = SimpleNamespace(
             available_size=MagicMock(return_value=3)
         )
+        scheduler.req_to_metadata_buffer_idx_allocator = SimpleNamespace(
+            available_size=MagicMock(return_value=5)
+        )
         scheduler.token_to_kv_pool_allocator = SimpleNamespace(
             full_available_size=MagicMock(return_value=9000),
             swa_available_size=MagicMock(return_value=7000),
@@ -383,6 +386,7 @@ class TestSchedulerVPP(unittest.TestCase):
         self.assertEqual(snapshot.kv_tokens, 7000)
         self.assertEqual(snapshot.activation_bytes, 32)
         self.assertEqual(snapshot.pending_sends, 2)
+        self.assertEqual(snapshot.metadata_slots, 5)
 
     @patch(
         "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
@@ -847,7 +851,7 @@ class TestSchedulerVPP(unittest.TestCase):
         scheduler._pp_vpp_select_tp_action = MagicMock(return_value=None)
         scheduler._pp_vpp_prepare_wavefront_batch = MagicMock(return_value=None)
         scheduler._pp_vpp_resource_snapshot = MagicMock(
-            return_value=PipelineResourceSnapshot(1, 8192, 0, 0)
+            return_value=PipelineResourceSnapshot(1, 8192, 0, 0, 1)
         )
         scheduler.get_rids = MagicMock(
             side_effect=lambda queue, _is_send, *statuses: (
@@ -918,6 +922,7 @@ class TestSchedulerVPP(unittest.TestCase):
                 return_value=128,
             ),
             patch.object(PipelineResourceGate, "can_admit", return_value=True),
+            patch.object(PipelineResourceGate, "can_bootstrap", return_value=True),
             self.assertRaises(StopIteration),
         ):
             scheduler._event_loop_pp_disagg_prefill_vpp_rank_local()

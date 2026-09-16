@@ -156,9 +156,11 @@ class TestPipelineLayout(unittest.TestCase):
                     kv_tokens=8192,
                     activation_bytes=50,
                     pending_sends=1,
+                    metadata_slots=1,
                 ),
             )
         self.assertTrue(gate.can_admit(1, 4096, 100))
+        self.assertTrue(gate.can_bootstrap())
 
         gate.update(
             2,
@@ -167,9 +169,11 @@ class TestPipelineLayout(unittest.TestCase):
                 kv_tokens=8192,
                 activation_bytes=200,
                 pending_sends=1,
+                metadata_slots=0,
             ),
         )
         self.assertFalse(gate.can_admit(1, 4096, 0))
+        self.assertFalse(gate.can_bootstrap())
 
         gate.update(
             2,
@@ -178,6 +182,7 @@ class TestPipelineLayout(unittest.TestCase):
                 kv_tokens=8192,
                 activation_bytes=150,
                 pending_sends=1,
+                metadata_slots=1,
             ),
         )
         self.assertFalse(gate.can_admit(1, 4096, 0))
@@ -189,9 +194,11 @@ class TestPipelineLayout(unittest.TestCase):
                 kv_tokens=8192,
                 activation_bytes=100,
                 pending_sends=1,
+                metadata_slots=1,
             ),
         )
         self.assertTrue(gate.can_admit(1, 4096, 0))
+        self.assertTrue(gate.can_bootstrap())
 
     def test_prefix_registry_commits_only_common_materialized_frontier(self):
         registry = PipelinePrefixRegistry()
