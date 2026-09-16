@@ -771,7 +771,7 @@ class SchedulerPPMixin:
             request_generation = int(getattr(req, "session_generation", None) or 0)
             entry = self._pp_vpp_prefix_registry.get(req.rid, request_generation)
             start = extend_range.start if entry is None else entry.planned_end
-            entry = self._pp_vpp_prefix_registry.plan(
+            self._pp_vpp_prefix_registry.plan(
                 rid=req.rid,
                 request_generation=request_generation,
                 residency_generation=request_generation,
@@ -781,10 +781,33 @@ class SchedulerPPMixin:
                     self.ps.pp_size * get_parallel().pp_virtual_stages
                 ),
             )
-            req.kv.kv_committed_len = entry.committed_end
             if not hasattr(req, "_vpp_original_skip_radix_cache_insert"):
                 req._vpp_original_skip_radix_cache_insert = req.skip_radix_cache_insert
             req.skip_radix_cache_insert = True
+
+    def _pp_vpp_apply_prefix_materialized(
+        self: Scheduler,
+        envelope: PipelineControlEnvelope,
+    ) -> None:
+        payload = envelope.payload or {}
+        rid = str(payload["rid"])
+        request_generation = int(payload["request_generation"])
+        entry = self._pp_vpp_prefix_registry.get(rid, request_generation)
+        if entry is None:
+            return
+        end = int(payload["end"])
+        materialized_end = self._pp_vpp_prefix_registry.mark_materialized(
+            rid,
+            request_generation,
+            int(payload["stage_id"]),
+            end,
+        )
+        if materialized_end >= end and entry.committed_end < end:
+            self._pp_vpp_prefix_registry.commit(
+                rid,
+                request_generation,
+                end,
+            )
 
     def _pp_vpp_advance_prefix_mapping(
         self: Scheduler,
@@ -1061,37 +1084,6 @@ class SchedulerPPMixin:
             forward_control(envelope, wire)
             return True
 
-        def apply_prefix_materialized(envelope: PipelineControlEnvelope) -> None:
-            payload = envelope.payload or {}
-            rid = str(payload["rid"])
-            request_generation = int(payload["request_generation"])
-            stage_id = int(payload["stage_id"])
-            end = int(payload["end"])
-            entry = self._pp_vpp_prefix_registry.get(
-                rid,
-                request_generation,
-            )
-            if entry is None:
-                return
-            materialized_end = self._pp_vpp_prefix_registry.mark_materialized(
-                rid,
-                request_generation,
-                stage_id,
-                end,
-            )
-            if materialized_end >= end and entry.committed_end < end:
-                self._pp_vpp_prefix_registry.commit(
-                    rid,
-                    request_generation,
-                    end,
-                )
-                req = self._pp_vpp_find_req(rid)
-                if req is not None:
-                    req.kv.kv_committed_len = max(
-                        req.kv.kv_committed_len,
-                        end,
-                    )
-
         def replica_identity(payload: Dict[str, object]) -> PipelineReplicaIdentity:
             return PipelineReplicaIdentity(
                 content_id=str(payload["content_id"]),
@@ -1226,7 +1218,7 @@ class SchedulerPPMixin:
                         "end": end,
                     },
                 )
-                apply_prefix_materialized(materialized)
+                self._pp_vpp_apply_prefix_materialized(materialized)
                 self._pp_vpp_queue_control(materialized.forwarded())
                 if not any(
                     pending[0] == batch_seq and pending[1] == stage_id
@@ -1444,7 +1436,7 @@ class SchedulerPPMixin:
             if envelope.kind == PipelineControlKind.PREFIX_MATERIALIZED:
                 if returned_to_source:
                     return
-                apply_prefix_materialized(envelope)
+                self._pp_vpp_apply_prefix_materialized(envelope)
                 forward_control(envelope, wire)
                 return
 

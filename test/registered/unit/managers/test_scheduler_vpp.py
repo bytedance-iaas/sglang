@@ -386,23 +386,43 @@ class TestSchedulerVPP(unittest.TestCase):
         "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
         return_value=SimpleNamespace(pp_virtual_stages=2),
     )
-    def test_vpp_prefix_plan_restores_committed_frontier(self, _get_parallel):
+    def test_vpp_prefix_plan_preserves_physical_kv_frontier(self, _get_parallel):
         scheduler = _make_scheduler()
         scheduler._pp_vpp_prefix_registry = PipelinePrefixRegistry()
         req = SimpleNamespace(
             rid="r0",
             session_generation=None,
-            extend_range=SimpleNamespace(start=0, end=4096),
-            kv=SimpleNamespace(kv_committed_len=4096),
+            extend_range=SimpleNamespace(start=0, end=256),
+            kv=SimpleNamespace(kv_committed_len=4, kv_allocated_len=4),
             skip_radix_cache_insert=False,
         )
 
         scheduler._pp_vpp_register_prefix_batch(SimpleNamespace(reqs=[req]))
 
         entry = scheduler._pp_vpp_prefix_registry.get("r0", 0)
-        self.assertEqual(entry.planned_end, 4096)
-        self.assertEqual(req.kv.kv_committed_len, 0)
+        self.assertEqual(entry.planned_end, 256)
+        self.assertEqual(req.kv.kv_committed_len, req.kv.kv_allocated_len)
         self.assertTrue(req.skip_radix_cache_insert)
+
+        for stage_id in range(8):
+            scheduler._pp_vpp_apply_prefix_materialized(
+                PipelineControlEnvelope(
+                    protocol_version=1,
+                    runtime_epoch=17,
+                    layout_digest="layout",
+                    kind=PipelineControlKind.PREFIX_MATERIALIZED,
+                    source_rank=stage_id % 4,
+                    payload={
+                        "rid": req.rid,
+                        "request_generation": 0,
+                        "stage_id": stage_id,
+                        "end": 256,
+                    },
+                )
+            )
+
+        self.assertEqual(entry.committed_end, 256)
+        self.assertEqual(req.kv.kv_committed_len, req.kv.kv_allocated_len)
 
     def test_vpp_batch_manifest_snapshots_request_ranges(self):
         scheduler = _make_scheduler()
