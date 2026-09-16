@@ -4083,6 +4083,45 @@ class DeepseekV4Model(nn.Module):
                 ),
             )
 
+        embed_prefetch_requested = envs.SGLANG_ENABLE_DSV41_ENGRAM_EMBED_PREFETCH.get()
+
+        self.engram_embed_prefetch_stream = None
+        self.engram_embed_prefetch_ready = None
+        if embed_prefetch_requested:
+            unavailable = []
+            engram14 = None
+            if not _is_cuda:
+                unavailable.append("CUDA is required")
+            if self.pp_group.world_size != 1:
+                unavailable.append("PP must be 1")
+            if config.vision_n_layers != 0:
+                unavailable.append("vision layers are not supported")
+            if not config.hc_pre_from_prev_sublayer:
+                unavailable.append("hc_pre_from_prev_sublayer must be enabled")
+            if not (self.start_layer <= 14 < self.end_layer):
+                unavailable.append("layer 14 is not on this rank")
+            else:
+                engram14 = self.layers[14].engram
+                if engram14 is None:
+                    unavailable.append("layer 14 has no Engram module")
+                elif not engram14.embed._shared:
+                    unavailable.append("layer 14 must use a shared host table")
+                elif not engram14.embed.host_table.registered:
+                    unavailable.append("the shared host table must be pinned")
+            if unavailable:
+                logger.warning(
+                    "Engram layer 14 embedding prefetch disabled: %s",
+                    "; ".join(unavailable),
+                )
+            else:
+                self.engram_embed_prefetch_stream = torch.cuda.Stream()
+                self.engram_embed_prefetch_ready = torch.cuda.Event()
+                logger.info(
+                    "Engram layer 14 embedding prefetch enabled for eager decode; "
+                    "WKV remains on the main stream and CUDA Graph decode uses "
+                    "the synchronous lookup"
+                )
+
         self.use_fused_mhc_post_pre = (
             is_cross_layer_mhc_fusion_enabled() or _is_fused_mhc_post_pre_enabled_xpu()
         )
@@ -4203,6 +4242,25 @@ class DeepseekV4Model(nn.Module):
                 )
             else:
                 hash_ids = self.engram_hasher(input_ids, forward_batch)
+        prefetched_engram_embeddings = None
+        if (
+            self.engram_embed_prefetch_stream is not None
+            and forward_batch.forward_mode.is_decode()
+            and hash_ids.shape[0] > 0
+            and not get_is_capture_mode()
+        ):
+            prefetch_stream = self.engram_embed_prefetch_stream
+            prefetch_stream.wait_stream(torch.cuda.current_stream())
+            engram = self.layers[14].engram
+            with torch.cuda.stream(prefetch_stream):
+                prefetched_engram_embeddings = engram.embed(
+                    hash_ids[:, engram.layer_hash_index]
+                )
+                self.engram_embed_prefetch_ready.record(prefetch_stream)
+            # The lookup consumes a view of hash_ids after the main stream moves
+            # on. Keep its backing allocation alive until the side stream is done.
+            hash_ids.record_stream(prefetch_stream)
+
         tail = None
         if (
             self.late_layer_start is not None
@@ -4247,30 +4305,41 @@ class DeepseekV4Model(nn.Module):
             if engram is not None:
                 precomputed_attn = None
                 before_engram = hidden_states
-                layer_hash_ids = hash_ids[:, engram.layer_hash_index]
-                # A TP-sharded Engram table also gathers across DP ranks.
-                # Its IDs and embeddings must use the same compact layout.
-                with (
-                    late_dp_layout.activate(forward_batch)
-                    if late_dp_layout is not None
-                    else nullcontext()
-                ):
-                    hidden_states = engram(
-                        (
-                            late_dp_layout.pad(hidden_states)
-                            if late_dp_layout is not None
-                            else hidden_states
-                        ),
-                        (
-                            late_dp_layout.pad(layer_hash_ids)
-                            if late_dp_layout is not None
-                            else layer_hash_ids
-                        ),
-                        forward_batch,
-                        cp_all_tokens=cp_extend,
-                    )
-                if late_dp_layout is not None:
-                    hidden_states = hidden_states[: late_dp_layout.local_rows]
+                if i == 14 and prefetched_engram_embeddings is not None:
+                    main_stream = torch.cuda.current_stream()
+                    main_stream.wait_event(self.engram_embed_prefetch_ready)
+                    # The output was allocated on the side stream and remains in
+                    # use by the main-stream WKV projection after this reference
+                    # goes out of scope.
+                    prefetched_engram_embeddings.record_stream(main_stream)
+                    kv = engram.project_from_embeddings(prefetched_engram_embeddings)
+                    hidden_states = engram.apply_gate(hidden_states, kv)
+                    prefetched_engram_embeddings = None
+                else:
+                    layer_hash_ids = hash_ids[:, engram.layer_hash_index]
+                    # A TP-sharded Engram table also gathers across DP ranks.
+                    # Its IDs and embeddings must use the same compact layout.
+                    with (
+                        late_dp_layout.activate(forward_batch)
+                        if late_dp_layout is not None
+                        else nullcontext()
+                    ):
+                        hidden_states = engram(
+                            (
+                                late_dp_layout.pad(hidden_states)
+                                if late_dp_layout is not None
+                                else hidden_states
+                            ),
+                            (
+                                late_dp_layout.pad(layer_hash_ids)
+                                if late_dp_layout is not None
+                                else layer_hash_ids
+                            ),
+                            forward_batch,
+                            cp_all_tokens=cp_extend,
+                        )
+                    if late_dp_layout is not None:
+                        hidden_states = hidden_states[: late_dp_layout.local_rows]
                 if (
                     self.config.model_type == "deepseek_v41"
                     and self.config.vision_n_layers > 0

@@ -563,6 +563,7 @@ class _HostTable:
         self.nbytes = nbytes
         self.group = group
         self.dirty = False
+        self.registered = False
         if layout == "shared":
             self.fd = self._open_shared_fd(nbytes, name)
             self.mm = mmap.mmap(
@@ -594,6 +595,7 @@ class _HostTable:
         err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), nbytes, 0)
         if int(err) != 0:
             raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
+        self.registered = True
 
     def _open_shared_fd(self, nbytes: int, name: str) -> int:
         owner = None
@@ -914,14 +916,22 @@ class Engram(nn.Module):
         cp_all_tokens: bool = False,
     ) -> torch.Tensor:
         """x [T, hc_mult, dim]; hash_ids [T, n_hash_cols] for this layer."""
-        # The lookup runs first even for an idle DP-attention batch: under DP
-        # attention it is a collective every rank has to join.
+        # The lookup runs first even for an idle DP-attention batch: a sharded
+        # table uses a collective every rank has to join, while a shared table
+        # returns an empty local result without communication.
         emb = self.embed(hash_ids, forward_batch, cp_all_tokens=cp_all_tokens)
         if x.shape[0] == 0:
             # Nothing to gate, and the MXFP8 quantize behind wkv rejects an
             # empty M.
             return x
-        kv, _ = self.wkv(emb.flatten(-2))
+        return self.apply_gate(x, self.project_from_embeddings(emb))
+
+    def project_from_embeddings(self, embeddings: torch.Tensor) -> torch.Tensor:
+        """Project already-gathered BF16 embeddings on the current stream."""
+        kv, _ = self.wkv(embeddings.flatten(-2))
+        return kv
+
+    def apply_gate(self, x: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
         return engram_gate(
             x, kv, self.q_weight, self.k_weight, self.eps, self.clamp_value
         )

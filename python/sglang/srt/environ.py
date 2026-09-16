@@ -1513,6 +1513,10 @@ class Envs:
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # Overlap layer 14's shared-host embedding lookup with earlier layers. The
+    # WKV projection stays on the main stream so this path works on Hopper and
+    # with DP attention without introducing a side-stream collective or GEMM.
+    SGLANG_ENABLE_DSV41_ENGRAM_EMBED_PREFETCH = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 
