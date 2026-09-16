@@ -1531,7 +1531,7 @@ class SchedulerPPMixin:
         # sends before any recv can form the same ring wait on CUDA. Parity
         # makes rank 1 post its recv first, which breaks the cycle for any
         # pp_size > 1.
-        needs_pairing = is_xpu() or self._pp_spec_relay
+        needs_pairing = is_xpu() or getattr(self, "_pp_spec_relay", False)
         send_first = (not needs_pairing) or ((self.ps.pp_rank % 2) == 0)
 
         def _do_send():
