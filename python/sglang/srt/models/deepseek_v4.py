@@ -4094,8 +4094,9 @@ class DeepseekV4Model(nn.Module):
                 unavailable.append("CUDA is required")
             if self.pp_group.world_size != 1:
                 unavailable.append("PP must be 1")
-            if config.vision_n_layers != 0:
-                unavailable.append("vision layers are not supported")
+            # Vision-capable checkpoints can prefetch rows too: WKV and gate
+            # stay on the main stream, followed by the common image-token mask
+            # in _forward_layers_hc_pre_from_prev.
             if not config.hc_pre_from_prev_sublayer:
                 unavailable.append("hc_pre_from_prev_sublayer must be enabled")
             if not (self.start_layer <= 14 < self.end_layer):
