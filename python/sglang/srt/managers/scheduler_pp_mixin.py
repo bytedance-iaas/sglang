@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import os
 import pickle
+import threading
 import time
+import urllib.request
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
@@ -1103,6 +1107,52 @@ class SchedulerPPMixin:
         pending_chunk_batches = set()
         tick = 0
 
+        # #region debug-point A-E:vpp-scheduler-state
+        def debug_report(hypothesis_id: str, location: str, msg: str, data) -> None:
+            if self.ps.tp_rank != 0:
+                return
+
+            def send() -> None:
+                url = "http://10.254.210.200:7777/event"
+                session_id = "vpp-admission-stall"
+                try:
+                    with open(".dbg/vpp-admission-stall.env") as env_file:
+                        for line in env_file:
+                            key, _, value = line.strip().partition("=")
+                            if key == "DEBUG_SERVER_URL":
+                                url = value
+                            elif key == "DEBUG_SESSION_ID":
+                                session_id = value
+                except OSError:
+                    pass
+                try:
+                    payload = json.dumps(
+                        {
+                            "sessionId": session_id,
+                            "runId": os.getenv("VPP_DEBUG_RUN_ID", "pre-fix"),
+                            "hypothesisId": hypothesis_id,
+                            "location": location,
+                            "msg": f"[DEBUG] {msg}",
+                            "data": data,
+                            "ts": time.time_ns() // 1_000_000,
+                        }
+                    ).encode()
+                    urllib.request.urlopen(
+                        urllib.request.Request(
+                            url,
+                            data=payload,
+                            headers={"Content-Type": "application/json"},
+                        ),
+                        timeout=0.2,
+                    ).read()
+                except Exception:
+                    pass
+
+            threading.Thread(target=send, daemon=True).start()
+
+        debug_last_blockers = None
+        # #endregion
+
         def control_extras(
             envelope: PipelineControlEnvelope,
             wire: Dict[str, object],
@@ -1587,6 +1637,21 @@ class SchedulerPPMixin:
             snapshot = self._pp_vpp_resource_snapshot(activation_send_work)
             if snapshot != last_resource_snapshot:
                 last_resource_snapshot = snapshot
+                # #region debug-point D:resource-snapshot
+                debug_report(
+                    "D",
+                    "scheduler_pp_mixin.py:resource-snapshot",
+                    "VPP resource snapshot changed",
+                    {
+                        "tick": tick,
+                        "pp_rank": self.ps.pp_rank,
+                        "request_slots": snapshot.request_slots,
+                        "kv_tokens": snapshot.kv_tokens,
+                        "activation_bytes": snapshot.activation_bytes,
+                        "pending_sends": snapshot.pending_sends,
+                    },
+                )
+                # #endregion
                 if self.ps.pp_rank == 0:
                     resource_gate.update(0, snapshot)
                 else:
@@ -1695,6 +1760,42 @@ class SchedulerPPMixin:
                 continuation = (
                     self.chunked_req is not None and self.chunked_req.kv.holds_kv
                 )
+                # #region debug-point A-C:admission-blockers
+                debug_blockers = (
+                    pending_admit,
+                    bootstrap_round_active,
+                    tuple(sorted(pending_chunk_batches)),
+                    rank_schedule.inflight_count,
+                    len(self.waiting_queue),
+                    len(self.disagg_prefill_bootstrap_queue.queue),
+                    len(self.disagg_prefill_inflight_queue),
+                )
+                if debug_blockers != debug_last_blockers:
+                    debug_last_blockers = debug_blockers
+                    debug_report(
+                        "A-B-C",
+                        "scheduler_pp_mixin.py:admission-gate",
+                        "VPP admission blocker state changed",
+                        {
+                            "tick": tick,
+                            "pending_admit": pending_admit,
+                            "bootstrap_round_active": bootstrap_round_active,
+                            "pending_chunk_batches": sorted(pending_chunk_batches),
+                            "inflight_slots": rank_schedule.inflight_count,
+                            "slot_batch_seqs": rank_schedule.slot_batch_seqs,
+                            "waiting_queue": len(self.waiting_queue),
+                            "bootstrap_queue": len(
+                                self.disagg_prefill_bootstrap_queue.queue
+                            ),
+                            "inflight_queue": len(
+                                self.disagg_prefill_inflight_queue
+                            ),
+                            "pending_bootstrap_applies": len(
+                                pending_bootstrap_applies
+                            ),
+                        },
+                    )
+                # #endregion
                 if (
                     pending_admit is None
                     and not bootstrap_round_active
@@ -1918,6 +2019,24 @@ class SchedulerPPMixin:
                 control_send_work,
                 max_control_sends,
             )
+            # #region debug-point E:transport-backlog
+            if tick % 256 == 0:
+                debug_report(
+                    "E",
+                    "scheduler_pp_mixin.py:transport-backlog",
+                    "VPP transport backlog sample",
+                    {
+                        "tick": tick,
+                        "pp_rank": self.ps.pp_rank,
+                        "control_outbox": len(self._pp_vpp_control_outbox),
+                        "control_send_work": len(control_send_work),
+                        "activation_send_work": len(activation_send_work),
+                        "ready_proxies": len(self._pp_vpp_ready_proxies),
+                        "arrivals": len(self._pp_vpp_arrivals),
+                        "inflight_slots": rank_schedule.inflight_count,
+                    },
+                )
+            # #endregion
             if activation_send_work or control_send_work:
                 server_is_idle = False
             if rank_schedule.inflight_count:
