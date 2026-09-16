@@ -194,6 +194,55 @@ class P2PWorkGroup:
             if isinstance(item.payload, torch.Tensor)
         )
 
+    # #region debug-point H4:activation-send-state
+    def debug_snapshot(self) -> Dict[str, Any]:
+        def work_completed(item: P2PWork):
+            if item.work is None:
+                return True
+            if (
+                self._cpu_waiter is not None
+                and isinstance(item.payload, torch.Tensor)
+                and item.payload.is_cpu
+            ):
+                return "waiter"
+            try:
+                return bool(item.work.is_completed())
+            except Exception as exc:
+                return f"{type(exc).__name__}: {exc}"
+
+        return {
+            "label": next(
+                (
+                    getattr(item, "_vpp_debug_label")
+                    for item in self.items
+                    if hasattr(item, "_vpp_debug_label")
+                ),
+                None,
+            ),
+            "items": len(self.items),
+            "cpu_waiter": (
+                None if self._cpu_waiter is None else self._cpu_waiter.completed()
+            ),
+            "works": tuple(
+                {
+                    "complete": work_completed(item),
+                    "device": (
+                        str(item.payload.device)
+                        if isinstance(item.payload, torch.Tensor)
+                        else None
+                    ),
+                    "bytes": (
+                        item.payload.numel() * item.payload.element_size()
+                        if isinstance(item.payload, torch.Tensor)
+                        else 0
+                    ),
+                }
+                for item in self.items
+            ),
+        }
+
+    # #endregion
+
 
 class TensorDictRecvHandle:
     _MAX_METADATA_BYTES = 64 * 1024 * 1024
@@ -502,6 +551,57 @@ class TensorDictRecvHandle:
             )
         unique = {id(tensor): tensor for tensor in tensors}
         return sum(tensor.numel() * tensor.element_size() for tensor in unique.values())
+
+    # #region debug-point H1-H3:activation-recv-state
+    def debug_snapshot(self) -> Dict[str, Any]:
+        def waiter_completed(waiter):
+            return None if waiter is None else waiter.completed()
+
+        def works_completed(works, waiter=None):
+            if waiter is not None:
+                return ("waiter",) * len(works)
+            completed = []
+            for work in works:
+                try:
+                    completed.append(bool(work.is_completed()))
+                except Exception as exc:
+                    completed.append(f"{type(exc).__name__}: {exc}")
+            return tuple(completed)
+
+        identity = None
+        if self._result is not None:
+            identity = {
+                "batch_seq": self._result.get("vpp_batch_seq"),
+                "src_stage": self._result.get("vpp_src_stage_id"),
+                "stage": self._result.get("vpp_stage_id"),
+                "msg_type": self._result.get("__msg_type__"),
+            }
+        return {
+            "state": self._state,
+            "src": self._src,
+            "tag": self._tag,
+            "buffered_bytes": self.buffered_tensor_bytes(),
+            "metadata_size": (
+                None if self._metadata_tensor is None else self._metadata_tensor.numel()
+            ),
+            "size_waiter": waiter_completed(self._size_waiter),
+            "metadata_waiter": waiter_completed(self._metadata_waiter),
+            "payload_waiter": waiter_completed(self._payload_waiter),
+            "payload_works": works_completed(
+                self._payload_works,
+                self._payload_waiter,
+            ),
+            "all_gather_waiter": waiter_completed(self._all_gather_waiter),
+            "all_gather_works": works_completed(
+                [entry[3] for entry in self._all_gather_entries],
+                self._all_gather_waiter,
+            ),
+            "tensor_keys": tuple(entry[0] for entry in self._tensor_entries),
+            "all_gather_keys": tuple(entry[0] for entry in self._all_gather_entries),
+            "identity": identity,
+        }
+
+    # #endregion
 
     def poll(self) -> Optional[Dict[str, Any]]:
         return self._advance(block=False)

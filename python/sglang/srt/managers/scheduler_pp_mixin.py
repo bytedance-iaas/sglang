@@ -1986,15 +1986,29 @@ class SchedulerPPMixin:
                 or rank_schedule.inflight_count > 0
             )
             if (
-                self.ps.tp_rank == 0
-                and has_pending_work
+                has_pending_work
                 and now - stall_last_progress_at >= 10
                 and now - stall_last_log_at >= 10
             ):
                 stall_last_log_at = now
+                # #region debug-point H1-H4:activation-transport-stall
+                pending_recv = getattr(self, "_pp_vpp_pending_recv", None)
+                recv_snapshot = (
+                    pending_recv.debug_snapshot()
+                    if pending_recv is not None
+                    and hasattr(pending_recv, "debug_snapshot")
+                    else None
+                )
+                send_snapshots = tuple(
+                    work_group.debug_snapshot()
+                    if isinstance(work_group, P2PWorkGroup)
+                    else {"type": type(work_group).__name__}
+                    for work_group in activation_send_work
+                )
+                # #endregion
                 logger.warning(
                     "[VPP-STALL] no scheduler progress for %.1fs "
-                    "tick=%s last_progress=%s@%s pp=%s "
+                    "tick=%s last_progress=%s@%s pp=%s tp=%s "
                     "pending_admit=%s bootstrap_round=%s transfer_round=%s "
                     "pending_chunks=%s pending_first_pass=%s "
                     "slots=%s ready=%s running=%s "
@@ -2003,12 +2017,13 @@ class SchedulerPPMixin:
                     "materialized=%s replica_updates=%s "
                     "control_outbox=%s control_sends=%s activation_sends=%s "
                     "ready_proxies=%s arrivals=%s resource_ranks=%s blocked_ranks=%s "
-                    "local_resource=%s",
+                    "local_resource=%s recv=%s sends=%s",
                     now - stall_last_progress_at,
                     tick,
                     stall_last_progress_event,
                     stall_last_progress_tick,
                     self.ps.pp_rank,
+                    self.ps.tp_rank,
                     pending_admit,
                     bootstrap_round_active,
                     transfer_round_active,
@@ -2035,6 +2050,8 @@ class SchedulerPPMixin:
                     sorted(resource_gate._snapshots),
                     sorted(resource_gate._blocked),
                     snapshot,
+                    recv_snapshot,
+                    send_snapshots,
                 )
             if activation_send_work or control_send_work:
                 server_is_idle = False
@@ -2916,6 +2933,15 @@ class SchedulerPPMixin:
                         batch_p2p=True,
                         tag=_VPP_ACTIVATION_TAG,
                     )
+                    # #region debug-point H4:activation-send-identity
+                    for work in send_work:
+                        if isinstance(work, P2PWork):
+                            work._vpp_debug_label = (
+                                action.batch_seq,
+                                action.stage_id,
+                                action.stage_id + 1,
+                            )
+                    # #endregion
                 if action.stage_id >= self.ps.pp_size:
                     set_time_batch(
                         cur_batch.reqs,
