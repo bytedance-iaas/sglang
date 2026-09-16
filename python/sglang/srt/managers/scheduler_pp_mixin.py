@@ -25,7 +25,6 @@ from sglang.srt.distributed.pipeline_layout import (
     PipelineLayout,
     PipelinePrefixRegistry,
     PipelineRankSchedule,
-    PipelineReadyQueueSchedule,
     PipelineReplicaIdentity,
     PipelineReplicaRegistry,
     PipelineResourceGate,
@@ -426,103 +425,6 @@ class SchedulerPPMixin:
             if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
                 self.on_idle()
 
-    def _pp_vpp_ingest_requests(self: Scheduler):
-        is_control_source = self.world_group.rank_in_group == 0
-        local_reqs = self.ingest_requests() if self.pp_group.is_first_rank else None
-        recv_reqs = self.world_group.broadcast_object(
-            local_reqs if is_control_source else None,
-            src=0,
-        )
-        if not self.pp_group.is_first_rank:
-            if recv_reqs:
-                self.metrics_reporter.record_scheduler_active()
-            self.process_input_requests(recv_reqs)
-        return recv_reqs
-
-    def _pp_vpp_collect_bootstrapped_ids(self: Scheduler):
-        good_rids, bad_rids = self.get_rids(
-            self.disagg_prefill_bootstrap_queue.queue,
-            True,
-            [KVPoll.WaitingForInput],
-            [KVPoll.Failed],
-        )
-        aborted_rids = {
-            req.rid
-            for req in self.disagg_prefill_bootstrap_queue.queue
-            if isinstance(req.finished_reason, FINISH_ABORT)
-        }
-        good_rids, bad_rids = self._route_aborts_to_bad(
-            good_rids, bad_rids, aborted_rids
-        )
-        gathered = self.world_group.all_gather_object([good_rids, bad_rids])
-        consensus_good = set(gathered[0][0])
-        consensus_bad = set()
-        for rank_good, rank_bad in gathered:
-            consensus_good.intersection_update(rank_good)
-            consensus_bad.update(rank_bad)
-        consensus_good.difference_update(consensus_bad)
-        return [sorted(consensus_good), sorted(consensus_bad)]
-
-    def _pp_vpp_collect_transferred_ids(self: Scheduler):
-        local_rids = self.get_rids(
-            self.disagg_prefill_inflight_queue,
-            True,
-            [KVPoll.Success, KVPoll.Failed],
-        )
-        gathered = self.world_group.all_gather_object(local_rids)
-        consensus = set(gathered[0])
-        for rank_rids in gathered[1:]:
-            consensus.intersection_update(rank_rids)
-        return sorted(consensus)
-
-    def _pp_vpp_broadcast_batch_result(
-        self: Scheduler,
-        batch_seq: int,
-        batch: ScheduleBatch,
-        mb_metadata: PPBatchMetadata,
-        last_rank_comm_queue: deque,
-    ) -> GenerationBatchResult:
-        output_source_rank = (self.ps.pp_size - 1) * self.ps.tp_size
-        output_tensors = None
-        if self.world_group.rank_in_group == output_source_rank:
-            output_event, output_proxy = last_rank_comm_queue.popleft()
-            output_event.synchronize()
-            output_tensors = {
-                key: value.to("cpu") if isinstance(value, torch.Tensor) else value
-                for key, value in output_proxy.tensors.items()
-            }
-        output_tensors = self.world_group.broadcast_object(
-            output_tensors,
-            src=output_source_rank,
-        )
-        if output_tensors is None:
-            raise RuntimeError("the final VPP stage produced no output")
-        output_batch_seq = int(output_tensors.get("vpp_batch_seq", -1))
-        if output_batch_seq != batch_seq:
-            raise RuntimeError(
-                f"VPP output batch mismatch: expected {batch_seq}, "
-                f"got {output_batch_seq}"
-            )
-        output_tensors = {
-            key: (
-                value.to(self.device, non_blocking=True)
-                if isinstance(value, torch.Tensor)
-                else value
-            )
-            for key, value in output_tensors.items()
-        }
-        with self.copy_stream_ctx:
-            self.copy_stream.wait_stream(self.schedule_stream)
-            batch_result = self._pp_prep_batch_result(
-                batch,
-                mb_metadata,
-                PPProxyTensors(output_tensors),
-            )
-            d2h_event = self.device_module.Event()
-            d2h_event.record(self.device_module.current_stream())
-        d2h_event.synchronize()
-        return batch_result
-
     def _pp_vpp_batch_manifest(
         self: Scheduler,
         batch_seq: int,
@@ -555,17 +457,6 @@ class SchedulerPPMixin:
             batch_p2p=True,
             tag=_VPP_ACTIVATION_TAG,
         )
-
-    def _pp_vpp_poll_receiver(self: Scheduler) -> bool:
-        handle: Optional[TensorDictRecvHandle] = self._pp_vpp_pending_recv
-        if handle is None:
-            self._pp_vpp_start_receiver()
-            handle = self._pp_vpp_pending_recv
-        tensors = handle.poll()
-        if tensors is None:
-            return False
-        self._pp_vpp_accept_received_tensors(tensors)
-        return True
 
     def _pp_vpp_accept_received_tensors(
         self: Scheduler,
@@ -670,16 +561,6 @@ class SchedulerPPMixin:
                 f"TP leader selected unavailable VPP task {(batch_seq, stage_id)}"
             )
         return rank_schedule.dispatch(action_tick, batch_seq, stage_id)
-
-    def _pp_vpp_action_input_ready(
-        self: Scheduler,
-        action: PipelineWavefrontAction,
-    ) -> bool:
-        if action.physical_rank != self.ps.pp_rank:
-            return True
-        if action.stage_id == 0:
-            return True
-        return (action.batch_seq, action.stage_id) in self._pp_vpp_ready_proxies
 
     def _pp_vpp_take_ready_proxy(
         self: Scheduler,
@@ -1001,40 +882,6 @@ class SchedulerPPMixin:
         self._pp_vpp_stage_events[(action.batch_seq, action.stage_id)] = event
         return True, send_work
 
-    def _pp_vpp_complete_wavefront_batch(
-        self: Scheduler,
-        batch_seq: int,
-        slot_batch_seqs: List[Optional[int]],
-    ) -> bool:
-        slot_id = batch_seq % len(self.mbs)
-        if slot_batch_seqs[slot_id] != batch_seq:
-            raise RuntimeError(
-                f"VPP completion for batch {batch_seq} found slot "
-                f"{slot_id} owned by {slot_batch_seqs[slot_id]}"
-            )
-        batch = self.mbs[slot_id]
-        if batch is None:
-            slot_batch_seqs[slot_id] = None
-            return False
-        metadata = self.mb_metadata[slot_id]
-        if metadata is None:
-            raise RuntimeError(
-                f"VPP batch {batch_seq} completed without pipeline metadata"
-            )
-
-        batch_result = self._pp_vpp_broadcast_batch_result(
-            batch_seq,
-            batch,
-            metadata,
-            self.last_rank_comm_queue,
-        )
-        self._pp_process_batch_result(batch, batch_result)
-        self.last_mbs[slot_id] = batch
-        self.mbs[slot_id] = None
-        self.mb_metadata[slot_id] = None
-        slot_batch_seqs[slot_id] = None
-        return True
-
     def _pp_vpp_take_local_completion(
         self: Scheduler,
         batch_seq: int,
@@ -1123,8 +970,6 @@ class SchedulerPPMixin:
         return True
 
     def _event_loop_pp_disagg_prefill_vpp(self: Scheduler):
-        if getattr(self, "_pp_vpp_use_replicated_test_loop", False):
-            return self._event_loop_pp_disagg_prefill_vpp_replicated()
         return self._event_loop_pp_disagg_prefill_vpp_rank_local()
 
     def _event_loop_pp_disagg_prefill_vpp_rank_local(self: Scheduler):
@@ -2019,144 +1864,6 @@ class SchedulerPPMixin:
             if activation_send_work or control_send_work:
                 server_is_idle = False
             if rank_schedule.inflight_count:
-                server_is_idle = False
-            if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
-                self.on_idle()
-            tick += 1
-
-    def _event_loop_pp_disagg_prefill_vpp_replicated(self: Scheduler):
-        self.init_pp_loop_state()
-        schedule = PipelineReadyQueueSchedule(
-            physical_size=self.ps.pp_size,
-            virtual_stages=get_parallel().pp_virtual_stages,
-            max_inflight=self.ps.pp_size,
-        )
-        slot_batch_seqs: List[Optional[int]] = [None] * schedule.max_inflight
-        pending_send_work = deque()
-        max_pending_send_work = schedule.max_inflight
-        pending_chunk_first_visit = set()
-        self._pp_vpp_pending_recv = None
-        self._pp_vpp_ready_proxies = {}
-        self._pp_vpp_slot_batch_seqs = slot_batch_seqs
-        self._pp_vpp_start_receiver()
-        next_batch_seq = 0
-        tick = 0
-
-        while True:
-            server_is_idle = True
-            while self._pp_vpp_poll_receiver():
-                pass
-            self._pp_vpp_reap_send_work(pending_send_work)
-            transferred_rids = []
-            can_poll_control = (
-                schedule.can_admit(next_batch_seq) and not pending_chunk_first_visit
-            )
-            if can_poll_control:
-                self._pp_vpp_ingest_requests()
-            self.process_pending_chunked_abort()
-
-            if can_poll_control:
-                bootstrapped_rids = self._pp_vpp_collect_bootstrapped_ids()
-                self.process_bootstrapped_queue(bootstrapped_rids)
-                transferred_rids = self._pp_vpp_collect_transferred_ids()
-
-                while (
-                    schedule.can_admit(next_batch_seq) and not pending_chunk_first_visit
-                ):
-                    slot_id = next_batch_seq % schedule.max_inflight
-                    batch = self._pp_vpp_prepare_wavefront_batch(
-                        next_batch_seq,
-                        slot_batch_seqs,
-                    )
-                    manifest = (
-                        None
-                        if batch is None
-                        else self._pp_vpp_batch_manifest(
-                            next_batch_seq,
-                            slot_id,
-                            batch,
-                        )
-                    )
-                    manifests = self.world_group.all_gather_object(manifest)
-                    if any(item != manifest for item in manifests):
-                        raise RuntimeError(
-                            "VPP ranks disagreed on ready-queue batch manifest for "
-                            f"batch {next_batch_seq}: {manifests}"
-                        )
-                    if batch is None:
-                        self.mbs[slot_id] = None
-                        self.mb_metadata[slot_id] = None
-                        slot_batch_seqs[slot_id] = None
-                        break
-                    schedule.admit(next_batch_seq)
-                    if schedule.slot_batch_seqs != tuple(slot_batch_seqs):
-                        raise RuntimeError(
-                            "VPP scheduler and batch slots diverged after admitting "
-                            f"batch {next_batch_seq}"
-                        )
-                    if getattr(batch, "chunked_req", None) is not None:
-                        pending_chunk_first_visit.add(next_batch_seq)
-                    next_batch_seq += 1
-                    server_is_idle = False
-
-            def action_is_ready(
-                physical_rank: int,
-                batch_seq: int,
-                stage_id: int,
-            ) -> bool:
-                if physical_rank != self.ps.pp_rank:
-                    return True
-                if (
-                    stage_id < schedule.logical_size - 1
-                    and len(pending_send_work) >= max_pending_send_work
-                ):
-                    return False
-                return self._pp_vpp_action_input_ready(
-                    PipelineWavefrontAction(
-                        tick=tick,
-                        batch_seq=batch_seq,
-                        slot_id=batch_seq % schedule.max_inflight,
-                        stage_id=stage_id,
-                        physical_rank=physical_rank,
-                    )
-                )
-
-            actions = schedule.actions(tick, is_ready=action_is_ready)
-            action = actions[self.ps.pp_rank]
-            if action is not None and action.stage_id > 0:
-                proxy = self._pp_vpp_take_ready_proxy(action)
-                self._pp_tensor_dict_inbox["vpp_proxy"].appendleft(proxy.tensors)
-            action_executed, send_work = self._pp_vpp_execute_wavefront_action(
-                action,
-                slot_batch_seqs,
-            )
-            if send_work:
-                pending_send_work.append(send_work)
-            if action_executed:
-                server_is_idle = False
-
-            completed_batch_seqs = schedule.complete(actions)
-            for completed_action in actions:
-                if (
-                    completed_action is not None
-                    and completed_action.stage_id == self.ps.pp_size - 1
-                ):
-                    pending_chunk_first_visit.discard(completed_action.batch_seq)
-            for batch_seq in completed_batch_seqs:
-                if self._pp_vpp_complete_wavefront_batch(
-                    batch_seq,
-                    slot_batch_seqs,
-                ):
-                    server_is_idle = False
-
-            if transferred_rids:
-                self.process_disagg_prefill_inflight_queue(transferred_rids)
-
-            for running_batch in self.running_mbs:
-                running_batch.batch_is_full = False
-            if schedule.inflight_count > 0:
-                server_is_idle = False
-            if pending_send_work:
                 server_is_idle = False
             if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
                 self.on_idle()
