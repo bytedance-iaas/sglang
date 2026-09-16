@@ -81,6 +81,7 @@ from sglang.srt.observability.scheduler_stage_metrics import (
 )
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_parallel,
     get_schedule,
 )
 from sglang.srt.utils import is_npu
@@ -839,9 +840,13 @@ class SchedulerDisaggregationPrefillMixin:
                 # still self.chunked_req, or its final chunk (extend_range
                 # reaching the end of the input) is in flight. A yielded req
                 # is neither, so do its deferred release here.
-                still_chunking = self.chunked_req is req or (
-                    req.extend_range is not None
-                    and req.extend_range.end >= len(req.origin_input_ids)
+                still_chunking = (
+                    req.inflight_middle_chunks > 0
+                    or self.chunked_req is req
+                    or (
+                        req.extend_range is not None
+                        and req.extend_range.end >= len(req.origin_input_ids)
+                    )
                 )
                 # Abort is terminal. Do not requeue an aborted optimistic
                 # request merely because bootstrap is still pending.
@@ -883,8 +888,7 @@ class SchedulerDisaggregationPrefillMixin:
                     chunk_end_by_rid = batch.disagg_prefill_chunk_end_by_rid
                     end_idx = (
                         chunk_end_by_rid[req.rid]
-                        if chunk_end_by_rid is not None
-                        and req.rid in chunk_end_by_rid
+                        if chunk_end_by_rid is not None and req.rid in chunk_end_by_rid
                         else req.tmp_end_idx
                     )
                     self.send_kv_chunk(req, last_chunk=False, end_idx=end_idx)
@@ -1105,14 +1109,16 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+        req.pending_bootstrap = False
+        prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+        if self.metrics_reporter.enable_metrics:
+            self.metrics_collector.increment_bootstrap_failed_reqs()
+        if req.inflight_middle_chunks > 0:
+            return
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache)
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
-        req.pending_bootstrap = False
-        prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
         self.output_streamer.stream_output([req], req.return_logprob)
-        if self.metrics_reporter.enable_metrics:
-            self.metrics_collector.increment_bootstrap_failed_reqs()
         if self.enable_hicache_storage:
             self.tree_cache.release_aborted_request(req.rid)
 
@@ -1192,6 +1198,8 @@ class SchedulerDisaggregationPrefillMixin:
 
     def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
+            return
+        if get_parallel().pp_virtual_stages > 1:
             return
 
         # Staging sends into positional grid slots, so the early-send boundary
