@@ -1,13 +1,9 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
-import os
 import pickle
-import threading
 import time
-import urllib.request
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
@@ -1106,52 +1102,18 @@ class SchedulerPPMixin:
         pending_first_pass: Dict[int, set[int]] = defaultdict(set)
         pending_chunk_batches = set()
         tick = 0
+        stall_last_progress_at = time.monotonic()
+        stall_last_progress_tick = 0
+        stall_last_progress_event = "init"
+        stall_last_log_at = 0.0
 
-        # #region debug-point A-E:vpp-scheduler-state
-        def debug_report(hypothesis_id: str, location: str, msg: str, data) -> None:
-            if self.ps.tp_rank != 0:
-                return
-
-            def send() -> None:
-                url = "http://10.254.210.200:7777/event"
-                session_id = "vpp-admission-stall"
-                try:
-                    with open(".dbg/vpp-admission-stall.env") as env_file:
-                        for line in env_file:
-                            key, _, value = line.strip().partition("=")
-                            if key == "DEBUG_SERVER_URL":
-                                url = value
-                            elif key == "DEBUG_SESSION_ID":
-                                session_id = value
-                except OSError:
-                    pass
-                try:
-                    payload = json.dumps(
-                        {
-                            "sessionId": session_id,
-                            "runId": os.getenv("VPP_DEBUG_RUN_ID", "pre-fix"),
-                            "hypothesisId": hypothesis_id,
-                            "location": location,
-                            "msg": f"[DEBUG] {msg}",
-                            "data": data,
-                            "ts": time.time_ns() // 1_000_000,
-                        }
-                    ).encode()
-                    urllib.request.urlopen(
-                        urllib.request.Request(
-                            url,
-                            data=payload,
-                            headers={"Content-Type": "application/json"},
-                        ),
-                        timeout=0.2,
-                    ).read()
-                except Exception:
-                    pass
-
-            threading.Thread(target=send, daemon=True).start()
-
-        debug_last_blockers = None
-        # #endregion
+        def mark_progress(event: str) -> None:
+            nonlocal stall_last_progress_at
+            nonlocal stall_last_progress_tick
+            nonlocal stall_last_progress_event
+            stall_last_progress_at = time.monotonic()
+            stall_last_progress_tick = tick
+            stall_last_progress_event = event
 
         def control_extras(
             envelope: PipelineControlEnvelope,
@@ -1611,7 +1573,7 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             while self._pp_vpp_poll_receiver_tp_consensus():
-                pass
+                mark_progress("activation")
             while self._pp_vpp_arrivals:
                 batch_seq, stage_id = self._pp_vpp_arrivals.popleft()
                 rank_schedule.mark_ready(batch_seq, stage_id)
@@ -1620,6 +1582,12 @@ class SchedulerPPMixin:
                 if control_message is None:
                     break
                 handle_control(*control_message)
+                if control_message[0].kind not in (
+                    PipelineControlKind.RESOURCE,
+                    PipelineControlKind.BOOTSTRAP_STATUS,
+                    PipelineControlKind.TRANSFER_STATUS,
+                ):
+                    mark_progress(f"control:{control_message[0].kind.value}")
             if pending_remote_admits:
                 envelope, wire = pending_remote_admits.popleft()
                 handle_control(envelope, wire)
@@ -1637,21 +1605,6 @@ class SchedulerPPMixin:
             snapshot = self._pp_vpp_resource_snapshot(activation_send_work)
             if snapshot != last_resource_snapshot:
                 last_resource_snapshot = snapshot
-                # #region debug-point D:resource-snapshot
-                debug_report(
-                    "D",
-                    "scheduler_pp_mixin.py:resource-snapshot",
-                    "VPP resource snapshot changed",
-                    {
-                        "tick": tick,
-                        "pp_rank": self.ps.pp_rank,
-                        "request_slots": snapshot.request_slots,
-                        "kv_tokens": snapshot.kv_tokens,
-                        "activation_bytes": snapshot.activation_bytes,
-                        "pending_sends": snapshot.pending_sends,
-                    },
-                )
-                # #endregion
                 if self.ps.pp_rank == 0:
                     resource_gate.update(0, snapshot)
                 else:
@@ -1760,42 +1713,6 @@ class SchedulerPPMixin:
                 continuation = (
                     self.chunked_req is not None and self.chunked_req.kv.holds_kv
                 )
-                # #region debug-point A-C:admission-blockers
-                debug_blockers = (
-                    pending_admit,
-                    bootstrap_round_active,
-                    tuple(sorted(pending_chunk_batches)),
-                    rank_schedule.inflight_count,
-                    len(self.waiting_queue),
-                    len(self.disagg_prefill_bootstrap_queue.queue),
-                    len(self.disagg_prefill_inflight_queue),
-                )
-                if debug_blockers != debug_last_blockers:
-                    debug_last_blockers = debug_blockers
-                    debug_report(
-                        "A-B-C",
-                        "scheduler_pp_mixin.py:admission-gate",
-                        "VPP admission blocker state changed",
-                        {
-                            "tick": tick,
-                            "pending_admit": pending_admit,
-                            "bootstrap_round_active": bootstrap_round_active,
-                            "pending_chunk_batches": sorted(pending_chunk_batches),
-                            "inflight_slots": rank_schedule.inflight_count,
-                            "slot_batch_seqs": rank_schedule.slot_batch_seqs,
-                            "waiting_queue": len(self.waiting_queue),
-                            "bootstrap_queue": len(
-                                self.disagg_prefill_bootstrap_queue.queue
-                            ),
-                            "inflight_queue": len(
-                                self.disagg_prefill_inflight_queue
-                            ),
-                            "pending_bootstrap_applies": len(
-                                pending_bootstrap_applies
-                            ),
-                        },
-                    )
-                # #endregion
                 if (
                     pending_admit is None
                     and not bootstrap_round_active
@@ -1837,6 +1754,7 @@ class SchedulerPPMixin:
                         if batch.chunked_req is not None:
                             pending_chunk_batches.add(next_batch_seq)
                         next_batch_seq += 1
+                        mark_progress("admission")
                         server_is_idle = False
             else:
                 self.process_pending_chunked_abort()
@@ -1946,6 +1864,7 @@ class SchedulerPPMixin:
                 if send_work:
                     activation_send_work.append(send_work)
                 if action_executed:
+                    mark_progress(f"stage:{action.stage_id}")
                     for identity, generation, start, end in replica_restores:
                         self._pp_vpp_pending_replica_updates.append(
                             (
@@ -2019,24 +1938,69 @@ class SchedulerPPMixin:
                 control_send_work,
                 max_control_sends,
             )
-            # #region debug-point E:transport-backlog
-            if tick % 256 == 0:
-                debug_report(
-                    "E",
-                    "scheduler_pp_mixin.py:transport-backlog",
-                    "VPP transport backlog sample",
+            now = time.monotonic()
+            has_pending_work = (
+                pending_admit is not None
+                or bootstrap_round_active
+                or bool(pending_chunk_batches)
+                or bool(pending_bootstrap_applies)
+                or bool(self.waiting_queue)
+                or bool(self.disagg_prefill_bootstrap_queue.queue)
+                or bool(self.disagg_prefill_inflight_queue)
+                or bool(self._pp_vpp_control_outbox)
+                or bool(control_send_work)
+                or bool(activation_send_work)
+                or rank_schedule.inflight_count > 0
+            )
+            if (
+                self.ps.tp_rank == 0
+                and has_pending_work
+                and now - stall_last_progress_at >= 10
+                and now - stall_last_log_at >= 10
+            ):
+                stall_last_log_at = now
+                logger.warning(
+                    "[VPP-STALL] no scheduler progress for %.1fs "
+                    "tick=%s last_progress=%s@%s pp=%s "
+                    "pending_admit=%s bootstrap_round=%s transfer_round=%s "
+                    "pending_chunks=%s pending_first_pass=%s "
+                    "slots=%s ready=%s running=%s "
+                    "waiting=%s bootstrap=%s inflight=%s "
+                    "bootstrap_applies=%s materialized=%s replica_updates=%s "
+                    "control_outbox=%s control_sends=%s activation_sends=%s "
+                    "ready_proxies=%s arrivals=%s resource_ranks=%s blocked_ranks=%s "
+                    "local_resource=%s",
+                    now - stall_last_progress_at,
+                    tick,
+                    stall_last_progress_event,
+                    stall_last_progress_tick,
+                    self.ps.pp_rank,
+                    pending_admit,
+                    bootstrap_round_active,
+                    transfer_round_active,
+                    sorted(pending_chunk_batches),
                     {
-                        "tick": tick,
-                        "pp_rank": self.ps.pp_rank,
-                        "control_outbox": len(self._pp_vpp_control_outbox),
-                        "control_send_work": len(control_send_work),
-                        "activation_send_work": len(activation_send_work),
-                        "ready_proxies": len(self._pp_vpp_ready_proxies),
-                        "arrivals": len(self._pp_vpp_arrivals),
-                        "inflight_slots": rank_schedule.inflight_count,
+                        batch_seq: sorted(ranks)
+                        for batch_seq, ranks in pending_first_pass.items()
                     },
+                    rank_schedule.slot_batch_seqs,
+                    rank_schedule.ready_tasks,
+                    rank_schedule.running,
+                    len(self.waiting_queue),
+                    len(self.disagg_prefill_bootstrap_queue.queue),
+                    len(self.disagg_prefill_inflight_queue),
+                    len(pending_bootstrap_applies),
+                    len(self._pp_vpp_pending_materialized),
+                    len(self._pp_vpp_pending_replica_updates),
+                    len(self._pp_vpp_control_outbox),
+                    len(control_send_work),
+                    len(activation_send_work),
+                    len(self._pp_vpp_ready_proxies),
+                    len(self._pp_vpp_arrivals),
+                    sorted(resource_gate._snapshots),
+                    sorted(resource_gate._blocked),
+                    snapshot,
                 )
-            # #endregion
             if activation_send_work or control_send_work:
                 server_is_idle = False
             if rank_schedule.inflight_count:
