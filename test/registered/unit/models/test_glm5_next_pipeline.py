@@ -159,6 +159,35 @@ def test_glm5_next_pp_embed_and_head_follow_stage_ownership(monkeypatch):
     assert not hasattr(last.model.embed_tokens, "weight")
 
 
+def test_glm5_next_mhc_pp_proxy_carries_only_widened_hidden_state(monkeypatch):
+    model = Glm5NextModel.__new__(Glm5NextModel)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(mhc=True)
+    model.start_layer = 1
+    model.end_layer = 1
+    model.first_k_dense_replace = 0
+    model.dflash_capture = False
+    model.pp_group = SimpleNamespace(is_first_rank=False, is_last_rank=False)
+    model.layers = nn.ModuleList()
+    model.layers_to_capture = []
+    model.enable_a2a_moe = False
+
+    monkeypatch.setattr(
+        "sglang.srt.models.glm5_next.BumpAllocator", lambda **_kwargs: object()
+    )
+
+    hidden_states = torch.randn(2, 12)
+    result = model.forward(
+        input_ids=torch.empty(0, dtype=torch.int64),
+        positions=torch.arange(2),
+        forward_batch=SimpleNamespace(can_run_tbo=False),
+        pp_proxy_tensors={"hidden_states": hidden_states},
+    )
+
+    assert set(result.tensors) == {"hidden_states"}
+    assert result["hidden_states"] is hidden_states
+
+
 @pytest.mark.parametrize("first_k_dense_replace", [2, 4])
 def test_glm5_next_tbo_stays_within_later_pp_stage(monkeypatch, first_k_dense_replace):
     class GuardedLayers(list):
