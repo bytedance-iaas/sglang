@@ -592,6 +592,8 @@ class SchedulerPPMixin:
         ).digest
 
     def _pp_vpp_start_control_receiver(self: Scheduler) -> None:
+        if self.ps.tp_rank != 0:
+            return
         if self._pp_vpp_pending_control_recv is not None:
             return
         self._pp_vpp_pending_control_recv = self.pp_group.recv_tensor_dict_async(
@@ -602,6 +604,8 @@ class SchedulerPPMixin:
     def _pp_vpp_poll_control_receiver(
         self: Scheduler,
     ) -> Optional[Tuple[PipelineControlEnvelope, Dict[str, object]]]:
+        if self.ps.tp_rank != 0:
+            raise RuntimeError("only TP0 may poll the VPP control ring")
         handle: Optional[TensorDictRecvHandle] = self._pp_vpp_pending_control_recv
         if handle is None:
             self._pp_vpp_start_control_receiver()
@@ -620,37 +624,33 @@ class SchedulerPPMixin:
         self._pp_vpp_start_control_receiver()
         return envelope, wire
 
-    def _pp_vpp_poll_control_receiver_tp_consensus(
+    def _pp_vpp_poll_control_receiver_tp_broadcast(
         self: Scheduler,
     ) -> Optional[Tuple[PipelineControlEnvelope, Dict[str, object]]]:
-        if self._pp_vpp_ready_control_message is None:
-            self._pp_vpp_ready_control_message = self._pp_vpp_poll_control_receiver()
-        message = self._pp_vpp_ready_control_message
-        identity = (
-            None
-            if message is None
-            else (
-                message[0].kind.value,
-                message[0].source_rank,
-                message[0].batch_seq,
-                message[0].generation,
-                message[0].slot_id,
-                message[0].hops,
-            )
-        )
-        identities = self.attn_tp_group.all_gather_object(identity)
-        if any(item is None for item in identities):
+        wire = None
+        if self.ps.tp_rank == 0:
+            message = self._pp_vpp_poll_control_receiver()
+            if message is not None:
+                wire = message[1]
+        wire = self.attn_tp_group.broadcast_object(wire, src=0)
+        if wire is None:
             return None
-        if any(item != identities[0] for item in identities[1:]):
-            raise RuntimeError(f"TP lanes received divergent VPP control: {identities}")
-        self._pp_vpp_ready_control_message = None
-        return message
+        envelope = PipelineControlEnvelope.from_dict(wire)
+        if envelope.protocol_version != _VPP_PROTOCOL_VERSION:
+            raise RuntimeError("VPP control protocol version mismatch")
+        if envelope.runtime_epoch != self._pp_vpp_runtime_epoch:
+            raise RuntimeError("stale VPP control runtime epoch")
+        if envelope.layout_digest != self._pp_vpp_control_layout_digest:
+            raise RuntimeError("VPP control layout digest mismatch")
+        return envelope, wire
 
     def _pp_vpp_queue_control(
         self: Scheduler,
         envelope: PipelineControlEnvelope,
         tensors: Optional[Dict[str, object]] = None,
     ) -> None:
+        if self.ps.tp_rank != 0:
+            return
         wire = envelope.to_dict()
         if tensors:
             cuda_keys = [
@@ -668,6 +668,8 @@ class SchedulerPPMixin:
         pending_work: deque,
         max_pending: int,
     ) -> None:
+        if self.ps.tp_rank != 0:
+            return
         self._pp_vpp_reap_send_work(pending_work)
         while self._pp_vpp_control_outbox and len(pending_work) < max_pending:
             wire = self._pp_vpp_control_outbox.popleft()
@@ -987,7 +989,6 @@ class SchedulerPPMixin:
         self._pp_vpp_arrivals = deque()
         self._pp_vpp_pending_recv = None
         self._pp_vpp_pending_control_recv = None
-        self._pp_vpp_ready_control_message = None
         self._pp_vpp_control_outbox = deque()
         self._pp_vpp_stage_events = {}
         self._pp_vpp_pending_materialized = deque()
@@ -1513,7 +1514,7 @@ class SchedulerPPMixin:
                 batch_seq, stage_id = self._pp_vpp_arrivals.popleft()
                 rank_schedule.mark_ready(batch_seq, stage_id)
             while True:
-                control_message = self._pp_vpp_poll_control_receiver_tp_consensus()
+                control_message = self._pp_vpp_poll_control_receiver_tp_broadcast()
                 if control_message is None:
                     break
                 handle_control(*control_message)

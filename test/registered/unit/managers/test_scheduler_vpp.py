@@ -282,9 +282,10 @@ class TestSchedulerVPP(unittest.TestCase):
             tag=2,
         )
 
-    def test_vpp_control_waits_for_same_envelope_on_every_tp_lane(self):
+    def test_vpp_control_tp0_broadcasts_pp_ring_message_to_tp_lanes(self):
         scheduler = _make_scheduler()
-        scheduler._pp_vpp_ready_control_message = None
+        scheduler._pp_vpp_runtime_epoch = 17
+        scheduler._pp_vpp_control_layout_digest = "layout"
         envelope = PipelineControlEnvelope(
             protocol_version=1,
             runtime_epoch=17,
@@ -296,20 +297,68 @@ class TestSchedulerVPP(unittest.TestCase):
         )
         message = (envelope, envelope.to_dict())
         scheduler._pp_vpp_poll_control_receiver = MagicMock(return_value=message)
-        identity = ("bootstrap_status", 0, -1, -1, -1, 1)
-        scheduler.attn_tp_group.all_gather_object = MagicMock(
-            side_effect=[
-                [identity, None],
-                [identity, identity],
-            ]
+        scheduler.attn_tp_group.broadcast_object = MagicMock(
+            side_effect=lambda value, src: value
         )
 
-        self.assertIsNone(scheduler._pp_vpp_poll_control_receiver_tp_consensus())
-        self.assertEqual(
-            scheduler._pp_vpp_poll_control_receiver_tp_consensus(),
-            message,
-        )
+        result = scheduler._pp_vpp_poll_control_receiver_tp_broadcast()
+
+        self.assertEqual(result, message)
         scheduler._pp_vpp_poll_control_receiver.assert_called_once_with()
+        scheduler.attn_tp_group.broadcast_object.assert_called_once_with(
+            envelope.to_dict(),
+            src=0,
+        )
+
+    def test_vpp_control_tp_follower_only_consumes_tp0_broadcast(self):
+        scheduler = _make_scheduler()
+        scheduler.ps.tp_rank = 1
+        envelope = PipelineControlEnvelope(
+            protocol_version=1,
+            runtime_epoch=17,
+            layout_digest="layout",
+            kind=PipelineControlKind.CACHE_UPDATE,
+            source_rank=3,
+            batch_seq=0,
+            generation=0,
+            hops=3,
+            payload={},
+        )
+        scheduler._pp_vpp_runtime_epoch = 17
+        scheduler._pp_vpp_control_layout_digest = "layout"
+        scheduler._pp_vpp_poll_control_receiver = MagicMock()
+        scheduler.attn_tp_group.broadcast_object = MagicMock(
+            return_value=envelope.to_dict()
+        )
+
+        result = scheduler._pp_vpp_poll_control_receiver_tp_broadcast()
+
+        self.assertEqual(result[0], envelope)
+        scheduler._pp_vpp_poll_control_receiver.assert_not_called()
+        scheduler.attn_tp_group.broadcast_object.assert_called_once_with(None, src=0)
+
+    def test_vpp_control_tp_follower_does_not_use_pp_ring(self):
+        scheduler = _make_scheduler()
+        scheduler.ps.tp_rank = 1
+        scheduler._pp_vpp_pending_control_recv = None
+        scheduler._pp_vpp_control_outbox = deque()
+        scheduler.pp_group.recv_tensor_dict_async = MagicMock()
+        scheduler.pp_group.send_tensor_dict = MagicMock()
+        envelope = PipelineControlEnvelope(
+            protocol_version=1,
+            runtime_epoch=17,
+            layout_digest="layout",
+            kind=PipelineControlKind.RESOURCE,
+            source_rank=1,
+        )
+
+        scheduler._pp_vpp_start_control_receiver()
+        scheduler._pp_vpp_queue_control(envelope)
+        scheduler._pp_vpp_flush_control_outbox(deque(), 4)
+
+        scheduler.pp_group.recv_tensor_dict_async.assert_not_called()
+        scheduler.pp_group.send_tensor_dict.assert_not_called()
+        self.assertEqual(len(scheduler._pp_vpp_control_outbox), 0)
 
     def test_vpp_resource_snapshot_tracks_allocator_and_activation_bytes(self):
         scheduler = _make_scheduler()
@@ -670,6 +719,9 @@ class TestSchedulerVPP(unittest.TestCase):
         scheduler.world_group.broadcast_object = MagicMock(return_value=17)
         scheduler.attn_tp_group.all_gather_object = MagicMock(
             side_effect=lambda value: [value, value]
+        )
+        scheduler.attn_tp_group.broadcast_object = MagicMock(
+            side_effect=lambda value, src: value
         )
         scheduler.model_config = SimpleNamespace(
             hidden_size=16,
