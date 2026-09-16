@@ -201,6 +201,7 @@ def test_glm5_next_tbo_stays_within_later_pp_stage(monkeypatch, first_k_dense_re
     model.start_layer = 4
     model.end_layer = 7
     model.first_k_dense_replace = first_k_dense_replace
+    model.config = SimpleNamespace(mhc=False)
     model.dflash_capture = False
     model.pp_group = SimpleNamespace(is_first_rank=False, is_last_rank=False)
     missing_layer = object()
