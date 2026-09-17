@@ -12,6 +12,7 @@ import torch
 import yaml
 
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.mem_cache.eic_stats import stats
 from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     MHATokenToKVPool,
@@ -86,6 +87,14 @@ def get_eic_config_file_path():
         config_file = "/sgl-workspace/config/remote-eic.yaml"
         logger.info(f"eic init with default config, config_file {config_file}")
     return config_file
+
+
+def _status_name(status_code) -> str:
+    if status_code == eic.StatusCode.SUCCESS:
+        return "SUCCESS"
+    if status_code == eic.StatusCode.PARTIAL_FAILED:
+        return "PARTIAL_FAILED"
+    return "FAILED"
 
 
 class MemoryStateInt(IntEnum):
@@ -268,6 +277,7 @@ class EICKVClient:
         eic_namespace = config.get("eic_namespace", "")
         logger.info(f"eic namespace: {eic_namespace}")
         self.eic_namespace = eic_namespace
+        stats.start_periodic_dump()
 
         self.gdr_bounce_buffer_size = config.get(
             "gdr_bounce_buffer_size", G_GDRBounceBufferSize
@@ -488,15 +498,22 @@ class EICKVClient:
         exist_option = eic.ExistOption()
         exist_option.ns = self.eic_namespace
 
+        _t0 = time.perf_counter()
         status_code, exist_outcome = self.connection.mexist(keys_vec, exist_option)
         if status_code == eic.StatusCode.SUCCESS:
+            stats.record_rpc("mexist", time.perf_counter() - _t0, "SUCCESS", len(keys))
             return [c == eic.StatusCode.SUCCESS for c in exist_outcome.status_codes]
         if status_code != eic.StatusCode.PARTIAL_FAILED:
             logger.error(f"eic exists {len(keys)} failed, status_code {status_code}")
+            stats.record_rpc(
+                "mexist", time.perf_counter() - _t0, "FAILED", len(keys), len(keys)
+            )
             return [False] * len(keys)
 
         codes = list(exist_outcome.status_codes)
+        codes += [None] * (len(keys) - len(codes))
         failed = [i for i, c in enumerate(codes) if c != eic.StatusCode.SUCCESS]
+        stats.incr("mexist.reprobe")
         retry_keys = eic.StringVector()
         for i in failed:
             retry_keys.append(keys[i])
@@ -504,11 +521,21 @@ class EICKVClient:
             retry_keys, exist_option
         )
         retry_codes = list(retry_outcome.status_codes)
+        still_failed = 0
         for j, i in enumerate(failed):
             if retry_status == eic.StatusCode.SUCCESS or (
                 j < len(retry_codes) and retry_codes[j] == eic.StatusCode.SUCCESS
             ):
                 codes[i] = eic.StatusCode.SUCCESS
+            else:
+                still_failed += 1
+        stats.record_rpc(
+            "mexist",
+            time.perf_counter() - _t0,
+            "SUCCESS" if still_failed == 0 else "PARTIAL_FAILED",
+            len(keys),
+            still_failed,
+        )
         return [c == eic.StatusCode.SUCCESS for c in codes]
 
     def allocate_eic_read_buffer(self, count):
@@ -551,6 +578,8 @@ class EICKVClient:
             ):
                 codes[i] = eic.StatusCode.SUCCESS
         recovered = sum(codes[i] == eic.StatusCode.SUCCESS for i in failed)
+        stats.incr("mget.refetch")
+        stats.incr("mget.recovered", recovered)
         logger.info(f"eic mget refetched {len(failed)} failed keys, {recovered} recovered")
         ok = all(c == eic.StatusCode.SUCCESS for c in codes)
         status = eic.StatusCode.SUCCESS if ok else eic.StatusCode.PARTIAL_FAILED
@@ -582,6 +611,7 @@ class EICKVClient:
         # Get data: recv data buffer tensor
         get_option = eic.GetOption()
         get_option.ns = self.eic_namespace
+        _mget_t0 = time.perf_counter()
         status_code, data_vals, get_outcome = self.connection.mget(
             data_keys, get_option, data_vals
         )
@@ -628,6 +658,13 @@ class EICKVClient:
             logger.warning(
                 f"eic mget {len(keys)} keys failed, fail count {fail_count}, success count {count - fail_count}"
             )
+        stats.record_rpc(
+            "mget",
+            time.perf_counter() - _mget_t0,
+            _status_name(status_code),
+            count,
+            fail_count,
+        )
         if device_copy:
             suc_count = 0
             for mask in success_mask:
@@ -729,13 +766,19 @@ class EICKVClient:
         set_option = eic.SetOption()
         set_option.ns = self.eic_namespace
         set_option.ttl_second = self.kv_set_ttl_option
+        t0 = time.perf_counter()
         status_code, set_outcome = self.connection.mset(keys_vec, vals_vec, set_option)
 
         if status_code != eic.StatusCode.SUCCESS:
             # kv set is idempotent: retry once on per-key RPC timeout.
+            stats.incr("mset.retry")
             status_code, set_outcome = self.connection.mset(
                 keys_vec, vals_vec, set_option
             )
+        failed_keys = 0 if status_code == eic.StatusCode.SUCCESS else count
+        stats.record_rpc(
+            "mset", time.perf_counter() - t0, _status_name(status_code), count, failed_keys
+        )
 
         # Write slots outlive the retry DMA; release them after.
         if registered:
@@ -758,6 +801,7 @@ class EICKVClient:
                 len(failed),
                 failed[0],
             )
+            stats.incr("mset.keys_failed", len(failed))
             return False
 
         logger.debug(f"set data key {len(keys)} success")
@@ -786,19 +830,30 @@ class EICKVClient:
         set_option = eic.SetOption()
         set_option.ns = self.eic_namespace
         set_option.ttl_second = self.kv_set_ttl_option
+        _t0 = time.perf_counter()
         status_code, set_outcome = self.connection.mset(keys_vec, vals_vec, set_option)
+        count = len(keys)
 
         if status_code != eic.StatusCode.SUCCESS:
-            logger.error(f"eic mset {len(keys)} failed, status_code {status_code}")
+            logger.error(f"eic mset {count} failed, status_code {status_code}")
+            stats.record_rpc(
+                "mset", time.perf_counter() - _t0, _status_name(status_code), count, count
+            )
             return False
-        else:
-            logger.debug(f"eic mset {len(keys)} success")
+        logger.debug(f"eic mset {count} success")
 
         failed = [
             (i, err_code)
             for i, err_code in enumerate(set_outcome.status_codes)
             if err_code != eic.StatusCode.SUCCESS
         ]
+        stats.record_rpc(
+            "mset",
+            time.perf_counter() - _t0,
+            _status_name(status_code) if not failed else "PARTIAL_FAILED",
+            count,
+            len(failed),
+        )
         if failed:
             logger.error(
                 "async set data key batch failed, total=%s failed=%s first_failed=%s",

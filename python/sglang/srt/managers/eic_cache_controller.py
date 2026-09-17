@@ -16,6 +16,7 @@ from sglang.srt.managers.cache_controller import (
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.eic_memory_pool import EICBaseTokenToKVPoolHost
+from sglang.srt.mem_cache.eic_stats import stats
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -265,6 +266,9 @@ class EICCacheController(HiCacheController):
             )
             result = temp_tensor.item()
         ret = result == 0
+        stats.incr("write.nodes")
+        if not ret:
+            stats.incr("write.fail")
         self.ack_write_queue.put((operation.node_id, ret))
 
     @staticmethod
@@ -362,6 +366,9 @@ class EICCacheController(HiCacheController):
             )
             result = temp_tensor.item()
         ret = result == 0
+        stats.incr("write.nodes")
+        if not ret:
+            stats.incr("write.fail")
         self.ack_write_queue.put((operation.node_id, ret))
 
     def load_operation_shared(self, operation: EICCacheOperation):
