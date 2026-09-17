@@ -2081,7 +2081,7 @@ class DeepseekSparseAttnBackend(
         if self.use_fused_topk:
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
-
+            logical_topk_indices = topk_indices
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         else:
             if topk_transform_method == TopkTransformMethod.RAGGED:
@@ -2246,14 +2246,15 @@ class DeepseekSparseAttnBackend(
                         pod_uid=envs.SGLANG_EAGLE_NUMERICAL_PROBE_POD_UID.get(),
                     )
                     self._prefill_flashmla_probe = probe
+                routing_inputs = {
+                    "logical_topk_indices": logical_topk_indices,
+                    "physical_topk_indices": page_table_1,
+                    "topk_length": metadata.dsa_cache_seqlens_int32,
+                }
+                if topk_indices_offset is not None:
+                    routing_inputs["topk_indices_offset"] = topk_indices_offset
                 probe.capture_gpu_hash_inputs(
-                    rids=forward_batch.rids,
-                    tensors={
-                        "logical_topk_indices": logical_topk_indices,
-                        "topk_indices_offset": topk_indices_offset,
-                        "physical_topk_indices": page_table_1,
-                        "topk_length": metadata.dsa_cache_seqlens_int32,
-                    },
+                    rids=forward_batch.rids, tensors=routing_inputs
                 )
             return self._forward_flashmla_sparse(
                 q_all=q_all,
