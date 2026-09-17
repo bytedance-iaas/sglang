@@ -26,20 +26,28 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 class TestDSAMultiStepDecode(unittest.TestCase):
     def test_recover_fused_ragged_logical_topk_preserves_sentinel(self):
-        physical = torch.tensor([[17, 24, -1], [103, -1, 109]], dtype=torch.int32)
+        physical = torch.tensor(
+            [[17, 24, -1], [103, -1, 109], [-1, -1, -1]], dtype=torch.int32
+        )
         offsets = torch.tensor([10, 100], dtype=torch.int32)
 
         logical = _recover_fused_ragged_logical_topk(physical, offsets)
 
         self.assertTrue(
             torch.equal(
-                logical, torch.tensor([[7, 14, -1], [3, -1, 9]], dtype=torch.int32)
+                logical,
+                torch.tensor(
+                    [[7, 14, -1], [3, -1, 9], [-1, -1, -1]], dtype=torch.int32
+                ),
             )
         )
         self.assertTrue(
             torch.equal(
                 physical,
-                torch.tensor([[17, 24, -1], [103, -1, 109]], dtype=torch.int32),
+                torch.tensor(
+                    [[17, 24, -1], [103, -1, 109], [-1, -1, -1]],
+                    dtype=torch.int32,
+                ),
             )
         )
 
@@ -48,7 +56,11 @@ class TestDSAMultiStepDecode(unittest.TestCase):
         cases = (
             (valid.flatten(), torch.zeros(2, dtype=torch.int32), "rank-2 indices"),
             (valid, torch.zeros((2, 1), dtype=torch.int32), "rank-1 offsets"),
-            (valid, torch.zeros(1, dtype=torch.int32), "one offset per output row"),
+            (
+                valid,
+                torch.zeros(3, dtype=torch.int32),
+                "fewer output rows than offsets",
+            ),
             (valid, torch.zeros(2, dtype=torch.int64), "int32 tensors"),
         )
         for physical, offsets, message in cases:
