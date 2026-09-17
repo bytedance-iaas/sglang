@@ -95,8 +95,12 @@ class MlaBmmFusionPlan:
 
 def _sample_prefill_attention_probe_columns(value: torch.Tensor) -> torch.Tensor:
     """Return a deterministic, bounded diagnostic view of a wide activation."""
-    if value.ndim != 2 or value.shape[1] < _PREFILL_ATTENTION_PROBE_SAMPLE_COLUMNS:
-        raise ValueError("Prefill attention probe requires a wide rank-2 activation")
+    if value.ndim != 2 or value.shape[1] <= 0:
+        raise ValueError(
+            "Prefill attention probe requires a non-empty rank-2 activation"
+        )
+    if value.shape[1] <= _PREFILL_ATTENTION_PROBE_SAMPLE_COLUMNS:
+        return value.contiguous()
     step = value.shape[1] // _PREFILL_ATTENTION_PROBE_SAMPLE_COLUMNS
     return value[:, ::step][:, :_PREFILL_ATTENTION_PROBE_SAMPLE_COLUMNS].contiguous()
 
@@ -770,6 +774,47 @@ class DeepseekMLAForwardMixin:
         gate: Optional[torch.Tensor] = None,
     ):
         save_kv_cache = True
+        if (
+            self.layer_id == 0
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and envs.SGLANG_EAGLE_PREFILL_INDEXER_STORE_PREFIX_TOKENS.get() > 0
+            and envs.SGLANG_EAGLE_PREFILL_PROBE_SCOPE.get() == "layer0-attention-input"
+        ):
+            prefill_input_probe = getattr(self, "_prefill_attention_probe", None)
+            if prefill_input_probe is None:
+                prefill_input_probe = EaglePrefillIndexerStoreProbe(
+                    envs.SGLANG_EAGLE_NUMERICAL_PROBE_RID.get(),
+                    prefix_tokens=envs.SGLANG_EAGLE_PREFILL_INDEXER_STORE_PREFIX_TOKENS.get(),
+                    page_size=64,
+                    capture_id=envs.SGLANG_EAGLE_NUMERICAL_PROBE_CAPTURE_ID.get(),
+                    pod_name=envs.SGLANG_EAGLE_NUMERICAL_PROBE_POD_NAME.get(),
+                    pod_uid=envs.SGLANG_EAGLE_NUMERICAL_PROBE_POD_UID.get(),
+                )
+                self._prefill_attention_probe = prefill_input_probe
+            if prefill_input_probe.matches(forward_batch.rids):
+                sampled_q_nope = _sample_prefill_attention_probe_columns(
+                    q_nope_out.flatten(1)
+                )
+                prefill_input_probe.capture(
+                    layer_id=1,
+                    rids=forward_batch.rids,
+                    key_raw=sampled_q_nope,
+                    positions=positions,
+                    out_cache_loc=forward_batch.out_cache_loc,
+                    key_semantics="layer_00_attention_inputs_sample256",
+                    projection_inputs={
+                        "q_nope_sample256": sampled_q_nope,
+                        "q_rope_sample256": _sample_prefill_attention_probe_columns(
+                            q_pe.flatten(1)
+                        ),
+                        "k_nope_sample256": _sample_prefill_attention_probe_columns(
+                            k_nope.flatten(1)
+                        ),
+                        "k_rope_sample256": _sample_prefill_attention_probe_columns(
+                            k_pe.flatten(1)
+                        ),
+                    },
+                )
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
