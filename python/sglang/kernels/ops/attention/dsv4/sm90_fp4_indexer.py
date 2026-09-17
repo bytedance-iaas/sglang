@@ -26,7 +26,8 @@ def _e2m1_decode(code):
     e = (code >> 1) & 3
     m = (code & 1).to(tl.float32)
     sub = m * 0.5
-    nor = (1.0 + m * 0.5) * tl.exp2((e - 1).to(tl.float32))
+    exp = tl.where(e == 1, 1.0, tl.where(e == 2, 2.0, 4.0))
+    nor = (1.0 + m * 0.5) * exp
     v = tl.where(e == 0, sub, nor)
     return tl.where((code >> 3) == 1, -v, v)
 
