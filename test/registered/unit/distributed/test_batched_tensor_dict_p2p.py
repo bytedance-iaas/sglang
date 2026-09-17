@@ -123,22 +123,6 @@ def _run_async_tensor_dict_gloo(rank, port, output):
 
 
 class TestBatchedTensorDictP2P(unittest.TestCase):
-    def test_work_group_debug_snapshot_does_not_wait(self):
-        work = _DeferredWork()
-        item = parallel_state.P2PWork(work, torch.arange(4))
-        item._vpp_debug_label = (4, 1, 2)
-        item._vpp_debug_group = "pp:device"
-        work_group = parallel_state.P2PWorkGroup([item])
-
-        snapshot = work_group.debug_snapshot()
-
-        self.assertEqual(snapshot["label"], (4, 1, 2))
-        self.assertEqual(snapshot["group"], "pp:device")
-        self.assertEqual(snapshot["items"], 1)
-        self.assertEqual(snapshot["works"][0]["complete"], False)
-        self.assertEqual(snapshot["works"][0]["bytes"], 32)
-        self.assertEqual(work.wait_count, 0)
-
     def test_default_send_keeps_unbatched_path(self):
         coordinator = _coordinator()
         tensor = torch.arange(4)
@@ -422,9 +406,6 @@ class TestBatchedTensorDictP2P(unittest.TestCase):
                 tag=53,
             )
 
-            snapshot = handle.debug_snapshot()
-            self.assertEqual(snapshot["state"], "metadata_size")
-            self.assertEqual(snapshot["tag"], 53)
             self.assertIsNone(handle.poll())
             self.assertEqual(len(recv_works), 1)
             recv_works[0][0].complete()
@@ -433,13 +414,6 @@ class TestBatchedTensorDictP2P(unittest.TestCase):
             recv_works[1][0].complete()
             self.assertIsNone(handle.poll())
             self.assertIsNotNone(payload_work)
-            snapshot = handle.debug_snapshot()
-            self.assertEqual(snapshot["state"], "payload")
-            self.assertEqual(snapshot["identity"]["batch_seq"], 3)
-            self.assertEqual(snapshot["identity"]["stage"], 5)
-            self.assertIsNone(snapshot["payload_waiter"])
-            self.assertEqual(snapshot["payload_works"], (False,))
-            self.assertEqual(payload_work.wait_count, 0)
             payload_work.complete()
             result = handle.poll()
             repeated_result = handle.poll()

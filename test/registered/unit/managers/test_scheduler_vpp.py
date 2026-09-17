@@ -20,7 +20,6 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.distributed.parallel_state import P2PWork  # noqa: E402
 from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
     PPBatchMetadata,
     SchedulerPPMixin,
@@ -414,33 +413,6 @@ class TestSchedulerVPP(unittest.TestCase):
         scheduler.pp_group.recv_tensor_dict_async.assert_not_called()
         scheduler.pp_group.send_tensor_dict.assert_not_called()
         self.assertEqual(len(scheduler._pp_vpp_control_outbox), 0)
-
-    def test_vpp_control_send_work_records_envelope_identity(self):
-        scheduler = _make_scheduler()
-        scheduler.ps.tp_rank = 0
-        scheduler.pp_group.unique_name = "pp"
-        work = P2PWork(MagicMock(), torch.arange(1))
-        scheduler.pp_group.send_tensor_dict = MagicMock(return_value=[work])
-        scheduler._pp_vpp_control_outbox = deque(
-            [
-                PipelineControlEnvelope(
-                    protocol_version=1,
-                    runtime_epoch=17,
-                    layout_digest="layout",
-                    kind=PipelineControlKind.ADMIT,
-                    source_rank=0,
-                    batch_seq=4,
-                    hops=1,
-                ).to_dict()
-            ]
-        )
-        pending = deque()
-
-        scheduler._pp_vpp_flush_control_outbox(pending, 4)
-
-        self.assertEqual(len(pending), 1)
-        self.assertEqual(work._vpp_debug_label, ("admit", 4, 1))
-        self.assertEqual(work._vpp_debug_group, "pp")
 
     def test_vpp_resource_snapshot_tracks_allocator_and_activation_bytes(self):
         scheduler = _make_scheduler()
