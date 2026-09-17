@@ -688,6 +688,21 @@ class SchedulerPPMixin:
                 tag=_VPP_CONTROL_TAG,
             )
             if work:
+                # #region debug-point H5-H6:control-send-identity
+                label = (
+                    wire.get("kind"),
+                    wire.get("batch_seq"),
+                    wire.get("hops"),
+                )
+                for item in work:
+                    if isinstance(item, P2PWork):
+                        item._vpp_debug_label = label
+                        item._vpp_debug_group = getattr(
+                            self.pp_group,
+                            "unique_name",
+                            None,
+                        )
+                # #endregion
                 pending_work.append(work)
 
     def _pp_vpp_new_control(
@@ -2017,6 +2032,41 @@ class SchedulerPPMixin:
                     else {"type": type(work_group).__name__}
                     for work_group in activation_send_work
                 )
+                control_recv = getattr(
+                    self,
+                    "_pp_vpp_pending_control_recv",
+                    None,
+                )
+                control_recv_snapshot = (
+                    control_recv.debug_snapshot()
+                    if control_recv is not None
+                    and hasattr(control_recv, "debug_snapshot")
+                    else None
+                )
+                control_send_snapshots = tuple(
+                    work_group.debug_snapshot()
+                    if isinstance(work_group, P2PWorkGroup)
+                    else {
+                        "type": type(work_group).__name__,
+                        "label": next(
+                            (
+                                getattr(item, "_vpp_debug_label")
+                                for item in work_group
+                                if hasattr(item, "_vpp_debug_label")
+                            ),
+                            None,
+                        ),
+                    }
+                    for work_group in tuple(control_send_work)[:3]
+                )
+                control_outbox_heads = tuple(
+                    (
+                        wire.get("kind"),
+                        wire.get("batch_seq"),
+                        wire.get("hops"),
+                    )
+                    for wire in tuple(self._pp_vpp_control_outbox)[:3]
+                )
                 # #endregion
                 logger.warning(
                     "[VPP-STALL] no scheduler progress for %.1fs "
@@ -2029,7 +2079,9 @@ class SchedulerPPMixin:
                     "materialized=%s replica_updates=%s "
                     "control_outbox=%s control_sends=%s activation_sends=%s "
                     "ready_proxies=%s arrivals=%s resource_ranks=%s blocked_ranks=%s "
-                    "local_resource=%s recv=%s sends=%s",
+                    "local_resource=%s recv=%s sends=%s "
+                    "control_recv=%s control_send_heads=%s "
+                    "control_outbox_heads=%s",
                     now - stall_last_progress_at,
                     tick,
                     stall_last_progress_event,
@@ -2064,6 +2116,9 @@ class SchedulerPPMixin:
                     snapshot,
                     recv_snapshot,
                     send_snapshots,
+                    control_recv_snapshot,
+                    control_send_snapshots,
+                    control_outbox_heads,
                 )
             if activation_send_work or control_send_work:
                 server_is_idle = False
@@ -2545,6 +2600,11 @@ class SchedulerPPMixin:
                 tag=tag,
             )
         )
+        # #region debug-point H5-H7:activation-group
+        for item in p2p_work:
+            if isinstance(item, P2PWork):
+                item._vpp_debug_group = getattr(pp_group, "unique_name", None)
+        # #endregion
         return p2p_work
 
     def _pp_recv_typed_dict(

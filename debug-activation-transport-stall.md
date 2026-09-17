@@ -63,3 +63,16 @@ Second minimal fix:
 - Report schedulable KV (`free + evictable`) in the VPP resource snapshot using
   the same full/SWA pool accounting as `PrefillAdder`.
 - Retain the inner `PrefillAdder` as the authoritative allocation check.
+
+Third multi-node stall at 2026-09-17 03:36:54:
+- Scheduling progresses through batch 118 before stalling.
+- All PP1 lanes receive the PP0->PP1 activation metadata size but not its
+  1114-byte metadata body.
+- All PP1 lanes retain the PP1->PP0 activation send; both CPU metadata works and
+  the GPU payload work are incomplete.
+- PP1 TP0 also has eight pending control sends and three queued controls.
+
+Pending evidence:
+- Activation and control receive group identities.
+- Control receive framing state and the first pending control send identities.
+- Matching PP0 transport state for the same stall.

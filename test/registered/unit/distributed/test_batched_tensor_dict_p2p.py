@@ -127,11 +127,13 @@ class TestBatchedTensorDictP2P(unittest.TestCase):
         work = _DeferredWork()
         item = parallel_state.P2PWork(work, torch.arange(4))
         item._vpp_debug_label = (4, 1, 2)
+        item._vpp_debug_group = "pp:device"
         work_group = parallel_state.P2PWorkGroup([item])
 
         snapshot = work_group.debug_snapshot()
 
         self.assertEqual(snapshot["label"], (4, 1, 2))
+        self.assertEqual(snapshot["group"], "pp:device")
         self.assertEqual(snapshot["items"], 1)
         self.assertEqual(snapshot["works"][0]["complete"], False)
         self.assertEqual(snapshot["works"][0]["bytes"], 32)

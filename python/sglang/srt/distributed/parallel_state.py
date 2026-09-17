@@ -219,6 +219,14 @@ class P2PWorkGroup:
                 ),
                 None,
             ),
+            "group": next(
+                (
+                    getattr(item, "_vpp_debug_group")
+                    for item in self.items
+                    if hasattr(item, "_vpp_debug_group")
+                ),
+                None,
+            ),
             "items": len(self.items),
             "cpu_waiter": (
                 None if self._cpu_waiter is None else self._cpu_waiter.completed()
@@ -578,6 +586,7 @@ class TensorDictRecvHandle:
             }
         return {
             "state": self._state,
+            "group": getattr(self._coordinator, "unique_name", None),
             "src": self._src,
             "tag": self._tag,
             "buffered_bytes": self.buffered_tensor_bytes(),
