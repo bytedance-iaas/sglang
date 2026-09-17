@@ -20,7 +20,6 @@ limitations under the License.
 #pragma once
 
 #include <cute/tensor.hpp>
-#include <cutlass/arch/barrier.h>
 #include <cutlass/bfloat16.h>
 #include <cutlass/float8.h>
 
@@ -198,14 +197,17 @@ struct Sm90Fp4GroupedIndexerKernel {
     float* out = reinterpret_cast<float*>(p.out);
     TiledMMA mma;
 
-    for (int row_in_group = warpgroup; row_in_group < group_rows; row_in_group += NUM_WARPGROUPS) {
+    const int rounds = ceil_div(group_rows, NUM_WARPGROUPS);
+    for (int round = 0; round < rounds; ++round) {
+      const int row_in_group = round * NUM_WARPGROUPS + warpgroup;
+      const bool active = row_in_group < group_rows;
       const int b = b0 + row_in_group;
       Tensor total = partition_fragment_C(mma, Shape<Int<HEADS>, Int<BLOCK_L>>{});
       cute::fill(total, 0.0f);
 
       CUTE_UNROLL
       for (int g = 0; g < SCALE_GROUPS; ++g) {
-        if (wg_tid < HEADS) {
+        if (active && wg_tid < HEADS) {
           float amax = 0.0f;
           const bf16* q_head = q + static_cast<int64_t>(b) * p.q_stride_b +
                                static_cast<int64_t>(wg_tid) * p.q_stride_h + g * SCALE_GROUP_SIZE;
@@ -215,38 +217,62 @@ struct Sm90Fp4GroupedIndexerKernel {
           }
           ss.q_scales[warpgroup][wg_tid] = fp4_query_scale(amax);
         }
-        cutlass::arch::NamedBarrier::arrive_and_wait(128, warpgroup);
+        __syncthreads();
 
-        for (int pair = wg_tid; pair < HEADS * (SCALE_GROUP_SIZE / 2); pair += 128) {
-          const int head = pair / (SCALE_GROUP_SIZE / 2);
-          const int d = (pair % (SCALE_GROUP_SIZE / 2)) * 2;
-          const bf16* src = q + static_cast<int64_t>(b) * p.q_stride_b +
-                            static_cast<int64_t>(head) * p.q_stride_h + g * SCALE_GROUP_SIZE + d;
-          const float inv_scale = 1.0f / ss.q_scales[warpgroup][head];
-          const uint16_t packed = f32x2_to_e4m3x2(
-              static_cast<float>(src[0]) * inv_scale, static_cast<float>(src[1]) * inv_scale);
-          fp8 v0, v1;
-          *reinterpret_cast<uint8_t*>(&v0) = packed & 0xff;
-          *reinterpret_cast<uint8_t*>(&v1) = packed >> 8;
-          sQ(head, d) = v0;
-          sQ(head, d + 1) = v1;
+        if (active) {
+          for (int pair = wg_tid; pair < HEADS * (SCALE_GROUP_SIZE / 2); pair += 128) {
+            const int head = pair / (SCALE_GROUP_SIZE / 2);
+            const int d = (pair % (SCALE_GROUP_SIZE / 2)) * 2;
+            const bf16* src = q + static_cast<int64_t>(b) * p.q_stride_b +
+                              static_cast<int64_t>(head) * p.q_stride_h + g * SCALE_GROUP_SIZE + d;
+            const float inv_scale = 1.0f / ss.q_scales[warpgroup][head];
+            const uint16_t packed = f32x2_to_e4m3x2(
+                static_cast<float>(src[0]) * inv_scale, static_cast<float>(src[1]) * inv_scale);
+            fp8 v0, v1;
+            *reinterpret_cast<uint8_t*>(&v0) = packed & 0xff;
+            *reinterpret_cast<uint8_t*>(&v1) = packed >> 8;
+            sQ(head, d) = v0;
+            sQ(head, d + 1) = v1;
+          }
         }
-        cutlass::arch::NamedBarrier::arrive_and_wait(128, warpgroup);
+        __syncthreads();
 
         Tensor part = partition_fragment_C(mma, Shape<Int<HEADS>, Int<BLOCK_L>>{});
-        if (g == 0) {
-          gemm_one_k32(mma, sQ, sK0, part, wg_tid);
-        } else if (g == 1) {
-          gemm_one_k32(mma, sQ, sK1, part, wg_tid);
-        } else if (g == 2) {
-          gemm_one_k32(mma, sQ, sK2, part, wg_tid);
-        } else {
-          gemm_one_k32(mma, sQ, sK3, part, wg_tid);
+        if (active) {
+          if (g == 0) {
+            gemm_one_k32(mma, sQ, sK0, part, wg_tid);
+          } else if (g == 1) {
+            gemm_one_k32(mma, sQ, sK1, part, wg_tid);
+          } else if (g == 2) {
+            gemm_one_k32(mma, sQ, sK2, part, wg_tid);
+          } else {
+            gemm_one_k32(mma, sQ, sK3, part, wg_tid);
+          }
+          warpgroup_commit_batch();
+          warpgroup_wait<0>();
+          warpgroup_fence_operand(part);
         }
-        warpgroup_commit_batch();
-        warpgroup_wait<0>();
-        warpgroup_fence_operand(part);
 
+        if (active) {
+          CUTE_UNROLL
+          for (int rp = 0; rp < 2; ++rp) {
+            const int head = (wg_tid / 32) * 16 + (wg_tid % 32) / 4 + 8 * rp;
+            CUTE_UNROLL
+            for (int j = 0; j < BLOCK_L / 8; ++j) {
+              CUTE_UNROLL
+              for (int cp = 0; cp < 2; ++cp) {
+                const int col = (wg_tid % 4) * 2 + 8 * j + cp;
+                const int i = j * 4 + rp * 2 + cp;
+                total(i) +=
+                    part(i) * ss.q_scales[warpgroup][head] * ss.k_scales[g][col];
+              }
+            }
+          }
+        }
+        __syncthreads();
+      }
+
+      if (active) {
         CUTE_UNROLL
         for (int rp = 0; rp < 2; ++rp) {
           const int head = (wg_tid / 32) * 16 + (wg_tid % 32) / 4 + 8 * rp;
@@ -256,30 +282,14 @@ struct Sm90Fp4GroupedIndexerKernel {
             for (int cp = 0; cp < 2; ++cp) {
               const int col = (wg_tid % 4) * 2 + 8 * j + cp;
               const int i = j * 4 + rp * 2 + cp;
-              total(i) +=
-                  part(i) * ss.q_scales[warpgroup][head] * ss.k_scales[g][col];
+              ss.scores[warpgroup][head * BLOCK_L + col] = bf16(total(i));
             }
           }
         }
-        cutlass::arch::NamedBarrier::arrive_and_wait(128, warpgroup);
       }
+      __syncthreads();
 
-      CUTE_UNROLL
-      for (int rp = 0; rp < 2; ++rp) {
-        const int head = (wg_tid / 32) * 16 + (wg_tid % 32) / 4 + 8 * rp;
-        CUTE_UNROLL
-        for (int j = 0; j < BLOCK_L / 8; ++j) {
-          CUTE_UNROLL
-          for (int cp = 0; cp < 2; ++cp) {
-            const int col = (wg_tid % 4) * 2 + 8 * j + cp;
-            const int i = j * 4 + rp * 2 + cp;
-            ss.scores[warpgroup][head * BLOCK_L + col] = bf16(total(i));
-          }
-        }
-      }
-      cutlass::arch::NamedBarrier::arrive_and_wait(128, warpgroup);
-
-      if (wg_tid < BLOCK_L) {
+      if (active && wg_tid < BLOCK_L) {
         float sum = 0.0f;
         CUTE_UNROLL
         for (int head = 0; head < HEADS; ++head) {
@@ -295,7 +305,7 @@ struct Sm90Fp4GroupedIndexerKernel {
               valid ? static_cast<float>(bf16(sum)) : -INFINITY;
         }
       }
-      cutlass::arch::NamedBarrier::arrive_and_wait(128, warpgroup);
+      __syncthreads();
     }
 #else
     if (cute::thread0()) {
