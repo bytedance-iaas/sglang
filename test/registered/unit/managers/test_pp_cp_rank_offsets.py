@@ -1,24 +1,17 @@
-import inspect
 import unittest
-from collections import defaultdict, deque
-from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock, call, patch
+from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.distributed.bootstrap import _prewarm_nccl  # noqa: E402
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState  # noqa: E402
 from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa: E402
     SchedulerRequestReceiver,
 )
-from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
-    SchedulerPPMixin,
-    _pp_attention_dp_control_ranks,
-)
+from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -136,10 +129,8 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
             ),
             patch(
                 "sglang.srt.managers.scheduler_components.request_receiver."
-                "get_exec",
-                return_value=SimpleNamespace(
-                    moe=SimpleNamespace(is_ep_scale_joiner=False)
-                ),
+                "is_ep_scale_joiner",
+                return_value=False,
             ),
             patch(
                 "sglang.srt.managers.scheduler_components.request_receiver."
@@ -164,168 +155,6 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
 
 
 class TestPPCPRankOffsets(unittest.TestCase):
-    def test_nccl_prewarm_initializes_proxy_and_output_pp_channels(self):
-        tp_handle = object()
-        proxy_handle = object()
-        output_handle = object()
-        proxy_group = SimpleNamespace(
-            device_group=proxy_handle, ranks=[0, 8], rank_in_group=0
-        )
-        output_group = SimpleNamespace(
-            device_group=output_handle, ranks=[0, 8], rank_in_group=0
-        )
-        warmup_tensor = object()
-        recv_tensor = object()
-        send_work = Mock()
-        recv_work = Mock()
-
-        with (
-            patch(
-                "sglang.srt.distributed.bootstrap.get_tp_group",
-                return_value=SimpleNamespace(device_group=tp_handle),
-            ),
-            patch(
-                "sglang.srt.distributed.bootstrap.get_pp_group",
-                return_value=proxy_group,
-            ),
-            patch(
-                "sglang.srt.distributed.bootstrap.get_pp_output_group",
-                return_value=output_group,
-            ),
-            patch(
-                "sglang.srt.distributed.bootstrap.torch.zeros",
-                return_value=warmup_tensor,
-            ),
-            patch(
-                "sglang.srt.distributed.bootstrap.torch.empty_like",
-                return_value=recv_tensor,
-            ),
-            patch(
-                "sglang.srt.distributed.bootstrap.torch.cuda.current_device",
-                return_value=0,
-            ),
-            patch("sglang.srt.distributed.bootstrap.dist.all_reduce") as all_reduce,
-            patch(
-                "sglang.srt.distributed.bootstrap.dist.isend",
-                return_value=send_work,
-            ) as isend,
-            patch(
-                "sglang.srt.distributed.bootstrap.dist.irecv",
-                return_value=recv_work,
-            ) as irecv,
-            patch("sglang.srt.distributed.bootstrap.dist.barrier") as barrier,
-            patch("sglang.srt.distributed.bootstrap.current_platform.synchronize"),
-        ):
-            _prewarm_nccl(tp_size=8, pp_size=2, moe_ep_size=8)
-
-        self.assertEqual(
-            all_reduce.call_args_list,
-            [
-                call(warmup_tensor, group=tp_handle),
-                call(warmup_tensor, group=proxy_handle),
-                call(warmup_tensor, group=output_handle),
-            ],
-        )
-        self.assertEqual(
-            isend.call_args_list,
-            [
-                call(warmup_tensor, dst=8, group=proxy_handle),
-                call(warmup_tensor, dst=8, group=output_handle),
-            ],
-        )
-        self.assertEqual(
-            irecv.call_args_list,
-            [
-                call(recv_tensor, src=8, group=proxy_handle),
-                call(recv_tensor, src=8, group=output_handle),
-            ],
-        )
-        self.assertEqual(send_work.wait.call_count, 2)
-        self.assertEqual(recv_work.wait.call_count, 2)
-        self.assertEqual(
-            barrier.call_args_list,
-            [
-                call(group=proxy_handle),
-                call(group=proxy_handle),
-                call(group=output_handle),
-                call(group=output_handle),
-            ],
-        )
-
-    def test_pp_proxy_and_output_use_independent_tensor_channels(self):
-        proxy_group = SimpleNamespace(
-            send_tensor_dict=Mock(return_value=[]),
-            recv_tensor_dict=Mock(return_value={"__msg_type__": "proxy"}),
-        )
-        output_group = SimpleNamespace(
-            send_tensor_dict=Mock(return_value=[]),
-            recv_tensor_dict=Mock(return_value={"__msg_type__": "output"}),
-        )
-        all_gather_group = object()
-        scheduler = SimpleNamespace(
-            pp_group=proxy_group,
-            pp_output_group=output_group,
-            _pp_tensor_dict_inbox=defaultdict(deque),
-            require_attn_tp_allgather=False,
-            attn_tp_group=all_gather_group,
-        )
-        proxy_tensors = {"hidden_states": object()}
-        output_tensors = {"next_token_ids": object()}
-
-        SchedulerPPMixin._pp_send_dict_to_next_stage(
-            scheduler, proxy_tensors, async_send=True, msg_type="proxy"
-        )
-        SchedulerPPMixin._pp_send_dict_to_next_stage(
-            scheduler, output_tensors, async_send=True, msg_type="output"
-        )
-        SchedulerPPMixin._pp_recv_typed_dict(
-            scheduler, expected_kind="proxy", all_gather_group=all_gather_group
-        )
-        SchedulerPPMixin._pp_recv_typed_dict(
-            scheduler, expected_kind="output", all_gather_group=all_gather_group
-        )
-
-        proxy_group.send_tensor_dict.assert_called_once_with(
-            tensor_dict=proxy_tensors, all_gather_group=None, async_send=True
-        )
-        output_group.send_tensor_dict.assert_called_once_with(
-            tensor_dict=output_tensors, all_gather_group=None, async_send=True
-        )
-        proxy_group.recv_tensor_dict.assert_called_once_with(
-            all_gather_group=all_gather_group
-        )
-        output_group.recv_tensor_dict.assert_called_once_with(
-            all_gather_group=all_gather_group
-        )
-
-    def test_pp_attention_dp_control_ranks_are_stage_local(self):
-        ps = _make_ps()
-        shifted_tp_ranks = list(range(24, 32))
-        dp1_ranks = _pp_attention_dp_control_ranks(ps, shifted_tp_ranks)
-        self.assertEqual(dp1_ranks, [28, 29, 30, 31])
-        dp0_ranks = _pp_attention_dp_control_ranks(
-            _make_ps(attn_dp_rank=0), shifted_tp_ranks
-        )
-        self.assertEqual(dp0_ranks, [24, 25, 26, 27])
-        self.assertEqual(set(dp0_ranks).intersection(dp1_ranks), set())
-
-    def test_prefill_keeps_delayed_output_and_legacy_consensus_order(self):
-        source = inspect.getsource(SchedulerPPMixin.event_loop_pp_disagg_prefill)
-        self.assertNotIn("relay_output_immediately=True", source)
-        self.assertNotIn("_pp_run_control_ring_phase", source)
-        self.assertIn("_pp_pd_send_consensus_bootstrapped_ids", source)
-        self.assertIn("_pp_pd_send_consensus_release_ids", source)
-
-    def test_decode_keeps_delayed_slots_and_isolates_consensus_channel(self):
-        source = inspect.getsource(SchedulerPPMixin.event_loop_pp_disagg_decode)
-        self.assertNotIn("relay_output_immediately=True", source)
-        self.assertNotIn("_pp_run_control_ring_phase", source)
-        # Three consensus phases each route both send and receive through the
-        # dedicated control communicator.
-        self.assertEqual(source.count("group=self.pp_disagg_control_group"), 6)
-        self.assertIn("self._pp_pd_send_consensus_bootstrapped_ids", source)
-        self.assertIn("self._pp_pd_send_consensus_release_ids", source)
-
     def test_request_receiver_uses_cp_size_for_pp_recv_rank(self):
         ps = _make_ps()
         calls = []
@@ -349,20 +178,14 @@ class TestPPCPRankOffsets(unittest.TestCase):
         scheduler = SchedulerPPMixin()
         scheduler.ps = ps
         scheduler.world_group = _fake_group()
-        scheduler.tp_group = SimpleNamespace(ranks=list(range(8, 16)))
-        control_group = object()
-        local_control_group = object()
-        scheduler.pp_disagg_control_group = control_group
-        scheduler.pp_disagg_local_control_group = local_control_group
         scheduler.attn_tp_group = _fake_group()
         scheduler.attn_tp_cpu_group = _fake_group()
         scheduler.attn_cp_group = _fake_group()
         scheduler.attn_cp_cpu_group = _fake_group()
         calls = []
-        broadcasts = []
 
         def fake_point_to_point_pyobj(data, rank, group, src, dst, **kwargs):
-            calls.append((rank, group, src, dst, kwargs.get("async_send", False)))
+            calls.append((rank, src, dst, kwargs.get("async_send", False)))
             return ["work"]
 
         with (
@@ -371,11 +194,8 @@ class TestPPCPRankOffsets(unittest.TestCase):
                 side_effect=fake_point_to_point_pyobj,
             ),
             patch(
-                "sglang.srt.managers.scheduler_pp_mixin.broadcast_pyobj",
-                side_effect=lambda data, rank, group, **kwargs: broadcasts.append(
-                    (rank, group, kwargs.get("src"))
-                )
-                or data,
+                "sglang.srt.managers.scheduler_pp_mixin.attn_cp_tp_broadcast_pyobj",
+                side_effect=lambda data: data,
             ),
         ):
             self.assertEqual(
@@ -383,45 +203,14 @@ class TestPPCPRankOffsets(unittest.TestCase):
                 ["work"],
             )
             self.assertEqual(scheduler._pp_recv_pyobj_from_prev_stage(), ["work"])
-            self.assertEqual(
-                scheduler._pp_send_pyobj_to_next_stage(
-                    ["control"], async_send=True, group=control_group
-                ),
-                ["work"],
-            )
-            self.assertEqual(
-                scheduler._pp_recv_pyobj_from_prev_stage(group=control_group),
-                ["work"],
-            )
-            with (
-                patch(
-                    "sglang.srt.managers.scheduler_pp_mixin."
-                    "_pp_attention_dp_control_ranks",
-                    return_value=[12, 13, 14, 15],
-                ),
-                patch(
-                    "sglang.srt.managers.scheduler_pp_mixin.torch.distributed.get_rank",
-                    return_value=12,
-                ),
-            ):
-                self.assertEqual(
-                    scheduler._pp_recv_pyobj_from_prev_stage(
-                        group=control_group, local_group=local_control_group
-                    ),
-                    ["work"],
-                )
 
         self.assertEqual(
             calls,
             [
-                (12, scheduler.world_group.cpu_group, 12, 4, True),
-                (12, scheduler.world_group.cpu_group, 4, 12, False),
-                (12, control_group, 12, 4, True),
-                (12, control_group, 4, 12, False),
-                (12, control_group, 4, 12, False),
+                (12, 12, 4, True),
+                (12, 4, 12, False),
             ],
         )
-        self.assertIn((12, local_control_group, 12), broadcasts)
 
 
 if __name__ == "__main__":
