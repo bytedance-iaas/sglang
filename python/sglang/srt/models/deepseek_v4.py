@@ -4135,7 +4135,8 @@ class DeepseekV4Model(nn.Module):
                 self.engram_embed_prefetch_stream = torch.cuda.Stream()
                 logger.info(
                     "Engram layers %s embedding prefetch enabled for eager/CUDA "
-                    "Graph decode and eager extend (total buffer budget %d bytes); "
+                    "Graph decode/target-verify and eager extend "
+                    "(total buffer budget %d bytes); "
                     "WKV stays on the main stream; prefill graphs use sync lookup",
                     list(self.engram_embed_prefetch_events),
                     self.engram_embed_prefetch_max_bytes,
@@ -4274,17 +4275,25 @@ class DeepseekV4Model(nn.Module):
             self.engram_embed_prefetch_stream is not None
             and hash_ids is not None
             and hash_ids.shape[0] > 0
+            # Fork and both joins must stay in one full graph. TARGET_VERIFY
+            # uses the decode graph runner too; is_extend() is broader than
+            # ordinary prefill and must not select its eager-only policy.
+            and not is_in_breakable_cuda_graph()
+            and not is_in_tc_piecewise_cuda_graph()
+            and not torch.compiler.is_compiling()
             and (
                 forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
                 or (
                     forward_batch.forward_mode
                     in (ForwardMode.EXTEND, ForwardMode.MIXED)
                     and not get_is_capture_mode()
-                    and not is_in_tc_piecewise_cuda_graph()
-                    and not torch.compiler.is_compiling()
                 )
             )
         ):
+            # Reuse this forward's hash IDs. In verify the hasher only reads
+            # history; DSPARK commits anchor + accepted drafts after sampling.
+            # Include graph-padded rows in the budget, never cache across steps.
             remaining_bytes = self.engram_embed_prefetch_max_bytes
             prefetch_ids_by_layer = {}
             # Keep L14's longer overlap window when both buffers do not fit.

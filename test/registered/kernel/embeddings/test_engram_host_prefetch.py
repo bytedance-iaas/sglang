@@ -317,9 +317,54 @@ class TestEngramHostPrefetch(CustomTestCase):
                     expected = _reference(weight, scale, expected_hashes[rows, 1])
                     torch.testing.assert_close(values.cpu(), expected, rtol=0, atol=0)
 
-    def test_model_layer_loop_graph_and_extend_match_sync(self):
+    def _model(self, embed1, embed14):
         import sglang.srt.models.deepseek_v4 as model_module
         from sglang.srt.layers.engram import Engram
+
+        # Exercise the production model loop, hash, lookup, WKV dispatch,
+        # gate and image mask. Only attention/FFN blocks are replaced.
+        engrams = {}
+        for index, (layer_id, embed) in enumerate(((1, embed1), (14, embed14))):
+            engram = Engram.__new__(Engram)
+            torch.nn.Module.__init__(engram)
+            engram.embed, engram.wkv = embed, _TestProjection()
+            engram.layer_hash_index = index
+            engram.eps, engram.clamp_value = 1e-6, 1e-6
+            engram.q_weight = engram.k_weight = torch.ones((2, 32), device="cuda")
+            engrams[layer_id] = engram
+        model = model_module.DeepseekV4Model.__new__(model_module.DeepseekV4Model)
+        torch.nn.Module.__init__(model)
+        model.config = SimpleNamespace(
+            model_type="deepseek_v41", vision_n_layers=2, image_token_id=7
+        )
+        model.pp_group = SimpleNamespace(world_size=1)
+        model.start_layer, model.end_layer = 0, 15
+        model.layers = [
+            SimpleNamespace(
+                engram=engrams.get(i),
+                forward_hc_pre_from_prev=lambda **kw: (
+                    kw["hidden_states"] + 0.125,
+                    None,
+                ),
+            )
+            for i in range(15)
+        ]
+        model.engram_hasher = self._hasher("cuda")
+        model.engram_hasher.image_token_id = 7
+        model.engram_embed_prefetch_stream = torch.cuda.Stream()
+        model.engram_embed_prefetch_events = {i: torch.cuda.Event() for i in (1, 14)}
+        model.engram_embed_prefetch_max_bytes = 128 * 1024 * 1024
+        model.late_layer_start = None
+        return model
+
+    @staticmethod
+    def _model_forward(model, ids, hidden, batch):
+        return model._forward_layers_hc_pre_from_prev(
+            batch.positions, hidden, batch, ids, ids, False, []
+        )[0]
+
+    def test_model_layer_loop_graph_and_extend_match_sync(self):
+        import sglang.srt.models.deepseek_v4 as model_module
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
         from sglang.srt.model_executor.runner_utils.capture_mode import (
             model_capture_mode,
@@ -329,42 +374,8 @@ class TestEngramHostPrefetch(CustomTestCase):
             self._embedding(layer_id=1, seed=1) as (embed1, _, _),
             self._embedding() as (embed14, _, _),
         ):
-            # Exercise the production model loop, hash, lookup, WKV dispatch,
-            # gate and image mask. Only attention/FFN blocks are replaced.
-            engrams = {}
-            for index, (layer_id, embed) in enumerate(((1, embed1), (14, embed14))):
-                engram = Engram.__new__(Engram)
-                torch.nn.Module.__init__(engram)
-                engram.embed, engram.wkv = embed, _TestProjection()
-                engram.layer_hash_index = index
-                engram.eps, engram.clamp_value = 1e-6, 1e-6
-                engram.q_weight = engram.k_weight = torch.ones((2, 32), device="cuda")
-                engrams[layer_id] = engram
-            model = model_module.DeepseekV4Model.__new__(model_module.DeepseekV4Model)
-            torch.nn.Module.__init__(model)
-            model.config = SimpleNamespace(
-                model_type="deepseek_v41", vision_n_layers=2, image_token_id=7
-            )
-            model.pp_group = SimpleNamespace(world_size=1)
-            model.start_layer, model.end_layer = 0, 15
-            model.layers = [
-                SimpleNamespace(
-                    engram=engrams.get(i),
-                    forward_hc_pre_from_prev=lambda **kw: (
-                        kw["hidden_states"] + 0.125,
-                        None,
-                    ),
-                )
-                for i in range(15)
-            ]
-            model.engram_hasher = self._hasher("cuda")
-            model.engram_hasher.image_token_id = 7
-            model.engram_embed_prefetch_stream = stream = torch.cuda.Stream()
-            model.engram_embed_prefetch_events = {
-                i: torch.cuda.Event() for i in (1, 14)
-            }
-            model.engram_embed_prefetch_max_bytes = 128 * 1024 * 1024
-            model.late_layer_start = None
+            model = self._model(embed1, embed14)
+            stream = model.engram_embed_prefetch_stream
             tokens = 7
             ids = torch.arange(tokens, device="cuda", dtype=torch.int64)
             hidden = torch.randn((tokens, 2, 32), device="cuda", dtype=torch.bfloat16)
@@ -376,15 +387,7 @@ class TestEngramHostPrefetch(CustomTestCase):
             )
 
             def forward():
-                return model._forward_layers_hc_pre_from_prev(
-                    batch.positions,
-                    hidden,
-                    batch,
-                    ids,
-                    ids,
-                    False,
-                    [],
-                )[0]
+                return self._model_forward(model, ids, hidden, batch)
 
             with (
                 patch.object(model_module, "is_cp_active", return_value=False),
@@ -436,6 +439,130 @@ class TestEngramHostPrefetch(CustomTestCase):
                 model.engram_embed_prefetch_stream = None
                 actual = forward()
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_target_verify_graph_and_eager_with_accept_reject_history(self):
+        import sglang.srt.models.deepseek_v4 as model_module
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            model_capture_mode,
+        )
+
+        with (
+            self._embedding(layer_id=1, seed=1) as (embed1, _, _),
+            self._embedding() as (embed14, _, _),
+            patch.object(model_module, "is_cp_active", return_value=False),
+            patch.object(model_module, "check_cuda_graph_backend", return_value=True),
+            patch.object(
+                model_module,
+                "get_platform",
+                return_value=SimpleNamespace(is_blackwell=False),
+            ),
+        ):
+            model = self._model(embed1, embed14)
+            hasher, oracle = model.engram_hasher, self._hasher("cpu")
+            oracle.image_token_id = 7
+            stream = model.engram_embed_prefetch_stream
+            capture_stream, pool = torch.cuda.Stream(), torch.cuda.graph_pool_handle()
+            buckets = {}
+            capture_history = hasher.history.clone()
+            width = 6  # DSPARK gamma=5: anchor + five proposed tokens.
+            for bs in (32, 7, 1):
+                tokens = bs * width
+                ids = torch.zeros(tokens, dtype=torch.int64, device="cuda")
+                hidden = torch.randn(
+                    (tokens, 2, 32), device="cuda", dtype=torch.bfloat16
+                )
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.TARGET_VERIFY,
+                    req_pool_indices=torch.arange(bs, device="cuda"),
+                    positions=torch.arange(width, device="cuda").repeat(bs) + 4,
+                    out_cache_loc=torch.ones_like(ids),
+                    spec_info=SimpleNamespace(draft_token_num=width),
+                )
+                capture_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(capture_stream):
+                    for _ in range(3):
+                        self._model_forward(model, ids, hidden, batch)
+                torch.cuda.current_stream().wait_stream(capture_stream)
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with (
+                    patch.object(embed1, "prefetch", wraps=embed1.prefetch) as p1,
+                    patch.object(embed14, "prefetch", wraps=embed14.prefetch) as p14,
+                    model_capture_mode(),
+                    torch.cuda.graph(graph, pool=pool, stream=capture_stream),
+                ):
+                    result = self._model_forward(model, ids, hidden, batch)
+                # Output equality alone would also pass with sync lookup.
+                p1.assert_called_once()
+                p14.assert_called_once()
+                buckets[bs] = graph, ids, hidden, batch, result
+                torch.testing.assert_close(
+                    hasher.history, capture_history, rtol=0, atol=0
+                )
+
+            oracle.history.copy_(torch.arange(123).reshape(41, 3) % 64)
+            hasher.history.copy_(oracle.history)
+            # Sequential history, changing inputs/slots, alternating shared-pool
+            # buckets, unequal local batches and entirely padded replays.
+            for step, bs in enumerate((1, 32, 7, 1, 7, 32) * 3):
+                graph, ids, hidden, batch, result = buckets[bs]
+                live = 0 if step % 6 == 0 else max(1, bs - step % 3)
+                cpu_ids = ((torch.arange(bs * width) + step * 7) % 64).view(bs, width)
+                cpu_ids[0, 0] = 7  # Preserve the vision-token mask too.
+                slots = (torch.arange(bs) + step) % 40
+                slots[live:] = slots[0]  # Padding aliases a live history slot.
+                positions = (torch.arange(width) + step % 5).repeat(bs)
+                locations = (torch.arange(bs) < live).repeat_interleave(width).long()
+                ids.copy_(cpu_ids.flatten())
+                batch.req_pool_indices.copy_(slots)
+                batch.positions.copy_(positions)
+                batch.out_cache_loc.copy_(locations)
+                hidden.fill_(step / 8)
+                before = oracle.history.clone()
+                cpu_batch = SimpleNamespace(
+                    forward_mode=ForwardMode.TARGET_VERIFY,
+                    req_pool_indices=slots,
+                    positions=positions,
+                    spec_info=batch.spec_info,
+                )
+                cpu_hashes = oracle(cpu_ids.flatten(), cpu_batch)
+                torch.testing.assert_close(
+                    hasher(ids, batch).cpu(), cpu_hashes, rtol=0, atol=0
+                )
+                model.engram_embed_prefetch_stream = None
+                expected = self._model_forward(model, ids, hidden, batch)
+                model.engram_embed_prefetch_stream = stream
+                eager = self._model_forward(model, ids, hidden, batch)
+                graph.replay()
+                torch.testing.assert_close(eager, expected, rtol=0, atol=0)
+                torch.testing.assert_close(result, expected, rtol=0, atol=0)
+                # No forward (including warmup/capture) commits speculative IDs.
+                torch.testing.assert_close(hasher.history.cpu(), before, rtol=0, atol=0)
+                torch.testing.assert_close(oracle.history, before, rtol=0, atol=0)
+
+                # 1 commits only the anchor (all drafts rejected); width commits
+                # all drafts. Only live requests are passed, like DSPARK's worker.
+                commit_lens = (torch.arange(live) + step) % width + 1
+                committed = before.clone()
+                for row in range(live):
+                    accepted = cpu_ids[row, : commit_lens[row]].to(torch.int32)
+                    committed[slots[row]] = torch.cat((before[slots[row]], accepted))[
+                        -3:
+                    ]
+                if live:
+                    hasher.commit_after_verify(
+                        ids.view(bs, width)[:live],
+                        batch.req_pool_indices[:live],
+                        commit_lens.cuda(),
+                    )
+                    oracle.commit_after_verify(
+                        cpu_ids[:live], slots[:live], commit_lens
+                    )
+                torch.testing.assert_close(
+                    hasher.history.cpu(), committed, rtol=0, atol=0
+                )
+                torch.testing.assert_close(oracle.history, committed, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

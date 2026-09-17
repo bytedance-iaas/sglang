@@ -1516,6 +1516,7 @@ class Envs:
     # Overlap layers 1/14's shared-host embedding lookups with earlier layers. The
     # WKV projection stays on the main stream so this path works on Hopper and
     # with DP attention without introducing a side-stream collective or GEMM.
+    # Eager/full-graph decode and target-verify; eager EXTEND/MIXED only.
     SGLANG_ENABLE_DSV41_ENGRAM_EMBED_PREFETCH = EnvBool(False)
     # Bound all early-live BF16 embedding buffers per rank/forward (128 MiB).
     # Reserve L14 first; layers exceeding the budget use sync lookup. 0 disables.

@@ -151,6 +151,8 @@ class TestDeepseekV4EngramPrefetch(CustomTestCase):
         mode=ForwardMode.DECODE,
         capture=False,
         piecewise=False,
+        breakable=False,
+        compiling=False,
         tail=None,
         cp=False,
         dp_size=1,
@@ -188,11 +190,19 @@ class TestDeepseekV4EngramPrefetch(CustomTestCase):
                 return_value=SimpleNamespace(is_none=lambda: True),
             ),
             patch.object(deepseek_v4, "get_attn_backend", return_value=backend),
-            patch.object(deepseek_v4, "is_in_breakable_cuda_graph", return_value=False),
+            patch.object(
+                deepseek_v4, "is_in_breakable_cuda_graph", return_value=breakable
+            ),
             patch.object(
                 deepseek_v4, "is_in_tc_piecewise_cuda_graph", return_value=piecewise
             ),
             patch.object(deepseek_v4, "get_is_capture_mode", return_value=capture),
+            patch.object(torch.compiler, "is_compiling", return_value=compiling),
+            patch.object(
+                deepseek_v4,
+                "bcg_deepseek_v4_engram_hash_ids",
+                side_effect=lambda hasher, ids: hasher(ids, batch),
+            ),
             patch.object(deepseek_v4, "check_cuda_graph_backend", return_value=True),
             patch.object(torch.cuda, "current_stream", return_value=main_stream),
             patch.object(
@@ -299,12 +309,43 @@ class TestDeepseekV4EngramPrefetch(CustomTestCase):
                     model.layers[layer_id].engram.embed.prefetch.assert_called_once()
                     self.assertEqual(model.layers[layer_id].engram.sync_calls, 0)
 
-    def test_prefill_graph_speculative_and_empty_batches_keep_sync_path(self):
+    def test_target_verify_eager_and_capture_keep_all_local_rows(self):
+        # gamma=5: each rank-local request verifies anchor + five drafts.
+        for capture in (False, True):
+            for requests in (1, 3, 8):
+                with self.subTest(capture=capture, requests=requests):
+                    ids = (torch.arange(requests * 6) + requests) % 16
+                    model = self._make_model()
+                    sync = self._make_model(enabled=False)
+                    # Bounded prefill must not trim a verify window.
+                    model.late_layer_start = sync.late_layer_start = 10
+                    kwargs = dict(mode=ForwardMode.TARGET_VERIFY, capture=capture)
+                    _, actual, stream = self._forward(model, ids, **kwargs)
+                    _, expected, _ = self._forward(sync, ids, **kwargs)
+                    torch.testing.assert_close(actual, expected)
+                    model.engram_hasher.assert_called_once()
+                    model._check_late_layer_tail_readers.assert_not_called()
+                    self.assertEqual(
+                        stream.wait_event.call_args_list,
+                        [call(model.engram_embed_prefetch_events[i]) for i in (1, 14)],
+                    )
+                    for layer_id, divisor in ((1, 3), (14, 5)):
+                        engram = model.layers[layer_id].engram
+                        self.assertEqual(engram.sync_calls, 0)
+                        engram.embed.prefetch.assert_called_once()
+                        torch.testing.assert_close(
+                            engram.embed.prefetch.call_args.args[0],
+                            (ids % divisor)[:, None],
+                        )
+
+    def test_prefill_graph_unsupported_and_empty_batches_keep_sync_path(self):
         for mode, capture, token_ids in (
             (ForwardMode.EXTEND, True, [1, 7, 2]),
-            (ForwardMode.TARGET_VERIFY, False, [1, 7, 2]),
+            (ForwardMode.DRAFT_EXTEND_V2, False, [1, 7, 2]),
+            (ForwardMode.SPLIT_PREFILL, False, [1, 7, 2]),
             (ForwardMode.IDLE, False, [1, 7, 2]),
             (ForwardMode.DECODE, False, []),
+            (ForwardMode.TARGET_VERIFY, True, []),
         ):
             with self.subTest(mode=mode, capture=capture, token_ids=token_ids):
                 ids = torch.tensor(token_ids, dtype=torch.int64)
@@ -331,6 +372,50 @@ class TestDeepseekV4EngramPrefetch(CustomTestCase):
         )
         for layer_id in (1, 14):
             model.layers[layer_id].engram.embed.prefetch.assert_not_called()
+
+    def test_verify_partial_graphs_and_compile_keep_sync_path(self):
+        ids = torch.arange(12)
+        for kwargs in ({"piecewise": True}, {"breakable": True}, {"compiling": True}):
+            with self.subTest(**kwargs):
+                model = self._make_model()
+                _, actual, stream = self._forward(
+                    model, ids, mode=ForwardMode.TARGET_VERIFY, **kwargs
+                )
+                _, expected, _ = self._forward(
+                    self._make_model(enabled=False),
+                    ids,
+                    mode=ForwardMode.TARGET_VERIFY,
+                    **kwargs,
+                )
+                torch.testing.assert_close(actual, expected)
+                stream.wait_event.assert_not_called()
+                for layer_id in (1, 14):
+                    self.assertEqual(model.layers[layer_id].engram.sync_calls, 1)
+
+    def test_verify_budget_counts_padded_token_rows_not_requests(self):
+        # Two graph request slots, six tokens each, even if only one is live.
+        ids = torch.arange(12)
+        per_layer_bytes = ids.numel() * 2
+        for budget, selected in (
+            (0, []),
+            (per_layer_bytes - 1, []),
+            (per_layer_bytes, [14]),
+            (2 * per_layer_bytes, [1, 14]),
+        ):
+            with self.subTest(budget=budget):
+                model = self._make_model()
+                model.engram_embed_prefetch_max_bytes = budget
+                _, actual, stream = self._forward(
+                    model, ids, mode=ForwardMode.TARGET_VERIFY, capture=True
+                )
+                _, expected, _ = self._forward(
+                    self._make_model(enabled=False), ids, mode=ForwardMode.TARGET_VERIFY
+                )
+                torch.testing.assert_close(actual, expected)
+                self.assertEqual(
+                    stream.wait_event.call_args_list,
+                    [call(model.engram_embed_prefetch_events[i]) for i in selected],
+                )
 
     def test_total_buffer_budget_reserves_l14_before_l1(self):
         ids = torch.tensor([1, 7, 2, 3, 4, 5])
