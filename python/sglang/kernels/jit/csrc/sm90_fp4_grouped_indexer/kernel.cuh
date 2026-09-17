@@ -37,7 +37,6 @@ namespace fp4_grouped_indexer_sm90 {
 using namespace cute;
 using bf16 = cutlass::bfloat16_t;
 using fp8 = cutlass::float_e5m2_t;
-using fp8_e4m3 = cutlass::float_e4m3_t;
 
 #define FP4_INDEXER_CUDA_CHECK(call)                                                        \
   do {                                                                                      \
@@ -56,18 +55,17 @@ __device__ __forceinline__ float ue8m0_to_f32(uint8_t exponent) {
   return __uint_as_float(static_cast<uint32_t>(exponent) << 23);
 }
 
-__device__ __forceinline__ float e2m1_to_f32(uint8_t code) {
-  constexpr uint64_t lut = 0x4c4844403c383000ULL;
-  fp8_e4m3 value;
-  *reinterpret_cast<uint8_t*>(&value) =
-      static_cast<uint8_t>((lut >> ((code & 7) * 8)) & 0xff) | ((code & 8) << 4);
-  return static_cast<float>(value);
-}
-
-__device__ __forceinline__ uint16_t f32x2_to_e5m2x2(float lo, float hi) {
-  uint16_t out;
-  asm volatile("cvt.rn.satfinite.e5m2x2.f32 %0, %1, %2;\n" : "=h"(out) : "f"(hi), "f"(lo));
-  return out;
+__device__ __forceinline__ uint8_t scaled_e2m1_to_e5m2(uint8_t code, int exponent_delta) {
+  // Positive E5M2 encodings of {0, .5, 1, 1.5, 2, 3, 4, 6}. Multiplication
+  // by a power of two is an exact exponent-field adjustment. The common scale
+  // is selected so production FP4 blocks remain in the normal E5M2 range.
+  constexpr uint64_t lut = 0x464442403e3c3800ULL;
+  const uint8_t magnitude = code & 7;
+  if (magnitude == 0) {
+    return 0;
+  }
+  const int base = static_cast<int>((lut >> (magnitude * 8)) & 0xff);
+  return static_cast<uint8_t>(base + exponent_delta * 4) | ((code & 8) << 4);
 }
 
 template <typename Kernel>
@@ -175,13 +173,13 @@ struct Sm90Fp4GroupedIndexerKernel {
       const uint8_t packed =
           table[static_cast<int64_t>(page) * p.table_stride + off * 64 + packed_col];
       const int common_exponent = (__float_as_uint(ss.k_scales[col]) >> 23) & 0xff;
-      const float relative_scale = ldexpf(1.0f, static_cast<int>(ss.k_exponents[g][col]) - common_exponent);
-      const uint16_t values =
-          f32x2_to_e5m2x2(e2m1_to_f32(packed & 0xf) * relative_scale,
-                          e2m1_to_f32(packed >> 4) * relative_scale);
+      const int exponent_delta =
+          static_cast<int>(ss.k_exponents[g][col]) - common_exponent;
       fp8 v0, v1;
-      *reinterpret_cast<uint8_t*>(&v0) = values & 0xff;
-      *reinterpret_cast<uint8_t*>(&v1) = values >> 8;
+      *reinterpret_cast<uint8_t*>(&v0) =
+          scaled_e2m1_to_e5m2(packed & 0xf, exponent_delta);
+      *reinterpret_cast<uint8_t*>(&v1) =
+          scaled_e2m1_to_e5m2(packed >> 4, exponent_delta);
       sK(col, d) = v0;
       sK(col, d + 1) = v1;
     }
@@ -226,13 +224,12 @@ struct Sm90Fp4GroupedIndexerKernel {
           const int exponent = static_cast<uint8_t>(packed_scale >> (8 * g));
           const int common_exponent =
               (__float_as_uint(ss.q_scales[warpgroup][head]) >> 23) & 0xff;
-          const float relative_scale = ldexpf(1.0f, exponent - common_exponent);
-          const uint16_t values =
-              f32x2_to_e5m2x2(e2m1_to_f32(packed & 0xf) * relative_scale,
-                              e2m1_to_f32(packed >> 4) * relative_scale);
+          const int exponent_delta = exponent - common_exponent;
           fp8 v0, v1;
-          *reinterpret_cast<uint8_t*>(&v0) = values & 0xff;
-          *reinterpret_cast<uint8_t*>(&v1) = values >> 8;
+          *reinterpret_cast<uint8_t*>(&v0) =
+              scaled_e2m1_to_e5m2(packed & 0xf, exponent_delta);
+          *reinterpret_cast<uint8_t*>(&v1) =
+              scaled_e2m1_to_e5m2(packed >> 4, exponent_delta);
           sQ(head, d) = v0;
           sQ(head, d + 1) = v1;
         }
