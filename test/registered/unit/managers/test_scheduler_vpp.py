@@ -124,43 +124,6 @@ class TestSchedulerVPP(unittest.TestCase):
         ):
             self.assertEqual(scheduler._pp_vpp_max_inflight(), 2)
 
-    def test_burst_allows_other_chunk_batches_to_be_admitted(self):
-        scheduler = _make_scheduler()
-
-        with patch(
-            "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
-            return_value=SimpleNamespace(pp_vpp_prefill_burst_size=6),
-        ):
-            self.assertTrue(scheduler._pp_vpp_allows_chunk_admission({3}))
-
-        with patch(
-            "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
-            return_value=SimpleNamespace(pp_vpp_prefill_burst_size=1),
-        ):
-            self.assertFalse(scheduler._pp_vpp_allows_chunk_admission({3}))
-            self.assertTrue(scheduler._pp_vpp_allows_chunk_admission(set()))
-
-    def test_pending_chunk_abort_updates_owning_slot(self):
-        scheduler = _make_scheduler()
-        req = SimpleNamespace(rid="r0")
-        scheduler.mbs = [None] * 2
-        scheduler._pp_vpp_chunked_reqs = [req, None]
-        scheduler._pending_chunked_abort_req = req
-        scheduler.chunked_req = None
-
-        def abort():
-            self.assertIs(scheduler.chunked_req, req)
-            scheduler.chunked_req = None
-            scheduler._pending_chunked_abort_req = None
-
-        scheduler.process_pending_chunked_abort = MagicMock(side_effect=abort)
-
-        scheduler._pp_vpp_process_pending_chunked_abort()
-
-        scheduler.process_pending_chunked_abort.assert_called_once_with()
-        self.assertIsNone(scheduler._pp_vpp_chunked_reqs[0])
-        self.assertIsNone(scheduler.chunked_req)
-
     @patch("sglang.srt.managers.scheduler_pp_mixin.get_vpp_pp_reverse_group")
     def test_pp2_activation_transport_separates_peer_directions(
         self, get_reverse_group
@@ -712,43 +675,6 @@ class TestSchedulerVPP(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "still owned"):
             scheduler._pp_vpp_prepare_wavefront_batch(9, slot_batch_seqs)
-
-    def test_prepare_wavefront_batch_isolates_chunked_request_by_slot(self):
-        scheduler = _make_scheduler()
-        scheduler.mbs = [None] * 2
-        scheduler.last_mbs = [None] * 2
-        scheduler.running_mbs = [SimpleNamespace() for _ in range(2)]
-        scheduler.mb_metadata = [None] * 2
-        first = SimpleNamespace(rid="r0")
-        second = SimpleNamespace(rid="r1")
-        continuation = SimpleNamespace(
-            rid="r1-next",
-            extend_range=None,
-            vpp_prefix_limit=0,
-        )
-        scheduler._pp_vpp_chunked_reqs = [first, second]
-
-        def process_chunk(**_kwargs):
-            self.assertIs(scheduler.chunked_req, second)
-            scheduler.chunked_req = continuation
-
-        scheduler.process_prefill_chunk = MagicMock(side_effect=process_chunk)
-        batch = SimpleNamespace(chunked_req=continuation)
-        scheduler.get_new_batch_prefill = MagicMock(
-            return_value=SimpleNamespace(
-                batch_to_run=batch,
-                running_batch=SimpleNamespace(),
-            )
-        )
-        scheduler.dp_attn_adapter = SimpleNamespace(
-            maybe_prepare_mlp_sync_batch=MagicMock(return_value=batch)
-        )
-
-        scheduler._pp_vpp_prepare_wavefront_batch(1, [None] * 2)
-
-        self.assertIs(scheduler._pp_vpp_chunked_reqs[0], first)
-        self.assertIs(scheduler._pp_vpp_chunked_reqs[1], continuation)
-        self.assertIsNone(scheduler.chunked_req)
 
     def test_prepare_wavefront_batch_snapshots_chunk_end(self):
         scheduler = _make_scheduler()

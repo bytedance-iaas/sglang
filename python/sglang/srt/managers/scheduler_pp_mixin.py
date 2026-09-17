@@ -95,40 +95,6 @@ class SchedulerPPMixin:
             return self.ps.pp_size
         return burst_size + self.ps.pp_size
 
-    def _pp_vpp_chunked_slots(self: Scheduler) -> List[Optional[Req]]:
-        slots = getattr(self, "_pp_vpp_chunked_reqs", None)
-        if slots is None:
-            slots = [None] * len(self.mbs)
-            self._pp_vpp_chunked_reqs = slots
-        if len(slots) != len(self.mbs):
-            raise RuntimeError("VPP chunked request slots do not match batch slots")
-        return slots
-
-    def _pp_vpp_allows_chunk_admission(
-        self: Scheduler,
-        pending_chunk_batches: set[int],
-    ) -> bool:
-        return get_parallel().pp_vpp_prefill_burst_size > 1 or not pending_chunk_batches
-
-    def _pp_vpp_process_pending_chunked_abort(self: Scheduler) -> None:
-        req = self._pending_chunked_abort_req
-        if req is None:
-            return
-        chunked_slots = self._pp_vpp_chunked_slots()
-        slot_id = next(
-            (index for index, item in enumerate(chunked_slots) if item is req),
-            None,
-        )
-        if slot_id is None:
-            self.process_pending_chunked_abort()
-            return
-        self.chunked_req = chunked_slots[slot_id]
-        try:
-            self.process_pending_chunked_abort()
-        finally:
-            chunked_slots[slot_id] = self.chunked_req
-            self.chunked_req = None
-
     def _pp_prewarm_vpp_device_group(self: Scheduler) -> None:
         if not self._pp_vpp_enabled():
             return
@@ -811,12 +777,8 @@ class SchedulerPPMixin:
             for req in batch.reqs:
                 if req.rid == rid:
                     return req
-        for req in getattr(self, "_pp_vpp_chunked_reqs", ()):
-            if req is not None and req.rid == rid:
-                return req
-        chunked_req = getattr(self, "chunked_req", None)
-        if chunked_req is not None and chunked_req.rid == rid:
-            return chunked_req
+        if self.chunked_req is not None and self.chunked_req.rid == rid:
+            return self.chunked_req
         return None
 
     def _pp_vpp_bootstrap_prefix_boundaries(
@@ -985,41 +947,35 @@ class SchedulerPPMixin:
 
         self.running_batch = self.running_mbs[slot_id]
         self.last_batch = self.last_mbs[slot_id]
-        chunked_slots = self._pp_vpp_chunked_slots()
-        self.chunked_req = chunked_slots[slot_id]
-        try:
-            self.process_prefill_chunk(
-                last_batch=self.last_batch,
-                running_batch=self.running_batch,
-            )
-            prefill_plan = self.get_new_batch_prefill(self.running_batch)
-            batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
-                prefill_plan.batch_to_run
-            )
-            if batch is not None:
-                reqs = getattr(batch, "reqs", None)
-                if reqs is None:
-                    reqs = (
-                        []
-                        if getattr(batch, "chunked_req", None) is None
-                        else [batch.chunked_req]
-                    )
-                batch.disagg_prefill_chunk_end_by_rid = {
-                    req.rid: min(req.extend_range.end, len(req.origin_input_ids))
-                    for req in reqs
-                    if req.extend_range is not None
-                }
-                for req in reqs:
-                    req.vpp_prefix_limit = None
-            self.running_batch = prefill_plan.running_batch
-            self.running_mbs[slot_id] = self.running_batch
-            self.mbs[slot_id] = batch
-            self.mb_metadata[slot_id] = None
-            slot_batch_seqs[slot_id] = batch_seq
-            return batch
-        finally:
-            chunked_slots[slot_id] = self.chunked_req
-            self.chunked_req = None
+        self.process_prefill_chunk(
+            last_batch=self.last_batch,
+            running_batch=self.running_batch,
+        )
+        prefill_plan = self.get_new_batch_prefill(self.running_batch)
+        batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+            prefill_plan.batch_to_run
+        )
+        if batch is not None:
+            reqs = getattr(batch, "reqs", None)
+            if reqs is None:
+                reqs = (
+                    []
+                    if getattr(batch, "chunked_req", None) is None
+                    else [batch.chunked_req]
+                )
+            batch.disagg_prefill_chunk_end_by_rid = {
+                req.rid: min(req.extend_range.end, len(req.origin_input_ids))
+                for req in reqs
+                if req.extend_range is not None
+            }
+            for req in reqs:
+                req.vpp_prefix_limit = None
+        self.running_batch = prefill_plan.running_batch
+        self.running_mbs[slot_id] = self.running_batch
+        self.mbs[slot_id] = batch
+        self.mb_metadata[slot_id] = None
+        slot_batch_seqs[slot_id] = batch_seq
+        return batch
 
     def _pp_vpp_execute_wavefront_action(
         self: Scheduler,
@@ -1137,16 +1093,7 @@ class SchedulerPPMixin:
             d2h_event = self.device_module.Event()
             d2h_event.record(self.device_module.current_stream())
         d2h_event.synchronize()
-        self.running_batch = self.running_mbs[slot_id]
-        self.last_batch = self.last_mbs[slot_id]
-        chunked_slots = self._pp_vpp_chunked_slots()
-        self.chunked_req = chunked_slots[slot_id]
-        try:
-            self._pp_process_batch_result(batch, batch_result)
-        finally:
-            self.running_mbs[slot_id] = self.running_batch
-            chunked_slots[slot_id] = self.chunked_req
-            self.chunked_req = None
+        self._pp_process_batch_result(batch, batch_result)
         if getattr(batch, "contains_last_prefill_chunk", False):
             for req in batch.reqs:
                 self._pp_vpp_prefix_registry.release(
@@ -1653,7 +1600,7 @@ class SchedulerPPMixin:
                 req = self._pp_vpp_find_req(rid)
                 if req is not None:
                     self._pending_chunked_abort_req = req
-                    self._pp_vpp_process_pending_chunked_abort()
+                    self.process_pending_chunked_abort()
                 rank_schedule.cancel(envelope.batch_seq)
                 forward_control(envelope, wire)
                 return
@@ -1811,7 +1758,7 @@ class SchedulerPPMixin:
                     )
 
                 pending_abort = self._pending_chunked_abort_req
-                self._pp_vpp_process_pending_chunked_abort()
+                self.process_pending_chunked_abort()
                 if pending_abort is not None:
                     cancelled_batches = [
                         slot_batch_seqs[slot_id]
@@ -1832,15 +1779,13 @@ class SchedulerPPMixin:
                         )
 
                 required_activation = token_budget * hidden_size * hc_mult * 2
-                slot_id = next_batch_seq % max_inflight
-                slot_chunked_req = self._pp_vpp_chunked_slots()[slot_id]
                 continuation = (
-                    slot_chunked_req is not None and slot_chunked_req.kv.holds_kv
+                    self.chunked_req is not None and self.chunked_req.kv.holds_kv
                 )
                 if (
                     pending_admit is None
                     and not bootstrap_round_active
-                    and self._pp_vpp_allows_chunk_admission(pending_chunk_batches)
+                    and not pending_chunk_batches
                     and rank_schedule.can_admit(next_batch_seq)
                     and resource_gate.can_admit(
                         required_request_slots=0 if continuation else 1,
@@ -1848,6 +1793,7 @@ class SchedulerPPMixin:
                         required_activation_bytes=required_activation,
                     )
                 ):
+                    slot_id = next_batch_seq % max_inflight
                     batch = self._pp_vpp_prepare_wavefront_batch(
                         next_batch_seq,
                         slot_batch_seqs,
@@ -1880,7 +1826,7 @@ class SchedulerPPMixin:
                         mark_progress("admission")
                         server_is_idle = False
             else:
-                self._pp_vpp_process_pending_chunked_abort()
+                self.process_pending_chunked_abort()
 
             for batch_seq, ranks in tuple(pending_first_pass.items()):
                 if len(ranks) != self.ps.pp_size:
@@ -2344,7 +2290,6 @@ class SchedulerPPMixin:
             for _ in range(self.pp_loop_size)
         ]
         self.mb_metadata: List[Optional[PPBatchMetadata]] = [None] * self.pp_loop_size
-        self._pp_vpp_chunked_reqs: List[Optional[Req]] = [None] * self.pp_loop_size
         self.pp_outputs: Optional[PPProxyTensors] = None
         self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
 
