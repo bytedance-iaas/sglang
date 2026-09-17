@@ -1021,6 +1021,13 @@ class TestContextParallelServerArgs(CustomTestCase):
         self.parser = server_args_module.argparse.ArgumentParser()
         ServerArgs.add_cli_args(self.parser)
 
+    def test_vpp_prefill_burst_size_cli(self):
+        args = self.parser.parse_args(
+            ["--model", "dummy", "--pp-vpp-prefill-burst-size", "6"]
+        )
+
+        self.assertEqual(args.pp_vpp_prefill_burst_size, 6)
+
     def _new_cp_args(self, **overrides):
         server_args = object.__new__(ServerArgs)
         defaults = dict(
@@ -1052,6 +1059,15 @@ class TestContextParallelServerArgs(CustomTestCase):
             cp_strategy=resolution_result(args, "cp_strategy"),
         )
         with self.assertRaisesRegex(ValueError, "--cp-strategy"):
+            handle_context_parallelism(server_args)
+
+    def test_vpp_prefill_burst_size_requires_vpp2(self):
+        server_args = self._new_cp_args(
+            pp_virtual_stages=1,
+            pp_vpp_prefill_burst_size=6,
+        )
+
+        with self.assertRaisesRegex(ValueError, "--pp-virtual-stages 2"):
             handle_context_parallelism(server_args)
 
     @override_platform(is_hip=False, is_npu=False)

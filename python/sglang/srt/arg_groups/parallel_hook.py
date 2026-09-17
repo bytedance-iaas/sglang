@@ -35,6 +35,12 @@ def handle_context_parallelism(server_args: Any):
         raise ValueError("--pp-virtual-stages must be at least 1")
     if cfg.pp_virtual_stages > 1 and cfg.pp_size == 1:
         raise ValueError("--pp-virtual-stages > 1 requires --pp-size > 1")
+    if cfg.pp_vpp_prefill_burst_size < 1:
+        raise ValueError("--pp-vpp-prefill-burst-size must be at least 1")
+    if cfg.pp_vpp_prefill_burst_size > 1 and cfg.pp_virtual_stages != 2:
+        raise ValueError(
+            "--pp-vpp-prefill-burst-size > 1 requires --pp-virtual-stages 2"
+        )
     if parse_connector_type(cfg.model_path) != ConnectorType.INSTANCE:
         model_config = model_config_of(server_args)
         hf_config = model_config.hf_config

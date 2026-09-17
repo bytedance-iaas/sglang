@@ -107,6 +107,7 @@ class PipelineRankSchedule:
         physical_size: int,
         virtual_stages: int,
         max_inflight: int,
+        prefill_burst_size: int = 1,
     ):
         if not 0 <= physical_rank < physical_size:
             raise ValueError("physical rank is outside pipeline")
@@ -114,16 +115,21 @@ class PipelineRankSchedule:
             raise ValueError("rank-local scheduler supports VPP2 only")
         if max_inflight < 1:
             raise ValueError("max inflight batches must be positive")
+        if prefill_burst_size < 1:
+            raise ValueError("prefill burst size must be positive")
         self.physical_rank = physical_rank
         self.physical_size = physical_size
         self.virtual_stages = virtual_stages
         self.max_inflight = max_inflight
+        self.prefill_burst_size = prefill_burst_size
         self.logical_size = physical_size * virtual_stages
         self._slots: list[Optional[int]] = [None] * max_inflight
         self._ready: list[tuple[int, int]] = []
         self._running: Optional[PipelineWavefrontAction] = None
         self._completed: set[int] = set()
         self._cancelled: set[int] = set()
+        self._burst_first_pass = True
+        self._burst_progress = {True: 0, False: 0}
 
     @property
     def slot_batch_seqs(self) -> Tuple[Optional[int], ...]:
@@ -191,8 +197,16 @@ class PipelineRankSchedule:
         ]
         if not available:
             return None
-        decode = [item for item in available if item[1] >= self.physical_size]
-        batch_seq, stage_id = min(decode if decode else available)
+        if self.prefill_burst_size == 1:
+            decode = [item for item in available if item[1] >= self.physical_size]
+            selected = decode if decode else available
+        else:
+            preferred_stage = self.physical_rank + (
+                0 if self._burst_first_pass else self.physical_size
+            )
+            preferred = [item for item in available if item[1] == preferred_stage]
+            selected = preferred if preferred else available
+        batch_seq, stage_id = min(selected)
         return self.dispatch(tick, batch_seq, stage_id)
 
     def dispatch(
@@ -219,6 +233,14 @@ class PipelineRankSchedule:
         if action != self._running:
             raise RuntimeError("rank-local completion does not match running task")
         self._running = None
+        if self.prefill_burst_size > 1:
+            is_first_pass = action.stage_id < self.physical_size
+            self._burst_progress[is_first_pass] += 1
+            while (
+                self._burst_progress[self._burst_first_pass] >= self.prefill_burst_size
+            ):
+                self._burst_progress[self._burst_first_pass] -= self.prefill_burst_size
+                self._burst_first_pass = not self._burst_first_pass
         successor = action.stage_id + 1
         batch_complete = successor == self.logical_size
         if batch_complete:

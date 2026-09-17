@@ -89,6 +89,12 @@ class SchedulerPPMixin:
     def _pp_vpp_enabled(self: Scheduler) -> bool:
         return get_parallel().pp_virtual_stages > 1
 
+    def _pp_vpp_max_inflight(self: Scheduler) -> int:
+        burst_size = get_parallel().pp_vpp_prefill_burst_size
+        if burst_size == 1:
+            return self.ps.pp_size
+        return burst_size + self.ps.pp_size
+
     def _pp_prewarm_vpp_device_group(self: Scheduler) -> None:
         if not self._pp_vpp_enabled():
             return
@@ -1085,12 +1091,13 @@ class SchedulerPPMixin:
 
     def _event_loop_pp_disagg_prefill_vpp_rank_local(self: Scheduler):
         self.init_pp_loop_state()
-        max_inflight = self.ps.pp_size
+        max_inflight = self._pp_vpp_max_inflight()
         rank_schedule = PipelineRankSchedule(
             physical_rank=self.ps.pp_rank,
             physical_size=self.ps.pp_size,
             virtual_stages=get_parallel().pp_virtual_stages,
             max_inflight=max_inflight,
+            prefill_burst_size=get_parallel().pp_vpp_prefill_burst_size,
         )
         slot_batch_seqs: List[Optional[int]] = [None] * max_inflight
         self._pp_vpp_slot_batch_seqs = slot_batch_seqs
@@ -2254,7 +2261,11 @@ class SchedulerPPMixin:
                 self.on_idle()
 
     def init_pp_loop_state(self: Scheduler):
-        self.pp_loop_size: int = self.ps.pp_size + get_parallel().pp_async_batch_depth
+        self.pp_loop_size: int = (
+            self._pp_vpp_max_inflight()
+            if self._pp_vpp_enabled()
+            else self.ps.pp_size + get_parallel().pp_async_batch_depth
+        )
         self.mbs = [None] * self.pp_loop_size
         self.last_mbs = [None] * self.pp_loop_size
         self.running_mbs = [

@@ -153,6 +153,92 @@ class TestPipelineLayout(unittest.TestCase):
             schedule.retire(0)
             self.assertEqual(schedule.inflight_count, 0)
 
+    def test_rank_local_scheduler_groups_first_and_second_pass_bursts(self):
+        schedule = PipelineRankSchedule(
+            physical_rank=1,
+            physical_size=2,
+            virtual_stages=2,
+            max_inflight=6,
+            prefill_burst_size=3,
+        )
+        for batch_seq in range(6):
+            schedule.admit(batch_seq)
+        for batch_seq in range(3):
+            schedule.mark_ready(batch_seq, 3)
+        for batch_seq in range(3, 6):
+            schedule.mark_ready(batch_seq, 1)
+
+        selected = []
+        for tick in range(6):
+            action = schedule.next_action(tick)
+            selected.append((action.batch_seq, action.stage_id))
+            schedule.complete(action)
+
+        self.assertEqual(
+            selected,
+            [
+                (3, 1),
+                (4, 1),
+                (5, 1),
+                (0, 3),
+                (1, 3),
+                (2, 3),
+            ],
+        )
+
+    def test_rank_local_burst_scheduler_falls_back_without_changing_phase(self):
+        schedule = PipelineRankSchedule(
+            physical_rank=1,
+            physical_size=2,
+            virtual_stages=2,
+            max_inflight=4,
+            prefill_burst_size=2,
+        )
+        schedule.admit(0)
+        schedule.mark_ready(0, 3)
+
+        fallback = schedule.next_action(0)
+        self.assertEqual((fallback.batch_seq, fallback.stage_id), (0, 3))
+        schedule.complete(fallback)
+
+        schedule.admit(1)
+        schedule.mark_ready(1, 1)
+        first = schedule.next_action(1)
+        self.assertEqual((first.batch_seq, first.stage_id), (1, 1))
+        schedule.complete(first)
+
+        schedule.admit(2)
+        schedule.mark_ready(2, 1)
+        second_first = schedule.next_action(2)
+        self.assertEqual((second_first.batch_seq, second_first.stage_id), (2, 1))
+        schedule.complete(second_first)
+
+        schedule.mark_ready(1, 3)
+        second_pass = schedule.next_action(3)
+        self.assertEqual((second_pass.batch_seq, second_pass.stage_id), (1, 3))
+        schedule.complete(second_pass)
+
+        schedule.admit(3)
+        schedule.mark_ready(2, 3)
+        schedule.mark_ready(3, 1)
+        next_burst = schedule.next_action(4)
+        self.assertEqual((next_burst.batch_seq, next_burst.stage_id), (3, 1))
+
+    def test_default_rank_local_scheduler_keeps_second_pass_priority(self):
+        schedule = PipelineRankSchedule(
+            physical_rank=1,
+            physical_size=2,
+            virtual_stages=2,
+            max_inflight=2,
+        )
+        schedule.admit(0)
+        schedule.mark_ready(0, 1)
+        schedule.mark_ready(0, 3)
+
+        action = schedule.next_action(0)
+
+        self.assertEqual((action.batch_seq, action.stage_id), (0, 3))
+
     def test_resource_gate_uses_hysteresis_and_all_rank_watermarks(self):
         gate = PipelineResourceGate(
             ranks=range(4),

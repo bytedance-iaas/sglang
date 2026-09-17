@@ -91,6 +91,39 @@ def _make_scheduler(*, is_first_rank=False, is_last_rank=False):
 
 
 class TestSchedulerVPP(unittest.TestCase):
+    def test_vpp_burst_expands_inflight_window_and_loop_slots(self):
+        scheduler = _make_scheduler()
+        scheduler.ps.pp_size = 2
+
+        with patch(
+            "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
+            return_value=SimpleNamespace(
+                pp_virtual_stages=2,
+                pp_vpp_prefill_burst_size=6,
+                pp_async_batch_depth=0,
+            ),
+        ):
+            self.assertEqual(scheduler._pp_vpp_max_inflight(), 8)
+            scheduler.init_pp_loop_state()
+
+        self.assertEqual(scheduler.pp_loop_size, 8)
+        self.assertEqual(len(scheduler.mbs), 8)
+        self.assertEqual(len(scheduler.mb_metadata), 8)
+
+    def test_default_vpp_burst_keeps_physical_pipeline_depth(self):
+        scheduler = _make_scheduler()
+        scheduler.ps.pp_size = 2
+
+        with patch(
+            "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
+            return_value=SimpleNamespace(
+                pp_virtual_stages=2,
+                pp_vpp_prefill_burst_size=1,
+                pp_async_batch_depth=0,
+            ),
+        ):
+            self.assertEqual(scheduler._pp_vpp_max_inflight(), 2)
+
     @patch("sglang.srt.managers.scheduler_pp_mixin.get_vpp_pp_reverse_group")
     def test_pp2_activation_transport_separates_peer_directions(
         self, get_reverse_group
@@ -970,6 +1003,7 @@ class TestSchedulerVPP(unittest.TestCase):
                 "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
                 return_value=SimpleNamespace(
                     pp_virtual_stages=2,
+                    pp_vpp_prefill_burst_size=1,
                     pp_async_batch_depth=0,
                 ),
             ),
