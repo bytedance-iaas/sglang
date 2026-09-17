@@ -30,6 +30,8 @@ struct Sm90Fp4GroupedIndexerParams {
   const void* q;
   int64_t q_stride_b;
   int64_t q_stride_h;
+  const void* q_scale;
+  int64_t q_scale_stride_b;
 
   const void* weights;
   int64_t weight_stride_b;

@@ -51,23 +51,8 @@ __host__ __device__ __forceinline__ constexpr int ceil_div(int x, int y) {
   return (x + y - 1) / y;
 }
 
-__device__ __forceinline__ uint16_t f32x2_to_e4m3x2(float lo, float hi) {
-  uint16_t out;
-  asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;\n" : "=h"(out) : "f"(hi), "f"(lo));
-  return out;
-}
-
 __device__ __forceinline__ float ue8m0_to_f32(uint8_t exponent) {
   return __uint_as_float(static_cast<uint32_t>(exponent) << 23);
-}
-
-__device__ __forceinline__ float fp4_query_scale(float amax) {
-  float x = fmaxf(amax * (1.0f / 6.0f), 1.0e-4f);
-  uint32_t bits = __float_as_uint(x);
-  uint32_t exponent = (bits >> 23) & 0xff;
-  exponent += (bits & 0x7fffff) != 0;
-  exponent = min(max(exponent, 1u), 254u);
-  return __uint_as_float(exponent << 23);
 }
 
 __device__ __forceinline__ uint8_t e2m1_to_e4m3(uint8_t code) {
@@ -192,7 +177,8 @@ struct Sm90Fp4GroupedIndexerKernel {
     }
     __syncthreads();
 
-    const bf16* q = reinterpret_cast<const bf16*>(p.q);
+    const uint8_t* q = reinterpret_cast<const uint8_t*>(p.q);
+    const uint32_t* q_scale = reinterpret_cast<const uint32_t*>(p.q_scale);
     const bf16* weights = reinterpret_cast<const bf16*>(p.weights);
     float* out = reinterpret_cast<float*>(p.out);
     TiledMMA mma;
@@ -208,14 +194,10 @@ struct Sm90Fp4GroupedIndexerKernel {
       CUTE_UNROLL
       for (int g = 0; g < SCALE_GROUPS; ++g) {
         if (active && wg_tid < HEADS) {
-          float amax = 0.0f;
-          const bf16* q_head = q + static_cast<int64_t>(b) * p.q_stride_b +
-                               static_cast<int64_t>(wg_tid) * p.q_stride_h + g * SCALE_GROUP_SIZE;
-          CUTE_UNROLL
-          for (int d = 0; d < SCALE_GROUP_SIZE; ++d) {
-            amax = fmaxf(amax, fabsf(static_cast<float>(q_head[d])));
-          }
-          ss.q_scales[warpgroup][wg_tid] = fp4_query_scale(amax);
+          const uint32_t packed_scale =
+              q_scale[static_cast<int64_t>(b) * p.q_scale_stride_b + wg_tid];
+          ss.q_scales[warpgroup][wg_tid] =
+              ue8m0_to_f32(static_cast<uint8_t>(packed_scale >> (8 * g)));
         }
         __syncthreads();
 
@@ -223,14 +205,12 @@ struct Sm90Fp4GroupedIndexerKernel {
           for (int pair = wg_tid; pair < HEADS * (SCALE_GROUP_SIZE / 2); pair += 128) {
             const int head = pair / (SCALE_GROUP_SIZE / 2);
             const int d = (pair % (SCALE_GROUP_SIZE / 2)) * 2;
-            const bf16* src = q + static_cast<int64_t>(b) * p.q_stride_b +
-                              static_cast<int64_t>(head) * p.q_stride_h + g * SCALE_GROUP_SIZE + d;
-            const float inv_scale = 1.0f / ss.q_scales[warpgroup][head];
-            const uint16_t packed = f32x2_to_e4m3x2(
-                static_cast<float>(src[0]) * inv_scale, static_cast<float>(src[1]) * inv_scale);
+            const uint8_t packed =
+                q[static_cast<int64_t>(b) * p.q_stride_b +
+                  static_cast<int64_t>(head) * p.q_stride_h + g * 16 + d / 2];
             fp8 v0, v1;
-            *reinterpret_cast<uint8_t*>(&v0) = packed & 0xff;
-            *reinterpret_cast<uint8_t*>(&v1) = packed >> 8;
+            *reinterpret_cast<uint8_t*>(&v0) = e2m1_to_e4m3(packed & 0xf);
+            *reinterpret_cast<uint8_t*>(&v1) = e2m1_to_e4m3(packed >> 4);
             sQ(head, d) = v0;
             sQ(head, d + 1) = v1;
           }

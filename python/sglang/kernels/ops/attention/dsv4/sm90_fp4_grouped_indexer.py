@@ -42,6 +42,7 @@ _get_current_stream_raw = torch._C._cuda_getCurrentRawStream
 )
 def _sm90_fp4_grouped_indexer_op(
     q: torch.Tensor,
+    q_scale: torch.Tensor,
     weights: torch.Tensor,
     req_to_token: torch.Tensor,
     req: torch.Tensor,
@@ -55,6 +56,7 @@ def _sm90_fp4_grouped_indexer_op(
 ) -> None:
     _jit_module().dispatch(
         q,
+        q_scale,
         weights,
         req_to_token,
         req,
@@ -68,6 +70,7 @@ def _sm90_fp4_grouped_indexer_op(
         ratio,
         q.stride(0),
         q.stride(1),
+        q_scale.stride(0),
         weights.stride(0),
         req_to_token.stride(0),
         table.stride(0),
@@ -101,6 +104,13 @@ def fp4_index_logits_grouped_sm90(
     assert req_to_token.stride(1) == 1 and table.stride(1) == 1
     assert ratio in (1, 2) and group_size > 1
 
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+        quantize_fp4_indexer_tensor,
+    )
+
+    q_fp4, q_scale = quantize_fp4_indexer_tensor(q, rne=True)
+    q_fp4 = q_fp4.view(q.shape[0], q.shape[1], 64).view(torch.uint8)
+    q_scale = q_scale.view(q.shape[0], q.shape[1])
     storage_width = (width + 3) // 4 * 4
     out_storage = torch.empty(
         (q.shape[0], storage_width), dtype=torch.float32, device=q.device
@@ -108,7 +118,8 @@ def fp4_index_logits_grouped_sm90(
     out = out_storage[:, :width]
     if width:
         _sm90_fp4_grouped_indexer_op(
-            q,
+            q_fp4,
+            q_scale,
             weights,
             req_to_token,
             req,

@@ -26,6 +26,7 @@ namespace sglang {
 
 void sm90_fp4_grouped_indexer_dispatch(
     tvm::ffi::TensorView q,
+    tvm::ffi::TensorView q_scale,
     tvm::ffi::TensorView weights,
     tvm::ffi::TensorView req_to_token,
     tvm::ffi::TensorView req,
@@ -39,6 +40,7 @@ void sm90_fp4_grouped_indexer_dispatch(
     int64_t ratio,
     int64_t q_stride_b,
     int64_t q_stride_h,
+    int64_t q_scale_stride_b,
     int64_t weight_stride_b,
     int64_t req_stride,
     int64_t table_stride,
@@ -53,6 +55,8 @@ void sm90_fp4_grouped_indexer_dispatch(
   params.q = q.data_ptr();
   params.q_stride_b = q_stride_b;
   params.q_stride_h = q_stride_h;
+  params.q_scale = q_scale.data_ptr();
+  params.q_scale_stride_b = q_scale_stride_b;
   params.weights = weights.data_ptr();
   params.weight_stride_b = weight_stride_b;
   params.req_to_token = req_to_token.data_ptr();
