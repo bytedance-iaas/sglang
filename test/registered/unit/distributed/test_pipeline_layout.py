@@ -325,6 +325,40 @@ class TestPipelineLayout(unittest.TestCase):
         self.assertEqual(entry.planned_end, 4096)
         self.assertEqual(entry.materialized_end, 4096)
 
+    def test_prefix_registry_tracks_multiple_inflight_chunks_in_order(self):
+        registry = PipelinePrefixRegistry()
+        entry = registry.plan(
+            rid="r0",
+            request_generation=3,
+            residency_generation=7,
+            start=0,
+            end=2048,
+            required_stages=range(4),
+        )
+        registry.plan(
+            rid="r0",
+            request_generation=3,
+            residency_generation=7,
+            start=2048,
+            end=4096,
+            required_stages=range(4),
+        )
+
+        for stage_id in range(4):
+            registry.mark_materialized("r0", 3, stage_id, 2048)
+        registry.commit("r0", 3, 2048)
+
+        self.assertEqual(entry.planned_end, 4096)
+        self.assertEqual(entry.committed_end, 2048)
+        self.assertTrue(entry.locked)
+
+        for stage_id in range(4):
+            registry.mark_materialized("r0", 3, stage_id, 4096)
+        registry.commit("r0", 3, 4096)
+
+        self.assertEqual(entry.committed_end, 4096)
+        self.assertFalse(entry.locked)
+
     def test_replica_registry_requires_contiguous_generation_matched_ranges(self):
         registry = PipelineReplicaRegistry()
         replicas = [

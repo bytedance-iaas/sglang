@@ -706,6 +706,48 @@ class TestSchedulerVPP(unittest.TestCase):
         self.assertEqual(batch.disagg_prefill_chunk_end_by_rid, {"r0": 4096})
         self.assertIsNone(req.vpp_prefix_limit)
 
+    def test_prepare_wavefront_batches_reuse_global_chunked_request(self):
+        scheduler = _make_scheduler()
+        scheduler.mbs = [None] * 2
+        scheduler.last_mbs = [None] * 2
+        scheduler.running_mbs = [SimpleNamespace() for _ in range(2)]
+        scheduler.mb_metadata = [None] * 2
+        req = SimpleNamespace(
+            rid="r0",
+            extend_range=None,
+            origin_input_ids=list(range(4096)),
+            vpp_prefix_limit=0,
+            inflight_middle_chunks=0,
+        )
+        scheduler.chunked_req = req
+        scheduler.process_prefill_chunk = MagicMock()
+        chunk_ends = iter((2048, 4096))
+
+        def next_batch(_running_batch):
+            req.extend_range = SimpleNamespace(end=next(chunk_ends))
+            req.inflight_middle_chunks += 1
+            batch = SimpleNamespace(chunked_req=req)
+            return SimpleNamespace(
+                batch_to_run=batch,
+                running_batch=SimpleNamespace(),
+            )
+
+        scheduler.get_new_batch_prefill = MagicMock(side_effect=next_batch)
+        scheduler.dp_attn_adapter = SimpleNamespace(
+            maybe_prepare_mlp_sync_batch=MagicMock(side_effect=lambda batch: batch)
+        )
+        slot_batch_seqs = [None] * 2
+
+        first = scheduler._pp_vpp_prepare_wavefront_batch(0, slot_batch_seqs)
+        second = scheduler._pp_vpp_prepare_wavefront_batch(1, slot_batch_seqs)
+
+        self.assertIs(first.chunked_req, req)
+        self.assertIs(second.chunked_req, req)
+        self.assertIs(scheduler.chunked_req, req)
+        self.assertEqual(req.inflight_middle_chunks, 2)
+        self.assertEqual(first.disagg_prefill_chunk_end_by_rid, {"r0": 2048})
+        self.assertEqual(second.disagg_prefill_chunk_end_by_rid, {"r0": 4096})
+
     def test_execute_wavefront_action_routes_expected_batch_and_stage(self):
         scheduler = _make_scheduler()
         batch = SimpleNamespace()
