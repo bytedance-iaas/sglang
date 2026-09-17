@@ -519,6 +519,45 @@ class TestSchedulerVPP(unittest.TestCase):
         self.assertEqual(entry.committed_end, 256)
         self.assertEqual(req.kv.kv_committed_len, req.kv.kv_allocated_len)
 
+    def test_vpp_prefix_mapping_does_not_regress_on_delayed_commit(self):
+        scheduler = _make_scheduler()
+        scheduler.mbs = []
+        scheduler.last_mbs = []
+        req = SimpleNamespace(
+            rid="r0",
+            prefix_indices=torch.empty(0, dtype=torch.int64),
+            kv=SimpleNamespace(holds_kv=True, req_pool_idx=0),
+        )
+        scheduler.waiting_queue = [req]
+        scheduler.chunked_req = req
+        mapping = torch.arange(12288, dtype=torch.int32).reshape(1, -1)
+        scheduler.req_to_token_pool = SimpleNamespace(req_to_token=mapping)
+
+        for end in range(2048, 12289, 2048):
+            scheduler._pp_vpp_advance_prefix_mapping("r0", 0, end)
+        for end in (2048, 4096, 2048, 12288):
+            scheduler._pp_vpp_advance_prefix_mapping("r0", 0, end)
+
+        torch.testing.assert_close(req.prefix_indices, torch.arange(12288))
+        mapping.fill_(-1)
+        torch.testing.assert_close(req.prefix_indices, torch.arange(12288))
+
+    def test_vpp_prefix_mapping_ignores_released_request(self):
+        scheduler = _make_scheduler()
+        scheduler.mbs = []
+        scheduler.last_mbs = []
+        req = SimpleNamespace(
+            rid="r0",
+            prefix_indices=torch.arange(2048),
+            kv=SimpleNamespace(holds_kv=False),
+        )
+        scheduler.waiting_queue = [req]
+        scheduler.chunked_req = req
+
+        scheduler._pp_vpp_advance_prefix_mapping("r0", 0, 4096)
+
+        torch.testing.assert_close(req.prefix_indices, torch.arange(2048))
+
     def test_vpp_batch_manifest_snapshots_request_ranges(self):
         scheduler = _make_scheduler()
         scheduler.mbs = [None] * 4

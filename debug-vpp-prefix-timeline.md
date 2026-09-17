@@ -124,3 +124,129 @@ Example, batch 30, same RID continuation `[4096,6144)` to batch 31 `[6144,7971)`
 FIRST_PASS_DONE precedes the end of S1 GPU work, confirming that it must not be interpreted as device completion. The measured overlap supports investigating finer-grained prefix admission dependencies. It does not establish safe same-RID six-S0 execution or a recoverable 25.9% throughput gain; ACK, launch, communication, and profiler overhead remain contributors.
 
 Local artifacts: `.dbg/vpp-prefix-20260917/report.md`, `timeline-batch30.svg`, `analysis-8k.json`, eight raw traces under `trace-8k/`, and server logs. Reproducible analysis scripts: `.dbg/analyze_vpp_timeline.py` and `.dbg/render_vpp_timeline.py`. Raw traces remain on the prefill container under `/tmp/vpp-prefix-20260917/trace-8k/`.
+
+## Barrier-removal experiment
+
+User authorized implementation and remote A/B measurement. Candidate is opt-in with
+`SGLANG_VPP_OVERLAP_CHUNKS=1`; global `chunked_req` ownership is unchanged.
+
+- Advance allocation mapping to the planned frontier before preparing continuation;
+  old first-pass commits cannot regress it.
+- Order each RID's stage launches by its immutable batch prefix length on the
+  existing forward stream; materialized/committed frontiers retain their GPU events.
+- Send middle-chunk KV only when processing its completed result.
+- Wait for pending admission ACK during a first-pass burst instead of immediately
+  falling back to S2.
+- Accept overlapping completed replica updates without regressing their frontier.
+- Profile labels use batch prefix lengths instead of mutable `Req.extend_range`.
+
+Validation used 14,336 input tokens, 8 greedy output tokens, concurrency 8,
+32 requests per round, three rounds, cache flush between rounds. Throughput runs
+do not enable the profiler; output tokens/logprobs are retained for comparison.
+Scripts: `.dbg/vpp-ab-launch.sh`, `.dbg/vpp-ab-bench.py`.
+Remote artifacts: `/tmp/vpp-ab-20260917/` in the prefill container.
+
+Existing focused tests: 48 passed. Two new mapping tests initially failed because
+their fixture omitted `mbs`/`last_mbs`; after fixing the fixture, all 37 scheduler
+tests passed. Skill report flush was attempted but blocked writing its own global
+`.skill_update_*` file by the sandbox; this did not affect test execution.
+
+Baseline (unmodified remote `4a3af89e7b`, burst 6) completed:
+
+| Round | Wall time (s) | Input token/s |
+|---|---:|---:|
+| 0 | 64.167701 | 7149.266616 |
+| 1 | 61.557656 | 7452.395505 |
+| 2 | 61.308717 | 7482.655365 |
+
+Median: 7452.395505 token/s; pooled: 7358.316976 token/s. All 96 responses
+completed with zero cached tokens. First token and its logprob match exactly
+for each input across all three rounds. Later decode tokens already differ
+across baseline runs (only 1/32 full outputs match between rounds 0 and 1).
+Use prefill first-token/logprob equality as the direct scheduling comparison;
+full PD decode correctness has this pre-existing limitation.
+
+Independent baseline profile completed 7 single-request 14k prompts (one warmup
+plus six measured), then stopped with no outstanding benchmark requests.
+All eight traces exported successfully; unlike the prior run, no native crash
+occurred. Export still pauses PP1 until PP0 finishes and must be excluded.
+Raw traces stay under `/tmp/vpp-ab-20260917/trace-baseline` (about 640 MiB).
+PP0/TP0 trace and analysis are also local under `.dbg/vpp-ab-20260917/`.
+Full-rank analysis completed for both baseline and candidate. Test services
+were stopped after collection.
+
+Candidate at `mem_fraction_static=0.85` stalled during its first 14k warmup,
+before any timed round. PP0 allocator reported a 939,524,096-byte allocation
+failure with only 215–752 MB free. Subsequent native py-spy samples on PP0/TP0,
+PP0/TP1 and PP1/TP0 all stopped in `cuKernelSetAttribute -> cublasGemmEx ->
+einsum -> DSV4.1 indexer scores`. All eight GPUs remained at 100% utilization.
+This rules out a pure CPU admission dependency wait; memory pressure and
+CUDA/cuBLAS initialization interacting with pending communication remain
+candidate causes. Preserve this failed run; next isolate additional activation
+headroom at `mem_fraction_static=0.80`, with all other settings unchanged.
+If this succeeds, rerun the baseline at 0.80 for a matched A/B comparison.
+Final focused test run: 50 passed.
+
+At 0.80 the long warmup completed, then concurrency-8 hit an ADMIT manifest
+mismatch: PP0 chose `[12288,14080)`, PP1 `[12288,14336)` for the same RID.
+Difference = one 256-token page. `PrefillAdder.add_chunked_req` reserves a page
+from SWA availability, whereas the rank-local resource gate only checked the
+chunk size. Candidate v2 adds one page to the KV admission requirement when
+overlap is enabled. This is a live runtime failure, not a throughput result;
+v2 must complete the entire A/B workload before any gain is claimed.
+
+Candidate v2 at 0.80 completed all three throughput rounds: 7996.057442,
+8371.888031, and 8423.448779 input token/s (median 8371.888031). This is
+12.34% above the old 0.85 baseline median, but is not yet a valid gain because
+the memory setting differs. More importantly, candidate first-token output is
+not stable across its own three runs: only 27/32 inputs retain the same greedy
+first token and 12/32 retain the same first-token logprob. The old barrier-on
+baseline was stable for all 32 inputs on both measures. Candidate output is
+therefore not correctness-acceptable.
+
+Candidate profile workload completed normally and all eight traces exported.
+The profile must still be analyzed for actual same-RID six-S0 runs and GPU idle
+time; trace export time is excluded from throughput.
+
+Matched barrier-on 0.80 baseline completed at 7155.509511, 7397.638345, and
+7414.463572 token/s (median 7397.638345, pooled 7320.603985). Its first token
+and first-token logprob are exactly equal to the old 0.85 baseline for all 96
+responses. Candidate's apparent matched gain is +13.17% median / +12.82%
+pooled, but remains invalid while candidate correctness differs.
+
+The VPP proxy already snapshots source pages, but exported indexer metadata and
+candidate masks were aliases of reusable forward-metadata buffers. Candidate
+v3 clones those tensors at the stage boundary to make them batch/content
+scoped before deeper same-RID pipelining. A mutation-after-export unit test
+passes (5 tests in the replay module). Runtime correctness must confirm or
+reject this aliasing hypothesis.
+
+Candidate v3 rejected that hypothesis: its first measured round still differed
+from the matched baseline for 5/32 greedy first tokens and 15/32 first-token
+logprobs (max absolute logprob difference 0.512). The clone patch and its test
+were removed. The next isolation run keeps barrier removal but sets burst size
+to 1. This distinguishes a generic overlap bug from corruption that appears
+only when one physical rank gets several stages ahead for the same RID.
+
+Candidate v2 profile proves the requested schedule occurred. On PP0/TP0, one
+RID ran six consecutive S0 GPU spans for `[0,2048)`, `[2048,4096)`,
+`[4096,6144)`, `[6144,8192)`, `[8192,10240)`, and `[10240,12288)`. Baseline
+maximum was two consecutive same-RID S0 stages. Across the profile windows,
+all-lane idle fell from 45.92% to 39.90% on PP0 and from 62.81% to 38.76% on
+PP1. These utilization gains describe the incorrect v2 and are diagnostic,
+not shippable performance.
+
+Barrier removal with burst size 1 completed three correct rounds at
+8098.063286, 8266.186635, and 8250.866233 token/s (median 8250.866233,
+pooled 8204.332107). All 96 first tokens and first-token logprobs exactly match
+the 0.80 baseline. Relative to that matched baseline, median throughput improves
+11.53%, pooled throughput improves 12.07%, and median wall time falls from
+62.013305 s to 55.600465 s (10.34%).
+
+Conclusion: removing the global first-pass commit round trip is valid at a
+one-first-pass lead. Allowing six consecutive same-RID S0 stages is not valid
+with the current request-scoped runtime state. It needs versioned,
+batch/content-scoped state banks for every mutable DSV4 intermediate consumed
+by later virtual stages, followed by commit of the accepted/materialized
+frontier. The experimental mode now rejects burst sizes other than 1 rather
+than exposing the incorrect six-S0 path.

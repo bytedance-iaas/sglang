@@ -971,6 +971,8 @@ class SchedulerPPMixin:
         req = self._pp_vpp_find_req(rid)
         if req is None or not req.kv.holds_kv:
             return
+        if end <= len(req.prefix_indices):
+            return
         req.prefix_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, :end
         ].to(dtype=torch.int64, copy=True)
@@ -989,6 +991,15 @@ class SchedulerPPMixin:
 
         self.running_batch = self.running_mbs[slot_id]
         self.last_batch = self.last_mbs[slot_id]
+        if getattr(self, "_pp_vpp_overlap_chunks", False):
+            req = self.chunked_req
+            if req is not None:
+                generation = int(getattr(req, "session_generation", None) or 0)
+                entry = self._pp_vpp_prefix_registry.get(req.rid, generation)
+                if entry is not None:
+                    self._pp_vpp_advance_prefix_mapping(
+                        req.rid, generation, entry.planned_end
+                    )
         self.process_prefill_chunk(
             last_batch=self.last_batch,
             running_batch=self.running_batch,
@@ -1138,6 +1149,14 @@ class SchedulerPPMixin:
         self._pp_process_batch_result(batch, batch_result)
         if getattr(batch, "contains_last_prefill_chunk", False):
             for req in batch.reqs:
+                if req is batch.chunked_req:
+                    continue
+                if getattr(self, "_pp_vpp_overlap_chunks", False):
+                    generation = int(getattr(req, "session_generation", None) or 0)
+                    for stage_id in range(self.ps.pp_size * 2):
+                        self._pp_vpp_launched_prefix.pop(
+                            (req.rid, generation, stage_id), None
+                        )
                 self._pp_vpp_prefix_registry.release(
                     req.rid,
                     int(getattr(req, "session_generation", None) or 0),
@@ -1154,6 +1173,8 @@ class SchedulerPPMixin:
 
     def _event_loop_pp_disagg_prefill_vpp_rank_local(self: Scheduler):
         self.init_pp_loop_state()
+        self._pp_vpp_overlap_chunks = os.getenv("SGLANG_VPP_OVERLAP_CHUNKS") == "1"
+        self._pp_vpp_launched_prefix = {}
         # #region debug-point H1-H3:prefix-timeline
         self._pp_vpp_timeline_enabled = os.getenv("SGLANG_VPP_TIMELINE") == "1"
         timeline_gate_state = None
@@ -1166,6 +1187,11 @@ class SchedulerPPMixin:
             max_inflight=max_inflight,
             prefill_burst_size=get_parallel().pp_vpp_prefill_burst_size,
         )
+        if self._pp_vpp_overlap_chunks and rank_schedule.prefill_burst_size != 1:
+            raise RuntimeError(
+                "SGLANG_VPP_OVERLAP_CHUNKS requires "
+                "--pp-vpp-prefill-burst-size=1"
+            )
         slot_batch_seqs: List[Optional[int]] = [None] * max_inflight
         self._pp_vpp_slot_batch_seqs = slot_batch_seqs
         self._pp_vpp_ready_proxies = {}
@@ -1276,6 +1302,12 @@ class SchedulerPPMixin:
                 and state.valid_end >= end
             ):
                 return
+            if (
+                state is not None
+                and state.residency_generation == generation
+                and start <= state.valid_end
+            ):
+                start = state.valid_end
             self._pp_vpp_replica_registry.install(
                 identity,
                 generation,
@@ -1848,6 +1880,9 @@ class SchedulerPPMixin:
                 continuation = (
                     self.chunked_req is not None and self.chunked_req.kv.holds_kv
                 )
+                required_kv_tokens = token_budget + (
+                    self.page_size if self._pp_vpp_overlap_chunks else 0
+                )
                 # #region debug-point H1:admission-gates
                 if self._pp_vpp_timeline_active():
                     gate_state = (
@@ -1859,7 +1894,7 @@ class SchedulerPPMixin:
                         rank_schedule.can_admit(next_batch_seq),
                         resource_gate.can_admit(
                             required_request_slots=0 if continuation else 1,
-                            required_kv_tokens=token_budget,
+                            required_kv_tokens=required_kv_tokens,
                             required_activation_bytes=required_activation,
                         ),
                         continuation,
@@ -1884,11 +1919,11 @@ class SchedulerPPMixin:
                 if (
                     pending_admit is None
                     and not bootstrap_round_active
-                    and not pending_chunk_batches
+                    and (self._pp_vpp_overlap_chunks or not pending_chunk_batches)
                     and rank_schedule.can_admit(next_batch_seq)
                     and resource_gate.can_admit(
                         required_request_slots=0 if continuation else 1,
-                        required_kv_tokens=token_budget,
+                        required_kv_tokens=required_kv_tokens,
                         required_activation_bytes=required_activation,
                     )
                 ):
@@ -1970,6 +2005,16 @@ class SchedulerPPMixin:
                 pending_first_pass.pop(batch_seq, None)
 
             def action_ready(batch_seq: int, stage_id: int) -> bool:
+                if self._pp_vpp_overlap_chunks:
+                    batch = self.mbs[batch_seq % max_inflight]
+                    for req, start in zip(batch.reqs, batch.prefix_lens):
+                        generation = int(getattr(req, "session_generation", None) or 0)
+                        entry = self._pp_vpp_prefix_registry.get(req.rid, generation)
+                        launched = self._pp_vpp_launched_prefix.get(
+                            (req.rid, generation, stage_id), entry.committed_end
+                        )
+                        if launched < start:
+                            return False
                 if (
                     stage_id < rank_schedule.logical_size - 1
                     and len(activation_send_work) >= max_inflight
@@ -2066,6 +2111,10 @@ class SchedulerPPMixin:
                                 getattr(req, "session_generation", None) or 0
                             )
                             end = batch.disagg_prefill_chunk_end_by_rid[req.rid]
+                            if self._pp_vpp_overlap_chunks:
+                                self._pp_vpp_launched_prefix[
+                                    (req.rid, request_generation, action.stage_id)
+                                ] = end
                             self._pp_vpp_pending_materialized.append(
                                 (
                                     action.batch_seq,
@@ -3043,10 +3092,10 @@ class SchedulerPPMixin:
                 chunks=[
                     (
                         hashlib.sha256(req.rid.encode()).hexdigest()[:16],
-                        req.extend_range.start,
+                        start,
                         cur_batch.disagg_prefill_chunk_end_by_rid.get(req.rid),
                     )
-                    for req in cur_batch.reqs
+                    for req, start in zip(cur_batch.reqs, cur_batch.prefix_lens)
                     if req.extend_range is not None
                 ],
             )
@@ -3064,6 +3113,10 @@ class SchedulerPPMixin:
                 is_last_stage = action.stage_id == (
                     self.ps.pp_size * get_parallel().pp_virtual_stages - 1
                 )
+                if getattr(cur_batch, "return_logprob", False) or getattr(
+                    cur_batch, "return_hidden_states", False
+                ):
+                    result.extend_input_len_per_req = list(cur_batch.extend_lens)
                 if is_last_stage:
                     if result.pp_hidden_states_proxy_tensors is not None:
                         raise RuntimeError("the final VPP stage did not produce logits")
