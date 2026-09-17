@@ -40,6 +40,7 @@ Serving benchmark snapshots: `benchmark/hicache/eic_snapshots/`.
 | `mem_cache/eic_memory_pool.py` | EIC client and host pools (MHA/MLA/NSA/DSv4) |
 | `mem_cache/eic_chunk_cache.py` | `EICChunkCache` / `EICSWAChunkCache` for `--disable-radix-cache` |
 | `mem_cache/eic_pp_reconcile.py` | Cross-PP load-length reconciler |
+| `mem_cache/eic_stats.py` | Dependency-free per-rank `EIC_STATS` line (#778): write ack/mset/mget/mexist errors, eic_hit%, miss reason counts, RPC p50/p95/p99/max; interval `EIC_STATS_INTERVAL_S` (60s) |
 
 Upstream APIs these subclass or call, the usual source of silent breakage after
 a refresh: `HiCacheController.__init__`, `HiRadixCache`,
@@ -94,6 +95,7 @@ not text conflicts but API-contract breaks found by review, all in EIC-owned fil
 | `scheduler.py` candidate loop | After `init_next_round_input`, skip a req whose matched prefix runs through an in-flight load-back (`prefix_loading`) | `load_back` publishes `node.value` before the DMA acks; adopting those slots reads KV still landing, and a failed load frees the tail under the req, whose insert then re-links freed slots into the tree (a page both free and cached). Same PR: `cache_unfinished_req` keeps a chunked req private while its prefix loads, `_match_prefix_helper` stops at a resident node under an evicted gap, and `batch_get` re-gets only the failed keys of a partial mget once | #768 | `test_failed_load_under_same_prefix_req_keeps_pool_invariant`, `test_chunk_insert_through_inflight_load_keeps_pool_invariant`, `test_partial_mget_refetches_only_failed_keys` |
 | `scheduler.py` `_abort_on_queued_limit`, `_abort_on_waiting_timeout`, `abort_request` | `release_load_admit(rid)` | Aborted or preempted requests leak admit locks otherwise | #670 | `EICReg.test_release_tombstones_and_drops_straggler_verdicts` |
 | `scheduler.py` idle check | `ongoing_load_admit` must be empty | PP-symmetric in-flight marker; the rank0-only maps would desync idle | #670 | none |
+| `scheduler.py` candidate loop else-branch | A PP=1 candidate that skips the load gate is counted once (`_eic_cold_counted`) as `miss.cold_or_probe_fail` with its device-only admit | Cold reqs never enter `_apply_span`, so the miss-reason accounting would miss the dominant class | #778 | none |
 | `managers/schedule_policy.py` `PrefillAdder` | `enable_eic_cache`; under EIC do not subtract `host_hit_length` and skip `init_load_back` | ep_main's `host_hit_length` means "host hit not loaded yet". The EIC gate has to fold the load into `prefix_indices` before admission to keep PP stages at one clamped length, so neither step applies. | #670 | none |
 | `distributed/communication_tags.py` | `HIRADIX_PP_VERDICT` | Verdict stream must not share a FIFO tag with num_ready | #670 | `EICReg.test_pp_bcast_from_first_is_nonblocking_isend` |
 
