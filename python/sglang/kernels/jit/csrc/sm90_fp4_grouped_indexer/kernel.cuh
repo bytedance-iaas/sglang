@@ -78,6 +78,7 @@ struct Sm90Fp4GroupedIndexerKernel {
   static constexpr int SCALE_GROUPS = 4;
   static constexpr int SCALE_GROUP_SIZE = 32;
   static constexpr int NUM_WARPGROUPS = 4;
+  static constexpr int WARPS_PER_WARPGROUP = 4;
   static constexpr int NUM_THREADS = 128 * NUM_WARPGROUPS;
 
   using SmemLayout = decltype(
@@ -88,7 +89,7 @@ struct Sm90Fp4GroupedIndexerKernel {
   struct SharedStorage {
     array_aligned<fp8, cosize_v<SmemLayout>, 128> q[NUM_WARPGROUPS];
     array_aligned<fp8, cosize_v<SmemLayout>, 128> k;
-    array_aligned<bf16, HEADS * BLOCK_L, 128> scores[NUM_WARPGROUPS];
+    array_aligned<float, WARPS_PER_WARPGROUP * BLOCK_L, 128> warp_sums[NUM_WARPGROUPS];
     int32_t slots[BLOCK_L];
     uint8_t k_exponents[SCALE_GROUPS][BLOCK_L];
     float k_scales[BLOCK_L];
@@ -245,17 +246,41 @@ struct Sm90Fp4GroupedIndexerKernel {
       }
 
       if (active) {
+        // Lanes with the same lane % 4 own the same 16 columns. Their two
+        // accumulator rows cover one contiguous 16-head slice.
+        const int warp = wg_tid / 32;
+        const int lane = wg_tid % 32;
+        const int head_in_warp = lane / 4;
+        const int head0 = warp * 16 + head_in_warp;
+        const int head1 = head0 + 8;
+        const float q_scale0 = ss.q_scales[warpgroup][head0];
+        const float q_scale1 = ss.q_scales[warpgroup][head1];
+        const float weight0 =
+            static_cast<float>(weights[static_cast<int64_t>(b) * p.weight_stride_b + head0]);
+        const float weight1 =
+            static_cast<float>(weights[static_cast<int64_t>(b) * p.weight_stride_b + head1]);
+
         CUTE_UNROLL
-        for (int rp = 0; rp < 2; ++rp) {
-          const int head = (wg_tid / 32) * 16 + (wg_tid % 32) / 4 + 8 * rp;
+        for (int j = 0; j < BLOCK_L / 8; ++j) {
           CUTE_UNROLL
-          for (int j = 0; j < BLOCK_L / 8; ++j) {
-            CUTE_UNROLL
-            for (int cp = 0; cp < 2; ++cp) {
-              const int col = (wg_tid % 4) * 2 + 8 * j + cp;
-              const int i = j * 4 + rp * 2 + cp;
-              ss.scores[warpgroup][head * BLOCK_L + col] =
-                  bf16(acc(i) * ss.q_scales[warpgroup][head] * ss.k_scales[col]);
+          for (int cp = 0; cp < 2; ++cp) {
+            const int col = (lane % 4) * 2 + 8 * j + cp;
+            const float k_scale = ss.k_scales[col];
+            const float score0 =
+                fmaxf(static_cast<float>(bf16(acc(j * 4 + cp) * q_scale0 * k_scale)), 0.0f);
+            const float score1 =
+                fmaxf(static_cast<float>(bf16(acc(j * 4 + 2 + cp) * q_scale1 * k_scale)), 0.0f);
+            float sum0 = static_cast<float>(bf16(score0 * weight0));
+            float sum1 = static_cast<float>(bf16(score1 * weight1));
+
+            sum0 += __shfl_down_sync(0xffffffffu, sum0, 16);
+            sum1 += __shfl_down_sync(0xffffffffu, sum1, 16);
+            sum0 += __shfl_down_sync(0xffffffffu, sum0, 8);
+            sum1 += __shfl_down_sync(0xffffffffu, sum1, 8);
+            sum0 += __shfl_down_sync(0xffffffffu, sum0, 4);
+            sum1 += __shfl_down_sync(0xffffffffu, sum1, 4);
+            if (head_in_warp == 0) {
+              ss.warp_sums[warpgroup][warp * BLOCK_L + col] = sum0 + sum1;
             }
           }
         }
@@ -263,13 +288,10 @@ struct Sm90Fp4GroupedIndexerKernel {
       __syncthreads();
 
       if (active && wg_tid < BLOCK_L) {
-        float sum = 0.0f;
+        float sum = ss.warp_sums[warpgroup][wg_tid];
         CUTE_UNROLL
-        for (int head = 0; head < HEADS; ++head) {
-          float score =
-              fmaxf(static_cast<float>(ss.scores[warpgroup][head * BLOCK_L + wg_tid]), 0.0f);
-          const float weight = static_cast<float>(weights[static_cast<int64_t>(b) * p.weight_stride_b + head]);
-          sum += static_cast<float>(bf16(score * weight));
+        for (int warp = 1; warp < WARPS_PER_WARPGROUP; ++warp) {
+          sum += ss.warp_sums[warpgroup][warp * BLOCK_L + wg_tid];
         }
         const int position = l0 + wg_tid;
         if (position < p.width) {
