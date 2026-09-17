@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import os
 import pickle
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 import torch
 import torch.distributed
@@ -86,6 +89,45 @@ class PPBatchMetadata:
 
 
 class SchedulerPPMixin:
+    # #region debug-point H1-H3:prefix-timeline
+    def _pp_vpp_timeline_active(self: Scheduler) -> bool:
+        return getattr(self, "_pp_vpp_timeline_enabled", False) and getattr(
+            getattr(self, "profiler_manager", None), "torch_profiler", None
+        ) is not None
+
+    def _pp_vpp_timeline(self: Scheduler, event: str, **data) -> None:
+        if not self._pp_vpp_timeline_active():
+            return
+        profile_id = self.profiler_manager.profile_id
+        if getattr(self, "_pp_vpp_timeline_profile_id", None) != profile_id:
+            self._pp_vpp_timeline_profile_id = profile_id
+            self._pp_vpp_timeline_count = 0
+        if self._pp_vpp_timeline_count >= 10000:
+            return
+        self._pp_vpp_timeline_count += 1
+        record = json.dumps(
+            {
+                "event": event,
+                "pp": self.ps.pp_rank,
+                "tp": self.ps.tp_rank,
+                "profile": profile_id,
+                "wall_ns": time.time_ns(),
+                "mono_ns": time.monotonic_ns(),
+                **data,
+            },
+            separators=(",", ":"),
+        )
+        with torch.profiler.record_function(
+            f"vpp_timeline/{event} {quote(record, safe=':,[]')}"
+        ):
+            pass
+        if self.ps.tp_rank == 0:
+            logger.info("[VPP_TIMELINE] %s", record)
+        if self._pp_vpp_timeline_count == 10000:
+            logger.warning("[VPP_TIMELINE] event limit reached; later markers omitted")
+
+    # #endregion
+
     def _pp_vpp_enabled(self: Scheduler) -> bool:
         return get_parallel().pp_virtual_stages > 1
 
@@ -1112,6 +1154,10 @@ class SchedulerPPMixin:
 
     def _event_loop_pp_disagg_prefill_vpp_rank_local(self: Scheduler):
         self.init_pp_loop_state()
+        # #region debug-point H1-H3:prefix-timeline
+        self._pp_vpp_timeline_enabled = os.getenv("SGLANG_VPP_TIMELINE") == "1"
+        timeline_gate_state = None
+        # #endregion
         max_inflight = self._pp_vpp_max_inflight()
         rank_schedule = PipelineRankSchedule(
             physical_rank=self.ps.pp_rank,
@@ -1365,6 +1411,21 @@ class SchedulerPPMixin:
                 envelope.source_rank == self.ps.pp_rank
                 and envelope.hops >= self.ps.pp_size
             )
+            # #region debug-point H1-H2:control-arrival
+            if envelope.kind in (
+                PipelineControlKind.ADMIT,
+                PipelineControlKind.FIRST_PASS_DONE,
+                PipelineControlKind.PREFIX_COMMIT,
+                PipelineControlKind.COMPLETION,
+            ):
+                self._pp_vpp_timeline(
+                    "control",
+                    kind=envelope.kind.value,
+                    batch=envelope.batch_seq,
+                    source=envelope.source_rank,
+                    returned=returned_to_source,
+                )
+            # #endregion
 
             if envelope.kind == PipelineControlKind.RESOURCE:
                 if self.ps.pp_rank == 0:
@@ -1636,6 +1697,11 @@ class SchedulerPPMixin:
             while self._pp_vpp_arrivals:
                 batch_seq, stage_id = self._pp_vpp_arrivals.popleft()
                 rank_schedule.mark_ready(batch_seq, stage_id)
+                # #region debug-point H2:activation-ready
+                self._pp_vpp_timeline(
+                    "activation_ready", batch=batch_seq, stage=stage_id
+                )
+                # #endregion
             while True:
                 control_message = self._pp_vpp_poll_control_receiver_tp_broadcast()
                 if control_message is None:
@@ -1782,6 +1848,39 @@ class SchedulerPPMixin:
                 continuation = (
                     self.chunked_req is not None and self.chunked_req.kv.holds_kv
                 )
+                # #region debug-point H1:admission-gates
+                if self._pp_vpp_timeline_active():
+                    gate_state = (
+                        self.profiler_manager.profile_id,
+                        next_batch_seq,
+                        pending_admit,
+                        bootstrap_round_active,
+                        tuple(sorted(pending_chunk_batches)),
+                        rank_schedule.can_admit(next_batch_seq),
+                        resource_gate.can_admit(
+                            required_request_slots=0 if continuation else 1,
+                            required_kv_tokens=token_budget,
+                            required_activation_bytes=required_activation,
+                        ),
+                        continuation,
+                        len(self.waiting_queue),
+                    )
+                    if gate_state != timeline_gate_state:
+                        self._pp_vpp_timeline(
+                            "admission_gate",
+                            next_batch=next_batch_seq,
+                            pending_admit=pending_admit,
+                            bootstrap=bootstrap_round_active,
+                            prefix_batches=gate_state[4],
+                            slot_ok=gate_state[5],
+                            resources_ok=gate_state[6],
+                            continuation=continuation,
+                            waiting=gate_state[8],
+                        )
+                        timeline_gate_state = gate_state
+                else:
+                    timeline_gate_state = None
+                # #endregion
                 if (
                     pending_admit is None
                     and not bootstrap_round_active
@@ -1822,6 +1921,13 @@ class SchedulerPPMixin:
                         pending_admit = next_batch_seq
                         if batch.chunked_req is not None:
                             pending_chunk_batches.add(next_batch_seq)
+                        # #region debug-point H1-H2:admit-enqueue
+                        self._pp_vpp_timeline(
+                            "admit_queued",
+                            batch=next_batch_seq,
+                            prefix_pending=batch.chunked_req is not None,
+                        )
+                        # #endregion
                         next_batch_seq += 1
                         mark_progress("admission")
                         server_is_idle = False
@@ -1854,6 +1960,11 @@ class SchedulerPPMixin:
                             },
                         ).forwarded()
                     )
+                    # #region debug-point H1:prefix-commit-enqueue
+                    self._pp_vpp_timeline(
+                        "prefix_commit_queued", batch=batch_seq, end=end
+                    )
+                    # #endregion
                 else:
                     pending_chunk_batches.discard(batch_seq)
                 pending_first_pass.pop(batch_seq, None)
@@ -2920,7 +3031,27 @@ class SchedulerPPMixin:
             )
 
         send_work = []
-        with torch.profiler.record_function(f"run_vpp_stage_{action.stage_id}"):
+        # #region debug-point H2-H3:stage-launch
+        stage_label = f"run_vpp_stage_{action.stage_id}"
+        if self._pp_vpp_timeline_active():
+            stage_label += f"/batch_{action.batch_seq}/slot_{action.slot_id}"
+            self._pp_vpp_timeline(
+                "stage_launch",
+                batch=action.batch_seq,
+                stage=action.stage_id,
+                slot=action.slot_id,
+                chunks=[
+                    (
+                        hashlib.sha256(req.rid.encode()).hexdigest()[:16],
+                        req.extend_range.start,
+                        cur_batch.disagg_prefill_chunk_end_by_rid.get(req.rid),
+                    )
+                    for req in cur_batch.reqs
+                    if req.extend_range is not None
+                ],
+            )
+        # #endregion
+        with torch.profiler.record_function(stage_label):
             with self.forward_stream_ctx:
                 self.forward_stream.wait_stream(self.schedule_stream)
                 if action.stage_id < self.ps.pp_size:
