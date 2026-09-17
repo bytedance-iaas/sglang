@@ -2571,6 +2571,18 @@ class DeepseekV2DecoderLayer(nn.Module):
                     self.layer_scatter_modes.layer_input_mode
                 ),
             )
+        if prefill_layer_probe is not None and prefill_layer_probe.matches(
+            forward_batch.rids
+        ):
+            prefill_layer_probe.capture_layer_boundary(
+                boundary=f"layer_{self.layer_id:02d}_attn_output",
+                rids=forward_batch.rids,
+                hidden_states=hidden_states,
+                residual=residual,
+                positions=positions,
+                prefix_len=int(forward_batch.extend_prefix_lens_cpu[0]),
+                out_cache_loc=forward_batch.out_cache_loc,
+            )
 
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             hidden_states = self.self_attn(
@@ -2617,6 +2629,18 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+        if prefill_layer_probe is not None and prefill_layer_probe.matches(
+            forward_batch.rids
+        ):
+            prefill_layer_probe.capture_layer_boundary(
+                boundary=f"layer_{self.layer_id:02d}_mlp_input",
+                rids=forward_batch.rids,
+                hidden_states=hidden_states,
+                residual=residual,
+                positions=positions,
+                prefix_len=int(forward_batch.extend_prefix_lens_cpu[0]),
+                out_cache_loc=forward_batch.out_cache_loc,
+            )
         if (
             target_forward_probe is not None
             and forward_batch.forward_mode.is_target_verify()
