@@ -1876,6 +1876,7 @@ class EaglePrefillIndexerStoreProbe:
                 "pod_uid": pod_uid,
             }
         self._invocations: dict[str, int] = {}
+        self._layer_boundary_invocations: dict[tuple[str, str], int] = {}
 
     @property
     def can_probe(self) -> bool:
@@ -2077,6 +2078,41 @@ class EaglePrefillIndexerStoreProbe:
                 "segments": segments,
                 "rank": _rank_payload(),
             },
+        )
+
+    def capture_layer_boundary(
+        self,
+        *,
+        boundary: str,
+        rids: Optional[list[str]],
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        positions: torch.Tensor,
+        prefix_len: int,
+        out_cache_loc: torch.Tensor,
+    ) -> None:
+        if not self.matches(rids):
+            return
+        inputs = {"hidden_states": hidden_states}
+        if residual is not None:
+            inputs["residual"] = residual
+        _, selected_positions, selected_locations, selected = (
+            select_prefill_indexer_store_rows(
+                hidden_states,
+                positions,
+                out_cache_loc,
+                prefix_len=prefix_len,
+                projection_inputs=inputs,
+            )
+        )
+        self.capture(
+            layer_id=1,
+            rids=rids,
+            key_raw=selected["hidden_states"],
+            positions=selected_positions,
+            out_cache_loc=selected_locations,
+            key_semantics=boundary,
+            projection_inputs=selected,
         )
 
 
