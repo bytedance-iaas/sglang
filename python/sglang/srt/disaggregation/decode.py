@@ -2596,8 +2596,6 @@ class SchedulerDisaggregationDecodeMixin:
         self: Scheduler, running_batch: ScheduleBatch
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
-        running_batch.has_new_decode_admission = False
-        admitted_new_batch = False
         # Process pending prebuilt batch: output processing + filter + merge
         new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
         if new_prebuilt_batch:
@@ -2623,7 +2621,6 @@ class SchedulerDisaggregationDecodeMixin:
                             num_draft_tokens=get_spec().speculative_num_draft_tokens,
                         )
                     running_batch.merge_batch(new_prebuilt_batch)
-                admitted_new_batch = True
 
         # Schedule decode batch
         if running_batch.is_empty():
@@ -2637,8 +2634,6 @@ class SchedulerDisaggregationDecodeMixin:
                 self.draft_worker.requires_dp_attention_eager_forward(ret)
             )
 
-        if ret is not None:
-            ret.has_new_decode_admission = admitted_new_batch
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
         if ret:
             set_schedule_time_batch(ret)

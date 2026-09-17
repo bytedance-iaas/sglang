@@ -477,8 +477,8 @@ class SchedulerPPMixin:
                 # is then the stage rendezvous.  Do not add a separate CPU
                 # fence here: an idle rank waiting in such a fence can starve
                 # device work that an active rank still needs to finish.
-                self._pp_wait_decode_dp_admission_slot_launch(
-                    cur_batch, self.launch_event if cur_batch else None
+                self._pp_wait_decode_dp_slot_launch(
+                    self.launch_event if cur_batch else None
                 )
 
                 if get_parallel().pp_async_batch_depth == 0:
@@ -757,16 +757,12 @@ class SchedulerPPMixin:
             p2p_work.work.wait()
         work.clear()
 
-    def _pp_wait_decode_dp_admission_slot_launch(
-        self: Scheduler,
-        batch: Optional[ScheduleBatch],
-        launch_event: Optional[torch.Event],
+    def _pp_wait_decode_dp_slot_launch(
+        self: Scheduler, launch_event: Optional[torch.Event]
     ) -> None:
         if not (
             getattr(self, "_pp_spec_relay", False)
             and get_parallel().enable_dp_attention
-            and batch is not None
-            and batch.has_new_decode_admission
         ):
             return
         if launch_event is not None:
