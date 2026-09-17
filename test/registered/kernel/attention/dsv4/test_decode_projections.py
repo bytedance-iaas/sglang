@@ -20,6 +20,9 @@ class TestHopperCandidateScoring(CustomTestCase):
         from sglang.kernels.ops.attention.dsv4.sm90_fp4_indexer import (
             fp4_index_logits_req_to_token,
         )
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+            store_fp4_index_k_cache,
+        )
         from sglang.kernels.ops.attention.dsv4.torch_quant import fake_quant_fp4
 
         torch.manual_seed(11)
@@ -40,25 +43,31 @@ class TestHopperCandidateScoring(CustomTestCase):
                 device="cuda",
                 dtype=torch.int64,
             )
-            req_to_token = torch.stack(
-                [
-                    torch.randperm(8 * page_size, device="cuda")[: 2 * width]
-                    for _ in range(2)
-                ]
+            slots = torch.stack(
+                [torch.randperm(4 * page_size, device="cuda")[:width] for _ in range(2)]
             ).to(torch.int32)
-            table = torch.randint(
-                0, 256, (8, page_size * 68), device="cuda", dtype=torch.uint8
+            table = torch.empty(
+                (4, page_size * 68), device="cuda", dtype=torch.uint8
             )
-            table[:, page_size * 64 :] = torch.randint(
-                120,
-                135,
-                (8, page_size * 4),
-                device="cuda",
-                dtype=torch.uint8,
+            store_fp4_index_k_cache(
+                torch.randn(
+                    4 * page_size,
+                    128,
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                ),
+                table,
+                torch.arange(4 * page_size, device="cuda", dtype=torch.int32),
+                page_size=page_size,
+                rne=True,
             )
 
             for ratio in (1, 2):
                 with self.subTest(group_size=group_size, ratio=ratio):
+                    req_to_token = torch.zeros(
+                        2, width * ratio, device="cuda", dtype=torch.int32
+                    )
+                    req_to_token[:, ::ratio] = slots * ratio
                     expected = fp4_index_logits_req_to_token(
                         q,
                         weights,
@@ -82,9 +91,7 @@ class TestHopperCandidateScoring(CustomTestCase):
                         width,
                         group_size=group_size,
                     )
-                    torch.testing.assert_close(
-                        actual, expected, rtol=2e-2, atol=5e-1, equal_nan=True
-                    )
+                    torch.testing.assert_close(actual, expected, equal_nan=True)
 
     def test_fp4_indexer_direct_mapping_matches_explicit_slots(self):
         from sglang.kernels.ops.attention.dsv4.sm90_fp4_indexer import (

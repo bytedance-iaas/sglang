@@ -3602,12 +3602,6 @@ class DeepseekV4AttnBackend(
         q = indexer.queries(q_lora, layer.freqs_cis[pos])
         weights = indexer.head_weights(x)
         logical_forward_mode = _get_logical_forward_mode(forward_batch)
-        verify_group_size = 1
-        if logical_forward_mode.is_target_verify():
-            draft_token_num = int(forward_batch.spec_info.draft_token_num)
-            if draft_token_num > 1 and bs % draft_token_num == 0:
-                # token_req_indices is request-major repeat_interleave in verify.
-                verify_group_size = draft_token_num
         compact = (
             (
                 logical_forward_mode.is_decode()
@@ -3678,7 +3672,6 @@ class DeepseekV4AttnBackend(
                 table.shape[1] // 68,
                 ratio,
                 lmax,
-                group_size=verify_group_size,
             )
         if indexer.is_candidate_source and not compact:
             self.candidate_masks = select_candidate_blocks(
