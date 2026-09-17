@@ -2257,6 +2257,7 @@ class GroupCoordinator:
                     and tensor.numel() % all_gather_size == 0
                 ):
                     tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+                tensor = tensor.contiguous()
                 comm_group = metadata_group if tensor.is_cpu else group
                 send_kwargs = {"tag": tag} if tag and tensor.is_cpu else {}
                 work = send_func(
@@ -2279,6 +2280,7 @@ class GroupCoordinator:
             if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
+            tensor = tensor.contiguous()
             comm_group = metadata_group if tensor.is_cpu else group
             tensors_to_send.append((tensor, comm_group))
         if tensors_to_send:

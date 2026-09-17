@@ -208,6 +208,56 @@ class TestBatchedTensorDictP2P(unittest.TestCase):
             [tensors["hidden_states"], tensors["prev_pre"]],
         )
 
+    def test_send_materializes_non_dense_tensor_payloads(self):
+        coordinator = _coordinator()
+        source = torch.arange(4).expand(3, 4)
+        self.assertFalse(source.is_contiguous())
+        work = MagicMock()
+
+        with (
+            patch.object(
+                parallel_state.torch.distributed,
+                "P2POp",
+                side_effect=lambda op, tensor, peer, group: SimpleNamespace(
+                    op=op,
+                    tensor=tensor,
+                    peer=peer,
+                    group=group,
+                ),
+            ),
+            patch.object(
+                parallel_state.torch.distributed,
+                "batch_isend_irecv",
+                return_value=[work],
+            ) as batch,
+        ):
+            result = parallel_state.GroupCoordinator.send_tensor_dict(
+                coordinator,
+                {"hidden_states": source},
+                async_send=True,
+                batch_p2p=True,
+            )
+
+        sent = batch.call_args.args[0][0].tensor
+        self.assertTrue(sent.is_contiguous())
+        torch.testing.assert_close(sent, source)
+        self.assertIs(result[0].payload, sent)
+        coordinator.send_object.assert_called_once_with(
+            [
+                (
+                    "hidden_states",
+                    parallel_state.TensorMetadata(
+                        "cpu",
+                        source.dtype,
+                        source.size(),
+                    ),
+                )
+            ],
+            dst=1,
+            async_send=True,
+            tag=0,
+        )
+
     def test_recv_posts_all_tensor_operations_before_waiting(self):
         coordinator = _coordinator()
         coordinator.recv_object.return_value = [

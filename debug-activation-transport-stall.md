@@ -76,3 +76,15 @@ Pending evidence:
 - Activation and control receive group identities.
 - Control receive framing state and the first pending control send identities.
 - Matching PP0 transport state for the same stall.
+
+Runtime exception at 2026-09-17 03:53:45:
+- `torch.distributed.batch_isend_irecv` rejects a VPP activation payload with
+  `ValueError: Tensors for P2P must be non-overlapping and dense`.
+- The tensor-dict transport preserves arbitrary proxy views and submits them
+  directly to P2P.
+
+Minimal fix:
+- Materialize each tensor as default contiguous after the optional TP slice and
+  before posting P2P operations.
+- Keep the materialized tensor in `P2PWork.payload` for the full async lifetime.
+- Preserve the original logical shape and dtype in tensor-dict metadata.
