@@ -76,6 +76,7 @@ from sglang.srt.utils.nvtx_utils import (
 )
 
 logger = logging.getLogger(__name__)
+_PREFILL_ATTENTION_PROBE_SAMPLE_COLUMNS = 256
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 _ENABLE_DSA_Q8KV8_BORN_FP8_Q = envs.SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q.get()
 _ENABLE_DSA_Q8KV8_QPREP_OVERLAP = envs.SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP.get()
@@ -90,6 +91,14 @@ class MlaBmmFusionPlan:
     q_nope_out_buf: torch.Tensor
     q_nope_out_view: torch.Tensor
     attn_output_buf: torch.Tensor
+
+
+def _sample_prefill_attention_probe_columns(value: torch.Tensor) -> torch.Tensor:
+    """Return a deterministic, bounded diagnostic view of a wide activation."""
+    if value.ndim != 2 or value.shape[1] < _PREFILL_ATTENTION_PROBE_SAMPLE_COLUMNS:
+        raise ValueError("Prefill attention probe requires a wide rank-2 activation")
+    step = value.shape[1] // _PREFILL_ATTENTION_PROBE_SAMPLE_COLUMNS
+    return value[:, ::step][:, :_PREFILL_ATTENTION_PROBE_SAMPLE_COLUMNS].contiguous()
 
 
 def _select_local_dcp_heads_for_autotune(
@@ -899,9 +908,11 @@ class DeepseekMLAForwardMixin:
                 self._prefill_attention_probe = prefill_attention_probe
             if prefill_attention_probe.matches(forward_batch.rids):
                 prefill_attention_probe.capture_layer_boundary(
-                    boundary="layer_00_absorbed_attention_context",
+                    boundary="layer_00_absorbed_attention_context_sample256",
                     rids=forward_batch.rids,
-                    hidden_states=attn_output.flatten(1, 2),
+                    hidden_states=_sample_prefill_attention_probe_columns(
+                        attn_output.flatten(1, 2)
+                    ),
                     residual=None,
                     positions=positions,
                     prefix_len=int(forward_batch.extend_prefix_lens_cpu[0]),
@@ -1023,9 +1034,9 @@ class DeepseekMLAForwardMixin:
             forward_batch.rids
         ):
             prefill_attention_probe.capture_layer_boundary(
-                boundary="layer_00_o_proj_input",
+                boundary="layer_00_o_proj_input_sample256",
                 rids=forward_batch.rids,
-                hidden_states=attn_bmm_output,
+                hidden_states=_sample_prefill_attention_probe_columns(attn_bmm_output),
                 residual=None,
                 positions=positions,
                 prefix_len=int(forward_batch.extend_prefix_lens_cpu[0]),
