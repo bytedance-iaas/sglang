@@ -1137,6 +1137,46 @@ class TestEagleNumericalProbe(unittest.TestCase):
         self.assertEqual(tuple(buffers["device_staging"].shape), (1024, 2, 6))
         self.assertEqual(tuple(buffers["host_staging"].shape), (1024, 2, 6))
 
+    def test_pp_target_forward_observer_captures_indexer_store_inputs(self):
+        observer = _PPTargetForwardDeviceObserver(
+            layer_ids=(0, 1),
+            max_rows=4,
+            hidden_size=3,
+            dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+        )
+        observer.install_indexer_store_inputs(layer_id=1, head_dim=4)
+        key_raw = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4)
+        positions = torch.tensor([1048588, 1048589], dtype=torch.int64)
+        out_cache_loc = torch.tensor([1048588, 1048589], dtype=torch.int64)
+        observer.capture_indexer_store_inputs(
+            layer_id=1,
+            key_raw=key_raw,
+            positions=positions,
+            out_cache_loc=out_cache_loc,
+        )
+
+        stage = observer.snapshot_stages()[
+            "target_verify_layer_01_indexer_store_inputs"
+        ]
+        self.assertEqual(
+            set(stage["tensors"]), {"key_raw", "positions", "out_cache_loc"}
+        )
+        self.assertTrue(torch.equal(stage["tensors"]["key_raw"][:2], key_raw))
+        self.assertTrue(torch.equal(stage["tensors"]["positions"][:2], positions))
+        self.assertTrue(
+            torch.equal(stage["tensors"]["out_cache_loc"][:2], out_cache_loc)
+        )
+        self.assertEqual(stage["tensor_metadata"]["key_raw"]["logical_rows"].item(), 2)
+
+        with self.assertRaisesRegex(ValueError, "does not fit"):
+            observer.capture_indexer_store_inputs(
+                layer_id=1,
+                key_raw=torch.zeros((5, 4), dtype=torch.bfloat16),
+                positions=torch.zeros((5,), dtype=torch.int64),
+                out_cache_loc=torch.zeros((5,), dtype=torch.int64),
+            )
+
     def test_pp_target_forward_observer_rejects_logical_topk_output_drift(self):
         observer = _PPTargetForwardDeviceObserver(
             layer_ids=(0,),

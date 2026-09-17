@@ -606,6 +606,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             pool.invalidate_index_buffer_for_layer(layer_id)
         if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
             return
+        target_forward_probe = getattr(self, "target_forward_probe", None)
+        if (
+            target_forward_probe is not None
+            and layer_id == 1
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            target_forward_probe.capture_indexer_store_inputs(
+                layer_id=layer_id,
+                key_raw=key_raw,
+                positions=positions,
+                out_cache_loc=out_cache_loc,
+            )
         if (
             not _is_fp8_fnuz
             and out_cache_loc is not None

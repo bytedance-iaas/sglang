@@ -205,6 +205,7 @@ _PP_TARGET_ATTENTION_OUTPUT_BOUNDARIES = (
 )
 _PP_TARGET_ATTENTION_TENSOR = "output"
 _PP_INDEXER_INPUT_TENSORS = ("q_fp8", "weights", "block_tables", "seq_lens")
+_PP_INDEXER_STORE_INPUT_TENSORS = ("key_raw", "positions", "out_cache_loc")
 _PP_INDEXER_CACHE_TENSORS = (
     "page_ids",
     "page_counts",
@@ -292,6 +293,8 @@ class _PPTargetForwardDeviceObserver:
         self._indexer_input_row_counts: dict[int, dict[str, torch.Tensor]] = {}
         self._indexer_input_page_sizes: dict[int, int] = {}
         self._indexer_page_columns: dict[int, torch.Tensor] = {}
+        self._indexer_store_input_buffers: dict[int, dict[str, torch.Tensor]] = {}
+        self._indexer_store_input_row_counts: dict[int, torch.Tensor] = {}
         self._indexer_cache_buffers: dict[int, dict[str, torch.Tensor]] = {}
         self._indexer_cache_head_dims: dict[int, int] = {}
         self._indexer_cache_scale_bytes: dict[int, int] = {}
@@ -586,6 +589,73 @@ class _PPTargetForwardDeviceObserver:
             "index_k_bytes": "paged_mqa_logical_page",
             "index_k_scale_bytes": "paged_mqa_logical_page",
         }
+
+    def install_indexer_store_inputs(self, *, layer_id: int, head_dim: int) -> None:
+        """Allocate fixed buffers for the fused norm/RoPE/quant/store inputs."""
+        if layer_id in self._indexer_store_input_buffers:
+            raise RuntimeError(
+                f"indexer-store observer is already installed for layer {layer_id}"
+            )
+        if head_dim <= 0:
+            raise ValueError(f"indexer-store head_dim must be positive: {head_dim}")
+        self._indexer_store_input_buffers[layer_id] = {
+            "key_raw": torch.empty(
+                (self.max_rows, head_dim), dtype=self.dtype, device=self.device
+            ),
+            "positions": torch.empty(
+                (self.max_rows,), dtype=torch.int64, device=self.device
+            ),
+            "out_cache_loc": torch.empty(
+                (self.max_rows,), dtype=torch.int64, device=self.device
+            ),
+        }
+        self._indexer_store_input_row_counts[layer_id] = torch.zeros(
+            (1,), dtype=torch.int32, device=self.device
+        )
+        stage = f"target_verify_layer_{layer_id:02d}_indexer_store_inputs"
+        self._row_domains[stage] = {
+            name: _PP_ATTN_GROUP_TARGET_TREE_ROW_DOMAIN
+            for name in _PP_INDEXER_STORE_INPUT_TENSORS
+        }
+
+    def capture_indexer_store_inputs(
+        self,
+        *,
+        layer_id: int,
+        key_raw: torch.Tensor,
+        positions: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+    ) -> None:
+        """Copy the exact inputs immediately before the fused index-K store."""
+        buffers = self._indexer_store_input_buffers.get(layer_id)
+        if buffers is None:
+            return
+        stage = f"target_verify_layer_{layer_id:02d}_indexer_store_inputs"
+        values = {
+            "key_raw": key_raw,
+            "positions": positions,
+            "out_cache_loc": out_cache_loc,
+        }
+        for name, value in values.items():
+            if value.device != self.device or value.dtype != buffers[name].dtype:
+                raise ValueError(
+                    f"{stage}.{name} identity changed: shape={tuple(value.shape)}, "
+                    f"dtype={value.dtype}, device={value.device}"
+                )
+            if value.ndim != buffers[name].ndim or any(
+                actual > limit
+                for actual, limit in zip(value.shape, buffers[name].shape)
+            ):
+                raise ValueError(
+                    f"{stage}.{name} shape {tuple(value.shape)} does not fit "
+                    f"fixed slot {tuple(buffers[name].shape)}"
+                )
+        rows = int(key_raw.shape[0])
+        if rows <= 0 or positions.shape[0] != rows or out_cache_loc.shape[0] != rows:
+            raise ValueError(f"{stage} row mismatch")
+        for name, value in values.items():
+            buffers[name][:rows].copy_(value)
+        self._indexer_store_input_row_counts[layer_id].fill_(rows)
 
     def capture_indexer_cache(
         self,
@@ -1027,6 +1097,18 @@ class _PPTargetForwardDeviceObserver:
                 },
                 "tensors": buffers,
             }
+        for layer_id, buffers in self._indexer_store_input_buffers.items():
+            stage = f"target_verify_layer_{layer_id:02d}_indexer_store_inputs"
+            stages[stage] = {
+                "tensor_metadata": {
+                    name: {
+                        "logical_rows": self._indexer_store_input_row_counts[layer_id],
+                        "row_domain": self._row_domains[stage][name],
+                    }
+                    for name in _PP_INDEXER_STORE_INPUT_TENSORS
+                },
+                "tensors": buffers,
+            }
         return stages
 
     def finalize_indexer_cache_stages(self) -> dict[str, dict]:
@@ -1068,6 +1150,8 @@ class _PPTargetForwardDeviceObserver:
             )
             key_hash = hashlib.sha256()
             scale_hash = hashlib.sha256()
+            key_row_hashes = []
+            scale_row_hashes = []
             key_sum = scale_sum = 0
             key_abs_max = scale_abs_max = 0
             device_staging = buffers["device_staging"]
@@ -1076,6 +1160,8 @@ class _PPTargetForwardDeviceObserver:
             for row, page_count_value in enumerate(page_counts.tolist()):
                 page_count = int(page_count_value)
                 context_len = int(context_lens[row].item())
+                key_row_hash = hashlib.sha256()
+                scale_row_hash = hashlib.sha256()
                 for start in range(0, page_count, int(device_staging.shape[0])):
                     chunk_pages = min(int(device_staging.shape[0]), page_count - start)
                     page_ids = device_block_tables[row, start : start + chunk_pages]
@@ -1096,18 +1182,25 @@ class _PPTargetForwardDeviceObserver:
                         host_chunk[-1, context_len % page_size :].zero_()
                     key_chunk = host_chunk[..., :head_dim].contiguous()
                     scale_chunk = host_chunk[..., head_dim:].contiguous()
-                    key_hash.update(key_chunk.numpy().tobytes())
-                    scale_hash.update(scale_chunk.numpy().tobytes())
+                    key_bytes = key_chunk.numpy().tobytes()
+                    scale_bytes = scale_chunk.numpy().tobytes()
+                    key_hash.update(key_bytes)
+                    scale_hash.update(scale_bytes)
+                    key_row_hash.update(key_bytes)
+                    scale_row_hash.update(scale_bytes)
                     key_sum += int(key_chunk.sum(dtype=torch.int64).item())
                     scale_sum += int(scale_chunk.sum(dtype=torch.int64).item())
                     key_abs_max = max(key_abs_max, int(key_chunk.max().item()))
                     scale_abs_max = max(scale_abs_max, int(scale_chunk.max().item()))
+                key_row_hashes.append(key_row_hash.hexdigest())
+                scale_row_hashes.append(scale_row_hash.hexdigest())
 
-            def byte_fingerprint(digest, value_sum, abs_max, width):
+            def byte_fingerprint(digest, row_hashes, value_sum, abs_max, width):
                 return {
                     "dtype": "torch.uint8",
                     "shape": [total_pages, page_size, width],
                     "sha256": digest.hexdigest(),
+                    "row_sha256": row_hashes,
                     "finite": True,
                     "sum": float(value_sum),
                     "abs_max": float(abs_max),
@@ -1117,10 +1210,11 @@ class _PPTargetForwardDeviceObserver:
                 "page_ids": _tensor_fingerprint(logical_page_ids, total_pages),
                 "page_counts": _tensor_fingerprint(page_counts, rows),
                 "index_k_bytes": byte_fingerprint(
-                    key_hash, key_sum, key_abs_max, head_dim
+                    key_hash, key_row_hashes, key_sum, key_abs_max, head_dim
                 ),
                 "index_k_scale_bytes": byte_fingerprint(
                     scale_hash,
+                    scale_row_hashes,
                     scale_sum,
                     scale_abs_max,
                     int(packed_source.shape[-1]) - head_dim,
@@ -1328,6 +1422,11 @@ class EaglePPSenderProbe:
                 head_dim=int(indexer.head_dim),
                 scale_bytes=4,
             )
+            if layer_id == layer_ids[1]:
+                observer.install_indexer_store_inputs(
+                    layer_id=layer_id,
+                    head_dim=int(indexer.head_dim),
+                )
             attention.target_forward_probe = observer
             indexer.target_forward_probe = observer
             radix_attention.target_forward_probe = observer
