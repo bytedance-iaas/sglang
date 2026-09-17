@@ -320,7 +320,9 @@ class TestPPCPRankOffsets(unittest.TestCase):
         source = inspect.getsource(SchedulerPPMixin.event_loop_pp_disagg_decode)
         self.assertNotIn("relay_output_immediately=True", source)
         self.assertNotIn("_pp_run_control_ring_phase", source)
-        self.assertEqual(source.count("group=self.pp_disagg_control_group"), 3)
+        # Three consensus phases each route both send and receive through the
+        # dedicated control communicator.
+        self.assertEqual(source.count("group=self.pp_disagg_control_group"), 6)
         self.assertIn("self._pp_pd_send_consensus_bootstrapped_ids", source)
         self.assertIn("self._pp_pd_send_consensus_release_ids", source)
 
