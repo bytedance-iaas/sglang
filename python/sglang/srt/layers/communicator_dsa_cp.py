@@ -195,10 +195,23 @@ class DSACPCommunicateWithAllReduceAndLayerNormFn(
     ):
         if hidden_states.shape[0] != 0:
             hidden_states, residual = layernorm(hidden_states, residual)
+        callback = getattr(forward_batch, "_prefill_prepare_mlp_probe_callback", None)
+        if callback is not None:
+            callback(
+                boundary="layer_00_post_attention_norm",
+                hidden_states=hidden_states,
+                residual=residual,
+            )
         # for prefill: attn tp scattered -> full
         # for decode: attn tp full -> full
         if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
             hidden_states = dsa_cp_gather_hidden_states(hidden_states)
+        if callback is not None:
+            callback(
+                boundary="layer_00_post_attention_gather",
+                hidden_states=hidden_states,
+                residual=residual,
+            )
         return hidden_states, residual
 
 

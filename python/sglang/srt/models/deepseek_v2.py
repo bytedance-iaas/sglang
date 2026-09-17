@@ -2533,7 +2533,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             self.layer_id == 0
             and forward_batch.forward_mode.is_extend_without_speculative()
             and envs.SGLANG_EAGLE_PREFILL_INDEXER_STORE_PREFIX_TOKENS.get() > 0
-            and envs.SGLANG_EAGLE_PREFILL_PROBE_SCOPE.get() == "layer0-mid"
+            and envs.SGLANG_EAGLE_PREFILL_PROBE_SCOPE.get() == "layer0-prepare-mlp"
         ):
             prefill_layer_probe = getattr(self, "_prefill_layer_probe", None)
             if prefill_layer_probe is None:
@@ -2562,19 +2562,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                     self.layer_scatter_modes.layer_input_mode
                 ),
             )
-        if prefill_layer_probe is not None and prefill_layer_probe.matches(
-            forward_batch.rids
-        ):
-            prefill_layer_probe.capture_layer_boundary(
-                boundary=f"layer_{self.layer_id:02d}_attn_output",
-                rids=forward_batch.rids,
-                hidden_states=hidden_states,
-                residual=residual,
-                positions=positions,
-                prefix_len=int(forward_batch.extend_prefix_lens_cpu[0]),
-                out_cache_loc=forward_batch.out_cache_loc,
-            )
-
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             hidden_states = self.self_attn(
                 positions=positions,
@@ -2617,21 +2604,31 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch, next_full_attention_layer_id
         )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        previous_callback = forward_batch._prefill_prepare_mlp_probe_callback
         if prefill_layer_probe is not None and prefill_layer_probe.matches(
             forward_batch.rids
         ):
-            prefill_layer_probe.capture_layer_boundary(
-                boundary=f"layer_{self.layer_id:02d}_mlp_input",
-                rids=forward_batch.rids,
-                hidden_states=hidden_states,
-                residual=residual,
-                positions=positions,
-                prefix_len=int(forward_batch.extend_prefix_lens_cpu[0]),
-                out_cache_loc=forward_batch.out_cache_loc,
+
+            def capture_prepare_mlp_boundary(*, boundary, hidden_states, residual):
+                prefill_layer_probe.capture_layer_boundary(
+                    boundary=boundary,
+                    rids=forward_batch.rids,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                    positions=positions,
+                    prefix_len=int(forward_batch.extend_prefix_lens_cpu[0]),
+                    out_cache_loc=forward_batch.out_cache_loc,
+                )
+
+            forward_batch._prefill_prepare_mlp_probe_callback = (
+                capture_prepare_mlp_boundary
             )
+        try:
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
+                hidden_states, residual, forward_batch
+            )
+        finally:
+            forward_batch._prefill_prepare_mlp_probe_callback = previous_callback
         if (
             target_forward_probe is not None
             and forward_batch.forward_mode.is_target_verify()
