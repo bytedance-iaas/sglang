@@ -70,7 +70,7 @@ struct Sm90Fp4GroupedIndexerKernel {
   static constexpr int BLOCK_L = 64;
   static constexpr int SCALE_GROUPS = 4;
   static constexpr int SCALE_GROUP_SIZE = 32;
-  static constexpr int NUM_WARPGROUPS = 4;
+  static constexpr int NUM_WARPGROUPS = 6;
   static constexpr int NUM_THREADS = 128 * NUM_WARPGROUPS;
 
   using SmemLayout =
