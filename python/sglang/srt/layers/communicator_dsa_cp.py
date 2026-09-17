@@ -184,6 +184,31 @@ class DSACPCommunicateWithAllReduceAndLayerNormFn(
         )
 
     @staticmethod
+    def _simple(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layernorm: torch.nn.Module,
+        context: CommunicateContext,
+    ):
+        callback = getattr(forward_batch, "_prefill_prepare_mlp_probe_callback", None)
+        if callback is not None:
+            callback(
+                boundary="layer_00_pre_residual_norm",
+                hidden_states=hidden_states,
+                residual=residual,
+            )
+        if hidden_states.shape[0] != 0:
+            hidden_states, residual = layernorm(hidden_states, residual)
+        if callback is not None:
+            callback(
+                boundary="layer_00_post_residual_norm",
+                hidden_states=hidden_states,
+                residual=residual,
+            )
+        return hidden_states, residual
+
+    @staticmethod
     def _gather_hidden_states_and_residual(
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
