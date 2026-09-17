@@ -876,6 +876,8 @@ class DeepseekSparseAttnBackend(
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
+        logical_topk_indices = None
+        topk_indices_offset = None
         # Batch indices selected when cp enabled: After splitting multiple sequences,
         # a certain cp rank may not have some of these sequences.
         # We use bs_idx_cpu to mark which sequences are finally selected by the current cp rank,
@@ -2083,6 +2085,7 @@ class DeepseekSparseAttnBackend(
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 if topk_indices is not None:
                     topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+                logical_topk_indices = topk_indices
                 topk_indices_offset = metadata.topk_indices_offset
                 assert topk_indices_offset is not None
                 mask = topk_indices != -1
@@ -2244,7 +2247,9 @@ class DeepseekSparseAttnBackend(
                 probe.capture_gpu_hash_inputs(
                     rids=forward_batch.rids,
                     tensors={
-                        "topk_indices": page_table_1,
+                        "logical_topk_indices": logical_topk_indices,
+                        "topk_indices_offset": topk_indices_offset,
+                        "physical_topk_indices": page_table_1,
                         "topk_length": metadata.dsa_cache_seqlens_int32,
                     },
                 )
