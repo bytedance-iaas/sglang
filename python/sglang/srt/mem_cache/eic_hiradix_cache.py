@@ -1315,7 +1315,7 @@ class EICHiRadixCache(RadixCache):
         # extend_range is still None here.
         req.host_hit_length = req.storage_hit_length = max(0, prefix_len - d)
         req.kv.cache_protected_len = prefix_len
-        stats.observe_admit(d, st["hh"], prefix_len)
+        stats.observe_admit(d, st.get("hh", 0), prefix_len)
         return True
 
     def release_load_admit(self, rid):
