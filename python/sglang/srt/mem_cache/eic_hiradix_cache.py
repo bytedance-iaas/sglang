@@ -35,6 +35,7 @@ from sglang.srt.mem_cache.eic_memory_pool import (
     get_eic_config_file_path,
 )
 from sglang.srt.mem_cache.eic_pp_reconcile import eic_pp_unsupported_reason
+from sglang.srt.mem_cache.eic_stats import stats
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool as NSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
@@ -807,8 +808,15 @@ class EICHiRadixCache(RadixCache):
         d, hh = st["d"], st["hh"]
         node = st["best_match_node"]
         quota = span - d
-        swa_ok = self._swa_headroom_ok(quota) and self._full_headroom_ok(quota)
-        if quota >= max(self.load_back_threshold, 1) and node is not None and swa_ok:
+        if hh <= 0 or node is None or quota <= 0:
+            reason = "miss.cold_or_probe_fail"
+        elif quota < max(self.load_back_threshold, 1):
+            reason = "miss.below_threshold"
+        elif not (self._swa_headroom_ok(quota) and self._full_headroom_ok(quota)):
+            reason = "miss.headroom"
+        else:
+            reason = None
+        if reason is None:
             node = self._clip_host_chain(node, d + hh - span, span - d)
             if node is not None:
                 indices = self.load_back(node, allow_evict=self.pp_size <= 1)
@@ -818,6 +826,8 @@ class EICHiRadixCache(RadixCache):
                     st["new_indices"] = indices
                     self._loadback_rid[node.id] = rid
                     return  # the LOADED report follows the local EIC ack
+            reason = "miss.dma_incomplete"  # frozen chain broke or load got no KV
+        stats.incr(reason)
         # Nothing kicked on this stage: its admissible length is device-only.
         if not self._pp_active:
             self._admit_verdict[st["h"]] = d
@@ -1305,6 +1315,7 @@ class EICHiRadixCache(RadixCache):
         # extend_range is still None here.
         req.host_hit_length = req.storage_hit_length = max(0, prefix_len - d)
         req.kv.cache_protected_len = prefix_len
+        stats.observe_admit(d, st["hh"], prefix_len)
         return True
 
     def release_load_admit(self, rid):
