@@ -106,6 +106,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_memory,
     get_parallel,
+    get_spec,
 )
 from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
@@ -2609,6 +2610,16 @@ class SchedulerDisaggregationDecodeMixin:
                     if self.enable_hisparse:
                         running_batch.hisparse_coordinator = self.hisparse_coordinator
                 else:
+                    if getattr(self, "_pp_spec_relay", False):
+                        from sglang.srt.speculative.pp_spec_relay import (
+                            normalize_pp_spec_relay,
+                        )
+
+                        new_prebuilt_batch.spec_info = normalize_pp_spec_relay(
+                            new_prebuilt_batch.spec_info,
+                            rids=[req.rid for req in new_prebuilt_batch.reqs],
+                            num_draft_tokens=get_spec().speculative_num_draft_tokens,
+                        )
                     running_batch.merge_batch(new_prebuilt_batch)
 
         # Schedule decode batch

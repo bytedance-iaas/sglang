@@ -59,3 +59,30 @@ def test_first_decode_rejects_missing_or_misaligned_bonus_tokens():
         normalize_pp_spec_relay(
             SimpleNamespace(), rids=["req-a"], num_draft_tokens=2
         )
+
+
+def test_running_relay_merges_a_newly_normalized_pd_decode_batch():
+    running = PPSpecRelayInput(
+        rids=["running"],
+        tokens=torch.tensor([[101, 11]], dtype=torch.int64),
+        parents=torch.tensor([[-1]], dtype=torch.int64),
+        top_scores=torch.tensor([[0]], dtype=torch.int64),
+    )
+    admitted = normalize_pp_spec_relay(
+        EagleDraftInput(bonus_tokens=torch.tensor([202], dtype=torch.int64)),
+        rids=["admitted"],
+        num_draft_tokens=2,
+    )
+
+    running.merge_batch(admitted)
+
+    assert running.rids == ["running", "admitted"]
+    torch.testing.assert_close(
+        running.tokens, torch.tensor([[101, 11], [202, 0]], dtype=torch.int64)
+    )
+    torch.testing.assert_close(
+        running.parents, torch.tensor([[-1], [-1]], dtype=torch.int64)
+    )
+    torch.testing.assert_close(
+        running.top_scores, torch.tensor([[0], [0]], dtype=torch.int64)
+    )
