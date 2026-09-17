@@ -479,7 +479,9 @@ def prepare_mlp_sync_batch_raw(
         local_forward_mode=local_forward_mode,
         prefill_cuda_graph_max_prefix_len=prefill_cuda_graph_max_prefix_len,
         has_new_decode_admission=(
-            local_batch.has_new_decode_admission if local_batch is not None else False
+            getattr(local_batch, "has_new_decode_admission", False)
+            if local_batch is not None
+            else False
         ),
     )
 
