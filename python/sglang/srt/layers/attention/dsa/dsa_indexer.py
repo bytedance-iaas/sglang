@@ -519,6 +519,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self._maybe_capture_prefill_projection(
                 forward_batch=forward_batch,
                 layer_id=self.layer_id,
+                projection_input=x,
                 key_raw=key,
                 positions=positions,
             )
@@ -587,6 +588,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         *,
         forward_batch: ForwardBatch,
         layer_id: int,
+        projection_input,
         key_raw: torch.Tensor,
         positions: torch.Tensor,
     ) -> None:
@@ -612,17 +614,33 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if not self._prefill_store_probe.matches(forward_batch.rids):
             return
         out_cache_loc = forward_batch.out_cache_loc
+        if isinstance(projection_input, torch.Tensor):
+            projection_inputs = {"projection_input": projection_input}
+        elif (
+            isinstance(projection_input, tuple)
+            and projection_input
+            and all(isinstance(value, torch.Tensor) for value in projection_input)
+        ):
+            projection_inputs = {
+                f"projection_input_{index}": value
+                for index, value in enumerate(projection_input)
+            }
+        else:
+            raise ValueError("unsupported Prefill indexer projection input contract")
         if forward_batch.attn_cp_metadata is not None and self.dsa_enable_prefill_cp:
             prefix_lens = forward_batch.extend_prefix_lens_cpu
             if prefix_lens is None or len(prefix_lens) != 1:
                 raise ValueError(
                     "Prefill indexer-store observer requires one CP request prefix length"
                 )
-            key_raw, positions, out_cache_loc = select_prefill_indexer_store_rows(
-                key_raw,
-                positions,
-                out_cache_loc,
-                prefix_len=int(prefix_lens[0]),
+            key_raw, positions, out_cache_loc, projection_inputs = (
+                select_prefill_indexer_store_rows(
+                    key_raw,
+                    positions,
+                    out_cache_loc,
+                    prefix_len=int(prefix_lens[0]),
+                    projection_inputs=projection_inputs,
+                )
             )
         self._prefill_store_probe.capture(
             layer_id=layer_id,
@@ -631,6 +649,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             positions=positions,
             out_cache_loc=out_cache_loc,
             key_semantics="pre_norm_rope_projection",
+            projection_inputs=projection_inputs,
         )
 
     def _get_k_bf16(
@@ -677,6 +696,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self._maybe_capture_prefill_projection(
             forward_batch=forward_batch,
             layer_id=layer_id,
+            projection_input=key_raw,
             key_raw=key_raw,
             positions=positions,
         )

@@ -1794,7 +1794,8 @@ def select_prefill_indexer_store_rows(
     out_cache_loc: torch.Tensor,
     *,
     prefix_len: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    projection_inputs: Optional[dict[str, torch.Tensor]] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     """Drop CP padding and align sharded positions to global cache locations."""
     if key_raw.ndim != 2 or positions.ndim != 1 or out_cache_loc.ndim != 1:
         raise ValueError(
@@ -1807,11 +1808,21 @@ def select_prefill_indexer_store_rows(
     if not bool(valid.any()):
         raise ValueError("Prefill indexer-store CP mapping has no logical rows")
     valid_indices = torch.nonzero(valid, as_tuple=False).flatten()
+    projection_inputs = projection_inputs or {}
+    for name, value in projection_inputs.items():
+        if value.ndim < 1 or value.shape[0] != key_raw.shape[0]:
+            raise ValueError(
+                f"Prefill indexer-store projection input {name} rows differ"
+            )
     selected_key = key_raw.index_select(0, valid_indices)
     selected_positions = positions.index_select(0, valid_indices)
     selected_offsets = local_offsets.index_select(0, valid_indices)
     selected_locations = out_cache_loc.index_select(0, selected_offsets)
-    return selected_key, selected_positions, selected_locations
+    selected_inputs = {
+        name: value.index_select(0, valid_indices)
+        for name, value in projection_inputs.items()
+    }
+    return selected_key, selected_positions, selected_locations, selected_inputs
 
 
 class EaglePrefillIndexerStoreProbe:
@@ -1927,6 +1938,7 @@ class EaglePrefillIndexerStoreProbe:
         positions: torch.Tensor,
         out_cache_loc: torch.Tensor,
         key_semantics: str,
+        projection_inputs: Optional[dict[str, torch.Tensor]] = None,
     ) -> None:
         request_kind = self._request_kind(rids)
         if request_kind is None or layer_id != 1:
@@ -1956,10 +1968,20 @@ class EaglePrefillIndexerStoreProbe:
                 "out_cache_loc": out_cache_loc,
             }
         )
+        projection_inputs = projection_inputs or {}
+        if not projection_inputs:
+            raise ValueError("prefill indexer-store projection inputs are required")
+        if any(
+            value.device != key_raw.device or value.shape[0] != key_raw.shape[0]
+            for value in projection_inputs.values()
+        ):
+            raise ValueError("prefill indexer-store projection input identity changed")
+        tensor_names = (
+            *_PP_INDEXER_STORE_INPUT_TENSORS,
+            *sorted(projection_inputs),
+        )
         tensor_states = {
-            segment: {
-                name: self._new_digest() for name in _PP_INDEXER_STORE_INPUT_TENSORS
-            }
+            segment: {name: self._new_digest() for name in tensor_names}
             for segment in _PREFILL_INDEXER_STORE_SEGMENTS
         }
         segment_minmax = {
@@ -1992,6 +2014,9 @@ class EaglePrefillIndexerStoreProbe:
                 self._update_digest(
                     tensor_states[segment]["out_cache_loc"], selected_loc
                 )
+                for name, value in projection_inputs.items():
+                    selected = value[start:end].index_select(0, device_indices)
+                    self._update_digest(tensor_states[segment][name], selected)
                 low = int(selected_pos.min())
                 high = int(selected_pos.max())
                 current = segment_minmax[segment]
@@ -2024,6 +2049,14 @@ class EaglePrefillIndexerStoreProbe:
                         dtype=out_cache_loc.dtype,
                         width=1,
                     ),
+                    **{
+                        name: self._finish_digest(
+                            states[name],
+                            dtype=value.dtype,
+                            width=(int(value.shape[1]) if value.ndim == 2 else 1),
+                        )
+                        for name, value in sorted(projection_inputs.items())
+                    },
                 },
             }
         if not segments:

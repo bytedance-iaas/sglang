@@ -42,12 +42,22 @@ class TestEagleNumericalProbe(unittest.TestCase):
         key_raw = torch.arange(20, dtype=torch.bfloat16).reshape(5, 4)
         positions = torch.tensor([104, 105, 106, 0, 0], dtype=torch.int64)
         out_cache_loc = torch.tensor([400, 401, 402], dtype=torch.int64)
-        key, selected_positions, locations = select_prefill_indexer_store_rows(
-            key_raw, positions, out_cache_loc, prefix_len=104
+        projection_input = torch.arange(30, dtype=torch.bfloat16).reshape(5, 6)
+        key, selected_positions, locations, selected_inputs = (
+            select_prefill_indexer_store_rows(
+                key_raw,
+                positions,
+                out_cache_loc,
+                prefix_len=104,
+                projection_inputs={"projection_input": projection_input},
+            )
         )
         self.assertTrue(torch.equal(key, key_raw[:3]))
         self.assertEqual(selected_positions.tolist(), [104, 105, 106])
         self.assertEqual(locations.tolist(), [400, 401, 402])
+        self.assertTrue(
+            torch.equal(selected_inputs["projection_input"], projection_input[:3])
+        )
 
     def test_prefill_indexer_store_probe_segments_seed_and_measured_rows(self):
         records = []
@@ -72,6 +82,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
             positions=positions,
             out_cache_loc=out_cache_loc,
             key_semantics="pre_norm_rope_projection",
+            projection_inputs={"projection_input": key_raw},
         )
         probe.capture(
             layer_id=1,
@@ -80,6 +91,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
             positions=positions[8:],
             out_cache_loc=out_cache_loc[8:],
             key_semantics="pre_norm_rope_projection",
+            projection_inputs={"projection_input": key_raw[8:]},
         )
 
         self.assertEqual(len(records), 2)
@@ -125,18 +137,21 @@ class TestEagleNumericalProbe(unittest.TestCase):
             layer_id=0,
             rids=["exact-rid"],
             key_semantics="pre_norm_rope_projection",
+            projection_inputs={"projection_input": tensors["key_raw"]},
             **tensors,
         )
         probe.capture(
             layer_id=1,
             rids=["other-rid"],
             key_semantics="pre_norm_rope_projection",
+            projection_inputs={"projection_input": tensors["key_raw"]},
             **tensors,
         )
         probe.capture(
             layer_id=1,
             rids=["exact-rid", "other-rid"],
             key_semantics="pre_norm_rope_projection",
+            projection_inputs={"projection_input": tensors["key_raw"]},
             **tensors,
         )
         self.assertEqual(records, [])
@@ -168,6 +183,9 @@ class TestEagleNumericalProbe(unittest.TestCase):
                 positions=torch.zeros((1,), dtype=torch.int64),
                 out_cache_loc=torch.zeros((2,), dtype=torch.int64),
                 key_semantics="pre_norm_rope_projection",
+                projection_inputs={
+                    "projection_input": torch.zeros((2, 4), dtype=torch.bfloat16)
+                },
             )
 
     def test_ragged_rows_fingerprint_ignores_invalid_tail(self):
