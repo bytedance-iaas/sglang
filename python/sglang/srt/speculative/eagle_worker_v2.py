@@ -1360,15 +1360,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch.seq_lens = batch_output.new_seq_lens
                 # Active ranks draft a real next tree. Idle DPA companions keep
                 # IDLE so draft_forward executes only collective participation.
-                if not batch.forward_mode.is_idle():
+                is_idle = batch.forward_mode.is_idle()
+                if not is_idle:
                     batch.forward_mode = ForwardMode.DECODE
                 # eagle_prepare_for_verify left the verify tokens here; the
                 # head-of-iteration draft always sees None (the scheduler
-                # clears it), so mirror that state.
-                batch.input_ids = None
+                # clears it), so mirror that state on active ranks. Idle ranks
+                # cannot rebuild tokens and need their device-local empty tensor
+                # for DPA padding on every eager draft step.
+                if not is_idle:
+                    batch.input_ids = None
                 # Attention metadata planning reads the CPU copies; one D2H
                 # per round (TODO: async or upper-bound estimate).
-                if not batch.forward_mode.is_idle():
+                if not is_idle:
                     batch.seq_lens_cpu = batch_output.new_seq_lens.to("cpu")
                     batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
                 with (
@@ -1382,7 +1386,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     next_verify_input, parent_list, top_scores_index = (
                         self.draft_worker.draft(batch, with_topology=True)
                     )
-                if not batch.forward_mode.is_idle():
+                if not is_idle:
                     batch_output.next_verify_chain = next_verify_input.draft_token
                     # The tree shape is data-dependent once topk > 1, so the other
                     # stages cannot re-derive it; relay it alongside the tokens.

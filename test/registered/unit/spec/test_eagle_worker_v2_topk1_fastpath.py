@@ -170,7 +170,10 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
             new_seq_lens=torch.empty(0, dtype=torch.int64)
             if idle
             else torch.tensor([9], dtype=torch.int64),
-            next_draft_input=SimpleNamespace(),
+            next_draft_input=SimpleNamespace(
+                hidden_states=torch.empty((0, 8), dtype=torch.float32),
+                is_verify_input=lambda: False,
+            ),
         )
         draft_worker = SimpleNamespace(
             draft_runner=SimpleNamespace(tp_group=object()),
@@ -203,6 +206,7 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
             seq_lens_sum=0 if idle else 8,
             spec_info=verify_input,
             input_ids=torch.empty(0, dtype=torch.int64),
+            out_cache_loc=torch.empty(0, dtype=torch.int64),
         )
         return worker, batch, verify_input, output, draft_worker, seen_verify_inputs
 
@@ -210,6 +214,18 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         worker, batch, verify_input, output, draft_worker, seen_verify_inputs = (
             self._pp_worker_and_batch(idle=False)
         )
+        seen_input_ids = []
+
+        def _draft(current_batch, *, with_topology):
+            self.assertTrue(with_topology)
+            seen_input_ids.append(current_batch.input_ids)
+            return (
+                SimpleNamespace(draft_token=torch.tensor([7, 8])),
+                torch.tensor([[-1]]),
+                torch.tensor([[0]]),
+            )
+
+        draft_worker.draft.side_effect = _draft
 
         with (
             patch(
@@ -233,12 +249,40 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         # One call is the post-verify tail draft. A second call would mean the
         # last PP stage replaced the scheduler-relayed verify tree.
         draft_worker.draft.assert_called_once_with(batch, with_topology=True)
+        self.assertEqual(seen_input_ids, [None])
         self.assertEqual(output.next_verify_chain.tolist(), [7, 8])
 
-    def test_pp_idle_rank_participates_in_tail_draft_without_publishing_tree(self):
+    def test_pp_idle_rank_reuses_empty_tokens_across_tail_draft_rounds(self):
         worker, batch, _verify_input, output, draft_worker, _seen_verify_inputs = (
             self._pp_worker_and_batch(idle=True)
         )
+        empty_input_ids = batch.input_ids
+        seen_input_ids = []
+        idle_draft_worker = object.__new__(EagleDraftWorker)
+        idle_draft_worker.speculative_num_steps = 3
+        idle_draft_worker.draft_attn_backend = SimpleNamespace(
+            attn_backends=[object(), object()]
+        )
+
+        def _forward(current_batch):
+            seen_input_ids.append(current_batch.input_ids)
+            self.assertIs(current_batch.input_ids, empty_input_ids)
+            self.assertEqual(current_batch.input_ids.shape, (0,))
+
+        idle_draft_worker.draft_runner = SimpleNamespace(
+            canary_manager=None, forward=MagicMock(side_effect=_forward)
+        )
+
+        def _draft(current_batch, *, with_topology):
+            self.assertTrue(with_topology)
+            idle_draft_worker.draft_forward(current_batch)
+            return (
+                SimpleNamespace(draft_token=torch.empty(0, dtype=torch.int64)),
+                torch.empty((0, 1), dtype=torch.int64),
+                torch.empty((0, 1), dtype=torch.int64),
+            )
+
+        draft_worker.draft.side_effect = _draft
 
         with (
             patch(
@@ -254,10 +298,18 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
                 return_value=contextlib.nullcontext(),
             ),
         ):
-            EAGLEWorkerV2.forward_batch_generation(worker, batch)
+            for _ in range(2):
+                EAGLEWorkerV2.forward_batch_generation(worker, batch)
+                # The scheduler's isolation restores the relayed verify input
+                # before the next round, but input_ids must remain a valid empty
+                # tensor throughout the idle tail draft.
+                batch.spec_info = _verify_input
 
-        draft_worker.draft.assert_called_once_with(batch, with_topology=True)
+        self.assertEqual(draft_worker.draft.call_count, 2)
+        self.assertEqual(seen_input_ids, [empty_input_ids] * 4)
+        self.assertEqual(idle_draft_worker.draft_runner.forward.call_count, 4)
         self.assertEqual(batch.forward_mode, ForwardMode.IDLE)
+        self.assertIs(batch.input_ids, empty_input_ids)
         self.assertFalse(hasattr(output, "next_verify_chain"))
 
 
