@@ -75,6 +75,9 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_split_and_rebuild_position,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.speculative.eagle_numerical_probe import (
+    EaglePrefillIndexerStoreProbe,
+)
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
@@ -2220,6 +2223,31 @@ class DeepseekSparseAttnBackend(
 
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            if (
+                layer.layer_id == 0
+                and forward_batch.forward_mode.is_extend_without_speculative()
+                and envs.SGLANG_EAGLE_PREFILL_INDEXER_STORE_PREFIX_TOKENS.get() > 0
+                and envs.SGLANG_EAGLE_PREFILL_PROBE_SCOPE.get()
+                == "layer0-flashmla-sparse-input"
+            ):
+                probe = getattr(self, "_prefill_flashmla_probe", None)
+                if probe is None:
+                    probe = EaglePrefillIndexerStoreProbe(
+                        envs.SGLANG_EAGLE_NUMERICAL_PROBE_RID.get(),
+                        prefix_tokens=envs.SGLANG_EAGLE_PREFILL_INDEXER_STORE_PREFIX_TOKENS.get(),
+                        page_size=self.real_page_size,
+                        capture_id=envs.SGLANG_EAGLE_NUMERICAL_PROBE_CAPTURE_ID.get(),
+                        pod_name=envs.SGLANG_EAGLE_NUMERICAL_PROBE_POD_NAME.get(),
+                        pod_uid=envs.SGLANG_EAGLE_NUMERICAL_PROBE_POD_UID.get(),
+                    )
+                    self._prefill_flashmla_probe = probe
+                probe.capture_gpu_hash_inputs(
+                    rids=forward_batch.rids,
+                    tensors={
+                        "topk_indices": page_table_1,
+                        "topk_length": metadata.dsa_cache_seqlens_int32,
+                    },
+                )
             return self._forward_flashmla_sparse(
                 q_all=q_all,
                 kv_cache=kv_cache,
