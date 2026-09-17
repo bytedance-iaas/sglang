@@ -804,37 +804,38 @@ class DeepseekMLAForwardMixin:
                 self._prefill_attention_probe = prefill_input_probe
             if prefill_input_probe.matches(forward_batch.rids):
                 logical_rows = int(positions.shape[0])
-                sampled_q_nope = _sample_prefill_attention_probe_columns(
-                    _align_prefill_attention_probe_rows(
-                        q_nope_out, logical_rows
-                    ).flatten(1)
-                )
-                prefill_input_probe.capture(
-                    layer_id=1,
-                    rids=forward_batch.rids,
-                    key_raw=sampled_q_nope,
-                    positions=positions,
-                    out_cache_loc=forward_batch.out_cache_loc,
-                    key_semantics="layer_00_attention_inputs_sample256",
-                    projection_inputs={
-                        "q_nope_sample256": sampled_q_nope,
-                        "q_rope_sample256": _sample_prefill_attention_probe_columns(
-                            _align_prefill_attention_probe_rows(
-                                q_pe, logical_rows
-                            ).flatten(1)
-                        ),
-                        "k_nope_sample256": _sample_prefill_attention_probe_columns(
-                            _align_prefill_attention_probe_rows(
-                                k_nope, logical_rows
-                            ).flatten(1)
-                        ),
-                        "k_rope_sample256": _sample_prefill_attention_probe_columns(
-                            _align_prefill_attention_probe_rows(
-                                k_pe, logical_rows
-                            ).flatten(1)
-                        ),
-                    },
-                )
+                sampled_inputs = {
+                    "q_nope": _sample_prefill_attention_probe_columns(
+                        _align_prefill_attention_probe_rows(
+                            q_nope_out, logical_rows
+                        ).flatten(1)
+                    ),
+                    "q_rope": _sample_prefill_attention_probe_columns(
+                        _align_prefill_attention_probe_rows(q_pe, logical_rows).flatten(
+                            1
+                        )
+                    ),
+                    "k_nope": _sample_prefill_attention_probe_columns(
+                        _align_prefill_attention_probe_rows(
+                            k_nope, logical_rows
+                        ).flatten(1)
+                    ),
+                    "k_rope": _sample_prefill_attention_probe_columns(
+                        _align_prefill_attention_probe_rows(k_pe, logical_rows).flatten(
+                            1
+                        )
+                    ),
+                }
+                for name, sampled in sampled_inputs.items():
+                    prefill_input_probe.capture_layer_boundary(
+                        boundary=f"layer_00_attention_input_{name}_sample256",
+                        rids=forward_batch.rids,
+                        hidden_states=sampled,
+                        residual=None,
+                        positions=positions,
+                        prefix_len=int(forward_batch.extend_prefix_lens_cpu[0]),
+                        out_cache_loc=forward_batch.out_cache_loc,
+                    )
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
