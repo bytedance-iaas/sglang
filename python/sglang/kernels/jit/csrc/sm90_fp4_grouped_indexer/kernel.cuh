@@ -36,7 +36,8 @@ namespace fp4_grouped_indexer_sm90 {
 
 using namespace cute;
 using bf16 = cutlass::bfloat16_t;
-using fp8 = cutlass::float_e4m3_t;
+using fp8 = cutlass::float_e5m2_t;
+using fp8_e4m3 = cutlass::float_e4m3_t;
 
 #define FP4_INDEXER_CUDA_CHECK(call)                                                        \
   do {                                                                                      \
@@ -55,10 +56,18 @@ __device__ __forceinline__ float ue8m0_to_f32(uint8_t exponent) {
   return __uint_as_float(static_cast<uint32_t>(exponent) << 23);
 }
 
-__device__ __forceinline__ uint8_t e2m1_to_e4m3(uint8_t code) {
+__device__ __forceinline__ float e2m1_to_f32(uint8_t code) {
   constexpr uint64_t lut = 0x4c4844403c383000ULL;
-  uint8_t magnitude = static_cast<uint8_t>((lut >> ((code & 7) * 8)) & 0xff);
-  return magnitude | ((code & 8) << 4);
+  fp8_e4m3 value;
+  *reinterpret_cast<uint8_t*>(&value) =
+      static_cast<uint8_t>((lut >> ((code & 7) * 8)) & 0xff) | ((code & 8) << 4);
+  return static_cast<float>(value);
+}
+
+__device__ __forceinline__ uint16_t f32x2_to_e5m2x2(float lo, float hi) {
+  uint16_t out;
+  asm volatile("cvt.rn.satfinite.e5m2x2.f32 %0, %1, %2;\n" : "=h"(out) : "f"(hi), "f"(lo));
+  return out;
 }
 
 template <typename Kernel>
@@ -73,32 +82,37 @@ struct Sm90Fp4GroupedIndexerKernel {
   static constexpr int NUM_WARPGROUPS = 6;
   static constexpr int NUM_THREADS = 128 * NUM_WARPGROUPS;
 
-  using SmemLayout =
-      decltype(tile_to_shape(GMMA::Layout_K_SW64_Atom<fp8>{}, Shape<Int<64>, Int<64>>{}, Step<_1, _2>{}));
+  using SmemLayout = decltype(
+      tile_to_shape(GMMA::Layout_K_SW64_Atom<fp8>{}, Shape<Int<64>, Int<128>>{}, Step<_1, _2>{}));
   using TiledMMA =
-      decltype(make_tiled_mma(GMMA::MMA_64x64x32_F32E4M3E4M3_SS_TN<>{}, Layout<Shape<_1, _1, _1>>{}));
+      decltype(make_tiled_mma(GMMA::MMA_64x64x32_F32E5M2E5M2_SS_TN<>{}, Layout<Shape<_1, _1, _1>>{}));
 
   struct SharedStorage {
     array_aligned<fp8, cosize_v<SmemLayout>, 128> q[NUM_WARPGROUPS];
-    array_aligned<fp8, cosize_v<SmemLayout>, 128> k[SCALE_GROUPS];
+    array_aligned<fp8, cosize_v<SmemLayout>, 128> k;
     array_aligned<bf16, HEADS * BLOCK_L, 128> scores[NUM_WARPGROUPS];
     int32_t slots[BLOCK_L];
-    float k_scales[SCALE_GROUPS][BLOCK_L];
+    uint8_t k_exponents[SCALE_GROUPS][BLOCK_L];
+    float k_scales[BLOCK_L];
     float q_scales[NUM_WARPGROUPS][HEADS];
   };
 
   template <typename TA, typename TB, typename TC>
-  static __device__ __forceinline__ void gemm_one_k32(
+  static __device__ __forceinline__ void gemm_k128(
       TiledMMA& mma, TA const& sQ, TB const& sK, TC& acc, int tid) {
     ThrMMA thr_mma = mma.get_slice(tid);
     Tensor q_frag = thr_mma.partition_fragment_A(sQ);
     Tensor k_frag = thr_mma.partition_fragment_B(sK);
-    static_assert(size<2>(q_frag) == 2);
-    static_assert(size<2>(k_frag) == 2);
+    static_assert(size<2>(q_frag) == 4);
+    static_assert(size<2>(k_frag) == 4);
     warpgroup_fence_operand(acc);
     warpgroup_arrive();
     mma.accumulate_ = GMMA::ScaleOut::Zero;
-    cute::gemm(mma, q_frag(_, _, 0), k_frag(_, _, 0), acc);
+    CUTE_UNROLL
+    for (int k = 0; k < size<2>(q_frag); ++k) {
+      cute::gemm(mma, q_frag(_, _, k), k_frag(_, _, k), acc);
+      mma.accumulate_ = GMMA::ScaleOut::One;
+    }
     warpgroup_fence_operand(acc);
   }
 
@@ -114,10 +128,7 @@ struct Sm90Fp4GroupedIndexerKernel {
     extern __shared__ char smem_raw[];
     SharedStorage& ss = *reinterpret_cast<SharedStorage*>(smem_raw);
     Tensor sQ = make_tensor(make_smem_ptr(ss.q[warpgroup].data()), SmemLayout{});
-    Tensor sK0 = make_tensor(make_smem_ptr(ss.k[0].data()), SmemLayout{});
-    Tensor sK1 = make_tensor(make_smem_ptr(ss.k[1].data()), SmemLayout{});
-    Tensor sK2 = make_tensor(make_smem_ptr(ss.k[2].data()), SmemLayout{});
-    Tensor sK3 = make_tensor(make_smem_ptr(ss.k[3].data()), SmemLayout{});
+    Tensor sK = make_tensor(make_smem_ptr(ss.k.data()), SmemLayout{});
 
     const int64_t* req = reinterpret_cast<const int64_t*>(p.req);
     const int64_t* lens = reinterpret_cast<const int64_t*>(p.lens);
@@ -135,45 +146,44 @@ struct Sm90Fp4GroupedIndexerKernel {
     }
     __syncthreads();
 
-    for (int idx = tid; idx < SCALE_GROUPS * BLOCK_L; idx += NUM_THREADS) {
-      const int g = idx / BLOCK_L;
-      const int col = idx % BLOCK_L;
+    if (tid < BLOCK_L) {
+      const int col = tid;
       const int slot = ss.slots[col];
       const int page = slot / p.page_size;
       const int off = slot - page * p.page_size;
-      const uint8_t exponent =
-          table[static_cast<int64_t>(page) * p.table_stride + p.page_size * 64 + off * 4 + g];
-      ss.k_scales[g][col] = ue8m0_to_f32(exponent);
+      uint8_t max_exponent = 1;
+      CUTE_UNROLL
+      for (int g = 0; g < SCALE_GROUPS; ++g) {
+        const uint8_t exponent =
+            table[static_cast<int64_t>(page) * p.table_stride + p.page_size * 64 + off * 4 + g];
+        ss.k_exponents[g][col] = exponent;
+        max_exponent = max(max_exponent, exponent);
+      }
+      const uint8_t common_exponent = max(static_cast<int>(max_exponent) - 12, 1);
+      ss.k_scales[col] = ue8m0_to_f32(common_exponent);
     }
+    __syncthreads();
 
-    for (int idx = tid; idx < SCALE_GROUPS * BLOCK_L * SCALE_GROUP_SIZE; idx += NUM_THREADS) {
-      const int g = idx / (BLOCK_L * SCALE_GROUP_SIZE);
-      const int rem = idx % (BLOCK_L * SCALE_GROUP_SIZE);
-      const int col = rem / SCALE_GROUP_SIZE;
-      const int d = rem % SCALE_GROUP_SIZE;
+    for (int pair = tid; pair < BLOCK_L * (HEAD_DIM / 2); pair += NUM_THREADS) {
+      const int col = pair / (HEAD_DIM / 2);
+      const int d = (pair % (HEAD_DIM / 2)) * 2;
+      const int g = d / SCALE_GROUP_SIZE;
       const int slot = ss.slots[col];
       const int page = slot / p.page_size;
       const int off = slot - page * p.page_size;
-      const int packed_col = g * 16 + d / 2;
+      const int packed_col = d / 2;
       const uint8_t packed =
           table[static_cast<int64_t>(page) * p.table_stride + off * 64 + packed_col];
-      const uint8_t code = (d & 1) ? (packed >> 4) : (packed & 0xf);
-      fp8 value;
-      *reinterpret_cast<uint8_t*>(&value) = e2m1_to_e4m3(code);
-      switch (g) {
-        case 0:
-          sK0(col, d) = value;
-          break;
-        case 1:
-          sK1(col, d) = value;
-          break;
-        case 2:
-          sK2(col, d) = value;
-          break;
-        default:
-          sK3(col, d) = value;
-          break;
-      }
+      const int common_exponent = (__float_as_uint(ss.k_scales[col]) >> 23) & 0xff;
+      const float relative_scale = ldexpf(1.0f, static_cast<int>(ss.k_exponents[g][col]) - common_exponent);
+      const uint16_t values =
+          f32x2_to_e5m2x2(e2m1_to_f32(packed & 0xf) * relative_scale,
+                          e2m1_to_f32(packed >> 4) * relative_scale);
+      fp8 v0, v1;
+      *reinterpret_cast<uint8_t*>(&v0) = values & 0xff;
+      *reinterpret_cast<uint8_t*>(&v1) = values >> 8;
+      sK(col, d) = v0;
+      sK(col, d + 1) = v1;
     }
     __syncthreads();
 
@@ -188,68 +198,53 @@ struct Sm90Fp4GroupedIndexerKernel {
       const int row_in_group = round * NUM_WARPGROUPS + warpgroup;
       const bool active = row_in_group < group_rows;
       const int b = b0 + row_in_group;
-      Tensor total = partition_fragment_C(mma, Shape<Int<HEADS>, Int<BLOCK_L>>{});
-      cute::fill(total, 0.0f);
 
-      CUTE_UNROLL
-      for (int g = 0; g < SCALE_GROUPS; ++g) {
-        if (active && wg_tid < HEADS) {
+      if (active && wg_tid < HEADS) {
+        const uint32_t packed_scale =
+            q_scale[static_cast<int64_t>(b) * p.q_scale_stride_b + wg_tid];
+        uint8_t max_exponent = 1;
+        CUTE_UNROLL
+        for (int g = 0; g < SCALE_GROUPS; ++g) {
+          max_exponent =
+              max(max_exponent, static_cast<uint8_t>(packed_scale >> (8 * g)));
+        }
+        const uint8_t common_exponent = max(static_cast<int>(max_exponent) - 12, 1);
+        ss.q_scales[warpgroup][wg_tid] = ue8m0_to_f32(common_exponent);
+      }
+      __syncthreads();
+
+      if (active) {
+        for (int pair = wg_tid; pair < HEADS * (HEAD_DIM / 2); pair += 128) {
+          const int head = pair / (HEAD_DIM / 2);
+          const int d = (pair % (HEAD_DIM / 2)) * 2;
+          const int g = d / SCALE_GROUP_SIZE;
+          const uint8_t packed =
+              q[static_cast<int64_t>(b) * p.q_stride_b +
+                static_cast<int64_t>(head) * p.q_stride_h + d / 2];
           const uint32_t packed_scale =
-              q_scale[static_cast<int64_t>(b) * p.q_scale_stride_b + wg_tid];
-          ss.q_scales[warpgroup][wg_tid] =
-              ue8m0_to_f32(static_cast<uint8_t>(packed_scale >> (8 * g)));
+              q_scale[static_cast<int64_t>(b) * p.q_scale_stride_b + head];
+          const int exponent = static_cast<uint8_t>(packed_scale >> (8 * g));
+          const int common_exponent =
+              (__float_as_uint(ss.q_scales[warpgroup][head]) >> 23) & 0xff;
+          const float relative_scale = ldexpf(1.0f, exponent - common_exponent);
+          const uint16_t values =
+              f32x2_to_e5m2x2(e2m1_to_f32(packed & 0xf) * relative_scale,
+                              e2m1_to_f32(packed >> 4) * relative_scale);
+          fp8 v0, v1;
+          *reinterpret_cast<uint8_t*>(&v0) = values & 0xff;
+          *reinterpret_cast<uint8_t*>(&v1) = values >> 8;
+          sQ(head, d) = v0;
+          sQ(head, d + 1) = v1;
         }
-        __syncthreads();
+      }
+      __syncthreads();
 
-        if (active) {
-          for (int pair = wg_tid; pair < HEADS * (SCALE_GROUP_SIZE / 2); pair += 128) {
-            const int head = pair / (SCALE_GROUP_SIZE / 2);
-            const int d = (pair % (SCALE_GROUP_SIZE / 2)) * 2;
-            const uint8_t packed =
-                q[static_cast<int64_t>(b) * p.q_stride_b +
-                  static_cast<int64_t>(head) * p.q_stride_h + g * 16 + d / 2];
-            fp8 v0, v1;
-            *reinterpret_cast<uint8_t*>(&v0) = e2m1_to_e4m3(packed & 0xf);
-            *reinterpret_cast<uint8_t*>(&v1) = e2m1_to_e4m3(packed >> 4);
-            sQ(head, d) = v0;
-            sQ(head, d + 1) = v1;
-          }
-        }
-        __syncthreads();
-
-        Tensor part = partition_fragment_C(mma, Shape<Int<HEADS>, Int<BLOCK_L>>{});
-        if (active) {
-          if (g == 0) {
-            gemm_one_k32(mma, sQ, sK0, part, wg_tid);
-          } else if (g == 1) {
-            gemm_one_k32(mma, sQ, sK1, part, wg_tid);
-          } else if (g == 2) {
-            gemm_one_k32(mma, sQ, sK2, part, wg_tid);
-          } else {
-            gemm_one_k32(mma, sQ, sK3, part, wg_tid);
-          }
-          warpgroup_commit_batch();
-          warpgroup_wait<0>();
-          warpgroup_fence_operand(part);
-        }
-
-        if (active) {
-          CUTE_UNROLL
-          for (int rp = 0; rp < 2; ++rp) {
-            const int head = (wg_tid / 32) * 16 + (wg_tid % 32) / 4 + 8 * rp;
-            CUTE_UNROLL
-            for (int j = 0; j < BLOCK_L / 8; ++j) {
-              CUTE_UNROLL
-              for (int cp = 0; cp < 2; ++cp) {
-                const int col = (wg_tid % 4) * 2 + 8 * j + cp;
-                const int i = j * 4 + rp * 2 + cp;
-                total(i) +=
-                    part(i) * ss.q_scales[warpgroup][head] * ss.k_scales[g][col];
-              }
-            }
-          }
-        }
-        __syncthreads();
+      Tensor acc = partition_fragment_C(mma, Shape<Int<HEADS>, Int<BLOCK_L>>{});
+      if (active) {
+        gemm_k128(mma, sQ, sK, acc, wg_tid);
+        warpgroup_commit_batch();
+        warpgroup_wait<0>();
+        warpgroup_fence_operand(acc);
       }
 
       if (active) {
@@ -262,7 +257,8 @@ struct Sm90Fp4GroupedIndexerKernel {
             for (int cp = 0; cp < 2; ++cp) {
               const int col = (wg_tid % 4) * 2 + 8 * j + cp;
               const int i = j * 4 + rp * 2 + cp;
-              ss.scores[warpgroup][head * BLOCK_L + col] = bf16(total(i));
+              ss.scores[warpgroup][head * BLOCK_L + col] =
+                  bf16(acc(i) * ss.q_scales[warpgroup][head] * ss.k_scales[col]);
             }
           }
         }
