@@ -590,6 +590,50 @@ class TestSchedulerVPP(unittest.TestCase):
             [[], ["bad"]],
         )
 
+    def test_vpp_bootstrap_apply_retry_treats_missing_target_as_applied(self):
+        scheduler = _make_scheduler()
+        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
+            queue=[SimpleNamespace(rid="r0")]
+        )
+        scheduler._pp_vpp_apply_bootstrap_prefix_boundaries = MagicMock()
+
+        def move_without_reporting(_status):
+            scheduler.disagg_prefill_bootstrap_queue.queue.clear()
+            return [[], []]
+
+        scheduler.process_bootstrapped_queue = MagicMock(
+            side_effect=move_without_reporting
+        )
+        remaining_good = {"r0"}
+        remaining_bad = set()
+
+        applied = scheduler._pp_vpp_try_apply_bootstrap_status(
+            {"r0": 0},
+            remaining_good,
+            remaining_bad,
+        )
+
+        self.assertTrue(applied)
+        self.assertEqual(remaining_good, set())
+
+    def test_vpp_bootstrap_apply_retry_waits_for_queued_target(self):
+        scheduler = _make_scheduler()
+        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
+            queue=[SimpleNamespace(rid="r0")]
+        )
+        scheduler._pp_vpp_apply_bootstrap_prefix_boundaries = MagicMock()
+        scheduler.process_bootstrapped_queue = MagicMock(return_value=[[], []])
+        remaining_good = {"r0"}
+
+        applied = scheduler._pp_vpp_try_apply_bootstrap_status(
+            {"r0": 0},
+            remaining_good,
+            set(),
+        )
+
+        self.assertFalse(applied)
+        self.assertEqual(remaining_good, {"r0"})
+
     def test_vpp_prefix_limit_caps_next_prefix_match(self):
         req = Req.__new__(Req)
         req.return_logprob = False

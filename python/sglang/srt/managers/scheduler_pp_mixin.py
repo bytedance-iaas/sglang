@@ -850,6 +850,27 @@ class SchedulerPPMixin:
                     f"expected <= {boundary}, got {len(req.prefix_indices)}"
                 )
 
+    def _pp_vpp_try_apply_bootstrap_status(
+        self: Scheduler,
+        boundaries: Dict[str, int],
+        remaining_good: set[str],
+        remaining_bad: set[str],
+    ) -> bool:
+        self._pp_vpp_apply_bootstrap_prefix_boundaries(boundaries, remaining_good)
+        applied_good, applied_bad = self.process_bootstrapped_queue(
+            [sorted(remaining_good), sorted(remaining_bad)]
+        )
+        remaining_good.difference_update(applied_good)
+        remaining_bad.difference_update(applied_bad)
+
+        # Applying the status is idempotent. A target that disappeared from the
+        # bootstrap queue was already moved to its next local state by an earlier
+        # attempt and must not prevent the ring ACK from advancing.
+        queued_rids = {req.rid for req in self.disagg_prefill_bootstrap_queue.queue}
+        remaining_good.intersection_update(queued_rids)
+        remaining_bad.intersection_update(queued_rids)
+        return not remaining_good and not remaining_bad
+
     def _pp_vpp_register_prefix_batch(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -1179,16 +1200,12 @@ class SchedulerPPMixin:
             remaining_good: set[str],
             remaining_bad: set[str],
         ) -> bool:
-            self._pp_vpp_apply_bootstrap_prefix_boundaries(
+            applied = self._pp_vpp_try_apply_bootstrap_status(
                 envelope.payload["prefix_boundaries"],
                 remaining_good,
+                remaining_bad,
             )
-            applied_good, applied_bad = self.process_bootstrapped_queue(
-                [sorted(remaining_good), sorted(remaining_bad)]
-            )
-            remaining_good.difference_update(applied_good)
-            remaining_bad.difference_update(applied_bad)
-            if remaining_good or remaining_bad:
+            if not applied:
                 return False
             forward_control(envelope, wire)
             return True
