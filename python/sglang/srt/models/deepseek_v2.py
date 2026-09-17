@@ -2530,9 +2530,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         target_forward_probe = getattr(self, "target_forward_probe", None)
         prefill_layer_probe = None
         if (
-            self.layer_id in (0, 1)
+            self.layer_id == 0
             and forward_batch.forward_mode.is_extend_without_speculative()
             and envs.SGLANG_EAGLE_PREFILL_INDEXER_STORE_PREFIX_TOKENS.get() > 0
+            and envs.SGLANG_EAGLE_PREFILL_PROBE_SCOPE.get() == "layer0-mid"
         ):
             prefill_layer_probe = getattr(self, "_prefill_layer_probe", None)
             if prefill_layer_probe is None:
@@ -2545,16 +2546,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                     pod_uid=envs.SGLANG_EAGLE_NUMERICAL_PROBE_POD_UID.get(),
                 )
                 self._prefill_layer_probe = prefill_layer_probe
-            if prefill_layer_probe.matches(forward_batch.rids):
-                prefill_layer_probe.capture_layer_boundary(
-                    boundary=f"layer_{self.layer_id:02d}_attn_input",
-                    rids=forward_batch.rids,
-                    hidden_states=hidden_states,
-                    residual=residual,
-                    positions=positions,
-                    prefix_len=int(forward_batch.extend_prefix_lens_cpu[0]),
-                    out_cache_loc=forward_batch.out_cache_loc,
-                )
         if (
             target_forward_probe is not None
             and forward_batch.forward_mode.is_target_verify()
@@ -2726,19 +2717,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                     if fuse_mlp_allreduce
                     else self.layer_scatter_modes.layer_output_mode
                 ),
-            )
-
-        if prefill_layer_probe is not None and prefill_layer_probe.matches(
-            forward_batch.rids
-        ):
-            prefill_layer_probe.capture_layer_boundary(
-                boundary=f"layer_{self.layer_id:02d}_layer_return",
-                rids=forward_batch.rids,
-                hidden_states=hidden_states,
-                residual=residual,
-                positions=positions,
-                prefix_len=int(forward_batch.extend_prefix_lens_cpu[0]),
-                out_cache_loc=forward_batch.out_cache_loc,
             )
 
         return hidden_states, residual, topk_indices

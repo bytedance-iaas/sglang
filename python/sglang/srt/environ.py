@@ -1510,6 +1510,7 @@ class Envs:
     # probe stages. Diagnostic only; never use this synchronous D2H path for
     # performance evidence.
     SGLANG_EAGLE_PREFILL_INDEXER_STORE_PREFIX_TOKENS = EnvInt(0)
+    SGLANG_EAGLE_PREFILL_PROBE_SCOPE = EnvStr("indexer")
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(

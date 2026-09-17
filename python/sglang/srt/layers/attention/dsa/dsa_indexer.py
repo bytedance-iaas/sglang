@@ -596,6 +596,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             layer_id != 1
             or not forward_batch.forward_mode.is_extend_without_speculative()
             or envs.SGLANG_EAGLE_PREFILL_INDEXER_STORE_PREFIX_TOKENS.get() <= 0
+            or envs.SGLANG_EAGLE_PREFILL_PROBE_SCOPE.get() != "indexer"
         ):
             return
         if self._prefill_store_probe is None:
