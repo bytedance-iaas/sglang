@@ -20,6 +20,7 @@ limitations under the License.
 #pragma once
 
 #include <cute/tensor.hpp>
+#include <cutlass/arch/barrier.h>
 #include <cutlass/bfloat16.h>
 #include <cutlass/float8.h>
 
@@ -214,7 +215,7 @@ struct Sm90Fp4GroupedIndexerKernel {
           }
           ss.q_scales[warpgroup][wg_tid] = fp4_query_scale(amax);
         }
-        NamedBarrier::arrive_and_wait(128, warpgroup);
+        cutlass::arch::NamedBarrier::arrive_and_wait(128, warpgroup);
 
         for (int pair = wg_tid; pair < HEADS * (SCALE_GROUP_SIZE / 2); pair += 128) {
           const int head = pair / (SCALE_GROUP_SIZE / 2);
@@ -230,7 +231,7 @@ struct Sm90Fp4GroupedIndexerKernel {
           sQ(head, d) = v0;
           sQ(head, d + 1) = v1;
         }
-        NamedBarrier::arrive_and_wait(128, warpgroup);
+        cutlass::arch::NamedBarrier::arrive_and_wait(128, warpgroup);
 
         Tensor part = partition_fragment_C(mma, Shape<Int<HEADS>, Int<BLOCK_L>>{});
         if (g == 0) {
@@ -260,7 +261,7 @@ struct Sm90Fp4GroupedIndexerKernel {
             }
           }
         }
-        NamedBarrier::arrive_and_wait(128, warpgroup);
+        cutlass::arch::NamedBarrier::arrive_and_wait(128, warpgroup);
       }
 
       CUTE_UNROLL
@@ -276,7 +277,7 @@ struct Sm90Fp4GroupedIndexerKernel {
           }
         }
       }
-      NamedBarrier::arrive_and_wait(128, warpgroup);
+      cutlass::arch::NamedBarrier::arrive_and_wait(128, warpgroup);
 
       if (wg_tid < BLOCK_L) {
         float sum = 0.0f;
@@ -294,7 +295,7 @@ struct Sm90Fp4GroupedIndexerKernel {
               valid ? static_cast<float>(bf16(sum)) : -INFINITY;
         }
       }
-      NamedBarrier::arrive_and_wait(128, warpgroup);
+      cutlass::arch::NamedBarrier::arrive_and_wait(128, warpgroup);
     }
 #else
     if (cute::thread0()) {
