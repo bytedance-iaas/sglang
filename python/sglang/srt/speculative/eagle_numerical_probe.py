@@ -1791,8 +1791,8 @@ def _tensor_fingerprint(
 class EaglePrefillIndexerStoreProbe:
     """Fingerprint exact-RID prefill index-K store inputs without GPU retention.
 
-    The isolated seed request is identified by its ``-prefix-seed`` suffix; the
-    measured request must match the configured exact RID. Every matching EXTEND
+    The isolated seed request uses ``<exact-rid>-prefix-seed``; the measured
+    request must match the configured exact RID. Every matching EXTEND
     invocation is emitted immediately, so later decode/verify stores cannot
     overwrite the evidence. Large K tensors are transferred and hashed in
     bounded row chunks.
@@ -1850,7 +1850,7 @@ class EaglePrefillIndexerStoreProbe:
     def _request_kind(self, rids: Optional[list[str]]) -> Optional[str]:
         if not self.can_probe or rids is None or len(rids) != 1:
             return None
-        if rids[0].endswith("-prefix-seed"):
+        if rids[0] == f"{self.expected_rid}-prefix-seed":
             return "prefix_seed"
         if rids[0] == self.expected_rid:
             return "measured"
