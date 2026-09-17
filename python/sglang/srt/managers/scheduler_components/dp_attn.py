@@ -99,6 +99,7 @@ class MLPSyncBatchInfo:
     local_can_run_tbo: bool
     local_forward_mode: int
     prefill_cuda_graph_max_prefix_len: int = 0
+    has_new_decode_admission: bool = False
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
@@ -120,6 +121,7 @@ class MLPSyncBatchInfo:
                 int(self.can_run_prefill_cuda_graph),
                 self.prefill_cuda_graph_max_prefix_len,
                 int(self.can_draft_cuda_graph),
+                int(self.has_new_decode_admission),
             ],
             device=device,
             dtype=dtype,
@@ -137,6 +139,7 @@ class MLPSyncBatchInfo:
                 0,  # can_run_prefill_cuda_graph
                 0,  # prefill_cuda_graph_max_prefix_len
                 1,  # can_draft_cuda_graph
+                0,  # has_new_decode_admission
             ],
             device=device,
             dtype=dtype,
@@ -220,6 +223,7 @@ class MLPSyncBatchInfo:
         self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())
         self.prefill_cuda_graph_max_prefix_len = int(tp0_info_cpu[:, 7].max())
         self.can_draft_cuda_graph = bool(tp0_info_cpu[:, 8].min())
+        self.has_new_decode_admission = bool(tp0_info_cpu[:, 9].max())
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 tp0_info_cpu[:, 5].tolist()
@@ -253,6 +257,7 @@ def _update_gather_batch(
         mlp_sync_info.prefill_cuda_graph_max_prefix_len
     )
     batch.can_run_dp_draft_cuda_graph = mlp_sync_info.can_draft_cuda_graph
+    batch.has_new_decode_admission = mlp_sync_info.has_new_decode_admission
 
 
 def should_skip_scheduler_all_gather(dp_size: int) -> bool:
@@ -473,6 +478,9 @@ def prepare_mlp_sync_batch_raw(
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
         prefill_cuda_graph_max_prefix_len=prefill_cuda_graph_max_prefix_len,
+        has_new_decode_admission=(
+            local_batch.has_new_decode_admission if local_batch is not None else False
+        ),
     )
 
     if dp_size == 1:

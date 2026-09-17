@@ -48,6 +48,37 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
 
         self.assertFalse(info.can_draft_cuda_graph)
 
+    def test_decode_admission_is_max_reduced_across_dp_ranks(self):
+        info = dp_attn.MLPSyncBatchInfo(
+            dp_size=2,
+            tp_size=1,
+            cp_size=1,
+            num_tokens=4,
+            num_tokens_for_logprob=4,
+            can_run_decode_cuda_graph=True,
+            can_run_prefill_cuda_graph=False,
+            can_draft_cuda_graph=True,
+            is_extend_in_batch=False,
+            local_can_run_tbo=True,
+            local_forward_mode=ForwardMode.DECODE.value,
+            has_new_decode_admission=False,
+        )
+
+        def _all_gather(output, local, group=None):
+            rows = output.view(2, 1, -1)
+            rows[0, 0].copy_(local)
+            rows[1, 0].copy_(local)
+            rows[1, 0, 9] = 1
+
+        tp_group = SimpleNamespace(active_ranks_cpu=torch.ones(2, dtype=torch.int32))
+        with (
+            patch.object(torch.distributed, "all_gather_into_tensor", _all_gather),
+            patch.object(dp_attn, "get_tp_group", return_value=tp_group),
+        ):
+            info.all_gather(device="cpu", group=object())
+
+        self.assertTrue(info.has_new_decode_admission)
+
     def test_skip_all_gather_policy(self):
         with envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False):
             self.assertTrue(dp_attn.should_skip_scheduler_all_gather(dp_size=1))

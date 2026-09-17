@@ -2308,6 +2308,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # For DP attention
     is_extend_in_batch: bool = False
+    # Rank-consistent marker that this scheduler slot admitted at least one
+    # newly transferred Decode request on any attention-DP rank.
+    has_new_decode_admission: bool = False
     can_run_decode_cuda_graph: bool = False
     can_run_dp_prefill_cuda_graph: bool = False
     dp_prefill_cuda_graph_max_prefix_len: int = 0
@@ -3628,6 +3631,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             can_run_dp_draft_cuda_graph=self.can_run_dp_draft_cuda_graph,
             force_disable_draft_cuda_graph=self.force_disable_draft_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
+            has_new_decode_admission=self.has_new_decode_admission,
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
