@@ -36,13 +36,6 @@ from sglang.srt.utils.common import is_xpu
 
 logger = logging.getLogger(__name__)
 
-_PP_PREFILL_DISAGG_SCHEDULER_FENCE_PHASES = (
-    "iteration_start",
-    "bootstrap_poll",
-    "bootstrap_done",
-    "transfer_done",
-)
-_PP_DISAGG_SCHEDULER_FENCE_PHASES = _PP_PREFILL_DISAGG_SCHEDULER_FENCE_PHASES
 PP_CONTROL_RING_MESSAGE_MARKER = "sglang_pp_control_ring_v1"
 
 if TYPE_CHECKING:
@@ -57,33 +50,6 @@ def _pp_attention_dp_control_ranks(ps, tp_ranks: List[int]) -> List[int]:
     group_end = group_start + group_size
     assert group_end <= len(tp_ranks)
     return tp_ranks[group_start:group_end]
-
-
-def _pp_disagg_scheduler_fence_specs(
-    disagg_mode: str, ps, tp_ranks: List[int]
-) -> List[Tuple[str, List[int]]]:
-    """Return scheduler-fence phases and their exact PP-stage participants."""
-    if disagg_mode == "prefill":
-        control_ranks = _pp_attention_dp_control_ranks(ps, tp_ranks)
-        return [
-            (phase, control_ranks)
-            for phase in _PP_PREFILL_DISAGG_SCHEDULER_FENCE_PHASES
-        ]
-    if disagg_mode == "decode":
-        # Decode control-ring payloads and result processing are asymmetric
-        # across attention-DP ranks.  Do not fence the whole PP stage here:
-        # an idle rank can otherwise wait in the fence while the active rank
-        # is still consuming a preallocation/release payload whose pending
-        # device work needs that idle rank to enter the next DP collective.
-        # The next scheduler all-gather is the safe rendezvous.
-        return []
-    return []
-
-
-def _pp_fence_scheduler_phase(group) -> None:
-    """Fence one PP scheduler phase on a dedicated control-only group."""
-    if group is not None:
-        torch.distributed.barrier(group=group)
 
 
 def _pp_pack_control_ring_message(phase: str, has_payload: bool, payload):
@@ -176,9 +142,6 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
-                _pp_fence_scheduler_phase(
-                    self.pp_disagg_scheduler_fence_groups["iteration_start"]
-                )
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
@@ -318,9 +281,13 @@ class SchedulerPPMixin:
         # PD additional state initialization
         bmbs = [None] * self.pp_loop_size
         tmbs = [None] * self.pp_loop_size
+        consensus_bootstrapped_rids: Optional[List[str]] = None
         transferred_rids: List[str] = []
+        release_rids: Optional[List[str]] = None
         send_bootstrapped_work = []
         send_transfer_work = []
+        send_consensus_bootstrapped_work = []
+        send_release_work = []
 
         while True:
             server_is_idle = True
@@ -338,27 +305,17 @@ class SchedulerPPMixin:
 
                 recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
-                self.send_req_work = self._pp_forward_stage_payload(
-                    self.send_req_work, recv_reqs
-                )
+
+                if not self.pp_group.is_last_rank:
+                    self._pp_commit_comm_work(self.send_req_work)
 
                 bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
                 bmbs[mb_id] = bootstrapped_rids
-                send_bootstrapped_work = self._pp_forward_stage_payload(
-                    send_bootstrapped_work, bootstrapped_rids
-                )
-                _pp_fence_scheduler_phase(
-                    self.pp_disagg_scheduler_fence_groups["bootstrap_done"]
-                )
+                self._pp_commit_comm_work(send_bootstrapped_work)
 
                 transferred_rids = self._pp_pd_get_prefill_transferred_ids()
+                self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
-                send_transfer_work = self._pp_forward_stage_payload(
-                    send_transfer_work, transferred_rids
-                )
-                _pp_fence_scheduler_phase(
-                    self.pp_disagg_scheduler_fence_groups["transfer_done"]
-                )
 
                 self.process_prefill_chunk(
                     last_batch=self.last_batch, running_batch=self.running_batch
@@ -394,42 +351,38 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
-                # A downstream stage receives this linear proxy before it can
-                # enter the wraparound control rings below. Complete the proxy
-                # exchange here so both stages reach those rings in one order.
-                if not self.pp_group.is_last_rank and cur_batch:
-                    self.device_module.current_stream().wait_event(self.launch_event)
-                    self._pp_send_and_commit_proxy(
-                        result.pp_hidden_states_proxy_tensors.tensors
-                    )
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
-                            relay_output_immediately=True,
                         )
                     )
-                # Every slot participates in both phases. Typed no-ops preserve
-                # protocol position while the dedicated communicator prevents
-                # cross-matching with request and linear metadata traffic.
-                next_consensus_bootstrapped_rids = self._pp_run_control_ring_phase(
-                    phase="prefill_bootstrap_consensus",
-                    origin_has_payload=(
-                        self.pp_group.is_last_rank
-                        and bmbs[next_first_rank_mb_id] is not None
-                    ),
-                    origin_payload=bootstrapped_rids,
-                    process_payload=self.process_bootstrapped_queue,
+                send_consensus_bootstrapped_work, consensus_bootstrapped_rids = (
+                    self._pp_pd_send_consensus_bootstrapped_ids(
+                        bmbs,
+                        next_first_rank_mb_id,
+                        consensus_bootstrapped_rids,
+                        bootstrapped_rids,
+                    )
                 )
-                next_release_rids = self._pp_run_control_ring_phase(
-                    phase="prefill_release_consensus",
-                    origin_has_payload=(
-                        self.pp_group.is_last_rank
-                        and tmbs[next_first_rank_mb_id] is not None
-                    ),
-                    origin_payload=transferred_rids,
+                send_release_work, release_rids = (
+                    self._pp_pd_send_consensus_release_ids(
+                        tmbs, next_first_rank_mb_id, release_rids, transferred_rids
+                    )
                 )
+
+                if bmbs[next_mb_id] is not None:
+                    next_consensus_bootstrapped_rids = (
+                        self._pp_recv_pyobj_from_prev_stage()
+                    )
+                    next_consensus_bootstrapped_rids = self.process_bootstrapped_queue(
+                        next_consensus_bootstrapped_rids
+                    )
+                self._pp_commit_comm_work(send_consensus_bootstrapped_work)
+                if tmbs[next_mb_id] is not None:
+                    next_release_rids = self._pp_recv_pyobj_from_prev_stage()
+                self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
@@ -439,10 +392,31 @@ class SchedulerPPMixin:
                     )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
-                if next_release_rids is not None:
+                if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
+                if not self.pp_group.is_last_rank:
+                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                        recv_reqs, async_send=True
+                    )
+                    send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
+                        bootstrapped_rids, async_send=True
+                    )
+                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
+                        transferred_rids, async_send=True
+                    )
+                    if cur_batch:
+                        self.device_module.current_stream().wait_event(
+                            self.launch_event
+                        )
+                        self.send_proxy_work = self._pp_send_dict_to_next_stage(
+                            result.pp_hidden_states_proxy_tensors.tensors,
+                            async_send=True,
+                            msg_type="proxy",
+                        )
 
                 self.pp_outputs = next_pp_outputs
+                release_rids = next_release_rids
+                consensus_bootstrapped_rids = next_consensus_bootstrapped_rids
                 self.running_batch.batch_is_full = False
 
             # When the server is idle, self-check and re-init some states
@@ -668,9 +642,6 @@ class SchedulerPPMixin:
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
         # communicate pre-consensus bootstrapp reqs
         if self.pp_group.is_first_rank:
-            _pp_fence_scheduler_phase(
-                self.pp_disagg_scheduler_fence_groups["bootstrap_poll"]
-            )
             # First rank, pop the bootstrap reqs from the bootstrap queue
             good_bootstrapped_rids, bad_bootstrapped_rids = self.get_rids(
                 self.disagg_prefill_bootstrap_queue.queue,
@@ -681,9 +652,6 @@ class SchedulerPPMixin:
         else:
             # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
             prev_bootstrapped_rids = self._pp_recv_pyobj_from_prev_stage()
-            _pp_fence_scheduler_phase(
-                self.pp_disagg_scheduler_fence_groups["bootstrap_poll"]
-            )
             prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
                 prev_bootstrapped_rids
             )
@@ -737,6 +705,46 @@ class SchedulerPPMixin:
                 set(prev_transferred_rids) & set(curr_transferred_rids)
             )
         return transferred_rids
+
+    def _pp_pd_send_consensus_bootstrapped_ids(
+        self: Scheduler,
+        bmbs: List[List[str]],
+        next_first_rank_mb_id: int,
+        consensus_bootstrapped_rids: List[str],
+        bootstrapped_rids: List[str],
+    ):
+        send_consensus_bootstrapped_work = []
+        if self.pp_group.is_last_rank:
+            if bmbs[next_first_rank_mb_id] is not None:
+                consensus_bootstrapped_rids = bootstrapped_rids
+                send_consensus_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
+                    consensus_bootstrapped_rids, async_send=True
+                )
+        elif consensus_bootstrapped_rids is not None:
+            send_consensus_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
+                consensus_bootstrapped_rids, async_send=True
+            )
+        return send_consensus_bootstrapped_work, consensus_bootstrapped_rids
+
+    def _pp_pd_send_consensus_release_ids(
+        self: Scheduler,
+        tmbs: List[List[str]],
+        next_first_rank_mb_id: int,
+        release_rids: List[str],
+        transferred_rids: List[str],
+    ):
+        send_release_work = []
+        if self.pp_group.is_last_rank:
+            if tmbs[next_first_rank_mb_id] is not None:
+                release_rids = transferred_rids
+                send_release_work = self._pp_send_pyobj_to_next_stage(
+                    release_rids, async_send=True
+                )
+        elif release_rids is not None:
+            send_release_work = self._pp_send_pyobj_to_next_stage(
+                release_rids, async_send=True
+            )
+        return send_release_work, release_rids
 
     def _pp_run_control_ring_phase(
         self: Scheduler,

@@ -16,11 +16,8 @@ from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa:
     SchedulerRequestReceiver,
 )
 from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
-    _PP_DISAGG_SCHEDULER_FENCE_PHASES,
     SchedulerPPMixin,
     _pp_attention_dp_control_ranks,
-    _pp_disagg_scheduler_fence_specs,
-    _pp_fence_scheduler_phase,
     _pp_pack_control_ring_message,
     _pp_unpack_control_ring_message,
 )
@@ -624,9 +621,7 @@ class TestPPCPRankOffsets(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "prefill_release_consensus"):
             _pp_unpack_control_ring_message(message, "prefill_release_consensus")
 
-    def test_pp_scheduler_fences_use_full_attention_dp_group_and_distinct_phases(
-        self,
-    ):
+    def test_pp_attention_dp_control_ranks_are_stage_local(self):
         ps = _make_ps()
         shifted_tp_ranks = list(range(24, 32))
         dp1_ranks = _pp_attention_dp_control_ranks(ps, shifted_tp_ranks)
@@ -637,42 +632,12 @@ class TestPPCPRankOffsets(unittest.TestCase):
         self.assertEqual(dp0_ranks, [24, 25, 26, 27])
         self.assertEqual(set(dp0_ranks).intersection(dp1_ranks), set())
 
-        fence_groups = {phase: object() for phase in _PP_DISAGG_SCHEDULER_FENCE_PHASES}
-        with patch(
-            "sglang.srt.managers.scheduler_pp_mixin.torch.distributed.barrier"
-        ) as barrier:
-            for phase in _PP_DISAGG_SCHEDULER_FENCE_PHASES:
-                _pp_fence_scheduler_phase(fence_groups[phase])
-            _pp_fence_scheduler_phase(None)
-
-        self.assertEqual(
-            [call.kwargs["group"] for call in barrier.call_args_list],
-            [fence_groups[phase] for phase in _PP_DISAGG_SCHEDULER_FENCE_PHASES],
-        )
-        self.assertEqual(len(set(fence_groups.values())), 4)
-
-    def test_pp_scheduler_fence_specs_match_mode_and_stage(self):
-        shifted_tp_ranks = list(range(24, 32))
-        ps = _make_ps(attn_dp_rank=1)
-
-        prefill_specs = _pp_disagg_scheduler_fence_specs(
-            "prefill", ps, shifted_tp_ranks
-        )
-        self.assertEqual(
-            prefill_specs,
-            [
-                (phase, [28, 29, 30, 31])
-                for phase in _PP_DISAGG_SCHEDULER_FENCE_PHASES
-            ],
-        )
-        self.assertEqual(
-            _pp_disagg_scheduler_fence_specs("decode", ps, shifted_tp_ranks),
-            [],
-        )
-        self.assertEqual(
-            _pp_disagg_scheduler_fence_specs("null", ps, shifted_tp_ranks),
-            [],
-        )
+    def test_prefill_keeps_delayed_output_and_legacy_consensus_order(self):
+        source = inspect.getsource(SchedulerPPMixin.event_loop_pp_disagg_prefill)
+        self.assertNotIn("relay_output_immediately=True", source)
+        self.assertNotIn("_pp_run_control_ring_phase", source)
+        self.assertIn("_pp_pd_send_consensus_bootstrapped_ids", source)
+        self.assertIn("_pp_pd_send_consensus_release_ids", source)
 
     def test_decode_control_phases_and_result_commit_finish_without_cross_dp_fence(
         self,

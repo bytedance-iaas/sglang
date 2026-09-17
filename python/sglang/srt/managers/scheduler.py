@@ -281,7 +281,6 @@ from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_pp_mixin import (
     SchedulerPPMixin,
     _pp_attention_dp_control_ranks,
-    _pp_disagg_scheduler_fence_specs,
 )
 from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
@@ -1212,7 +1211,7 @@ class Scheduler(
         self.pp_disagg_control_group = None
         self.pp_disagg_local_control_group = None
         if (
-            get_disagg().disaggregation_mode in ("prefill", "decode")
+            get_disagg().disaggregation_mode == "decode"
             and self.ps.pp_size > 1
         ):
             # The PP consensus ring has a fixed typed phase sequence. Keep it
@@ -1235,22 +1234,6 @@ class Scheduler(
                 "Initialized PP disaggregation local control group: ranks=%s",
                 local_control_ranks,
             )
-        self.pp_disagg_scheduler_fence_groups = {}
-        disagg_mode = get_disagg().disaggregation_mode
-        if disagg_mode in ("prefill", "decode") and self.ps.pp_size > 1:
-            for phase, control_ranks in _pp_disagg_scheduler_fence_specs(
-                disagg_mode, self.ps, self.tp_group.ranks
-            ):
-                self.pp_disagg_scheduler_fence_groups[phase] = (
-                    create_custom_parallel_group(control_ranks, backend="gloo")
-                )
-                logger.info(
-                    "Initialized PP disaggregation scheduler fence group: "
-                    "phase=%s ranks=%s",
-                    phase,
-                    control_ranks,
-                )
-
         # NOTE: dp_tp_* are request/data-plane coordination groups (not tensor collectives).
         # When DP attention is enabled, scope to the attention-TP group; otherwise use
         # the base TP group. Entry rank is the local rank 0 in that group.
