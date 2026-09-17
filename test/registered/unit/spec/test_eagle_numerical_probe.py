@@ -23,6 +23,7 @@ from sglang.srt.speculative.eagle_numerical_probe import (
     EagleNumericalProbe,
     EaglePDHandoffProbe,
     EaglePPSenderProbe,
+    EaglePrefillIndexerStoreProbe,
     _emit_json_record,
     _PPTargetForwardDeviceObserver,
     _ragged_rows_fingerprint,
@@ -36,6 +37,109 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestEagleNumericalProbe(unittest.TestCase):
+    def test_prefill_indexer_store_probe_segments_seed_and_measured_rows(self):
+        records = []
+        probe = EaglePrefillIndexerStoreProbe(
+            "exact-rid",
+            prefix_tokens=8,
+            page_size=4,
+            capture_id="generation-1",
+            pod_name="prefill-0",
+            pod_uid="uid-1",
+            chunk_rows=3,
+            emit_fn=lambda marker, payload: records.append((marker, payload)),
+        )
+        key_raw = torch.arange(40, dtype=torch.bfloat16).reshape(10, 4)
+        positions = torch.arange(10, dtype=torch.int64)
+        out_cache_loc = torch.arange(100, 110, dtype=torch.int64)
+
+        probe.capture(
+            layer_id=1,
+            rids=["exact-rid-prefix-seed"],
+            key_raw=key_raw,
+            positions=positions,
+            out_cache_loc=out_cache_loc,
+        )
+        probe.capture(
+            layer_id=1,
+            rids=["exact-rid"],
+            key_raw=key_raw[8:],
+            positions=positions[8:],
+            out_cache_loc=out_cache_loc[8:],
+        )
+
+        self.assertEqual(len(records), 2)
+        self.assertEqual(
+            [payload["request_kind"] for _, payload in records],
+            ["prefix_seed", "measured"],
+        )
+        seed_segments = records[0][1]["segments"]
+        self.assertEqual(
+            {name: value["logical_rows"] for name, value in seed_segments.items()},
+            {"prefix_body": 4, "prefix_tail": 4, "request_added": 2},
+        )
+        self.assertEqual(seed_segments["prefix_tail"]["position_min"], 4)
+        self.assertEqual(seed_segments["prefix_tail"]["position_max"], 7)
+        self.assertEqual(
+            seed_segments["prefix_body"]["tensors"]["key_raw"]["sha256"],
+            hashlib.sha256(
+                key_raw[:4].contiguous().view(torch.uint8).numpy().tobytes()
+            ).hexdigest(),
+        )
+        measured_segments = records[1][1]["segments"]
+        self.assertEqual(set(measured_segments), {"request_added"})
+        self.assertEqual(measured_segments["request_added"]["logical_rows"], 2)
+        self.assertEqual(records[0][1]["capture"]["pod_uid"], "uid-1")
+
+    def test_prefill_indexer_store_probe_ignores_other_rids_and_layers(self):
+        records = []
+        probe = EaglePrefillIndexerStoreProbe(
+            "exact-rid",
+            prefix_tokens=8,
+            page_size=4,
+            capture_id="generation-1",
+            pod_name="prefill-0",
+            pod_uid="uid-1",
+            emit_fn=lambda marker, payload: records.append((marker, payload)),
+        )
+        tensors = {
+            "key_raw": torch.zeros((2, 4), dtype=torch.bfloat16),
+            "positions": torch.tensor([8, 9], dtype=torch.int64),
+            "out_cache_loc": torch.tensor([8, 9], dtype=torch.int64),
+        }
+        probe.capture(layer_id=0, rids=["exact-rid"], **tensors)
+        probe.capture(layer_id=1, rids=["other-rid"], **tensors)
+        probe.capture(layer_id=1, rids=["exact-rid", "other-rid"], **tensors)
+        self.assertEqual(records, [])
+
+    def test_prefill_indexer_store_probe_fails_closed_on_invalid_contract(self):
+        with self.assertRaisesRegex(ValueError, "prefix_tokens > page_size"):
+            EaglePrefillIndexerStoreProbe(
+                "exact-rid",
+                prefix_tokens=4,
+                page_size=4,
+                capture_id="generation-1",
+                pod_name="prefill-0",
+                pod_uid="uid-1",
+            )
+        probe = EaglePrefillIndexerStoreProbe(
+            "exact-rid",
+            prefix_tokens=8,
+            page_size=4,
+            capture_id="generation-1",
+            pod_name="prefill-0",
+            pod_uid="uid-1",
+            emit_fn=lambda *_: None,
+        )
+        with self.assertRaisesRegex(ValueError, "aligned non-empty row axes"):
+            probe.capture(
+                layer_id=1,
+                rids=["exact-rid"],
+                key_raw=torch.zeros((2, 4), dtype=torch.bfloat16),
+                positions=torch.zeros((1,), dtype=torch.int64),
+                out_cache_loc=torch.zeros((2,), dtype=torch.int64),
+            )
+
     def test_ragged_rows_fingerprint_ignores_invalid_tail(self):
         left = torch.tensor([[1.0, 2.0, 90.0], [3.0, 80.0, 70.0]])
         changed_tail = torch.tensor([[1.0, 2.0, -9.0], [3.0, -8.0, -7.0]])

@@ -1505,6 +1505,11 @@ class Envs:
     SGLANG_EAGLE_NUMERICAL_PROBE_CAPTURE_ID = EnvStr(None)
     SGLANG_EAGLE_NUMERICAL_PROBE_POD_NAME = EnvStr(None)
     SGLANG_EAGLE_NUMERICAL_PROBE_POD_UID = EnvStr(None)
+    # Exact shared-prefix boundary for the matching RID's prefill index-K store
+    # observer. Zero disables that observer while retaining the other numerical
+    # probe stages. Diagnostic only; never use this synchronous D2H path for
+    # performance evidence.
+    SGLANG_EAGLE_PREFILL_INDEXER_STORE_PREFIX_TOKENS = EnvInt(0)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(

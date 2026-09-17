@@ -206,6 +206,11 @@ _PP_TARGET_ATTENTION_OUTPUT_BOUNDARIES = (
 _PP_TARGET_ATTENTION_TENSOR = "output"
 _PP_INDEXER_INPUT_TENSORS = ("q_fp8", "weights", "block_tables", "seq_lens")
 _PP_INDEXER_STORE_INPUT_TENSORS = ("key_raw", "positions", "out_cache_loc")
+_PREFILL_INDEXER_STORE_SEGMENTS = (
+    "prefix_body",
+    "prefix_tail",
+    "request_added",
+)
 _PP_INDEXER_CACHE_TENSORS = (
     "page_ids",
     "page_counts",
@@ -1781,6 +1786,234 @@ def _tensor_fingerprint(
     if cpu.numel() <= 16:
         result["values"] = cpu.reshape(-1).tolist()
     return result
+
+
+class EaglePrefillIndexerStoreProbe:
+    """Fingerprint exact-RID prefill index-K store inputs without GPU retention.
+
+    The isolated seed request is identified by its ``-prefix-seed`` suffix; the
+    measured request must match the configured exact RID. Every matching EXTEND
+    invocation is emitted immediately, so later decode/verify stores cannot
+    overwrite the evidence. Large K tensors are transferred and hashed in
+    bounded row chunks.
+    """
+
+    def __init__(
+        self,
+        expected_rid: Optional[str],
+        *,
+        prefix_tokens: int,
+        page_size: int,
+        capture_id: Optional[str] = None,
+        pod_name: Optional[str] = None,
+        pod_uid: Optional[str] = None,
+        chunk_rows: int = 8192,
+        emit_fn=_emit_json_record,
+    ) -> None:
+        self.expected_rid = expected_rid or None
+        self.prefix_tokens = int(prefix_tokens)
+        self.page_size = int(page_size)
+        self.chunk_rows = int(chunk_rows)
+        self._emit_fn = emit_fn
+        capture_values = (capture_id, pod_name, pod_uid)
+        if self.expected_rid is None:
+            if any(capture_values) or self.prefix_tokens:
+                raise ValueError(
+                    "prefill indexer-store capture configuration requires an exact RID"
+                )
+            self.capture_identity = None
+        else:
+            if not all(capture_values):
+                raise ValueError(
+                    "prefill indexer-store probe requires capture id and Pod name/UID"
+                )
+            if self.prefix_tokens <= self.page_size or self.page_size <= 0:
+                raise ValueError(
+                    "prefill indexer-store probe requires prefix_tokens > page_size > 0"
+                )
+            if self.chunk_rows <= 0:
+                raise ValueError("prefill indexer-store chunk_rows must be positive")
+            self.capture_identity = {
+                "id": capture_id,
+                "pod_name": pod_name,
+                "pod_uid": pod_uid,
+            }
+        self._invocations: dict[str, int] = {}
+
+    @property
+    def can_probe(self) -> bool:
+        return self.expected_rid is not None
+
+    def _request_kind(self, rids: Optional[list[str]]) -> Optional[str]:
+        if not self.can_probe or rids is None or len(rids) != 1:
+            return None
+        if rids[0].endswith("-prefix-seed"):
+            return "prefix_seed"
+        if rids[0] == self.expected_rid:
+            return "measured"
+        return None
+
+    @staticmethod
+    def _new_digest() -> dict:
+        return {
+            "sha256": hashlib.sha256(),
+            "rows": 0,
+            "sum": 0.0,
+            "abs_max": 0.0,
+            "finite": True,
+        }
+
+    @staticmethod
+    def _update_digest(state: dict, value: torch.Tensor) -> None:
+        cpu = value.detach().contiguous().cpu()
+        state["sha256"].update(cpu.reshape(-1).view(torch.uint8).numpy().tobytes())
+        state["rows"] += int(cpu.shape[0])
+        if cpu.numel() == 0:
+            return
+        numeric = cpu.to(torch.float64)
+        finite = torch.isfinite(numeric)
+        state["finite"] = state["finite"] and bool(finite.all())
+        if bool(finite.any()):
+            selected = numeric[finite]
+            state["sum"] += float(selected.sum())
+            state["abs_max"] = max(state["abs_max"], float(selected.abs().max()))
+
+    @staticmethod
+    def _finish_digest(state: dict, *, dtype: torch.dtype, width: int) -> dict:
+        return {
+            "dtype": str(dtype),
+            "shape": [state["rows"], *([] if width == 1 else [width])],
+            "sha256": state["sha256"].hexdigest(),
+            "finite": state["finite"],
+            "sum": state["sum"],
+            "abs_max": state["abs_max"],
+        }
+
+    def capture(
+        self,
+        *,
+        layer_id: int,
+        rids: Optional[list[str]],
+        key_raw: torch.Tensor,
+        positions: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+    ) -> None:
+        request_kind = self._request_kind(rids)
+        if request_kind is None or layer_id != 1:
+            return
+        if (
+            key_raw.ndim != 2
+            or positions.ndim != 1
+            or out_cache_loc.ndim != 1
+            or key_raw.shape[0] != positions.shape[0]
+            or key_raw.shape[0] != out_cache_loc.shape[0]
+            or key_raw.shape[0] <= 0
+        ):
+            raise ValueError(
+                "prefill indexer-store inputs require aligned non-empty row axes"
+            )
+        if positions.dtype != torch.int64 or out_cache_loc.dtype != torch.int64:
+            raise ValueError(
+                "prefill indexer-store positions and out_cache_loc must be int64"
+            )
+        if not (key_raw.device == positions.device == out_cache_loc.device):
+            raise ValueError("prefill indexer-store inputs must share one device")
+
+        _synchronize_cuda_tensors(
+            {
+                "key_raw": key_raw,
+                "positions": positions,
+                "out_cache_loc": out_cache_loc,
+            }
+        )
+        tensor_states = {
+            segment: {
+                name: self._new_digest() for name in _PP_INDEXER_STORE_INPUT_TENSORS
+            }
+            for segment in _PREFILL_INDEXER_STORE_SEGMENTS
+        }
+        segment_minmax = {
+            segment: [None, None] for segment in _PREFILL_INDEXER_STORE_SEGMENTS
+        }
+        prefix_tail_start = self.prefix_tokens - self.page_size
+        rows = int(key_raw.shape[0])
+        for start in range(0, rows, self.chunk_rows):
+            end = min(start + self.chunk_rows, rows)
+            pos_cpu = positions[start:end].detach().contiguous().cpu()
+            loc_cpu = out_cache_loc[start:end].detach().contiguous().cpu()
+            for segment in _PREFILL_INDEXER_STORE_SEGMENTS:
+                if segment == "prefix_body":
+                    mask = pos_cpu < prefix_tail_start
+                elif segment == "prefix_tail":
+                    mask = (pos_cpu >= prefix_tail_start) & (
+                        pos_cpu < self.prefix_tokens
+                    )
+                else:
+                    mask = pos_cpu >= self.prefix_tokens
+                if not bool(mask.any()):
+                    continue
+                indices = torch.nonzero(mask, as_tuple=False).flatten()
+                device_indices = indices.to(device=key_raw.device)
+                selected_key = key_raw[start:end].index_select(0, device_indices)
+                selected_pos = pos_cpu.index_select(0, indices)
+                selected_loc = loc_cpu.index_select(0, indices)
+                self._update_digest(tensor_states[segment]["key_raw"], selected_key)
+                self._update_digest(tensor_states[segment]["positions"], selected_pos)
+                self._update_digest(
+                    tensor_states[segment]["out_cache_loc"], selected_loc
+                )
+                low = int(selected_pos.min())
+                high = int(selected_pos.max())
+                current = segment_minmax[segment]
+                current[0] = low if current[0] is None else min(current[0], low)
+                current[1] = high if current[1] is None else max(current[1], high)
+
+        rid = rids[0]
+        invocation = self._invocations.get(rid, 0) + 1
+        self._invocations[rid] = invocation
+        segments = {}
+        for segment, states in tensor_states.items():
+            segment_rows = states["positions"]["rows"]
+            if segment_rows == 0:
+                continue
+            segments[segment] = {
+                "logical_rows": segment_rows,
+                "position_min": segment_minmax[segment][0],
+                "position_max": segment_minmax[segment][1],
+                "tensors": {
+                    "key_raw": self._finish_digest(
+                        states["key_raw"],
+                        dtype=key_raw.dtype,
+                        width=int(key_raw.shape[1]),
+                    ),
+                    "positions": self._finish_digest(
+                        states["positions"], dtype=positions.dtype, width=1
+                    ),
+                    "out_cache_loc": self._finish_digest(
+                        states["out_cache_loc"],
+                        dtype=out_cache_loc.dtype,
+                        width=1,
+                    ),
+                },
+            }
+        if not segments:
+            raise ValueError("prefill indexer-store invocation has no classified rows")
+        self._emit_fn(
+            "EAGLE_PREFILL_INDEXER_STORE_PROBE_STAGE",
+            {
+                "rid": rid,
+                "request_kind": request_kind,
+                "capture": self.capture_identity,
+                "phase": "prefill",
+                "stage": "layer_01_indexer_store_inputs",
+                "invocation": invocation,
+                "logical_rows": rows,
+                "prefix_tokens": self.prefix_tokens,
+                "page_size": self.page_size,
+                "segments": segments,
+                "rank": _rank_payload(),
+            },
+        )
 
 
 def _ragged_rows_fingerprint(
