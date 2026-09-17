@@ -62,6 +62,9 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_musa,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.speculative.eagle_numerical_probe import (
+    EaglePrefillIndexerStoreProbe,
+)
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
@@ -876,6 +879,34 @@ class DeepseekMLAForwardMixin:
                     attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
         target_forward_probe = getattr(self, "target_forward_probe", None)
+        prefill_attention_probe = None
+        if (
+            self.layer_id == 0
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and envs.SGLANG_EAGLE_PREFILL_INDEXER_STORE_PREFIX_TOKENS.get() > 0
+            and envs.SGLANG_EAGLE_PREFILL_PROBE_SCOPE.get() == "layer0-attention-output"
+        ):
+            prefill_attention_probe = getattr(self, "_prefill_attention_probe", None)
+            if prefill_attention_probe is None:
+                prefill_attention_probe = EaglePrefillIndexerStoreProbe(
+                    envs.SGLANG_EAGLE_NUMERICAL_PROBE_RID.get(),
+                    prefix_tokens=envs.SGLANG_EAGLE_PREFILL_INDEXER_STORE_PREFIX_TOKENS.get(),
+                    page_size=64,
+                    capture_id=envs.SGLANG_EAGLE_NUMERICAL_PROBE_CAPTURE_ID.get(),
+                    pod_name=envs.SGLANG_EAGLE_NUMERICAL_PROBE_POD_NAME.get(),
+                    pod_uid=envs.SGLANG_EAGLE_NUMERICAL_PROBE_POD_UID.get(),
+                )
+                self._prefill_attention_probe = prefill_attention_probe
+            if prefill_attention_probe.matches(forward_batch.rids):
+                prefill_attention_probe.capture_layer_boundary(
+                    boundary="layer_00_absorbed_attention_context",
+                    rids=forward_batch.rids,
+                    hidden_states=attn_output.flatten(1, 2),
+                    residual=None,
+                    positions=positions,
+                    prefix_len=int(forward_batch.extend_prefix_lens_cpu[0]),
+                    out_cache_loc=forward_batch.out_cache_loc,
+                )
 
         _kvb_v = None
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
@@ -988,6 +1019,18 @@ class DeepseekMLAForwardMixin:
             )
         if gate is not None:
             attn_bmm_output = self._apply_gated(attn_bmm_output, gate)
+        if prefill_attention_probe is not None and prefill_attention_probe.matches(
+            forward_batch.rids
+        ):
+            prefill_attention_probe.capture_layer_boundary(
+                boundary="layer_00_o_proj_input",
+                rids=forward_batch.rids,
+                hidden_states=attn_bmm_output,
+                residual=None,
+                positions=positions,
+                prefix_len=int(forward_batch.extend_prefix_lens_cpu[0]),
+                out_cache_loc=forward_batch.out_cache_loc,
+            )
         if (
             target_forward_probe is not None
             and forward_batch.forward_mode.is_target_verify()
