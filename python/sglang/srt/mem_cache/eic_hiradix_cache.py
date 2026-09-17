@@ -1307,7 +1307,7 @@ class EICHiRadixCache(RadixCache):
         req.set_extend_input_len(len(req.fill_ids) - prefix_len)
         req.cache_protected_len = prefix_len
         req.last_matched_prefix_len = prefix_len
-        stats.observe_admit(d, st["hh"], prefix_len)
+        stats.observe_admit(d, st.get("hh", 0), prefix_len)
         return True
 
     def release_load_admit(self, rid):
