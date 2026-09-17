@@ -30,6 +30,7 @@ from sglang.srt.speculative.eagle_numerical_probe import (
     _synchronize_cuda_tensors,
     _tensor_fingerprint,
     maybe_record_eagle_numerical_stage,
+    select_prefill_indexer_store_rows,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -37,6 +38,17 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestEagleNumericalProbe(unittest.TestCase):
+    def test_select_prefill_indexer_store_rows_drops_cp_padding(self):
+        key_raw = torch.arange(20, dtype=torch.bfloat16).reshape(5, 4)
+        positions = torch.tensor([104, 105, 106, 0, 0], dtype=torch.int64)
+        out_cache_loc = torch.tensor([400, 401, 402], dtype=torch.int64)
+        key, selected_positions, locations = select_prefill_indexer_store_rows(
+            key_raw, positions, out_cache_loc, prefix_len=104
+        )
+        self.assertTrue(torch.equal(key, key_raw[:3]))
+        self.assertEqual(selected_positions.tolist(), [104, 105, 106])
+        self.assertEqual(locations.tolist(), [400, 401, 402])
+
     def test_prefill_indexer_store_probe_segments_seed_and_measured_rows(self):
         records = []
         probe = EaglePrefillIndexerStoreProbe(

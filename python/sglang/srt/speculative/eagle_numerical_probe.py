@@ -1788,6 +1788,32 @@ def _tensor_fingerprint(
     return result
 
 
+def select_prefill_indexer_store_rows(
+    key_raw: torch.Tensor,
+    positions: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    *,
+    prefix_len: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Drop CP padding and align sharded positions to global cache locations."""
+    if key_raw.ndim != 2 or positions.ndim != 1 or out_cache_loc.ndim != 1:
+        raise ValueError(
+            "Prefill indexer-store CP mapping requires rank-2 K and vectors"
+        )
+    if key_raw.shape[0] != positions.shape[0]:
+        raise ValueError("Prefill indexer-store CP key/position rows differ")
+    local_offsets = positions - int(prefix_len)
+    valid = (local_offsets >= 0) & (local_offsets < out_cache_loc.shape[0])
+    if not bool(valid.any()):
+        raise ValueError("Prefill indexer-store CP mapping has no logical rows")
+    valid_indices = torch.nonzero(valid, as_tuple=False).flatten()
+    selected_key = key_raw.index_select(0, valid_indices)
+    selected_positions = positions.index_select(0, valid_indices)
+    selected_offsets = local_offsets.index_select(0, valid_indices)
+    selected_locations = out_cache_loc.index_select(0, selected_offsets)
+    return selected_key, selected_positions, selected_locations
+
+
 class EaglePrefillIndexerStoreProbe:
     """Fingerprint exact-RID prefill index-K store inputs without GPU retention.
 

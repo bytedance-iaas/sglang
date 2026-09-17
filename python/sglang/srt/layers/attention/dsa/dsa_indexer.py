@@ -596,6 +596,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if self._prefill_store_probe is None:
             from sglang.srt.speculative.eagle_numerical_probe import (
                 EaglePrefillIndexerStoreProbe,
+                select_prefill_indexer_store_rows,
             )
 
             self._prefill_store_probe = EaglePrefillIndexerStoreProbe(
@@ -615,16 +616,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 raise ValueError(
                     "Prefill indexer-store observer requires one CP request prefix length"
                 )
-            local_offsets = positions - int(prefix_lens[0])
-            if (
-                local_offsets.numel() != key_raw.shape[0]
-                or bool((local_offsets < 0).any())
-                or bool((local_offsets >= out_cache_loc.shape[0]).any())
-            ):
-                raise ValueError(
-                    "Prefill indexer-store observer cannot map CP positions to cache locations"
-                )
-            out_cache_loc = out_cache_loc.index_select(0, local_offsets)
+            key_raw, positions, out_cache_loc = select_prefill_indexer_store_rows(
+                key_raw,
+                positions,
+                out_cache_loc,
+                prefix_len=int(prefix_lens[0]),
+            )
         self._prefill_store_probe.capture(
             layer_id=layer_id,
             rids=forward_batch.rids,
