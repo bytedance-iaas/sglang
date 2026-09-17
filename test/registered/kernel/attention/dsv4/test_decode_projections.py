@@ -12,6 +12,80 @@ register_cuda_ci(est_time=35, stage="base-b-kernel-unit", runner_config="1-gpu-l
 
 
 class TestHopperCandidateScoring(CustomTestCase):
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9,
+        "requires an SM90 GPU",
+    )
+    def test_fp4_indexer_grouped_tensor_core_matches_triton(self):
+        from sglang.kernels.ops.attention.dsv4.sm90_fp4_indexer import (
+            fp4_index_logits_req_to_token,
+        )
+        from sglang.kernels.ops.attention.dsv4.torch_quant import fake_quant_fp4
+
+        torch.manual_seed(11)
+        heads, width, page_size = 64, 131, 64
+        for group_size in (3, 6):
+            rows = 2 * group_size
+            q = fake_quant_fp4(
+                torch.randn(rows, heads, 128, device="cuda", dtype=torch.bfloat16)
+            )
+            weights = torch.randn(
+                rows, heads, device="cuda", dtype=torch.bfloat16
+            )
+            req = torch.arange(2, device="cuda", dtype=torch.int64).repeat_interleave(
+                group_size
+            )
+            lens = torch.tensor(
+                [width - i for _ in range(2) for i in range(group_size)],
+                device="cuda",
+                dtype=torch.int64,
+            )
+            req_to_token = torch.stack(
+                [
+                    torch.randperm(8 * page_size, device="cuda")[: 2 * width]
+                    for _ in range(2)
+                ]
+            ).to(torch.int32)
+            table = torch.randint(
+                0, 256, (8, page_size * 68), device="cuda", dtype=torch.uint8
+            )
+            table[:, page_size * 64 :] = torch.randint(
+                120,
+                135,
+                (8, page_size * 4),
+                device="cuda",
+                dtype=torch.uint8,
+            )
+
+            for ratio in (1, 2):
+                with self.subTest(group_size=group_size, ratio=ratio):
+                    expected = fp4_index_logits_req_to_token(
+                        q,
+                        weights,
+                        req_to_token,
+                        req,
+                        lens,
+                        table,
+                        page_size,
+                        ratio,
+                        width,
+                    )
+                    actual = fp4_index_logits_req_to_token(
+                        q,
+                        weights,
+                        req_to_token,
+                        req,
+                        lens,
+                        table,
+                        page_size,
+                        ratio,
+                        width,
+                        group_size=group_size,
+                    )
+                    torch.testing.assert_close(
+                        actual, expected, rtol=2e-2, atol=5e-1, equal_nan=True
+                    )
+
     def test_fp4_indexer_direct_mapping_matches_explicit_slots(self):
         from sglang.kernels.ops.attention.dsv4.sm90_fp4_indexer import (
             fp4_index_logits_candidate_blocks,

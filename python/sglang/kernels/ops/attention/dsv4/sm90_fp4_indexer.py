@@ -251,6 +251,7 @@ def fp4_index_logits_req_to_token(
     width: int,
     candidate_block_size: int = 0,
     write_logits: bool = True,
+    group_size: int = 1,
 ) -> (
     torch.Tensor
     | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
@@ -267,6 +268,29 @@ def fp4_index_logits_req_to_token(
     weights = weights.to(torch.bfloat16).contiguous()
     req = req.to(torch.int64).contiguous()
     lens = lens.to(torch.int64).contiguous()
+    if (
+        group_size > 1
+        and H == 64
+        and not candidate_block_size
+        and write_logits
+        and torch.cuda.get_device_capability(q.device)[0] == 9
+    ):
+        from sglang.kernels.ops.attention.dsv4.sm90_fp4_grouped_indexer import (
+            fp4_index_logits_grouped_sm90,
+        )
+
+        return fp4_index_logits_grouped_sm90(
+            q,
+            weights,
+            req_to_token,
+            req,
+            lens,
+            table,
+            page_size,
+            ratio,
+            width,
+            group_size,
+        )
     output_width = triton.cdiv(width, 4) * 4 if write_logits else 4
     out_storage = torch.empty((B, output_width), dtype=torch.float32, device=q.device)
     out = out_storage[:, :width]
