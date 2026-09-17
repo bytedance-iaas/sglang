@@ -469,6 +469,18 @@ class SchedulerPPMixin:
                         self.last_rank_comm_queue,
                     )
 
+                # A DPA rank may finish enqueueing this slot before a peer that
+                # is still issuing the same Graph/MegaMoE work.  If it starts
+                # the next metadata collective immediately, communicator order
+                # can diverge from the peer still inside the current forward.
+                # Finish this rank's launch first; the next metadata all-gather
+                # is then the stage rendezvous.  Do not add a separate CPU
+                # fence here: an idle rank waiting in such a fence can starve
+                # device work that an active rank still needs to finish.
+                self._pp_wait_decode_dp_slot_launch(
+                    self.launch_event if cur_batch else None
+                )
+
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -744,6 +756,17 @@ class SchedulerPPMixin:
         for p2p_work in work:
             p2p_work.work.wait()
         work.clear()
+
+    def _pp_wait_decode_dp_slot_launch(
+        self: Scheduler, launch_event: Optional[torch.Event]
+    ) -> None:
+        if not (
+            getattr(self, "_pp_spec_relay", False)
+            and get_parallel().enable_dp_attention
+        ):
+            return
+        if launch_event is not None:
+            launch_event.synchronize()
 
     def _pp_commit_send_output_work_and_preprocess_output_tensors(
         self: Scheduler,

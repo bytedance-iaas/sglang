@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
@@ -157,6 +157,35 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
 
 
 class TestPPCPRankOffsets(unittest.TestCase):
+    def test_decode_dp_slot_launch_waits_for_device(self):
+        launch_event = SimpleNamespace(synchronize=Mock())
+        scheduler = SimpleNamespace(_pp_spec_relay=True)
+
+        with patch(
+            "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
+            return_value=SimpleNamespace(enable_dp_attention=True),
+        ):
+            SchedulerPPMixin._pp_wait_decode_dp_slot_launch(scheduler, launch_event)
+
+        launch_event.synchronize.assert_called_once_with()
+
+    def test_decode_dp_slot_sync_is_gated_to_pp_spec_dpa(self):
+        for relay, dpa in ((False, True), (True, False), (False, False)):
+            with self.subTest(relay=relay, dpa=dpa):
+                launch_event = SimpleNamespace(synchronize=Mock())
+                scheduler = SimpleNamespace(
+                    _pp_spec_relay=relay,
+                )
+                with patch(
+                    "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
+                    return_value=SimpleNamespace(enable_dp_attention=dpa),
+                ):
+                    SchedulerPPMixin._pp_wait_decode_dp_slot_launch(
+                        scheduler, launch_event
+                    )
+
+                launch_event.synchronize.assert_not_called()
+
     def test_request_receiver_uses_cp_size_for_pp_recv_rank(self):
         ps = _make_ps()
         calls = []
