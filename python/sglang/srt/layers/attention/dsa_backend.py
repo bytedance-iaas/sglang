@@ -2075,6 +2075,8 @@ class DeepseekSparseAttnBackend(
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
+        logical_topk_indices = None
+        topk_indices_offset = None
 
         if self.use_fused_topk:
             if topk_indices is not None:
