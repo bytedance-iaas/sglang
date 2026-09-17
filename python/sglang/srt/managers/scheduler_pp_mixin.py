@@ -722,11 +722,15 @@ class SchedulerPPMixin:
             allocator, "swa_available_size"
         ):
             kv_tokens = min(
-                int(allocator.full_available_size()),
-                int(allocator.swa_available_size()),
+                int(allocator.full_available_size())
+                + int(self.tree_cache.full_evictable_size()),
+                int(allocator.swa_available_size())
+                + int(self.tree_cache.swa_evictable_size()),
             )
         else:
-            kv_tokens = int(allocator.available_size())
+            kv_tokens = int(allocator.available_size()) + int(
+                self.tree_cache.evictable_size()
+            )
         activation_bytes = 0
         for proxy in self._pp_vpp_ready_proxies.values():
             activation_bytes += sum(

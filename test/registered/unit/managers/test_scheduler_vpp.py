@@ -423,8 +423,12 @@ class TestSchedulerVPP(unittest.TestCase):
             available_size=MagicMock(return_value=5)
         )
         scheduler.token_to_kv_pool_allocator = SimpleNamespace(
-            full_available_size=MagicMock(return_value=9000),
+            full_available_size=MagicMock(return_value=3584),
             swa_available_size=MagicMock(return_value=7000),
+        )
+        scheduler.tree_cache = SimpleNamespace(
+            full_evictable_size=MagicMock(return_value=1024),
+            swa_evictable_size=MagicMock(return_value=256),
         )
         scheduler._pp_vpp_ready_proxies = {
             (0, 1): PPProxyTensors(
@@ -435,7 +439,7 @@ class TestSchedulerVPP(unittest.TestCase):
         snapshot = scheduler._pp_vpp_resource_snapshot(2)
 
         self.assertEqual(snapshot.request_slots, 3)
-        self.assertEqual(snapshot.kv_tokens, 7000)
+        self.assertEqual(snapshot.kv_tokens, 4608)
         self.assertEqual(snapshot.activation_bytes, 32)
         self.assertEqual(snapshot.pending_sends, 2)
         self.assertEqual(snapshot.metadata_slots, 5)

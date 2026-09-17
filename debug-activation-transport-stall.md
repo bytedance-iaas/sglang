@@ -48,4 +48,18 @@ Minimal fix:
 Post-fix verification:
 - Local focused tests pass, including PP2 directional routing and duplicate group
   rank construction.
-- Multi-node post-fix evidence is pending.
+- Multi-node evidence confirms the activation deadlock is gone: no activation send
+  or payload work remains pending.
+
+Second multi-node stall at 2026-09-17 03:05:04:
+- All slots are empty and activation transport is idle.
+- PP1 reports 3584 physical free KV tokens, below the 4096 token gate.
+- The outer resource gate counts only allocator free space, while `PrefillAdder`
+  admits against allocator free plus radix-evictable KV.
+- Completed batches can therefore leave enough evictable KV to run the next batch
+  while the outer gate permanently rejects it; metadata buffers then remain held.
+
+Second minimal fix:
+- Report schedulable KV (`free + evictable`) in the VPP resource snapshot using
+  the same full/SWA pool accounting as `PrefillAdder`.
+- Retain the inner `PrefillAdder` as the authoritative allocation check.
