@@ -85,7 +85,8 @@ struct Sm90Fp4GroupedIndexerKernel {
   static constexpr int BLOCK_L = 64;
   static constexpr int SCALE_GROUPS = 4;
   static constexpr int SCALE_GROUP_SIZE = 32;
-  static constexpr int NUM_THREADS = 128;
+  static constexpr int NUM_WARPGROUPS = 2;
+  static constexpr int NUM_THREADS = 128 * NUM_WARPGROUPS;
 
   using SmemLayout =
       decltype(tile_to_shape(GMMA::Layout_K_SW64_Atom<fp8>{}, Shape<Int<64>, Int<64>>{}, Step<_1, _2>{}));
@@ -93,12 +94,12 @@ struct Sm90Fp4GroupedIndexerKernel {
       decltype(make_tiled_mma(GMMA::MMA_64x64x32_F32E4M3E4M3_SS_TN<>{}, Layout<Shape<_1, _1, _1>>{}));
 
   struct SharedStorage {
-    array_aligned<fp8, cosize_v<SmemLayout>, 128> q;
+    array_aligned<fp8, cosize_v<SmemLayout>, 128> q[NUM_WARPGROUPS];
     array_aligned<fp8, cosize_v<SmemLayout>, 128> k[SCALE_GROUPS];
-    array_aligned<bf16, HEADS * BLOCK_L, 128> scores;
+    array_aligned<bf16, HEADS * BLOCK_L, 128> scores[NUM_WARPGROUPS];
     int32_t slots[BLOCK_L];
     float k_scales[SCALE_GROUPS][BLOCK_L];
-    float q_scales[HEADS];
+    float q_scales[NUM_WARPGROUPS][HEADS];
   };
 
   template <typename TA, typename TB, typename TC>
@@ -119,13 +120,15 @@ struct Sm90Fp4GroupedIndexerKernel {
   static __device__ __forceinline__ void devfunc(const Sm90Fp4GroupedIndexerParams& p) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)
     const int tid = threadIdx.x;
+    const int warpgroup = tid / 128;
+    const int wg_tid = tid % 128;
     const int l0 = blockIdx.x * BLOCK_L;
     const int b0 = blockIdx.y * p.group_size;
     const int group_rows = min(p.group_size, p.batch_size - b0);
 
     extern __shared__ char smem_raw[];
     SharedStorage& ss = *reinterpret_cast<SharedStorage*>(smem_raw);
-    Tensor sQ = make_tensor(make_smem_ptr(ss.q.data()), SmemLayout{});
+    Tensor sQ = make_tensor(make_smem_ptr(ss.q[warpgroup].data()), SmemLayout{});
     Tensor sK0 = make_tensor(make_smem_ptr(ss.k[0].data()), SmemLayout{});
     Tensor sK1 = make_tensor(make_smem_ptr(ss.k[1].data()), SmemLayout{});
     Tensor sK2 = make_tensor(make_smem_ptr(ss.k[2].data()), SmemLayout{});
@@ -194,31 +197,31 @@ struct Sm90Fp4GroupedIndexerKernel {
     float* out = reinterpret_cast<float*>(p.out);
     TiledMMA mma;
 
-    for (int row_in_group = 0; row_in_group < group_rows; ++row_in_group) {
+    for (int row_in_group = warpgroup; row_in_group < group_rows; row_in_group += NUM_WARPGROUPS) {
       const int b = b0 + row_in_group;
       Tensor total = partition_fragment_C(mma, Shape<Int<HEADS>, Int<BLOCK_L>>{});
       cute::fill(total, 0.0f);
 
       CUTE_UNROLL
       for (int g = 0; g < SCALE_GROUPS; ++g) {
-        if (tid < HEADS) {
+        if (wg_tid < HEADS) {
           float amax = 0.0f;
           const bf16* q_head = q + static_cast<int64_t>(b) * p.q_stride_b +
-                               static_cast<int64_t>(tid) * p.q_stride_h + g * SCALE_GROUP_SIZE;
+                               static_cast<int64_t>(wg_tid) * p.q_stride_h + g * SCALE_GROUP_SIZE;
           CUTE_UNROLL
           for (int d = 0; d < SCALE_GROUP_SIZE; ++d) {
             amax = fmaxf(amax, fabsf(static_cast<float>(q_head[d])));
           }
-          ss.q_scales[tid] = fp4_query_scale(amax);
+          ss.q_scales[warpgroup][wg_tid] = fp4_query_scale(amax);
         }
-        __syncthreads();
+        NamedBarrier::arrive_and_wait(128, warpgroup);
 
-        for (int pair = tid; pair < HEADS * (SCALE_GROUP_SIZE / 2); pair += NUM_THREADS) {
+        for (int pair = wg_tid; pair < HEADS * (SCALE_GROUP_SIZE / 2); pair += 128) {
           const int head = pair / (SCALE_GROUP_SIZE / 2);
           const int d = (pair % (SCALE_GROUP_SIZE / 2)) * 2;
           const bf16* src = q + static_cast<int64_t>(b) * p.q_stride_b +
                             static_cast<int64_t>(head) * p.q_stride_h + g * SCALE_GROUP_SIZE + d;
-          const float inv_scale = 1.0f / ss.q_scales[head];
+          const float inv_scale = 1.0f / ss.q_scales[warpgroup][head];
           const uint16_t packed = f32x2_to_e4m3x2(
               static_cast<float>(src[0]) * inv_scale, static_cast<float>(src[1]) * inv_scale);
           fp8 v0, v1;
@@ -227,17 +230,17 @@ struct Sm90Fp4GroupedIndexerKernel {
           sQ(head, d) = v0;
           sQ(head, d + 1) = v1;
         }
-        __syncthreads();
+        NamedBarrier::arrive_and_wait(128, warpgroup);
 
         Tensor part = partition_fragment_C(mma, Shape<Int<HEADS>, Int<BLOCK_L>>{});
         if (g == 0) {
-          gemm_one_k32(mma, sQ, sK0, part, tid);
+          gemm_one_k32(mma, sQ, sK0, part, wg_tid);
         } else if (g == 1) {
-          gemm_one_k32(mma, sQ, sK1, part, tid);
+          gemm_one_k32(mma, sQ, sK1, part, wg_tid);
         } else if (g == 2) {
-          gemm_one_k32(mma, sQ, sK2, part, tid);
+          gemm_one_k32(mma, sQ, sK2, part, wg_tid);
         } else {
-          gemm_one_k32(mma, sQ, sK3, part, tid);
+          gemm_one_k32(mma, sQ, sK3, part, wg_tid);
         }
         warpgroup_commit_batch();
         warpgroup_wait<0>();
@@ -245,51 +248,53 @@ struct Sm90Fp4GroupedIndexerKernel {
 
         CUTE_UNROLL
         for (int rp = 0; rp < 2; ++rp) {
-          const int head = (tid / 32) * 16 + (tid % 32) / 4 + 8 * rp;
+          const int head = (wg_tid / 32) * 16 + (wg_tid % 32) / 4 + 8 * rp;
           CUTE_UNROLL
           for (int j = 0; j < BLOCK_L / 8; ++j) {
             CUTE_UNROLL
             for (int cp = 0; cp < 2; ++cp) {
-              const int col = (tid % 4) * 2 + 8 * j + cp;
+              const int col = (wg_tid % 4) * 2 + 8 * j + cp;
               const int i = j * 4 + rp * 2 + cp;
-              total(i) += part(i) * ss.q_scales[head] * ss.k_scales[g][col];
+              total(i) +=
+                  part(i) * ss.q_scales[warpgroup][head] * ss.k_scales[g][col];
             }
           }
         }
-        __syncthreads();
+        NamedBarrier::arrive_and_wait(128, warpgroup);
       }
 
       CUTE_UNROLL
       for (int rp = 0; rp < 2; ++rp) {
-        const int head = (tid / 32) * 16 + (tid % 32) / 4 + 8 * rp;
+        const int head = (wg_tid / 32) * 16 + (wg_tid % 32) / 4 + 8 * rp;
         CUTE_UNROLL
         for (int j = 0; j < BLOCK_L / 8; ++j) {
           CUTE_UNROLL
           for (int cp = 0; cp < 2; ++cp) {
-            const int col = (tid % 4) * 2 + 8 * j + cp;
+            const int col = (wg_tid % 4) * 2 + 8 * j + cp;
             const int i = j * 4 + rp * 2 + cp;
-            ss.scores[head * BLOCK_L + col] = bf16(total(i));
+            ss.scores[warpgroup][head * BLOCK_L + col] = bf16(total(i));
           }
         }
       }
-      __syncthreads();
+      NamedBarrier::arrive_and_wait(128, warpgroup);
 
-      if (tid < BLOCK_L) {
+      if (wg_tid < BLOCK_L) {
         float sum = 0.0f;
         CUTE_UNROLL
         for (int head = 0; head < HEADS; ++head) {
-          float score = fmaxf(static_cast<float>(ss.scores[head * BLOCK_L + tid]), 0.0f);
+          float score =
+              fmaxf(static_cast<float>(ss.scores[warpgroup][head * BLOCK_L + wg_tid]), 0.0f);
           const float weight = static_cast<float>(weights[static_cast<int64_t>(b) * p.weight_stride_b + head]);
           sum += static_cast<float>(bf16(score * weight));
         }
-        const int position = l0 + tid;
+        const int position = l0 + wg_tid;
         if (position < p.width) {
           const bool valid = position < lens[b];
           out[static_cast<int64_t>(b) * p.out_stride + position] =
               valid ? static_cast<float>(bf16(sum)) : -INFINITY;
         }
       }
-      __syncthreads();
+      NamedBarrier::arrive_and_wait(128, warpgroup);
     }
 #else
     if (cute::thread0()) {
