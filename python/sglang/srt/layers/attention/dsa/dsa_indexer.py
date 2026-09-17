@@ -45,6 +45,9 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
+from sglang.srt.speculative.eagle_numerical_probe import (
+    select_prefill_indexer_store_rows,
+)
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
@@ -596,7 +599,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if self._prefill_store_probe is None:
             from sglang.srt.speculative.eagle_numerical_probe import (
                 EaglePrefillIndexerStoreProbe,
-                select_prefill_indexer_store_rows,
             )
 
             self._prefill_store_probe = EaglePrefillIndexerStoreProbe(
