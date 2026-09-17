@@ -1877,6 +1877,7 @@ class EaglePrefillIndexerStoreProbe:
             }
         self._invocations: dict[str, int] = {}
         self._layer_boundary_invocations: dict[tuple[str, str], int] = {}
+        self._gpu_hash_invocations: dict[str, int] = {}
 
     @property
     def can_probe(self) -> bool:
@@ -2113,6 +2114,47 @@ class EaglePrefillIndexerStoreProbe:
             out_cache_loc=selected_locations,
             key_semantics=boundary,
             projection_inputs=selected,
+        )
+
+    def capture_gpu_hash_inputs(
+        self,
+        *,
+        rids: Optional[list[str]],
+        tensors: dict[str, torch.Tensor],
+    ) -> None:
+        request_kind = self._request_kind(rids)
+        if request_kind is None:
+            return
+        from sglang.kernels.ops.memory.gpu_tensor_hash import gpu_tensor_hash
+
+        if not tensors or any(
+            not value.is_cuda or value.numel() == 0 for value in tensors.values()
+        ):
+            raise ValueError("Prefill attention GPU hash requires CUDA tensors")
+        rid = rids[0]
+        invocation = self._gpu_hash_invocations.get(rid, 0) + 1
+        self._gpu_hash_invocations[rid] = invocation
+        hashes = {}
+        for name, value in sorted(tensors.items()):
+            contiguous = value.detach().contiguous()
+            hashes[name] = {
+                "dtype": str(contiguous.dtype),
+                "shape": list(contiguous.shape),
+                "hash64_seed0": f"{gpu_tensor_hash(contiguous, seed=0x243F6A88):016x}",
+                "hash64_seed1": f"{gpu_tensor_hash(contiguous, seed=0x9E3779B9):016x}",
+            }
+        self._emit_fn(
+            "EAGLE_PREFILL_ATTENTION_GPU_HASH",
+            {
+                "rid": rid,
+                "request_kind": request_kind,
+                "capture": self.capture_identity,
+                "phase": "prefill",
+                "stage": "layer_00_attention_inputs_full_width",
+                "invocation": invocation,
+                "hashes": hashes,
+                "rank": _rank_payload(),
+            },
         )
 
 

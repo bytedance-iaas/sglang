@@ -789,7 +789,8 @@ class DeepseekMLAForwardMixin:
             self.layer_id == 0
             and forward_batch.forward_mode.is_extend_without_speculative()
             and envs.SGLANG_EAGLE_PREFILL_INDEXER_STORE_PREFIX_TOKENS.get() > 0
-            and envs.SGLANG_EAGLE_PREFILL_PROBE_SCOPE.get() == "layer0-attention-input"
+            and envs.SGLANG_EAGLE_PREFILL_PROBE_SCOPE.get()
+            == "layer0-attention-input-gpu-hash"
         ):
             prefill_input_probe = getattr(self, "_prefill_attention_probe", None)
             if prefill_input_probe is None:
@@ -804,38 +805,23 @@ class DeepseekMLAForwardMixin:
                 self._prefill_attention_probe = prefill_input_probe
             if prefill_input_probe.matches(forward_batch.rids):
                 logical_rows = int(positions.shape[0])
-                sampled_inputs = {
-                    "q_nope": _sample_prefill_attention_probe_columns(
-                        _align_prefill_attention_probe_rows(
-                            q_nope_out, logical_rows
-                        ).flatten(1)
-                    ),
-                    "q_rope": _sample_prefill_attention_probe_columns(
-                        _align_prefill_attention_probe_rows(q_pe, logical_rows).flatten(
-                            1
-                        )
-                    ),
-                    "k_nope": _sample_prefill_attention_probe_columns(
-                        _align_prefill_attention_probe_rows(
-                            k_nope, logical_rows
-                        ).flatten(1)
-                    ),
-                    "k_rope": _sample_prefill_attention_probe_columns(
-                        _align_prefill_attention_probe_rows(k_pe, logical_rows).flatten(
-                            1
-                        )
-                    ),
+                full_width_inputs = {
+                    "q_nope": _align_prefill_attention_probe_rows(
+                        q_nope_out, logical_rows
+                    ).flatten(1),
+                    "q_rope": _align_prefill_attention_probe_rows(
+                        q_pe, logical_rows
+                    ).flatten(1),
+                    "k_nope": _align_prefill_attention_probe_rows(
+                        k_nope, logical_rows
+                    ).flatten(1),
+                    "k_rope": _align_prefill_attention_probe_rows(
+                        k_pe, logical_rows
+                    ).flatten(1),
                 }
-                for name, sampled in sampled_inputs.items():
-                    prefill_input_probe.capture_layer_boundary(
-                        boundary=f"layer_00_attention_input_{name}_sample256",
-                        rids=forward_batch.rids,
-                        hidden_states=sampled,
-                        residual=None,
-                        positions=positions,
-                        prefix_len=int(forward_batch.extend_prefix_lens_cpu[0]),
-                        out_cache_loc=forward_batch.out_cache_loc,
-                    )
+                prefill_input_probe.capture_gpu_hash_inputs(
+                    rids=forward_batch.rids, tensors=full_width_inputs
+                )
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
