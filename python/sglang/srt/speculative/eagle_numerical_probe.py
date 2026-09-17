@@ -1320,15 +1320,14 @@ class EaglePPSenderProbe:
                 // indexer_page_size,
                 page_size=indexer_page_size,
             )
-            if layer_id == layer_ids[1]:
-                observer.install_indexer_cache(
-                    layer_id=layer_id,
-                    max_pages=(max_indexer_columns + indexer_page_size - 1)
-                    // indexer_page_size,
-                    page_size=indexer_page_size,
-                    head_dim=int(indexer.head_dim),
-                    scale_bytes=4,
-                )
+            observer.install_indexer_cache(
+                layer_id=layer_id,
+                max_pages=(max_indexer_columns + indexer_page_size - 1)
+                // indexer_page_size,
+                page_size=indexer_page_size,
+                head_dim=int(indexer.head_dim),
+                scale_bytes=4,
+            )
             attention.target_forward_probe = observer
             indexer.target_forward_probe = observer
             radix_attention.target_forward_probe = observer
