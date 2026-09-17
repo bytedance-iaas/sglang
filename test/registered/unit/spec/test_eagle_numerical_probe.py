@@ -59,6 +59,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
             key_raw=key_raw,
             positions=positions,
             out_cache_loc=out_cache_loc,
+            key_semantics="pre_norm_rope_projection",
         )
         probe.capture(
             layer_id=1,
@@ -66,6 +67,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
             key_raw=key_raw[8:],
             positions=positions[8:],
             out_cache_loc=out_cache_loc[8:],
+            key_semantics="pre_norm_rope_projection",
         )
 
         self.assertEqual(len(records), 2)
@@ -107,9 +109,24 @@ class TestEagleNumericalProbe(unittest.TestCase):
             "positions": torch.tensor([8, 9], dtype=torch.int64),
             "out_cache_loc": torch.tensor([8, 9], dtype=torch.int64),
         }
-        probe.capture(layer_id=0, rids=["exact-rid"], **tensors)
-        probe.capture(layer_id=1, rids=["other-rid"], **tensors)
-        probe.capture(layer_id=1, rids=["exact-rid", "other-rid"], **tensors)
+        probe.capture(
+            layer_id=0,
+            rids=["exact-rid"],
+            key_semantics="pre_norm_rope_projection",
+            **tensors,
+        )
+        probe.capture(
+            layer_id=1,
+            rids=["other-rid"],
+            key_semantics="pre_norm_rope_projection",
+            **tensors,
+        )
+        probe.capture(
+            layer_id=1,
+            rids=["exact-rid", "other-rid"],
+            key_semantics="pre_norm_rope_projection",
+            **tensors,
+        )
         self.assertEqual(records, [])
 
     def test_prefill_indexer_store_probe_fails_closed_on_invalid_contract(self):
@@ -138,6 +155,7 @@ class TestEagleNumericalProbe(unittest.TestCase):
                 key_raw=torch.zeros((2, 4), dtype=torch.bfloat16),
                 positions=torch.zeros((1,), dtype=torch.int64),
                 out_cache_loc=torch.zeros((2,), dtype=torch.int64),
+                key_semantics="pre_norm_rope_projection",
             )
 
     def test_ragged_rows_fingerprint_ignores_invalid_tail(self):

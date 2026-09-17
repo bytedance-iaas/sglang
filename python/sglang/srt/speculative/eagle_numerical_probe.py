@@ -1844,6 +1844,9 @@ class EaglePrefillIndexerStoreProbe:
     def can_probe(self) -> bool:
         return self.expected_rid is not None
 
+    def matches(self, rids: Optional[list[str]]) -> bool:
+        return self._request_kind(rids) is not None
+
     def _request_kind(self, rids: Optional[list[str]]) -> Optional[str]:
         if not self.can_probe or rids is None or len(rids) != 1:
             return None
@@ -1897,6 +1900,7 @@ class EaglePrefillIndexerStoreProbe:
         key_raw: torch.Tensor,
         positions: torch.Tensor,
         out_cache_loc: torch.Tensor,
+        key_semantics: str,
     ) -> None:
         request_kind = self._request_kind(rids)
         if request_kind is None or layer_id != 1:
@@ -2006,6 +2010,7 @@ class EaglePrefillIndexerStoreProbe:
                 "capture": self.capture_identity,
                 "phase": "prefill",
                 "stage": "layer_01_indexer_store_inputs",
+                "key_semantics": key_semantics,
                 "invocation": invocation,
                 "logical_rows": rows,
                 "prefix_tokens": self.prefix_tokens,

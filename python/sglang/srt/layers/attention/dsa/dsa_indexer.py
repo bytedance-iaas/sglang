@@ -468,6 +468,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     ):
         weights_raw = None
         if enable_dual_stream:
+            if (
+                forward_batch.forward_mode.is_extend_without_speculative()
+                and envs.SGLANG_EAGLE_PREFILL_INDEXER_STORE_PREFIX_TOKENS.get() > 0
+            ):
+                raise RuntimeError(
+                    "Prefill indexer-store observer does not support the dual-stream path"
+                )
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
 
@@ -506,6 +513,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 key, weights_raw = self._fused_k_weights(x)
             else:
                 key, _ = self.wk(x)
+            self._maybe_capture_prefill_projection(
+                forward_batch=forward_batch,
+                layer_id=self.layer_id,
+                key_raw=key,
+                positions=positions,
+            )
             key = self.k_norm(key)
             k_rope, _ = torch.split(
                 key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
@@ -566,6 +579,61 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         return query, key, weights_raw
 
+    def _maybe_capture_prefill_projection(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        key_raw: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        if (
+            layer_id != 1
+            or not forward_batch.forward_mode.is_extend_without_speculative()
+            or envs.SGLANG_EAGLE_PREFILL_INDEXER_STORE_PREFIX_TOKENS.get() <= 0
+        ):
+            return
+        if self._prefill_store_probe is None:
+            from sglang.srt.speculative.eagle_numerical_probe import (
+                EaglePrefillIndexerStoreProbe,
+            )
+
+            self._prefill_store_probe = EaglePrefillIndexerStoreProbe(
+                envs.SGLANG_EAGLE_NUMERICAL_PROBE_RID.get(),
+                prefix_tokens=envs.SGLANG_EAGLE_PREFILL_INDEXER_STORE_PREFIX_TOKENS.get(),
+                page_size=get_token_to_kv_pool().page_size,
+                capture_id=envs.SGLANG_EAGLE_NUMERICAL_PROBE_CAPTURE_ID.get(),
+                pod_name=envs.SGLANG_EAGLE_NUMERICAL_PROBE_POD_NAME.get(),
+                pod_uid=envs.SGLANG_EAGLE_NUMERICAL_PROBE_POD_UID.get(),
+            )
+        if not self._prefill_store_probe.matches(forward_batch.rids):
+            return
+        out_cache_loc = forward_batch.out_cache_loc
+        if forward_batch.attn_cp_metadata is not None and self.dsa_enable_prefill_cp:
+            prefix_lens = forward_batch.extend_prefix_lens_cpu
+            if prefix_lens is None or len(prefix_lens) != 1:
+                raise ValueError(
+                    "Prefill indexer-store observer requires one CP request prefix length"
+                )
+            local_offsets = positions - int(prefix_lens[0])
+            if (
+                local_offsets.numel() != key_raw.shape[0]
+                or bool((local_offsets < 0).any())
+                or bool((local_offsets >= out_cache_loc.shape[0]).any())
+            ):
+                raise ValueError(
+                    "Prefill indexer-store observer cannot map CP positions to cache locations"
+                )
+            out_cache_loc = out_cache_loc.index_select(0, local_offsets)
+        self._prefill_store_probe.capture(
+            layer_id=layer_id,
+            rids=forward_batch.rids,
+            key_raw=key_raw,
+            positions=positions,
+            out_cache_loc=out_cache_loc,
+            key_semantics="pre_norm_rope_projection",
+        )
+
     def _get_k_bf16(
         self,
         x: torch.Tensor,
@@ -607,31 +675,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             pool.invalidate_index_buffer_for_layer(layer_id)
         if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
             return
-        if (
-            layer_id == 1
-            and forward_batch.forward_mode.is_extend_without_speculative()
-            and envs.SGLANG_EAGLE_PREFILL_INDEXER_STORE_PREFIX_TOKENS.get() > 0
-        ):
-            if self._prefill_store_probe is None:
-                from sglang.srt.speculative.eagle_numerical_probe import (
-                    EaglePrefillIndexerStoreProbe,
-                )
-
-                self._prefill_store_probe = EaglePrefillIndexerStoreProbe(
-                    envs.SGLANG_EAGLE_NUMERICAL_PROBE_RID.get(),
-                    prefix_tokens=envs.SGLANG_EAGLE_PREFILL_INDEXER_STORE_PREFIX_TOKENS.get(),
-                    page_size=page_size,
-                    capture_id=envs.SGLANG_EAGLE_NUMERICAL_PROBE_CAPTURE_ID.get(),
-                    pod_name=envs.SGLANG_EAGLE_NUMERICAL_PROBE_POD_NAME.get(),
-                    pod_uid=envs.SGLANG_EAGLE_NUMERICAL_PROBE_POD_UID.get(),
-                )
-            self._prefill_store_probe.capture(
-                layer_id=layer_id,
-                rids=forward_batch.rids,
-                key_raw=key_raw,
-                positions=positions,
-                out_cache_loc=out_cache_loc,
-            )
+        self._maybe_capture_prefill_projection(
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            key_raw=key_raw,
+            positions=positions,
+        )
         target_forward_probe = getattr(self, "target_forward_probe", None)
         if (
             target_forward_probe is not None
