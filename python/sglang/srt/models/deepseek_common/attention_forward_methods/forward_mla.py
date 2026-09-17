@@ -105,6 +105,17 @@ def _sample_prefill_attention_probe_columns(value: torch.Tensor) -> torch.Tensor
     return value[:, ::step][:, :_PREFILL_ATTENTION_PROBE_SAMPLE_COLUMNS].contiguous()
 
 
+def _align_prefill_attention_probe_rows(
+    value: torch.Tensor, logical_rows: int
+) -> torch.Tensor:
+    """Drop backend alignment padding after validating the logical prefix."""
+    if value.ndim < 1 or value.shape[0] < logical_rows:
+        raise ValueError(
+            "Prefill attention probe input has fewer rows than logical positions"
+        )
+    return value.narrow(0, 0, logical_rows)
+
+
 def _select_local_dcp_heads_for_autotune(
     attn_output: torch.Tensor, num_local_heads: int
 ) -> torch.Tensor:
@@ -792,8 +803,11 @@ class DeepseekMLAForwardMixin:
                 )
                 self._prefill_attention_probe = prefill_input_probe
             if prefill_input_probe.matches(forward_batch.rids):
+                logical_rows = int(positions.shape[0])
                 sampled_q_nope = _sample_prefill_attention_probe_columns(
-                    q_nope_out.flatten(1)
+                    _align_prefill_attention_probe_rows(
+                        q_nope_out, logical_rows
+                    ).flatten(1)
                 )
                 prefill_input_probe.capture(
                     layer_id=1,
@@ -805,13 +819,19 @@ class DeepseekMLAForwardMixin:
                     projection_inputs={
                         "q_nope_sample256": sampled_q_nope,
                         "q_rope_sample256": _sample_prefill_attention_probe_columns(
-                            q_pe.flatten(1)
+                            _align_prefill_attention_probe_rows(
+                                q_pe, logical_rows
+                            ).flatten(1)
                         ),
                         "k_nope_sample256": _sample_prefill_attention_probe_columns(
-                            k_nope.flatten(1)
+                            _align_prefill_attention_probe_rows(
+                                k_nope, logical_rows
+                            ).flatten(1)
                         ),
                         "k_rope_sample256": _sample_prefill_attention_probe_columns(
-                            k_pe.flatten(1)
+                            _align_prefill_attention_probe_rows(
+                                k_pe, logical_rows
+                            ).flatten(1)
                         ),
                     },
                 )
