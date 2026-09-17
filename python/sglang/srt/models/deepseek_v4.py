@@ -140,6 +140,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    ForwardMode,
     PPProxyTensors,
 )
 from sglang.srt.model_executor.forward_context import (
@@ -158,6 +159,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
+    is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import (
@@ -4086,10 +4088,14 @@ class DeepseekV4Model(nn.Module):
         embed_prefetch_requested = envs.SGLANG_ENABLE_DSV41_ENGRAM_EMBED_PREFETCH.get()
 
         self.engram_embed_prefetch_stream = None
-        self.engram_embed_prefetch_ready = None
+        self.engram_embed_prefetch_events = {}
+        self.engram_embed_prefetch_max_bytes = (
+            envs.SGLANG_DSV41_ENGRAM_EMBED_PREFETCH_MAX_BYTES.get()
+        )
         if embed_prefetch_requested:
+            if self.engram_embed_prefetch_max_bytes < 0:
+                raise ValueError("Engram embedding prefetch byte budget must be >= 0")
             unavailable = []
-            engram14 = None
             if not _is_cuda:
                 unavailable.append("CUDA is required")
             if self.pp_group.world_size != 1:
@@ -4099,28 +4105,40 @@ class DeepseekV4Model(nn.Module):
             # in _forward_layers_hc_pre_from_prev.
             if not config.hc_pre_from_prev_sublayer:
                 unavailable.append("hc_pre_from_prev_sublayer must be enabled")
-            if not (self.start_layer <= 14 < self.end_layer):
-                unavailable.append("layer 14 is not on this rank")
-            else:
-                engram14 = self.layers[14].engram
-                if engram14 is None:
-                    unavailable.append("layer 14 has no Engram module")
-                elif not engram14.embed._shared:
-                    unavailable.append("layer 14 must use a shared host table")
-                elif not engram14.embed.host_table.registered:
-                    unavailable.append("the shared host table must be pinned")
             if unavailable:
                 logger.warning(
-                    "Engram layer 14 embedding prefetch disabled: %s",
+                    "Engram embedding prefetch disabled: %s",
                     "; ".join(unavailable),
                 )
             else:
+                for layer_id in (1, 14):
+                    reason = None
+                    if not (self.start_layer <= layer_id < self.end_layer):
+                        reason = "layer is not on this rank"
+                    else:
+                        engram = self.layers[layer_id].engram
+                        if engram is None:
+                            reason = "layer has no Engram module"
+                        elif not engram.embed._shared:
+                            reason = "layer must use a shared host table"
+                        elif not engram.embed.host_table.registered:
+                            reason = "the shared host table must be pinned"
+                    if reason is not None:
+                        logger.warning(
+                            "Engram layer %d embedding prefetch disabled: %s",
+                            layer_id,
+                            reason,
+                        )
+                    else:
+                        self.engram_embed_prefetch_events[layer_id] = torch.cuda.Event()
+            if self.engram_embed_prefetch_events:
                 self.engram_embed_prefetch_stream = torch.cuda.Stream()
-                self.engram_embed_prefetch_ready = torch.cuda.Event()
                 logger.info(
-                    "Engram layer 14 embedding prefetch enabled for eager decode; "
-                    "WKV remains on the main stream and CUDA Graph decode uses "
-                    "the synchronous lookup"
+                    "Engram layers %s embedding prefetch enabled for eager/CUDA "
+                    "Graph decode and eager extend (total buffer budget %d bytes); "
+                    "WKV stays on the main stream; prefill graphs use sync lookup",
+                    list(self.engram_embed_prefetch_events),
+                    self.engram_embed_prefetch_max_bytes,
                 )
 
         self.use_fused_mhc_post_pre = (
@@ -4243,25 +4261,6 @@ class DeepseekV4Model(nn.Module):
                 )
             else:
                 hash_ids = self.engram_hasher(input_ids, forward_batch)
-        prefetched_engram_embeddings = None
-        if (
-            self.engram_embed_prefetch_stream is not None
-            and forward_batch.forward_mode.is_decode()
-            and hash_ids.shape[0] > 0
-            and not get_is_capture_mode()
-        ):
-            prefetch_stream = self.engram_embed_prefetch_stream
-            prefetch_stream.wait_stream(torch.cuda.current_stream())
-            engram = self.layers[14].engram
-            with torch.cuda.stream(prefetch_stream):
-                prefetched_engram_embeddings = engram.embed(
-                    hash_ids[:, engram.layer_hash_index]
-                )
-                self.engram_embed_prefetch_ready.record(prefetch_stream)
-            # The lookup consumes a view of hash_ids after the main stream moves
-            # on. Keep its backing allocation alive until the side stream is done.
-            hash_ids.record_stream(prefetch_stream)
-
         tail = None
         if (
             self.late_layer_start is not None
@@ -4270,6 +4269,47 @@ class DeepseekV4Model(nn.Module):
             self._check_late_layer_tail_readers(forward_batch)
             attn_backend = get_attn_backend()
             tail = attn_backend.tail_forward_metadata.late_layer_tail
+        prefetched_engram_embeddings = {}
+        if (
+            self.engram_embed_prefetch_stream is not None
+            and hash_ids is not None
+            and hash_ids.shape[0] > 0
+            and (
+                forward_batch.forward_mode.is_decode()
+                or (
+                    forward_batch.forward_mode
+                    in (ForwardMode.EXTEND, ForwardMode.MIXED)
+                    and not get_is_capture_mode()
+                    and not is_in_tc_piecewise_cuda_graph()
+                    and not torch.compiler.is_compiling()
+                )
+            )
+        ):
+            remaining_bytes = self.engram_embed_prefetch_max_bytes
+            prefetch_ids_by_layer = {}
+            # Keep L14's longer overlap window when both buffers do not fit.
+            for layer_id in sorted(self.engram_embed_prefetch_events, reverse=True):
+                engram = self.layers[layer_id].engram
+                prefetch_ids = hash_ids[:, engram.layer_hash_index]
+                # Bounded replay changes only the layers at/after the tail
+                # boundary. Hash history and these CP/DP IDs stay rank-local.
+                if tail is not None and self.late_layer_start <= layer_id:
+                    prefetch_ids = tail.rows(prefetch_ids)
+                buffer_bytes = prefetch_ids.numel() * engram.embed.dim * 2
+                if 0 < buffer_bytes <= remaining_bytes:
+                    prefetch_ids_by_layer[layer_id] = prefetch_ids
+                    remaining_bytes -= buffer_bytes
+            # One FIFO stream, earliest consumer first. Distinct events let L1
+            # join only its own gather while L14 can remain in flight.
+            for layer_id, prefetch_ids in sorted(prefetch_ids_by_layer.items()):
+                prefetched_engram_embeddings[layer_id] = self.layers[
+                    layer_id
+                ].engram.embed.prefetch(
+                    prefetch_ids,
+                    self.engram_embed_prefetch_stream,
+                    self.engram_embed_prefetch_events[layer_id],
+                )
+
         saved_full = None
         prev_pre = None
         precomputed_attn = None
@@ -4306,16 +4346,14 @@ class DeepseekV4Model(nn.Module):
             if engram is not None:
                 precomputed_attn = None
                 before_engram = hidden_states
-                if i == 14 and prefetched_engram_embeddings is not None:
+                prefetched_embeddings = prefetched_engram_embeddings.pop(i, None)
+                if prefetched_embeddings is not None:
                     main_stream = torch.cuda.current_stream()
-                    main_stream.wait_event(self.engram_embed_prefetch_ready)
-                    # The output was allocated on the side stream and remains in
-                    # use by the main-stream WKV projection after this reference
-                    # goes out of scope.
-                    prefetched_engram_embeddings.record_stream(main_stream)
-                    kv = engram.project_from_embeddings(prefetched_engram_embeddings)
+                    main_stream.wait_event(self.engram_embed_prefetch_events[i])
+                    # Join before WKV/gate; allocations belong to this stream.
+                    kv = engram.project_from_embeddings(prefetched_embeddings)
                     hidden_states = engram.apply_gate(hidden_states, kv)
-                    prefetched_engram_embeddings = None
+                    prefetched_embeddings = None
                 else:
                     layer_hash_ids = hash_ids[:, engram.layer_hash_index]
                     # A TP-sharded Engram table also gathers across DP ranks.
