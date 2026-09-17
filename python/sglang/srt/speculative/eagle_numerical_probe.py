@@ -207,9 +207,9 @@ _PP_TARGET_ATTENTION_TENSOR = "output"
 _PP_INDEXER_INPUT_TENSORS = ("q_fp8", "weights", "block_tables", "seq_lens")
 _PP_INDEXER_CACHE_TENSORS = (
     "page_ids",
+    "page_counts",
     "index_k_bytes",
     "index_k_scale_bytes",
-    "row_mapping_valid",
 )
 _PP_INDEXER_LOGITS_TENSORS = ("logits", "seq_lens")
 _PP_FLASHMLA_INPUT_TENSORS = (
@@ -293,9 +293,10 @@ class _PPTargetForwardDeviceObserver:
         self._indexer_input_page_sizes: dict[int, int] = {}
         self._indexer_page_columns: dict[int, torch.Tensor] = {}
         self._indexer_cache_buffers: dict[int, dict[str, torch.Tensor]] = {}
-        self._indexer_cache_row_counts: dict[int, dict[str, torch.Tensor]] = {}
         self._indexer_cache_head_dims: dict[int, int] = {}
-        self._indexer_cache_token_positions: dict[int, torch.Tensor] = {}
+        self._indexer_cache_scale_bytes: dict[int, int] = {}
+        self._indexer_cache_page_sizes: dict[int, int] = {}
+        self._indexer_cache_sources: dict[int, torch.Tensor] = {}
         self._indexer_logits_buffers: dict[int, dict[str, torch.Tensor]] = {}
         self._indexer_logits_row_counts: dict[int, torch.Tensor] = {}
         self.device = self.buffer.device
@@ -553,7 +554,7 @@ class _PPTargetForwardDeviceObserver:
         head_dim: int,
         scale_bytes: int,
     ) -> None:
-        """Allocate a graph-stable snapshot of logically referenced index-K pages."""
+        """Allocate bounded staging for post-replay index-K fingerprints."""
         if layer_id in self._indexer_cache_buffers:
             raise RuntimeError(
                 f"indexer-cache observer is already installed for layer {layer_id}"
@@ -561,39 +562,29 @@ class _PPTargetForwardDeviceObserver:
         dimensions = (max_pages, page_size, head_dim, scale_bytes)
         if any(value <= 0 for value in dimensions):
             raise ValueError(f"indexer-cache dimensions must be positive: {dimensions}")
-        packed = torch.zeros(
-            (max_pages, page_size, head_dim + scale_bytes),
-            dtype=torch.uint8,
-            device=self.device,
-        )
+        staging_pages = min(max_pages, 1024)
         self._indexer_cache_buffers[layer_id] = {
-            "packed": packed,
-            "page_ids": torch.zeros(
-                (max_pages,), dtype=torch.int32, device=self.device
+            "device_staging": torch.empty(
+                (staging_pages, page_size, head_dim + scale_bytes),
+                dtype=torch.uint8,
+                device=self.device,
             ),
-            "row_mapping_valid": torch.zeros(
-                (1,), dtype=torch.int32, device=self.device
-            ),
-        }
-        page_rows = torch.zeros((1,), dtype=torch.int32, device=self.device)
-        self._indexer_cache_row_counts[layer_id] = {
-            "page_ids": page_rows,
-            "index_k_bytes": page_rows,
-            "index_k_scale_bytes": page_rows,
-            "row_mapping_valid": torch.ones(
-                (1,), dtype=torch.int32, device=self.device
+            "host_staging": torch.empty(
+                (staging_pages, page_size, head_dim + scale_bytes),
+                dtype=torch.uint8,
+                device="cpu",
+                pin_memory=self.device.type == "cuda",
             ),
         }
         self._indexer_cache_head_dims[layer_id] = head_dim
-        self._indexer_cache_token_positions[layer_id] = torch.arange(
-            max_pages * page_size, dtype=torch.int32, device=self.device
-        ).reshape(max_pages, page_size)
+        self._indexer_cache_scale_bytes[layer_id] = scale_bytes
+        self._indexer_cache_page_sizes[layer_id] = page_size
         stage = f"target_verify_layer_{layer_id:02d}_indexer_cache"
         self._row_domains[stage] = {
             "page_ids": "paged_mqa_logical_page",
+            "page_counts": _PP_ATTN_GROUP_TARGET_TREE_ROW_DOMAIN,
             "index_k_bytes": "paged_mqa_logical_page",
             "index_k_scale_bytes": "paged_mqa_logical_page",
-            "row_mapping_valid": "paged_mqa_cache_mapping_check",
         }
 
     def capture_indexer_cache(
@@ -605,12 +596,10 @@ class _PPTargetForwardDeviceObserver:
         seq_lens: torch.Tensor,
         page_size: int,
     ) -> None:
-        """Copy packed index-K bytes/scales in logical page-table order."""
-        buffers = self._indexer_cache_buffers.get(layer_id)
-        if buffers is None:
+        """Bind the stable index-K storage used by this graph replay."""
+        if layer_id not in self._indexer_cache_buffers:
             return
         stage = f"target_verify_layer_{layer_id:02d}_indexer_cache"
-        packed = buffers["packed"]
         if self._indexer_input_page_sizes.get(layer_id) != page_size:
             raise ValueError(
                 f"{stage}.page_size changed: expected="
@@ -622,7 +611,9 @@ class _PPTargetForwardDeviceObserver:
             or kv_cache_fp8.device != self.device
             or kv_cache_fp8.shape[1] != page_size
             or kv_cache_fp8.shape[2] != 1
-            or kv_cache_fp8.shape[3] != packed.shape[2]
+            or kv_cache_fp8.shape[3]
+            != self._indexer_cache_head_dims[layer_id]
+            + self._indexer_cache_scale_bytes[layer_id]
         ):
             raise ValueError(
                 f"{stage}.kv_cache_fp8 identity changed: "
@@ -634,39 +625,17 @@ class _PPTargetForwardDeviceObserver:
             or block_tables.dtype != torch.int32
             or block_tables.device != self.device
             or seq_lens.numel() % block_tables.shape[0] != 0
-            or block_tables.shape[1] != packed.shape[0]
+            or block_tables.shape[1]
+            != self._indexer_input_buffers[layer_id]["block_tables"].shape[1]
         ):
             raise ValueError(
                 f"{stage} invalid block-table/context layout: "
                 f"block_tables={tuple(block_tables.shape)}, "
                 f"seq_lens={tuple(seq_lens.shape)}"
             )
-        context_lens = seq_lens.reshape(block_tables.shape[0], -1)
-        valid_pages = (context_lens.max(dim=1).values + page_size - 1) // page_size
-        page_columns = self._indexer_page_columns[layer_id][: block_tables.shape[1]]
-        logical_block_tables = torch.where(
-            page_columns.unsqueeze(0) < valid_pages.unsqueeze(1),
-            block_tables,
-            torch.zeros_like(block_tables),
-        )
-        page_ids = logical_block_tables[0]
-        buffers["page_ids"].copy_(page_ids)
-        torch.index_select(kv_cache_fp8.squeeze(2), 0, page_ids, out=packed)
-        max_context_len = context_lens.max()
-        valid_token_mask = (
-            self._indexer_cache_token_positions[layer_id] < max_context_len
-        )
-        packed.mul_(valid_token_mask.unsqueeze(-1))
-        row_mapping_valid = (
-            logical_block_tables.eq(logical_block_tables[:1])
-            .all()
-            .to(torch.int32)
-            .reshape(1)
-        )
-        buffers["row_mapping_valid"].copy_(row_mapping_valid)
-        self._indexer_cache_row_counts[layer_id]["page_ids"].copy_(
-            valid_pages.max().reshape(1) * row_mapping_valid
-        )
+        existing = self._indexer_cache_sources.setdefault(layer_id, kv_cache_fp8)
+        if existing.data_ptr() != kv_cache_fp8.data_ptr():
+            raise ValueError(f"{stage}.kv_cache_fp8 storage changed")
 
     def install_indexer_logits(self, *, layer_id: int, max_columns: int) -> None:
         """Allocate a graph-stable copy of one layer's direct TopK inputs."""
@@ -1058,26 +1027,113 @@ class _PPTargetForwardDeviceObserver:
                 },
                 "tensors": buffers,
             }
+        return stages
+
+    def finalize_indexer_cache_stages(self) -> dict[str, dict]:
+        """Fingerprint each target row's referenced cache after graph replay."""
+        stages = {}
         for layer_id, buffers in self._indexer_cache_buffers.items():
             stage = f"target_verify_layer_{layer_id:02d}_indexer_cache"
-            packed = buffers["packed"]
+            source = self._indexer_cache_sources.get(layer_id)
+            if source is None:
+                raise ValueError(f"{stage} did not capture an index-K cache source")
+            input_buffers = self._indexer_input_buffers[layer_id]
+            rows = int(self._indexer_input_row_counts[layer_id]["block_tables"].item())
+            seq_rows = int(self._indexer_input_row_counts[layer_id]["seq_lens"].item())
+            if rows <= 0 or seq_rows <= 0 or seq_rows % rows:
+                raise ValueError(
+                    f"{stage} invalid captured rows: block_tables={rows}, "
+                    f"seq_lens={seq_rows}"
+                )
+            page_size = self._indexer_cache_page_sizes[layer_id]
             head_dim = self._indexer_cache_head_dims[layer_id]
+            device_block_tables = input_buffers["block_tables"][:rows].detach()
+            block_tables = device_block_tables.cpu()
+            context_lens = (
+                input_buffers["seq_lens"][:seq_rows]
+                .reshape(rows, -1)
+                .max(dim=1)
+                .values.detach()
+                .cpu()
+            )
+            page_counts = (context_lens + page_size - 1) // page_size
+            total_pages = int(page_counts.sum().item())
+            if total_pages <= 0:
+                raise ValueError(f"{stage} captured no logical pages")
+            logical_page_ids = torch.cat(
+                [
+                    block_tables[row, : int(count)]
+                    for row, count in enumerate(page_counts)
+                ]
+            )
+            key_hash = hashlib.sha256()
+            scale_hash = hashlib.sha256()
+            key_sum = scale_sum = 0
+            key_abs_max = scale_abs_max = 0
+            device_staging = buffers["device_staging"]
+            host_staging = buffers["host_staging"]
+            packed_source = source.squeeze(2)
+            for row, page_count_value in enumerate(page_counts.tolist()):
+                page_count = int(page_count_value)
+                context_len = int(context_lens[row].item())
+                for start in range(0, page_count, int(device_staging.shape[0])):
+                    chunk_pages = min(int(device_staging.shape[0]), page_count - start)
+                    page_ids = device_block_tables[row, start : start + chunk_pages]
+                    torch.index_select(
+                        packed_source,
+                        0,
+                        page_ids,
+                        out=device_staging[:chunk_pages],
+                    )
+                    host_staging[:chunk_pages].copy_(
+                        device_staging[:chunk_pages],
+                        non_blocking=self.device.type == "cuda",
+                    )
+                    if self.device.type == "cuda":
+                        torch.cuda.current_stream(self.device).synchronize()
+                    host_chunk = host_staging[:chunk_pages]
+                    if start + chunk_pages == page_count and context_len % page_size:
+                        host_chunk[-1, context_len % page_size :].zero_()
+                    key_chunk = host_chunk[..., :head_dim].contiguous()
+                    scale_chunk = host_chunk[..., head_dim:].contiguous()
+                    key_hash.update(key_chunk.numpy().tobytes())
+                    scale_hash.update(scale_chunk.numpy().tobytes())
+                    key_sum += int(key_chunk.sum(dtype=torch.int64).item())
+                    scale_sum += int(scale_chunk.sum(dtype=torch.int64).item())
+                    key_abs_max = max(key_abs_max, int(key_chunk.max().item()))
+                    scale_abs_max = max(scale_abs_max, int(scale_chunk.max().item()))
+
+            def byte_fingerprint(digest, value_sum, abs_max, width):
+                return {
+                    "dtype": "torch.uint8",
+                    "shape": [total_pages, page_size, width],
+                    "sha256": digest.hexdigest(),
+                    "finite": True,
+                    "sum": float(value_sum),
+                    "abs_max": float(abs_max),
+                }
+
             tensors = {
-                "page_ids": buffers["page_ids"],
-                "index_k_bytes": packed[..., :head_dim],
-                "index_k_scale_bytes": packed[..., head_dim:],
-                "row_mapping_valid": buffers["row_mapping_valid"],
+                "page_ids": _tensor_fingerprint(logical_page_ids, total_pages),
+                "page_counts": _tensor_fingerprint(page_counts, rows),
+                "index_k_bytes": byte_fingerprint(
+                    key_hash, key_sum, key_abs_max, head_dim
+                ),
+                "index_k_scale_bytes": byte_fingerprint(
+                    scale_hash,
+                    scale_sum,
+                    scale_abs_max,
+                    int(packed_source.shape[-1]) - head_dim,
+                ),
             }
-            stages[stage] = {
-                "tensor_metadata": {
-                    name: {
-                        "logical_rows": self._indexer_cache_row_counts[layer_id][name],
+            for name, fingerprint in tensors.items():
+                fingerprint.update(
+                    {
+                        "logical_rows": rows if name == "page_counts" else total_pages,
                         "row_domain": self._row_domains[stage][name],
                     }
-                    for name in _PP_INDEXER_CACHE_TENSORS
-                },
-                "tensors": tensors,
-            }
+                )
+            stages[stage] = {"tensors": tensors}
         return stages
 
 
@@ -1336,8 +1392,12 @@ class EaglePPSenderProbe:
                     "tensors": tensors,
                 }
             }
+            finalized_stages = {}
             if self._target_forward_observer is not None:
                 stage_sources.update(self._target_forward_observer.snapshot_stages())
+                finalized_stages.update(
+                    self._target_forward_observer.finalize_indexer_cache_stages()
+                )
             snapshots = {}
             cuda_devices = set()
             for stage_name, stage_source in stage_sources.items():
@@ -1418,6 +1478,7 @@ class EaglePPSenderProbe:
                 rank[name] = value
         self._pending = {
             "snapshots": snapshots,
+            "finalized_stages": finalized_stages,
             "completion_event": completion_event,
             "rank": rank,
             "transport": {
@@ -1444,6 +1505,7 @@ class EaglePPSenderProbe:
                 stage_name: self._finalize_stage_snapshot(stage_snapshot)
                 for stage_name, stage_snapshot in pending["snapshots"].items()
             }
+            stages.update(pending["finalized_stages"])
         except (RuntimeError, TypeError, ValueError) as exc:
             self._emit(
                 rejection=(

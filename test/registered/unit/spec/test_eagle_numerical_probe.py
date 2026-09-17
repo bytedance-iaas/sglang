@@ -1063,8 +1063,15 @@ class TestEagleNumericalProbe(unittest.TestCase):
             scale_bytes=2,
         )
         cache = torch.arange(5 * 2 * 6, dtype=torch.uint8).reshape(5, 2, 1, 6)
-        block_tables = torch.tensor([[3, 1, 4], [3, 1, 4]], dtype=torch.int32)
+        block_tables = torch.tensor([[3, 1, 4], [2, 0, 4]], dtype=torch.int32)
         seq_lens = torch.tensor([[5, 4], [5, 4]], dtype=torch.int32)
+        observer.capture_indexer_inputs(
+            layer_id=1,
+            q_fp8=torch.zeros((2, 2, 8), dtype=torch.uint8),
+            weights=torch.zeros((2, 2), dtype=torch.float32),
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+        )
         observer.capture_indexer_cache(
             layer_id=1,
             kv_cache_fp8=cache,
@@ -1073,31 +1080,32 @@ class TestEagleNumericalProbe(unittest.TestCase):
             page_size=2,
         )
 
-        stage = observer.snapshot_stages()["target_verify_layer_01_indexer_cache"]
+        stage = observer.finalize_indexer_cache_stages()[
+            "target_verify_layer_01_indexer_cache"
+        ]
         self.assertEqual(
             set(stage["tensors"]),
             {
                 "page_ids",
+                "page_counts",
                 "index_k_bytes",
                 "index_k_scale_bytes",
-                "row_mapping_valid",
             },
         )
-        self.assertTrue(
-            torch.equal(stage["tensors"]["page_ids"], torch.tensor([3, 1, 4]))
+        self.assertEqual(stage["tensors"]["page_counts"]["values"], [3, 3])
+        self.assertEqual(stage["tensors"]["page_ids"]["values"], [3, 1, 4, 2, 0, 4])
+        expected = torch.cat(
+            (cache[[3, 1, 4]].squeeze(2), cache[[2, 0, 4]].squeeze(2)), dim=0
         )
-        expected = cache[[3, 1, 4]].squeeze(2).clone()
-        expected[-1, 1].zero_()
-        self.assertTrue(
-            torch.equal(stage["tensors"]["index_k_bytes"], expected[..., :4])
-        )
-        self.assertTrue(
-            torch.equal(stage["tensors"]["index_k_scale_bytes"], expected[..., 4:])
-        )
-        self.assertEqual(stage["tensors"]["row_mapping_valid"].item(), 1)
+        expected[2, 1].zero_()
+        expected[5, 1].zero_()
         self.assertEqual(
-            stage["tensor_metadata"]["index_k_bytes"]["logical_rows"].item(),
-            3,
+            stage["tensors"]["index_k_bytes"]["sha256"],
+            _tensor_fingerprint(expected[..., :4], 6)["sha256"],
+        )
+        self.assertEqual(
+            stage["tensors"]["index_k_scale_bytes"]["sha256"],
+            _tensor_fingerprint(expected[..., 4:], 6)["sha256"],
         )
 
         with self.assertRaisesRegex(ValueError, "invalid block-table/context layout"):
@@ -1109,21 +1117,25 @@ class TestEagleNumericalProbe(unittest.TestCase):
                 page_size=2,
             )
 
-        observer.capture_indexer_cache(
+    def test_pp_target_forward_observer_bounds_indexer_cache_staging(self):
+        observer = _PPTargetForwardDeviceObserver(
+            layer_ids=(0, 1),
+            max_rows=4,
+            hidden_size=3,
+            dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+        )
+        observer.install_indexer_cache(
             layer_id=1,
-            kv_cache_fp8=cache,
-            block_tables=torch.tensor([[3, 1, 4], [3, 2, 4]], dtype=torch.int32),
-            seq_lens=seq_lens,
+            max_pages=16_514,
             page_size=2,
+            head_dim=4,
+            scale_bytes=2,
         )
-        inconsistent = observer.snapshot_stages()[
-            "target_verify_layer_01_indexer_cache"
-        ]
-        self.assertEqual(inconsistent["tensors"]["row_mapping_valid"].item(), 0)
-        self.assertEqual(
-            inconsistent["tensor_metadata"]["index_k_bytes"]["logical_rows"].item(),
-            0,
-        )
+        buffers = observer._indexer_cache_buffers[1]
+        self.assertEqual(set(buffers), {"device_staging", "host_staging"})
+        self.assertEqual(tuple(buffers["device_staging"].shape), (1024, 2, 6))
+        self.assertEqual(tuple(buffers["host_staging"].shape), (1024, 2, 6))
 
     def test_pp_target_forward_observer_rejects_logical_topk_output_drift(self):
         observer = _PPTargetForwardDeviceObserver(
