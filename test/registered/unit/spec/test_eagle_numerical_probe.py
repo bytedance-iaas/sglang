@@ -25,6 +25,7 @@ from sglang.srt.speculative.eagle_numerical_probe import (
     EaglePPSenderProbe,
     EaglePrefillIndexerStoreProbe,
     _emit_json_record,
+    _gpu_hash_fingerprint,
     _PPTargetForwardDeviceObserver,
     _ragged_rows_fingerprint,
     _synchronize_cuda_tensors,
@@ -38,6 +39,31 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestEagleNumericalProbe(unittest.TestCase):
+    def test_gpu_hash_fingerprint_row_multiset_is_order_independent(self):
+        calls = []
+
+        def fake_hash(tensor, *, seed):
+            calls.append((tensor.clone(), seed))
+            return int(tensor.to(torch.int64).sum()) + seed
+
+        value = torch.tensor([[3, 1, 2], [6, 4, 5]], dtype=torch.int32)
+        result = _gpu_hash_fingerprint(
+            value, gpu_tensor_hash=fake_hash, include_row_multiset=True
+        )
+
+        self.assertEqual(len(calls), 4)
+        self.assertTrue(torch.equal(calls[2][0], torch.tensor([[1, 2, 3], [4, 5, 6]])))
+        self.assertIn("row_multiset_hash64_seed0", result)
+        self.assertIn("row_multiset_hash64_seed1", result)
+
+    def test_gpu_hash_fingerprint_rejects_non_integer_row_multiset(self):
+        with self.assertRaisesRegex(ValueError, "rank-2 integer tensor"):
+            _gpu_hash_fingerprint(
+                torch.zeros((2, 3), dtype=torch.float32),
+                gpu_tensor_hash=lambda *_args, **_kwargs: 0,
+                include_row_multiset=True,
+            )
+
     def test_select_prefill_indexer_store_rows_drops_cp_padding(self):
         key_raw = torch.arange(20, dtype=torch.bfloat16).reshape(5, 4)
         positions = torch.tensor([104, 105, 106, 0, 0], dtype=torch.int64)

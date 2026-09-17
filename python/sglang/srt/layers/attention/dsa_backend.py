@@ -2281,9 +2281,6 @@ class DeepseekSparseAttnBackend(
                     )
                 routing_inputs = {
                     "logical_topk_indices": logical_topk_indices,
-                    "logical_topk_indices_row_sorted": torch.sort(
-                        logical_topk_indices, dim=1
-                    ).values,
                     "physical_topk_indices": page_table_1,
                     "topk_length": metadata.dsa_cache_seqlens_int32,
                 }

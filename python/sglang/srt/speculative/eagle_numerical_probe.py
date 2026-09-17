@@ -2136,13 +2136,13 @@ class EaglePrefillIndexerStoreProbe:
         self._gpu_hash_invocations[rid] = invocation
         hashes = {}
         for name, value in sorted(tensors.items()):
-            contiguous = value.detach().contiguous()
-            hashes[name] = {
-                "dtype": str(contiguous.dtype),
-                "shape": list(contiguous.shape),
-                "hash64_seed0": f"{gpu_tensor_hash(contiguous, seed=0x243F6A88):016x}",
-                "hash64_seed1": f"{gpu_tensor_hash(contiguous, seed=0x9E3779B9):016x}",
-            }
+            hashes[name] = _gpu_hash_fingerprint(
+                value,
+                gpu_tensor_hash=gpu_tensor_hash,
+                include_row_multiset=(
+                    request_kind == "measured" and name == "logical_topk_indices"
+                ),
+            )
         self._emit_fn(
             "EAGLE_PREFILL_ATTENTION_GPU_HASH",
             {
@@ -2156,6 +2156,36 @@ class EaglePrefillIndexerStoreProbe:
                 "rank": _rank_payload(),
             },
         )
+
+
+def _gpu_hash_fingerprint(
+    tensor: torch.Tensor, *, gpu_tensor_hash, include_row_multiset: bool = False
+) -> dict:
+    contiguous = tensor.detach().contiguous()
+    result = {
+        "dtype": str(contiguous.dtype),
+        "shape": list(contiguous.shape),
+        "hash64_seed0": f"{gpu_tensor_hash(contiguous, seed=0x243F6A88):016x}",
+        "hash64_seed1": f"{gpu_tensor_hash(contiguous, seed=0x9E3779B9):016x}",
+    }
+    if include_row_multiset:
+        if contiguous.ndim != 2 or contiguous.dtype not in {
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+            torch.uint8,
+        }:
+            raise ValueError(
+                "GPU row-multiset hash requires a rank-2 integer tensor, "
+                f"got shape={tuple(contiguous.shape)}, dtype={contiguous.dtype}"
+            )
+        row_sorted = torch.sort(contiguous, dim=1).values
+        result.update(
+            row_multiset_hash64_seed0=f"{gpu_tensor_hash(row_sorted, seed=0x243F6A88):016x}",
+            row_multiset_hash64_seed1=f"{gpu_tensor_hash(row_sorted, seed=0x9E3779B9):016x}",
+        )
+    return result
 
 
 def _ragged_rows_fingerprint(
