@@ -299,6 +299,30 @@ def _compiled_cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
     return torch.cat(tensors, dim=dim)
 
 
+def _recover_fused_ragged_logical_topk(
+    physical_topk_indices: torch.Tensor, topk_indices_offset: torch.Tensor
+) -> torch.Tensor:
+    """Undo the fused RAGGED output offset without changing invalid slots."""
+    if physical_topk_indices.ndim != 2 or topk_indices_offset.ndim != 1:
+        raise ValueError(
+            "fused RAGGED TopK recovery requires rank-2 indices and rank-1 offsets"
+        )
+    if physical_topk_indices.shape[0] != topk_indices_offset.shape[0]:
+        raise ValueError(
+            "fused RAGGED TopK recovery requires one offset per output row"
+        )
+    if (
+        physical_topk_indices.dtype != torch.int32
+        or topk_indices_offset.dtype != torch.int32
+    ):
+        raise ValueError("fused RAGGED TopK recovery requires int32 tensors")
+    if physical_topk_indices.device != topk_indices_offset.device:
+        raise ValueError("fused RAGGED TopK indices and offsets must share a device")
+    valid = physical_topk_indices != -1
+    offsets = topk_indices_offset.unsqueeze(1)
+    return torch.where(valid, physical_topk_indices - offsets, physical_topk_indices)
+
+
 def _cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
     """
     Concatenate two tensors along the last dimension.
@@ -2081,7 +2105,6 @@ class DeepseekSparseAttnBackend(
         if self.use_fused_topk:
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
-            logical_topk_indices = topk_indices
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         else:
             if topk_transform_method == TopkTransformMethod.RAGGED:
@@ -2246,8 +2269,21 @@ class DeepseekSparseAttnBackend(
                         pod_uid=envs.SGLANG_EAGLE_NUMERICAL_PROBE_POD_UID.get(),
                     )
                     self._prefill_flashmla_probe = probe
+                if self.use_fused_topk:
+                    if topk_transform_method != TopkTransformMethod.RAGGED:
+                        raise RuntimeError(
+                            "prefill logical TopK observer requires fused RAGGED routing"
+                        )
+                    topk_indices_offset = metadata.topk_indices_offset
+                    assert topk_indices_offset is not None
+                    logical_topk_indices = _recover_fused_ragged_logical_topk(
+                        page_table_1, topk_indices_offset
+                    )
                 routing_inputs = {
                     "logical_topk_indices": logical_topk_indices,
+                    "logical_topk_indices_row_sorted": torch.sort(
+                        logical_topk_indices, dim=1
+                    ).values,
                     "physical_topk_indices": page_table_1,
                     "topk_length": metadata.dsa_cache_seqlens_int32,
                 }
