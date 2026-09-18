@@ -53,8 +53,11 @@ class TestComputeWorldSize(unittest.TestCase):
 
 
 class TestSchedulerInternalStateWorldSize(unittest.TestCase):
-    def _get_internal_state(self, shape: dict) -> dict:
+    def _get_internal_state(self, shape: dict, slots=None) -> dict:
         scheduler = Scheduler.__new__(Scheduler)
+        if slots is not None:
+            scheduler.ps = SimpleNamespace(pp_rank=1, tp_rank=3)
+            scheduler.running_mbs = slots
         scheduler.metrics_reporter = SimpleNamespace(
             last_gen_throughput=1.0,
             spec_total_num_forward_ct=0,
@@ -91,6 +94,23 @@ class TestSchedulerInternalStateWorldSize(unittest.TestCase):
         internal_state = self._get_internal_state(shape)
 
         self.assertEqual(internal_state["world_size"], 4)
+        self.assertNotIn("pp_scheduler", internal_state)
+
+    def test_pp_snapshot_sums_persistent_slots_including_empty_slots(self):
+        shape = _shape(tp_size=8, pp_size=2, dp_size=8, enable_dp_attention=True)
+        internal_state = self._get_internal_state(
+            shape,
+            [SimpleNamespace(reqs=list(range(8))), None, SimpleNamespace(reqs=[9])],
+        )
+        self.assertEqual(
+            internal_state["pp_scheduler"],
+            {
+                "pp_rank": 1,
+                "tp_rank": 3,
+                "running_requests_per_slot": [8, 0, 1],
+                "running_requests_total": 9,
+            },
+        )
 
     def test_the_reported_size_is_not_one_replica_of_a_data_parallel_server(self):
         """Each plain dp replica has its own process group, so no scheduler can report the whole server from it."""

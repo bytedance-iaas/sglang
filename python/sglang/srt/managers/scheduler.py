@@ -5039,6 +5039,18 @@ class Scheduler(
         )
         ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        if hasattr(self, "running_mbs"):
+            # Persistent PP slots partition this rank's requests. The regular
+            # running-request gauge only describes the currently selected slot.
+            slot_counts = [
+                len(batch.reqs) if batch else 0 for batch in self.running_mbs
+            ]
+            ret["pp_scheduler"] = {
+                "pp_rank": self.ps.pp_rank,
+                "tp_rank": self.ps.tp_rank,
+                "running_requests_per_slot": slot_counts,
+                "running_requests_total": sum(slot_counts),
+            }
 
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
