@@ -169,6 +169,7 @@ MXFP8_MOE_RUNNER_BACKEND_CHOICES = [
 FP8_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
     "deep_gemm",
+    "humming",
     "flashinfer_trtllm",
     "flashinfer_cutlass",
     "flashinfer_deepgemm",

@@ -64,6 +64,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     dispatch_block_fp8_mxfp8_linear,
     dispatch_w8a8_block_fp8_linear,
     dispatch_w8a8_mxfp8_linear,
+    get_fp8_gemm_runner_backend,
     input_to_float8,
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -73,6 +74,11 @@ from sglang.srt.layers.quantization.fp8_utils import (
     torch_w8a8_block_fp8_linear,
     unshuffle_aiter_fp8_weight,
     use_aiter_bpreshuffle_gemm,
+)
+from sglang.srt.layers.quantization.humming_fp8 import (
+    can_use_humming_fp8_linear,
+    humming_fp8_linear,
+    prepare_humming_fp8_linear,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
@@ -513,6 +519,13 @@ class Fp8LinearMethod(LinearMethodBase):
         )
         self.convert_mxfp8_to_block = self.use_mxfp8 and _mxfp8_to_block_fp8_required
         self.weight_block_size = self.quant_config.weight_block_size
+        self.use_humming = (
+            get_fp8_gemm_runner_backend().is_humming()
+            and not self.use_marlin
+            and not self.use_mxfp8
+            and self.weight_block_size == [32, 32]
+            and getattr(self.quant_config, "scale_fmt", None) == "ue8m0"
+        )
         self.w8a8_block_fp8_linear = None
         self.w8a8_mxfp8_linear = None
         self.mxfp8_dense_backend = None
@@ -801,6 +814,8 @@ class Fp8LinearMethod(LinearMethodBase):
 
         layer.weight.data = weight.data
         layer.weight_scale_inv.data = weight_scale.data
+        if self.use_humming:
+            prepare_humming_fp8_linear(layer)
         if self.block_fp8_as_mxfp8:
             self._prepare_block_fp8_as_mxfp8(layer)
 
@@ -1133,6 +1148,9 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self.use_humming and can_use_humming_fp8_linear(layer, x):
+            return humming_fp8_linear(layer, x, bias)
+
         if self.use_marlin:
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,
