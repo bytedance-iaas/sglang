@@ -2007,7 +2007,9 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
                 swa_host_indices[token_offset].item(),
                 page_data,
             )
+        _t_cat = time.perf_counter()
         torch.cuda.current_stream().synchronize()
+        _t_sync1 = time.perf_counter()
 
         for layer_id in range(self.transfer_layer_num):
             self.host_pool_group.load_to_device_per_layer(
@@ -2019,7 +2021,11 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
                 pool_transfers=transfers,
             )
         torch.cuda.current_stream().synchronize()
-        stats.observe_lat("load.unpack", time.perf_counter() - _wb_t0)
+        _t_end = time.perf_counter()
+        stats.observe_lat("load.unpack.cat", _t_cat - _wb_t0)
+        stats.observe_lat("load.unpack.sync", _t_sync1 - _t_cat)
+        stats.observe_lat("load.unpack.h2d", _t_end - _t_sync1)
+        stats.observe_lat("load.unpack", _t_end - _wb_t0)
 
     def assign_page_data(self, content_hashes, flat_data, device_indices=None):
         logger.debug(f"assign_deepseek_v4_page_data hashes {content_hashes}")
