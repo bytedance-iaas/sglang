@@ -3732,6 +3732,13 @@ class Scheduler(
             ):
                 if not tc.check_load_back_progress(req):
                     continue
+            elif self.enable_eic_cache and not getattr(req, "_eic_cold_counted", False):
+                from sglang.srt.mem_cache.eic_stats import stats
+
+                _d = len(req.prefix_indices)
+                stats.observe_admit(_d, 0, _d)
+                stats.incr("miss.cold_or_probe_fail")
+                req._eic_cold_counted = True
 
             if (
                 self.enable_hicache_storage

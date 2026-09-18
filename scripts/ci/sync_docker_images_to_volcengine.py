@@ -29,8 +29,7 @@ AUTO_TAG_SPECS = {"version", "today-nightly"}
 DOCKER_HUB_API_HOSTS = ("hub.docker.com", "registry.hub.docker.com")
 DOCKER_HUB_RETRYABLE_STATUS_CODES = {403, 429, 500, 502, 503, 504}
 DOCKER_HUB_USER_AGENT = (
-    "sglang-volcengine-image-sync/1.0 "
-    "(+https://github.com/bytedance-iaas/sglang)"
+    "sglang-volcengine-image-sync/1.0 " "(+https://github.com/bytedance-iaas/sglang)"
 )
 DEFAULT_VARIANT_RE = re.compile(
     r"^(latest|dev|nightly|nightly-[0-9a-f]{7,64}|nightly-dev-[0-9]{8}-[0-9a-f]{7,64}|v\d+\.\d+\.\d+(?:\.post\d+)?)$"
@@ -107,9 +106,7 @@ def fetch_docker_hub_page(page_url: str, *, attempts: int = 3) -> dict:
         if attempt + 1 < attempts:
             time.sleep(2**attempt)
 
-    raise SystemExit(
-        "Docker Hub tags API failed after retries: " + "; ".join(errors)
-    )
+    raise SystemExit("Docker Hub tags API failed after retries: " + "; ".join(errors))
 
 
 def fetch_docker_hub_tags(image_name: str, *, pages: int = 10) -> list[DockerTag]:
