@@ -336,6 +336,7 @@ class Fp8GemmRunnerBackend(Enum):
     FLASHINFER_DEEPGEMM = "flashinfer_deepgemm"
     CUTLASS = "cutlass"
     DEEP_GEMM = "deep_gemm"
+    HUMMING = "humming"
     TRITON = "triton"
     AITER = "aiter"
 
@@ -359,6 +360,9 @@ class Fp8GemmRunnerBackend(Enum):
 
     def is_deep_gemm(self) -> bool:
         return self == Fp8GemmRunnerBackend.DEEP_GEMM
+
+    def is_humming(self) -> bool:
+        return self == Fp8GemmRunnerBackend.HUMMING
 
     def is_triton(self) -> bool:
         return self == Fp8GemmRunnerBackend.TRITON
@@ -585,12 +589,19 @@ def dispatch_w8a8_block_fp8_linear(
     1. The --fp8-gemm-backend server argument (preferred)
     2. Auto-detection based on hardware capabilities
     """
+    backend = get_fp8_gemm_runner_backend()
+    if backend.is_humming():
+        if not get_platform().is_sm90:
+            raise RuntimeError("--fp8-gemm-backend=humming requires SM90 GPUs")
+        # Humming needs load-time repacked weights. Fp8LinearMethod owns that
+        # cache and the small-M dispatch; direct weight consumers and all
+        # ineligible layers retain the original Triton layout and quantization.
+        return partial(triton_w8a8_block_fp8_linear, act_scale_ue8m0=act_scale_ue8m0)
+
     # Only Triton reads the block size at launch; DeepGEMM, the FlashInfer
     # groupwise kernels and CUTLASS take 128-wide K blocks only.
     if weight_block_size is not None and weight_block_size[1] != 128:
         return partial(triton_w8a8_block_fp8_linear, act_scale_ue8m0=act_scale_ue8m0)
-
-    backend = get_fp8_gemm_runner_backend()
 
     # Handle explicit backend selection via --fp8-gemm-backend
     if not backend.is_auto():
