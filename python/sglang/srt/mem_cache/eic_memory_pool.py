@@ -615,7 +615,9 @@ class EICKVClient:
         status_code, data_vals, get_outcome = self.connection.mget(
             data_keys, get_option, data_vals
         )
-        stats.observe_lat("mget.first", time.perf_counter() - _mget_t0)
+        _first_s = time.perf_counter() - _mget_t0
+        stats.observe_lat("mget.first", _first_s)
+        stats.observe_slow("mget", _first_s, 1.0)
         if status_code == eic.StatusCode.PARTIAL_FAILED:
             _rf_t0 = time.perf_counter()
             status_code, get_outcome = self._refetch_failed(
@@ -2025,7 +2027,9 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
         stats.observe_lat("load.unpack.cat", _t_cat - _wb_t0)
         stats.observe_lat("load.unpack.sync", _t_sync1 - _t_cat)
         stats.observe_lat("load.unpack.h2d", _t_end - _t_sync1)
-        stats.observe_lat("load.unpack", _t_end - _wb_t0)
+        _unpack_s = _t_end - _wb_t0
+        stats.observe_lat("load.unpack", _unpack_s)
+        stats.observe_slow("unpack", _unpack_s, 1.0)
 
     def assign_page_data(self, content_hashes, flat_data, device_indices=None):
         logger.debug(f"assign_deepseek_v4_page_data hashes {content_hashes}")
