@@ -639,10 +639,13 @@ class EICKVClient:
         status_code, data_vals, get_outcome = self.connection.mget(
             data_keys, get_option, data_vals
         )
+        stats.observe_lat("mget.first", time.perf_counter() - _mget_t0)
         if status_code == eic.StatusCode.PARTIAL_FAILED:
+            _rf_t0 = time.perf_counter()
             status_code, get_outcome = self._refetch_failed(
                 keys, objs, registered, get_option, get_outcome
             )
+            stats.observe_lat("mget.refetch_s", time.perf_counter() - _rf_t0)
 
         result = []
         device_copy = False
@@ -2009,6 +2012,7 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
                     )
 
     def device_writeback(self, device_indices, src_tensor, src_indices):
+        _wb_t0 = time.perf_counter()
         chunk_count = len(src_indices)
         page_count = chunk_count // self.page_chunk_count
         if page_count == 0:
@@ -2065,6 +2069,7 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
                     self.io_backend,
                 )
         torch.cuda.current_stream().synchronize()
+        stats.observe_lat("load.unpack", time.perf_counter() - _wb_t0)
 
     def assign_page_data(self, content_hashes, flat_data, device_indices=None):
         logger.debug(f"assign_deepseek_v4_page_data hashes {content_hashes}")
