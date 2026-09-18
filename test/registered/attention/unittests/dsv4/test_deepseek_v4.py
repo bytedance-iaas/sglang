@@ -413,6 +413,33 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             SharedReadEnds.PRE_REPLAY,
         )
 
+    def test_target_verify_shared_read_boundary_tracks_graph_backend(self):
+        from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.model_runner = SimpleNamespace(
+            spec_algorithm=SimpleNamespace(is_dspark=lambda: False)
+        )
+        with mock.patch(
+            "sglang.srt.layers.attention.deepseek_v4_backend.check_cuda_graph_backend",
+            side_effect=lambda phase, selected: selected == "breakable",
+        ):
+            self.assertIs(
+                backend.shared_read_ends(ForwardMode.TARGET_VERIFY),
+                SharedReadEnds.POST_REPLAY,
+            )
+        with mock.patch(
+            "sglang.srt.layers.attention.deepseek_v4_backend.check_cuda_graph_backend",
+            return_value=False,
+        ):
+            self.assertIs(
+                backend.shared_read_ends(ForwardMode.TARGET_VERIFY),
+                SharedReadEnds.IN_REPLAY,
+            )
+
     def test_snapshot_builds_cache_only_for_sparse_prefill(self):
         from sglang.srt.environ import envs
         from sglang.srt.layers.attention.deepseek_v4_backend import (

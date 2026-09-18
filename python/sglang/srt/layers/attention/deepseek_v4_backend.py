@@ -68,6 +68,7 @@ from sglang.srt.layers.attention.verify_mask import (
 )
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, check_cuda_graph_backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     get_parallel,
@@ -514,11 +515,15 @@ class DeepseekV4AttnBackend(
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         # Breakable-graph verify rereads shared state across segments.
-        # DSPARK verify replays one full (non-breakable) graph that honors the
-        # out-graph/in-graph init contract, so the base IN_REPLAY bound holds.
-        if fm.is_target_verify():
-            if self.model_runner.spec_algorithm.is_dspark():
-                return SharedReadEnds.IN_REPLAY
+        # Full-graph verify (including DSPARK) honors the out-graph/in-graph
+        # init contract, so the graph-recorded IN_REPLAY event is sufficient.
+        # Keep the conservative post-replay fence only for the backend that
+        # actually segments the replay.
+        if (
+            fm.is_target_verify()
+            and not self.model_runner.spec_algorithm.is_dspark()
+            and check_cuda_graph_backend(Phase.DECODE, Backend.BREAKABLE)
+        ):
             return SharedReadEnds.POST_REPLAY
         metadata = self.forward_metadata
         if (
