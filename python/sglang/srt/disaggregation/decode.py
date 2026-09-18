@@ -2657,6 +2657,12 @@ class SchedulerDisaggregationDecodeMixin:
         curr_batch_size = running_batch.batch_size()
 
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
+        if self.ps.pp_size > 1:
+            # Each DPA scheduler owns its own persistent PP slots. Bound the
+            # current slot, not all slots or the combined DP batch. Requests
+            # here already own preallocated rows, so available_size() is not
+            # an admission budget (unlike ordinary prefill admission).
+            batch_size = min(batch_size, get_parallel().pp_max_micro_batch_size)
 
         num_not_used_batch = batch_size - curr_batch_size
 
