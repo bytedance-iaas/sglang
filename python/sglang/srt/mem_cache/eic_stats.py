@@ -130,7 +130,7 @@ class EicStats:
             "admit reqs=%d device_hit=%d eic_expected=%d eic_got=%d eic_missing=%d eic_hit%%=%s | "
             "miss: cold_or_probe_fail=%d headroom=%d below_threshold=%d dma_incomplete=%d | "
             "load ops=%d qsize_max=%d | "
-            "%s %s %s %s %s %s %s %s",
+            "%s %s %s %s %s %s %s %s %s %s %s",
             self._rank,
             uptime,
             c.get("write.nodes", 0),
@@ -170,6 +170,9 @@ class EicStats:
             lat_str("load.wait"),
             lat_str("load.service"),
             lat_str("load.unpack"),
+            lat_str("load.unpack.cat"),
+            lat_str("load.unpack.sync"),
+            lat_str("load.unpack.h2d"),
             lat_str("mget.first"),
             lat_str("mget.refetch_s"),
         )
