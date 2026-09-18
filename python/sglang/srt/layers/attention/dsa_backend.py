@@ -324,6 +324,17 @@ def _recover_fused_ragged_logical_topk(
     return torch.where(valid, physical_topk_indices - offsets, physical_topk_indices)
 
 
+def _recover_prefill_probe_logical_topk(
+    *, probe, rids, physical_topk_indices, topk_indices_offset
+) -> Optional[torch.Tensor]:
+    """Recover only after the probe accepts the current request identity."""
+    if not probe.matches(rids):
+        return None
+    return _recover_fused_ragged_logical_topk(
+        physical_topk_indices, topk_indices_offset
+    )
+
+
 def _cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
     """
     Concatenate two tensors along the last dimension.
@@ -2277,8 +2288,11 @@ class DeepseekSparseAttnBackend(
                         )
                     topk_indices_offset = metadata.topk_indices_offset
                     assert topk_indices_offset is not None
-                    logical_topk_indices = _recover_fused_ragged_logical_topk(
-                        page_table_1, topk_indices_offset
+                    logical_topk_indices = _recover_prefill_probe_logical_topk(
+                        probe=probe,
+                        rids=forward_batch.rids,
+                        physical_topk_indices=page_table_1,
+                        topk_indices_offset=topk_indices_offset,
                     )
                 routing_inputs = {
                     "logical_topk_indices": logical_topk_indices,

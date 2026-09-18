@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnMultiStepBackend,
     TopkTransformMethod,
     _recover_fused_ragged_logical_topk,
+    _recover_prefill_probe_logical_topk,
     _restore_dsa_decode_dp_padding,
     _trim_dsa_decode_dp_padding,
 )
@@ -25,6 +26,31 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestDSAMultiStepDecode(unittest.TestCase):
+    def test_prefill_logical_topk_recovery_ignores_unmatched_rid_before_shape_check(
+        self,
+    ):
+        probe = SimpleNamespace(matches=lambda _rids: False)
+
+        result = _recover_prefill_probe_logical_topk(
+            probe=probe,
+            rids=["warmup-rid"],
+            physical_topk_indices=torch.zeros((4, 3), dtype=torch.int32),
+            topk_indices_offset=torch.zeros(1, dtype=torch.int32),
+        )
+
+        self.assertIsNone(result)
+
+    def test_prefill_logical_topk_recovery_validates_matched_rid(self):
+        probe = SimpleNamespace(matches=lambda _rids: True)
+
+        with self.assertRaisesRegex(ValueError, "fewer offset rows than output"):
+            _recover_prefill_probe_logical_topk(
+                probe=probe,
+                rids=["exact-rid"],
+                physical_topk_indices=torch.zeros((4, 3), dtype=torch.int32),
+                topk_indices_offset=torch.zeros(1, dtype=torch.int32),
+            )
+
     def test_recover_fused_ragged_logical_topk_preserves_sentinel(self):
         physical = torch.tensor([[17, 24, -1], [103, -1, 109]], dtype=torch.int32)
         offsets = torch.tensor([10, 100, 200], dtype=torch.int32)
