@@ -78,6 +78,13 @@ class EicStats:
         with self._lock:
             self._lat[name].append(seconds)
 
+    def observe_slow(self, name, seconds, threshold_s):
+        # Cumulative count of samples over a threshold. The latency deques are
+        # sliding windows, so their p99/max repeats one outlier for many dumps;
+        # only this counter differences into a real event rate.
+        with self._lock:
+            self._c[f"{name}.slow{int(threshold_s)}"] += seconds > threshold_s
+
     def observe_max(self, name, value):
         # Gauge sampled by the caller; the dump reports the peak seen.
         with self._lock:
@@ -130,6 +137,7 @@ class EicStats:
             "admit reqs=%d device_hit=%d eic_expected=%d eic_got=%d eic_missing=%d eic_hit%%=%s | "
             "miss: cold_or_probe_fail=%d headroom=%d below_threshold=%d dma_incomplete=%d | "
             "load ops=%d qsize_max=%d | "
+            "slow>1s: mget=%d unpack=%d | "
             "%s %s %s %s %s %s %s %s %s %s %s",
             self._rank,
             uptime,
@@ -164,6 +172,8 @@ class EicStats:
             c.get("miss.dma_incomplete", 0),
             c.get("load.ops", 0),
             c.get("load.qsize", 0),
+            c.get("mget.slow1", 0),
+            c.get("unpack.slow1", 0),
             lat_str("mset"),
             lat_str("mget"),
             lat_str("mexist"),
