@@ -45,12 +45,13 @@ def _advance_until_in_running_mbs(
 class TestAbortPPCrossSlot(ScriptedTestCase):
     ENGINE_KWARGS = base_engine_kwargs(
         chunked_prefill_size=DEFAULT_CHUNK_SIZE,
-        pp_size=4,
+        pp_size=2,
+        pp_async_batch_depth=2,
         pp_max_micro_batch_size=1,
     )
 
     def test_abort_all_reaches_running_reqs_in_all_microbatch_slots(self):
-        """abort_all must abort running reqs in every PP microbatch slot, not just the current one (needs >2 slots)."""
+        """PP2 async abort_all must drain every in-flight slot."""
         self.server.execute_script(
             self._script_abort_all_reaches_running_reqs_in_all_microbatch_slots
         )
@@ -75,6 +76,10 @@ class TestAbortPPCrossSlot(ScriptedTestCase):
             for req in mb.reqs:
                 slot_of[req.rid] = slot_id
         slots = {slot_of[r.rid] for r in reqs}
+        assert len(t.scheduler.running_mbs) == 4, (
+            "PP2 + async depth 2 must expose four persistent slots; "
+            f"got {len(t.scheduler.running_mbs)}"
+        )
         assert len(slots) == len(reqs), (
             f"setup invalid: reqs must each occupy a distinct mb slot to exercise "
             f"the cross-slot abort scan; slot_of={slot_of!r}"

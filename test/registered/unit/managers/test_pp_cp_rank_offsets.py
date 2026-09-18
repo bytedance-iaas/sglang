@@ -1,17 +1,19 @@
 import unittest
+from collections import defaultdict, deque
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState  # noqa: E402
-from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa: E402
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
-from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
+from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -128,8 +130,7 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
                 return_value=parallel,
             ),
             patch(
-                "sglang.srt.managers.scheduler_components.request_receiver."
-                "get_exec",
+                "sglang.srt.managers.scheduler_components.request_receiver.get_exec",
                 return_value=SimpleNamespace(
                     moe=SimpleNamespace(is_ep_scale_joiner=False)
                 ),
@@ -157,6 +158,54 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
 
 
 class TestPPCPRankOffsets(unittest.TestCase):
+    def test_pp2_async_depth_two_initializes_four_isolated_slots(self):
+        scheduler = SchedulerPPMixin()
+        scheduler.ps = SimpleNamespace(pp_size=2)
+        scheduler.spec_algorithm = SimpleNamespace(is_none=lambda: False)
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
+                return_value=SimpleNamespace(
+                    pp_async_batch_depth=2,
+                    enable_dsa_prefill_context_parallel=False,
+                ),
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_pp_mixin.envs.SGLANG_ENABLE_PP_SPEC.get",
+                return_value=True,
+            ),
+        ):
+            scheduler.init_pp_loop_state()
+
+        self.assertEqual(scheduler.pp_loop_size, 4)
+        self.assertEqual(len(scheduler.running_mbs), 4)
+        self.assertEqual(len(scheduler.last_mbs), 4)
+        self.assertEqual(len(scheduler.mbs), 4)
+        self.assertEqual(len(scheduler.mb_metadata), 4)
+        self.assertEqual(len({id(batch) for batch in scheduler.running_mbs}), 4)
+        self.assertTrue(all(batch.is_empty() for batch in scheduler.running_mbs))
+        self.assertTrue(scheduler._pp_spec_relay)
+
+    def test_typed_proxy_and_output_inbox_preserves_cross_slot_order(self):
+        scheduler = SchedulerPPMixin()
+        scheduler._pp_tensor_dict_inbox = defaultdict(deque)
+        scheduler.pp_group = SimpleNamespace(
+            recv_tensor_dict=Mock(
+                side_effect=[
+                    {"__msg_type__": "output", "value": torch.tensor([1])},
+                    {"__msg_type__": "proxy", "value": torch.tensor([2])},
+                ]
+            )
+        )
+
+        proxy = scheduler._pp_recv_typed_dict(expected_kind="proxy")
+        output = scheduler._pp_recv_typed_dict(expected_kind="output")
+
+        self.assertEqual(proxy["value"].item(), 2)
+        self.assertEqual(output["value"].item(), 1)
+        self.assertEqual(scheduler.pp_group.recv_tensor_dict.call_count, 2)
+
     def test_decode_dp_slot_launch_waits_for_device(self):
         launch_event = SimpleNamespace(synchronize=Mock())
         scheduler = SimpleNamespace(_pp_spec_relay=True)
