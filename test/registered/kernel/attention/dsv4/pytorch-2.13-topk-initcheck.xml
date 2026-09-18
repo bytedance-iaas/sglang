@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Local validation only: torch cf30153c4c131c8164ee7798e5022d810682e2cb,
+     CUDA 13.0/H20. Pure torch.randn(12, 131072).cuda().topk(512) reproduces
+     these reads with both Compute Sanitizer 2025.3.1 and 2026.3.0.
+     TensorTopK.cu reads uninitialized desired scratch in the first histogram
+     and update passes; desiredMask is initially zero, and lower bits are
+     replaced in later passes. Do not suppress whole kernels or API checks.
+     Re-evaluate these exact instruction signatures on another torch build.
+     No SGLang/Triton kernel matches this signature. -->
+<ComputeSanitizerOutput>
+  <record>
+    <kind>Initcheck</kind>
+    <what>
+      <text>Uninitialized __global__ memory read of size 4 bytes</text>
+      <size>4</size>
+    </what>
+    <where>
+      <func>computeBlockDigitCounts</func>
+      <pc>0x260</pc>
+    </where>
+  </record>
+  <record>
+    <kind>Initcheck</kind>
+    <what>
+      <text>Uninitialized __global__ memory read of size 4 bytes</text>
+      <size>4</size>
+    </what>
+    <where>
+      <func>computeBlockwiseWithinKCounts</func>
+      <pc>0x380</pc>
+    </where>
+  </record>
+</ComputeSanitizerOutput>
