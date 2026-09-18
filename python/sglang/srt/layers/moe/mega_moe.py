@@ -127,6 +127,10 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
         return False
+    if getattr(moe.experts, "fused_moe_backend", None) is not None:
+        # The provider owns the weight layout and checks its capacity. A
+        # fallback to the ordinary runner cannot consume these packed weights.
+        return True
     if _device_sm == 90:
         if not is_sm90_fp8_mega_moe_available(moe.experts):
             return False
@@ -186,8 +190,6 @@ def _run_mega_routed(
     input_ids_global: Optional[torch.Tensor],
     num_tokens: int,
 ) -> torch.Tensor:
-    import deep_gemm
-
     from sglang.srt.distributed.parallel_state import get_moe_ep_group
 
     hidden_size = moe.config.hidden_size
@@ -213,6 +215,23 @@ def _run_mega_routed(
     else:
         topk_ids = None
         topk_weights = None
+
+    backend = getattr(moe.experts, "fused_moe_backend", None)
+    if backend is not None:
+        if num_tokens == 0:
+            from types import SimpleNamespace
+
+            topk_output = SimpleNamespace(
+                topk_ids=hidden_states.new_empty(
+                    (0, moe.experts.top_k), dtype=torch.int32
+                ),
+                topk_weights=hidden_states.new_empty(
+                    (0, moe.experts.top_k), dtype=torch.float32
+                ),
+            )
+        return backend.forward(moe.experts, hidden_states, topk_output)
+
+    import deep_gemm
 
     ep_group = get_moe_ep_group().device_group
     num_experts = moe.experts.num_experts
