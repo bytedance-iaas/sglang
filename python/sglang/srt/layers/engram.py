@@ -287,6 +287,14 @@ class EngramHasher(nn.Module):
                 device=input_ids.device,
             )
         mode = forward_batch.forward_mode
+        if mode.is_idle():
+            # DP padding can make an IDLE rank nonempty. These are dummy rows,
+            # not requests: never read/commit request history for them.
+            return torch.zeros(
+                (num_tokens, self.primes.shape[0], self.offsets.shape[1]),
+                dtype=torch.int64,
+                device=input_ids.device,
+            )
         req_slots = forward_batch.req_pool_indices
         bs = req_slots.shape[0]
         device = input_ids.device
@@ -563,6 +571,7 @@ class _HostTable:
         self.nbytes = nbytes
         self.group = group
         self.dirty = False
+        self.registered = False
         if layout == "shared":
             self.fd = self._open_shared_fd(nbytes, name)
             self.mm = mmap.mmap(
@@ -594,6 +603,7 @@ class _HostTable:
         err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), nbytes, 0)
         if int(err) != 0:
             raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
+        self.registered = True
 
     def _open_shared_fd(self, nbytes: int, name: str) -> int:
         owner = None
@@ -743,17 +753,8 @@ class EngramEmbedding(nn.Module):
         cp_all_tokens: bool = False,
     ) -> torch.Tensor:
         if self._shared:
-            if indices.shape[0] == 0:
-                return self._empty(indices)
             out = self._empty(indices)
-            engram_gather(
-                self.weight.data_ptr(),
-                self.scale.data_ptr(),
-                indices.reshape(-1),
-                out.view(-1, self.dim),
-                self.dim,
-                FP8_BLOCK_SIZE,
-            )
+            self._gather_shared_into(indices, out)
             return out
         if cp_all_tokens and self.tp_size > 1:
             # Prefill CP: gather the hash ids over the CP group first so every
@@ -769,6 +770,39 @@ class EngramEmbedding(nn.Module):
         if self.tp_size > 1 and get_attention_dp_size() > 1:
             return self._dp_sharded_lookup(indices, forward_batch)
         return self._lookup(indices)
+
+    def _gather_shared_into(self, indices: torch.Tensor, out: torch.Tensor) -> None:
+        if indices.numel() == 0:
+            return
+        engram_gather(
+            self.weight.data_ptr(),
+            self.scale.data_ptr(),
+            indices.reshape(-1),
+            out.view(-1, self.dim),
+            self.dim,
+            FP8_BLOCK_SIZE,
+        )
+
+    def prefetch(
+        self, indices: torch.Tensor, stream: torch.cuda.Stream, ready: torch.cuda.Event
+    ) -> torch.Tensor:
+        """Enqueue a shared-host lookup; the caller must wait on ``ready``.
+
+        Allocate on the consuming stream, including the contiguous ID copy, so
+        decode graph capture owns both allocations in its graph pool. The fork
+        here and the caller's join must belong to the same full CUDA graph.
+        This performs no collective: DP/CP ranks may request different rows.
+        """
+        assert self._shared and self.host_table.registered
+        indices = indices.contiguous()
+        out = self._empty(indices)
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            self._gather_shared_into(indices, out)
+            ready.record(stream)
+        indices.record_stream(stream)
+        out.record_stream(stream)
+        return out
 
     def _lookup(self, indices: torch.Tensor) -> torch.Tensor:
         """Lookup when every TP rank holds the same indices: the device and
@@ -914,14 +948,22 @@ class Engram(nn.Module):
         cp_all_tokens: bool = False,
     ) -> torch.Tensor:
         """x [T, hc_mult, dim]; hash_ids [T, n_hash_cols] for this layer."""
-        # The lookup runs first even for an idle DP-attention batch: under DP
-        # attention it is a collective every rank has to join.
+        # The lookup runs first even for an idle DP-attention batch: a sharded
+        # table uses a collective every rank has to join, while a shared table
+        # returns an empty local result without communication.
         emb = self.embed(hash_ids, forward_batch, cp_all_tokens=cp_all_tokens)
         if x.shape[0] == 0:
             # Nothing to gate, and the MXFP8 quantize behind wkv rejects an
             # empty M.
             return x
-        kv, _ = self.wkv(emb.flatten(-2))
+        return self.apply_gate(x, self.project_from_embeddings(emb))
+
+    def project_from_embeddings(self, embeddings: torch.Tensor) -> torch.Tensor:
+        """Project already-gathered BF16 embeddings on the current stream."""
+        kv, _ = self.wkv(embeddings.flatten(-2))
+        return kv
+
+    def apply_gate(self, x: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
         return engram_gate(
             x, kv, self.q_weight, self.k_weight, self.eps, self.clamp_value
         )
