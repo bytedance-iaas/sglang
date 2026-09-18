@@ -66,6 +66,24 @@ class EicStats:
             self._c["eic.admitted_tokens"] += max(0, admitted - device_hit)
             self._c["eic.missing_tokens"] += max(0, device_hit + eic_expected - admitted)
 
+    def observe_load(self, wait_s, service_s):
+        # Splits a load op's wall time into queue wait vs service. Separate
+        # counters so the periodic line can say which one dominates.
+        with self._lock:
+            self._c["load.ops"] += 1
+            self._lat["load.wait"].append(wait_s)
+            self._lat["load.service"].append(service_s)
+
+    def observe_lat(self, name, seconds):
+        with self._lock:
+            self._lat[name].append(seconds)
+
+    def observe_max(self, name, value):
+        # Gauge sampled by the caller; the dump reports the peak seen.
+        with self._lock:
+            if value > self._c[name]:
+                self._c[name] = value
+
     def _dump_loop(self):
         while True:
             time.sleep(_INTERVAL_S)
@@ -111,7 +129,8 @@ class EicStats:
             "mexist calls=%d fail=%s reprobe=%d | "
             "admit reqs=%d device_hit=%d eic_expected=%d eic_got=%d eic_missing=%d eic_hit%%=%s | "
             "miss: cold_or_probe_fail=%d headroom=%d below_threshold=%d dma_incomplete=%d | "
-            "%s %s %s",
+            "load ops=%d qsize_max=%d | "
+            "%s %s %s %s %s %s %s %s",
             self._rank,
             uptime,
             c.get("write.nodes", 0),
@@ -143,9 +162,16 @@ class EicStats:
             c.get("miss.headroom", 0),
             c.get("miss.below_threshold", 0),
             c.get("miss.dma_incomplete", 0),
+            c.get("load.ops", 0),
+            c.get("load.qsize", 0),
             lat_str("mset"),
             lat_str("mget"),
             lat_str("mexist"),
+            lat_str("load.wait"),
+            lat_str("load.service"),
+            lat_str("load.unpack"),
+            lat_str("mget.first"),
+            lat_str("mget.refetch_s"),
         )
 
 

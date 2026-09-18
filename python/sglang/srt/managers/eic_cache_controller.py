@@ -60,6 +60,7 @@ class EICCacheOperation(CacheOperation):
     ):
         self.content_hash = content_hash
         self.node_id = node_id
+        self.enqueue_t = time.perf_counter()
         super().__init__(
             host_indices=host_indices,
             device_indices=device_indices,
@@ -465,11 +466,16 @@ class EICCacheController(HiCacheController):
                 # self.load_cache_event.clear()
                 try:
                     operation = self.load_queue.get(block=True, timeout=1)
+                    _t_start = time.perf_counter()
                     self.load_wait_event.set()
                     try:
                         self.load_from_eic(operation)
                     finally:
                         self.load_wait_event.clear()
+                    stats.observe_load(
+                        _t_start - operation.enqueue_t, time.perf_counter() - _t_start
+                    )
+                    stats.observe_max("load.qsize", self.load_queue.qsize())
                 except Empty:
                     continue
                 except Exception as e:
