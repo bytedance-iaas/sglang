@@ -408,6 +408,10 @@ def test_topk_v2_ragged_window(name: str, rows, k: int, offset_shift: int) -> No
     before = scores.clone()
 
     our_raw = _run_ragged(scores, lengths, starts, offsets, k)
+    replay_raw = _run_ragged(before.clone(), lengths, starts, offsets, k)
+    assert our_raw == replay_raw
+    for row in our_raw:
+        assert row == sorted(row)
 
     # reference on the window slice, padded to a common width for the helper
     max_len = max(n for _, n in rows)
@@ -439,6 +443,8 @@ def test_topk_v2_ragged_no_row_starts(k: int) -> None:
     explicit = _run_ragged(scores.clone(), lengths, starts, offsets, k)
     implicit = _run_ragged(scores.clone(), lengths, None, offsets, k)
     for i in range(len(rows)):
+        assert explicit[i] == sorted(explicit[i])
+        assert implicit[i] == sorted(implicit[i])
         assert sorted(explicit[i]) == sorted(implicit[i]), f"row {i} differs"
 
 

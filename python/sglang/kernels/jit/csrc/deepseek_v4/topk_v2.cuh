@@ -292,7 +292,7 @@ TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams par
 
   const auto problem = TopKProblem{
       .in = score + (row_start - rem),
-      .out = out,
+      .out = nullptr,
       .page_table = nullptr,  // unused
       .topk = topk,
       .seq_len = seq_len + rem,
@@ -300,13 +300,19 @@ TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams par
       .bias = offset - static_cast<int32_t>(rem),
   };
   __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
-  if (problem.seq_len <= Register2::kMaxSeqLen) {
-    Register2::forward<kPDL>(problem, &smem);
-  } else if (problem.seq_len <= Register4::kMaxSeqLen) {
-    Register4::forward<kPDL>(problem, &smem);
+  __shared__ int32_t s_topk_indices[kMaxTopK];
+  auto staged_problem = problem;
+  staged_problem.out = s_topk_indices;
+  if (staged_problem.seq_len <= Register2::kMaxSeqLen) {
+    Register2::forward<kPDL>(staged_problem, &smem);
+  } else if (staged_problem.seq_len <= Register4::kMaxSeqLen) {
+    Register4::forward<kPDL>(staged_problem, &smem);
   } else {
-    Streaming::forward<kPDL>(problem, &smem);
+    Streaming::forward<kPDL>(staged_problem, &smem);
   }
+  __syncthreads();
+  sort_selected_indices(s_topk_indices, topk);
+  for_each_item(topk, [&](uint32_t tx, uint32_t) { out[tx] = s_topk_indices[tx]; });
   // PDL trigger secondary at the end the block typically has no use, so ignore it
 }
 
