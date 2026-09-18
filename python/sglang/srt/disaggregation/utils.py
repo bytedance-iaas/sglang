@@ -453,7 +453,6 @@ class MetadataBuffers:
         )
 
     def set_buf(self, req: Req):
-
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
         # counts and slots 4-6 are reused for multimodal prompt token counts
@@ -989,9 +988,12 @@ def build_kv_layer_ids(
     Returns [] for pools that cannot report ids, leaving the peers on positional
     pairing.
     """
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+        DeepSeekV4TokenToKVPool,
+    )
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
-    if not isinstance(token_to_kv_pool, HybridLinearKVPool):
+    if not isinstance(token_to_kv_pool, (HybridLinearKVPool, DeepSeekV4TokenToKVPool)):
         return []
     layer_ids = token_to_kv_pool.get_kv_layer_ids()
     if draft_token_to_kv_pool is None:
@@ -1379,7 +1381,16 @@ def setup_state_kv_args(
         # state list is described per-entry via get_state_buf_infos.
         if isinstance(token_to_kv_pool, BaseSWAKVPool):
             append_state_component(
-                kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
+                kv_args,
+                StateType.SWA,
+                data_ptrs,
+                data_lens,
+                item_lens,
+                layer_ids=(
+                    token_to_kv_pool.get_state_layer_ids()
+                    if hasattr(token_to_kv_pool, "get_state_layer_ids")
+                    else None
+                ),
             )
             # MXFP8 KV: each sub-pool's block scales ride as their own component
             # so they inherit the index payload of the KV they describe.
@@ -1413,6 +1424,14 @@ def setup_state_kv_args(
                         ring_ptrs,
                         ring_lens,
                         ring_item_lens,
+                        layer_ids=(
+                            token_to_kv_pool.get_unified_swa_ring_layer_ids()
+                            if hasattr(
+                                token_to_kv_pool,
+                                "get_unified_swa_ring_layer_ids",
+                            )
+                            else None
+                        ),
                     )
             if hasattr(token_to_kv_pool, "get_request_state_buf_infos"):
                 c128_ptrs, c128_lens, c128_item_lens = (
@@ -1425,6 +1444,14 @@ def setup_state_kv_args(
                         c128_ptrs,
                         c128_lens,
                         c128_item_lens,
+                        layer_ids=(
+                            token_to_kv_pool.get_request_state_layer_ids()
+                            if hasattr(
+                                token_to_kv_pool,
+                                "get_request_state_layer_ids",
+                            )
+                            else None
+                        ),
                     )
         elif isinstance(token_to_kv_pool, HybridLinearKVPool):
             dim = (
