@@ -307,10 +307,10 @@ def _recover_fused_ragged_logical_topk(
         raise ValueError(
             "fused RAGGED TopK recovery requires rank-2 indices and rank-1 offsets"
         )
-    logical_rows = topk_indices_offset.shape[0]
-    if physical_topk_indices.shape[0] < logical_rows:
+    physical_rows = physical_topk_indices.shape[0]
+    if topk_indices_offset.shape[0] < physical_rows:
         raise ValueError(
-            "fused RAGGED TopK recovery has fewer output rows than offsets"
+            "fused RAGGED TopK recovery has fewer offset rows than output rows"
         )
     if (
         physical_topk_indices.dtype != torch.int32
@@ -319,13 +319,9 @@ def _recover_fused_ragged_logical_topk(
         raise ValueError("fused RAGGED TopK recovery requires int32 tensors")
     if physical_topk_indices.device != topk_indices_offset.device:
         raise ValueError("fused RAGGED TopK indices and offsets must share a device")
-    physical_prefix = physical_topk_indices[:logical_rows]
-    valid = physical_prefix != -1
-    offsets = topk_indices_offset.unsqueeze(1)
-    logical_prefix = torch.where(valid, physical_prefix - offsets, physical_prefix)
-    if physical_topk_indices.shape[0] == logical_rows:
-        return logical_prefix
-    return torch.cat([logical_prefix, physical_topk_indices[logical_rows:]], dim=0)
+    valid = physical_topk_indices != -1
+    offsets = topk_indices_offset[:physical_rows].unsqueeze(1)
+    return torch.where(valid, physical_topk_indices - offsets, physical_topk_indices)
 
 
 def _cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
