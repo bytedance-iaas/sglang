@@ -148,7 +148,11 @@ def _estimate_masked_standard_layout_peak_bytes(
         input_scale_row_bytes = 0
         down_scale_row_bytes = 0
     else:
-        block_k = quant_info.block_shape[1] if quant_info.block_shape else 128
+        block_k = (
+            128
+            if quant_info.w13_weight_residual is not None
+            else (quant_info.block_shape[1] if quant_info.block_shape else 128)
+        )
         packed_scales = quant_info.use_mxfp8 or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         scale_item_bytes = (
             torch.uint8.itemsize if packed_scales else torch.float32.itemsize
@@ -249,6 +253,8 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     use_fp8: bool
     w13_scale: Optional[torch.Tensor] = None
     w2_scale: Optional[torch.Tensor] = None
+    w13_weight_residual: Optional[torch.Tensor] = None
+    w2_weight_residual: Optional[torch.Tensor] = None
     block_shape: Optional[List[int]] = None
     # DSV4 mxfp4 layout flag; selects recipe_a=(1,128)/recipe_b=(1,32) downstream.
     is_fp4_experts: bool = False
@@ -326,6 +332,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         hidden_states_dtype = running_state["hidden_states_dtype"]
         hidden_states_shape = running_state["hidden_states_shape"]
         m_indices = runner_input.m_indices
+        use_sm90_fp4 = quant_info.w13_weight_residual is not None
         trace_deepep_v2_contig = (
             envs.SGLANG_DEEPEP_V2_TRACE_CONTIG.get()
             and running_state.get("deepep_v2_expanded", False)
@@ -361,18 +368,28 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         )
         if (
             deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES
+            and not use_sm90_fp4
             and not runner_input.hidden_states_scale_tma_aligned
         ):
             hidden_states_scale = tma_align_input_scale(hidden_states_scale)
 
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
-            (hidden_states, hidden_states_scale),
-            w13_weight_fp8,
-            gateup_output,
-            m_indices,
-            recipe_a=recipe_a,
-            recipe_b=recipe_b,
-        )
+        if use_sm90_fp4:
+            deep_gemm_wrapper.grouped_gemm_nt_f8fp4bf16_contig(
+                (hidden_states, hidden_states_scale),
+                w13_weight_fp8,
+                quant_info.w13_weight_residual,
+                gateup_output,
+                m_indices,
+            )
+        else:
+            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
+                (hidden_states, hidden_states_scale),
+                w13_weight_fp8,
+                gateup_output,
+                m_indices,
+                recipe_a=recipe_a,
+                recipe_b=recipe_b,
+            )
         if trace_deepep_v2_contig:
             torch.cuda.synchronize()
             logger.warning("DeepEP v2 expanded contig gateup GEMM returned")
@@ -509,17 +526,27 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 device=hidden_states_device,
                 dtype=torch.bfloat16,
             )
-        if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        use_sm90_fp4 = quant_info.w2_weight_residual is not None
+        if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES and not use_sm90_fp4:
             down_input_scale = tma_align_input_scale(down_input_scale)
 
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
-            (down_input_fp8, down_input_scale),
-            w2_weight_fp8,
-            down_output,
-            m_indices,
-            recipe_a=recipe_a,
-            recipe_b=recipe_b,
-        )
+        if use_sm90_fp4:
+            deep_gemm_wrapper.grouped_gemm_nt_f8fp4bf16_contig(
+                (down_input_fp8, down_input_scale),
+                w2_weight_fp8,
+                quant_info.w2_weight_residual,
+                down_output,
+                m_indices,
+            )
+        else:
+            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
+                (down_input_fp8, down_input_scale),
+                w2_weight_fp8,
+                down_output,
+                m_indices,
+                recipe_a=recipe_a,
+                recipe_b=recipe_b,
+            )
         if trace_deepep_v2_contig:
             torch.cuda.synchronize()
             logger.warning("DeepEP v2 expanded contig down GEMM returned")
@@ -532,7 +559,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-
         hidden_states = runner_input.hidden_states
         all_tokens = running_state["all_tokens"]
         hidden_states_device = running_state["hidden_states_device"]
@@ -611,6 +637,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         w2_weight = quant_info.w2_weight
         w13_scale = quant_info.w13_scale
         w2_scale = quant_info.w2_scale
+        use_sm90_fp4 = quant_info.w13_weight_residual is not None
 
         hidden_states_device = running_state["hidden_states_device"]
         trace_deepep_v2_masked = envs.SGLANG_DEEPEP_V2_TRACE_MASKED.get()
@@ -631,7 +658,12 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             )
 
         use_mxfp8 = quant_info.use_mxfp8
-        scale_block_size = quant_info.block_shape[1] if quant_info.block_shape else 128
+        if use_sm90_fp4:
+            scale_block_size = 128
+        else:
+            scale_block_size = (
+                quant_info.block_shape[1] if quant_info.block_shape else 128
+            )
 
         if use_mxfp8:
             recipe_b = tuple(quant_info.block_shape)
@@ -663,7 +695,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 hidden_states_scale = _cast_to_e8m0_with_rounding_up(
                     hidden_states_scale
                 )
-        elif deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        elif deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES and not use_sm90_fp4:
             hidden_states_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                 hidden_states_scale
             )
@@ -684,15 +716,25 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 n,
             )
             raise
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
-            (hidden_states, hidden_states_scale),
-            (w13_weight, w13_scale),
-            gateup_output,
-            masked_m,
-            expected_m,
-            recipe_a=recipe_a,
-            recipe_b=recipe_b,
-        )
+        if use_sm90_fp4:
+            deep_gemm_wrapper.grouped_gemm_nt_f8fp4bf16_masked(
+                (hidden_states, hidden_states_scale),
+                (w13_weight, w13_scale),
+                quant_info.w13_weight_residual,
+                gateup_output,
+                masked_m,
+                expected_m,
+            )
+        else:
+            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+                (hidden_states, hidden_states_scale),
+                (w13_weight, w13_scale),
+                gateup_output,
+                masked_m,
+                expected_m,
+                recipe_a=recipe_a,
+                recipe_b=recipe_b,
+            )
         if trace_deepep_v2_masked:
             torch.cuda.synchronize()
             logger.warning("DeepEP v2 masked runner gateup GEMM returned")
@@ -749,6 +791,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         # GroupGemm-1
         n = w2_weight.shape[1]
+        use_sm90_fp4 = quant_info.w2_weight_residual is not None
 
         if (
             use_mxfp8
@@ -762,7 +805,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     down_input_scale
                 )
             )
-        elif deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        elif deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES and not use_sm90_fp4:
             down_input_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                 down_input_scale
             )
@@ -775,6 +818,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             )
 
         down_gemm_overlap_args = running_state.get("down_gemm_overlap_args", None)
+        if use_sm90_fp4 and down_gemm_overlap_args is not None:
+            raise RuntimeError(
+                "SM90 FP8xFP4 masked DeepGEMM does not support down-GEMM overlap"
+            )
         if down_gemm_overlap_args is None:
             gemm_overlap_args_dict = {}
         else:
@@ -787,16 +834,26 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 "max_block_n": max_block_n,
             }
 
-        deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
-            (down_input, down_input_scale),
-            (w2_weight, w2_scale),
-            down_output,
-            masked_m,
-            expected_m,
-            recipe_a=recipe_a_down,
-            recipe_b=recipe_b,
-            **gemm_overlap_args_dict,
-        )
+        if use_sm90_fp4:
+            deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8fp4bf16_masked(
+                (down_input, down_input_scale),
+                (w2_weight, w2_scale),
+                quant_info.w2_weight_residual,
+                down_output,
+                masked_m,
+                expected_m,
+            )
+        else:
+            deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+                (down_input, down_input_scale),
+                (w2_weight, w2_scale),
+                down_output,
+                masked_m,
+                expected_m,
+                recipe_a=recipe_a_down,
+                recipe_b=recipe_b,
+                **gemm_overlap_args_dict,
+            )
         if trace_deepep_v2_masked:
             torch.cuda.synchronize()
             logger.warning("DeepEP v2 masked runner down GEMM returned")
@@ -919,6 +976,14 @@ def pre_permute_standard_to_deep_gemm(
     hidden_states_dtype = hidden_states.dtype
     hidden_states_device = hidden_states.device
     hidden_states_ref = hidden_states
+    activation_block_shape = (
+        [1, 128]
+        if quant_info.w13_weight_residual is not None
+        else quant_info.block_shape
+    )
+    activation_block_k = (
+        activation_block_shape[1] if activation_block_shape else 128
+    )
 
     topk_weights, topk_ids = topk_weights, topk_ids
 
@@ -937,7 +1002,7 @@ def pre_permute_standard_to_deep_gemm(
                 runner_config.num_local_experts,
                 hidden_states,
                 runner_config.top_k,
-                quant_info.block_shape,
+                activation_block_shape,
                 output_dtype=output_dtype,
                 use_mxfp8=quant_info.use_mxfp8,
                 expert_start=expert_start,
@@ -963,7 +1028,7 @@ def pre_permute_standard_to_deep_gemm(
         running_state["hidden_states_device"] = hidden_states_device
         running_state["src2dst"] = src2dst
         running_state["mxfp8_act_gran_k"] = (
-            quant_info.block_shape[1] if quant_info.block_shape else 128
+            activation_block_k
         )
 
         return DeepGemmRunnerInput(
@@ -1013,11 +1078,10 @@ def pre_permute_standard_to_deep_gemm(
             sglang_per_token_group_quant_fp8,
         )
 
-        block_k = quant_info.block_shape[1] if quant_info.block_shape else 128
         packed_input_source, packed_input_source_scale = (
             sglang_per_token_group_quant_fp8(
                 hidden_states,
-                block_k,
+                activation_block_k,
                 column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
@@ -1028,7 +1092,7 @@ def pre_permute_standard_to_deep_gemm(
             device=hidden_states_device,
             dtype=torch.float8_e4m3fn,
         )
-        scale_width = k // block_k
+        scale_width = k // activation_block_k
         if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
             scale_width = ceil_div(scale_width, 4)
         if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
@@ -1061,7 +1125,7 @@ def pre_permute_standard_to_deep_gemm(
         m_indices,
         src2dst,
         scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-        quant_block_size=(quant_info.block_shape[1] if quant_info.block_shape else 128),
+        quant_block_size=activation_block_k,
         expert_start=expert_start,
     )
     if packed_input_source is not hidden_states:
@@ -1081,7 +1145,7 @@ def pre_permute_standard_to_deep_gemm(
     running_state["src2dst"] = src2dst
     running_state["all_tokens"] = all_tokens
     running_state["mxfp8_act_gran_k"] = (
-        quant_info.block_shape[1] if quant_info.block_shape else 128
+        activation_block_k
     )
 
     return DeepGemmRunnerInput(
@@ -1494,11 +1558,11 @@ def _varlen_deep_gemm_silu_mul_quant(
     # DSV4-specific activations (clamped swiglu, swizzled gate|up layout) stay
     # on the DSV4 JIT kernel; it is the only implementation carrying them.
     if swiglu_limit is not None or swizzle:
-        assert N % 4 == 0 and G % 4 == 0 and D // 8 >= E, (
-            "DSV4 JIT activation requires N % 4 == 0, G % 4 == 0 and "
+        assert N % 4 == 0 and D // 8 >= E, (
+            "DSV4 JIT activation requires N % 4 == 0 and "
             f"D // 8 >= num_experts, got N={N} G={G} D={D} E={E}"
         )
-        packed_ue8m0 = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        packed_ue8m0 = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and G % 4 == 0
         down_input = torch.empty(
             (E, N, D), device=hidden_states_device, dtype=torch.float8_e4m3fn
         )

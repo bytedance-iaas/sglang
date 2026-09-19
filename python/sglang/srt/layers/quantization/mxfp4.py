@@ -309,7 +309,6 @@ class Mxfp4Config(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config):
-
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_mxfp4_serialized = "mxfp4" in quant_method
 
@@ -348,7 +347,6 @@ class Mxfp4Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
-
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
@@ -651,6 +649,56 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 deinterleave_moe_mxfp4_w13_for_marlin(layer)
             prepare_moe_mxfp4_layer_for_marlin(layer)
             layer._mxfp4_backend = "marlin"
+            return
+
+        if self.use_deep_gemm and get_platform().is_sm90:
+            from deep_gemm.utils.math import preprocess_sm90_mxfp4_weight
+
+            def preprocess_in_chunks(weight, scale):
+                weight = weight.view(torch.int8)
+                _, rows, sf_k = scale.shape
+                aligned_rows = ((rows + 15) // 16) * 16
+                processed_scale = torch.empty_strided(
+                    scale.shape,
+                    (aligned_rows * sf_k, 1, aligned_rows),
+                    dtype=torch.uint8,
+                    device=scale.device,
+                )
+                residual = torch.empty(
+                    weight.size(0), dtype=torch.float32, device=weight.device
+                )
+                for start in range(0, weight.size(0), 4):
+                    end = min(start + 4, weight.size(0))
+                    processed_weight, offsets, chunk_residual = (
+                        preprocess_sm90_mxfp4_weight(
+                            weight[start:end],
+                            scale[start:end],
+                        )
+                    )
+                    weight[start:end].copy_(processed_weight)
+                    processed_scale[start:end].copy_(offsets)
+                    residual[start:end].copy_(chunk_residual)
+                return weight, processed_scale, residual
+
+            w13_weight, w13_scale, w13_residual = preprocess_in_chunks(
+                layer.w13_weight.data, layer.w13_weight_scale.data
+            )
+            w2_weight, w2_scale, w2_residual = preprocess_in_chunks(
+                layer.w2_weight.data, layer.w2_weight_scale.data
+            )
+            layer.w13_weight.data = w13_weight
+            layer.w13_weight_scale.data = w13_scale
+            layer.w2_weight.data = w2_weight
+            layer.w2_weight_scale.data = w2_scale
+            layer.register_parameter(
+                "w13_weight_residual",
+                Parameter(w13_residual, requires_grad=False),
+            )
+            layer.register_parameter(
+                "w2_weight_residual",
+                Parameter(w2_residual, requires_grad=False),
+            )
+            layer._mxfp4_backend = "deep_gemm_sm90"
             return
 
         if self.use_deep_gemm or self.use_mega_moe:
@@ -1539,7 +1587,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-
         from sglang.srt.layers.moe.token_dispatcher import (
             DispatchOutputChecker,
             StandardCombineInput,
@@ -1559,6 +1606,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 use_fp8=True,
                 w13_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
+                w13_weight_residual=getattr(layer, "w13_weight_residual", None),
+                w2_weight_residual=getattr(layer, "w2_weight_residual", None),
                 block_shape=[128, 128],
                 is_fp4_experts=True,
             )
@@ -1994,7 +2043,6 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         w13_weight = torch.nn.Parameter(

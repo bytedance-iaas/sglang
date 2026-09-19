@@ -1767,6 +1767,57 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 logger.warning_once("Dequantized FP4 expert weights to FP8.")
 
             if self.is_fp4_expert:
+                if get_platform().is_sm90 and will_use_deepgemm:
+                    from deep_gemm.utils.math import preprocess_sm90_mxfp4_weight
+
+                    def preprocess_in_chunks(weight, scale):
+                        weight = weight.view(torch.int8)
+                        _, rows, sf_k = scale.shape
+                        aligned_rows = ((rows + 15) // 16) * 16
+                        processed_scale = torch.empty_strided(
+                            scale.shape,
+                            (aligned_rows * sf_k, 1, aligned_rows),
+                            dtype=torch.uint8,
+                            device=scale.device,
+                        )
+                        residual = torch.empty(
+                            weight.size(0),
+                            dtype=torch.float32,
+                            device=weight.device,
+                        )
+                        for start in range(0, weight.size(0), 4):
+                            end = min(start + 4, weight.size(0))
+                            processed_weight, offsets, chunk_residual = (
+                                preprocess_sm90_mxfp4_weight(
+                                    weight[start:end],
+                                    scale[start:end],
+                                )
+                            )
+                            weight[start:end].copy_(processed_weight)
+                            processed_scale[start:end].copy_(offsets)
+                            residual[start:end].copy_(chunk_residual)
+                        return weight, processed_scale, residual
+
+                    w13_weight, w13_scale, w13_residual = preprocess_in_chunks(
+                        layer.w13_weight.data, layer.w13_weight_scale_inv.data
+                    )
+                    w2_weight, w2_scale, w2_residual = preprocess_in_chunks(
+                        layer.w2_weight.data, layer.w2_weight_scale_inv.data
+                    )
+                    layer.w13_weight.data = w13_weight
+                    layer.w13_weight_scale_inv.data = w13_scale
+                    layer.w2_weight.data = w2_weight
+                    layer.w2_weight_scale_inv.data = w2_scale
+                    layer.register_parameter(
+                        "w13_weight_residual",
+                        Parameter(w13_residual, requires_grad=False),
+                    )
+                    layer.register_parameter(
+                        "w2_weight_residual",
+                        Parameter(w2_residual, requires_grad=False),
+                    )
+                    return
+
                 if get_moe_runner_backend().is_marlin():
                     layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
                     layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
@@ -2648,6 +2699,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 use_fp8=True,
                 w13_scale=w13_scale,
                 w2_scale=w2_scale,
+                w13_weight_residual=getattr(layer, "w13_weight_residual", None),
+                w2_weight_residual=getattr(layer, "w2_weight_residual", None),
                 block_shape=block_shape,
                 is_fp4_experts=self.is_fp4_expert,
                 use_mxfp8=self.use_mxfp8,

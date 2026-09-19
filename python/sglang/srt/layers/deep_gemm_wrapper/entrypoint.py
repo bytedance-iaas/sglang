@@ -97,6 +97,33 @@ def grouped_gemm_nt_f8f8bf16_masked(
             )
 
 
+def grouped_gemm_nt_f8fp4bf16_masked(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    weight_residual: torch.Tensor,
+    out: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+    masked_m_max_hint: Optional[int] = None,
+    active_groups_hint: Optional[int] = None,
+):
+    lhs = _ensure_cuda(lhs)
+    rhs = _ensure_cuda(rhs)
+
+    return deep_gemm.m_grouped_fp8_fp4_gemm_nt_masked(
+        lhs,
+        rhs,
+        out,
+        masked_m,
+        expected_m,
+        recipe_a=(1, 128),
+        recipe_b=(1, 32),
+        weight_residual=weight_residual,
+        masked_m_max_hint=masked_m_max_hint,
+        active_groups_hint=active_groups_hint,
+    )
+
+
 def _ensure_cuda(
     pair: Tuple[torch.Tensor, torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -157,6 +184,30 @@ def grouped_gemm_nt_f8f8bf16_contig(
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
             lhs, rhs, out, m_indices, **fp4_kwargs
         )
+
+
+def grouped_gemm_nt_f8fp4bf16_contig(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    weight_residual: torch.Tensor,
+    out: torch.Tensor,
+    m_indices: torch.Tensor,
+):
+    if lhs[0].shape[0] == 0:
+        return
+
+    lhs = _ensure_cuda(lhs)
+    rhs = _ensure_cuda(rhs)
+
+    deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
+        lhs,
+        rhs,
+        out,
+        m_indices,
+        recipe_a=(1, 128),
+        recipe_b=(1, 32),
+        weight_residual=weight_residual,
+    )
 
 
 def grouped_gemm_nt_bf16_contig(
