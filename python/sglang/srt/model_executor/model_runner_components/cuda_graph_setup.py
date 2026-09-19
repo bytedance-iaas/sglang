@@ -201,6 +201,8 @@ def refresh_deep_gemm_layout_memory_budget(
             return
     else:
         if model_runner.is_draft_worker:
+            if _deep_gemm_layout_memory_budget_initialized:
+                return
             moe_runner_backend = (
                 get_spec().speculative_moe_runner_backend
                 or get_exec().moe.moe_runner_backend
