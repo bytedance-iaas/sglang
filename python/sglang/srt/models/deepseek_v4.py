@@ -4362,8 +4362,15 @@ class DeepseekV4Model(nn.Module):
                 forward_batch,
                 inherit_full_state=False,
             )
-            input_ids = tail.rows(input_ids)
-            input_ids_global = tail.rows(input_ids_global)
+            local_input_ids = tail.rows(local_input_ids)
+            if tail.cp_metadata is not None:
+                tail_input_ids = forward_batch.input_ids[tail.output_token_indices]
+                input_ids = cp_interleave_input_ids(tail_input_ids, forward_batch)
+                input_ids_global = input_ids
+            else:
+                input_ids = tail.rows(input_ids)
+                input_ids_global = tail.rows(input_ids_global)
+                local_input_ids = input_ids
             positions = tail.positions
             if hash_ids is not None:
                 hash_ids = tail.rows(hash_ids)

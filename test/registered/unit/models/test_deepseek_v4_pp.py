@@ -7,12 +7,12 @@ import torch
 
 import sglang.srt.models.deepseek_v4 as deepseek_v4
 from sglang.srt.layers.attention.deepseek_v4_backend import LateLayerTail
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.models.deepseek_v4 import (
     DeepseekV4Model,
     _dsv41_multimodal_enabled,
     _should_build_dsv41_vision,
 )
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -170,6 +170,96 @@ class TestDeepSeekV41PP(unittest.TestCase):
         self.assertTrue(torch.equal(output, hidden_states + 1))
         self.assertTrue(torch.equal(output_pre, prev_pre + 1))
         self.assertIs(output_tail, tail)
+
+    def test_cp_tail_continuation_rebuilds_global_input_ids(self):
+        tail_cp_metadata = object()
+        tail = LateLayerTail(
+            token_indices=torch.tensor([1, 3]),
+            positions=torch.tensor([12, 13]),
+            extend_seq_lens=torch.tensor([4], dtype=torch.int32),
+            extend_seq_lens_cpu=[4],
+            swa_out_cache_loc=torch.tensor([6, 7], dtype=torch.int32),
+            cp_metadata=tail_cp_metadata,
+            global_token_indices=torch.tensor([4, 5, 6, 7]),
+        )
+        forward_batch = SimpleNamespace(
+            input_ids=torch.arange(8),
+            attn_cp_metadata=object(),
+            forward_mode=SimpleNamespace(
+                is_extend=lambda: True,
+                is_extend_without_speculative=lambda: True,
+                is_decode=lambda: False,
+                is_target_verify=lambda: False,
+            ),
+        )
+
+        def enter_late_layer_tail(batch, inherit_full_state):
+            self.assertFalse(inherit_full_state)
+            batch.attn_cp_metadata = tail_cp_metadata
+            return ("full", None, 0)
+
+        backend = SimpleNamespace(
+            tail_forward_metadata=SimpleNamespace(late_layer_tail=tail),
+            enter_late_layer_tail=MagicMock(side_effect=enter_late_layer_tail),
+            exit_late_layer_tail=MagicMock(),
+        )
+        layer = _Layer()
+        model = SimpleNamespace(
+            config=SimpleNamespace(model_type="deepseek_v41"),
+            pp_group=SimpleNamespace(world_size=4),
+            engram_hasher=None,
+            engram_embed_prefetch_stream=None,
+            late_layer_start=21,
+            start_layer=30,
+            end_layer=31,
+            layers={30: layer},
+            _check_late_layer_tail_readers=MagicMock(),
+        )
+        hidden_states = torch.arange(8).reshape(2, 1, 4)
+        prev_pre = torch.arange(8).reshape(2, 1, 4)
+        tail_global_input_ids = torch.tensor([4, 6, 5, 7])
+
+        with (
+            patch.object(deepseek_v4, "get_attn_backend", return_value=backend),
+            patch.object(deepseek_v4, "is_cp_active", return_value=True),
+            patch.object(
+                deepseek_v4,
+                "cp_shard_hidden_states",
+                return_value=torch.tensor([0, 2, 4, 6]),
+            ),
+            patch.object(
+                deepseek_v4,
+                "cp_interleave_input_ids",
+                return_value=tail_global_input_ids,
+            ) as reorder,
+            patch.object(
+                deepseek_v4,
+                "check_cuda_graph_backend",
+                return_value=True,
+            ),
+            patch.object(deepseek_v4, "nullcontext", return_value=nullcontext()),
+        ):
+            DeepseekV4Model._forward_layers_hc_pre_from_prev(
+                model,
+                torch.arange(4),
+                hidden_states,
+                forward_batch,
+                torch.arange(4),
+                torch.arange(8),
+                False,
+                [],
+                prev_pre,
+                True,
+            )
+
+        torch.testing.assert_close(
+            reorder.call_args.args[0], torch.tensor([4, 5, 6, 7])
+        )
+        self.assertIs(reorder.call_args.args[1].attn_cp_metadata, tail_cp_metadata)
+        torch.testing.assert_close(layer.calls[0]["hidden_states"], hidden_states)
+        torch.testing.assert_close(
+            layer.calls[0]["input_ids_global"], tail_global_input_ids
+        )
 
 
 if __name__ == "__main__":
