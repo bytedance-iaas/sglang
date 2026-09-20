@@ -9,7 +9,10 @@ Only a derived, non-persistent Humming layout is cached at weight-load time.
 import torch
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec
+
+_HUMMING_FP8_MAX_M = envs.SGLANG_HUMMING_FP8_MAX_M.get()
 
 
 def _requires_deterministic_gemm() -> bool:
@@ -93,8 +96,7 @@ def can_use_humming_fp8_linear(layer: torch.nn.Module, x) -> bool:
     if x.shape[-1] != layer.weight.shape[1]:
         return False
     m = x.numel() // x.shape[-1]
-    # Limit the first integration to the measured decode/verify envelope.
-    return 0 < m <= 64 and not _requires_deterministic_gemm()
+    return 0 < m <= _HUMMING_FP8_MAX_M and not _requires_deterministic_gemm()
 
 
 def humming_fp8_linear(

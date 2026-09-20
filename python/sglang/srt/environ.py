@@ -1011,6 +1011,9 @@ class Envs:
     SGLANG_HUMMING_INPUT_QUANT_CONFIG = EnvJSON(None)
     SGLANG_HUMMING_USE_F16_ACCUM = EnvBool(False)
     SGLANG_HUMMING_MOE_GEMM_TYPE = EnvStr("")
+    # Dense W8A8 Humming dispatch token limit. The conservative default covers
+    # decode/verify; larger values opt prefill shapes into the same path.
+    SGLANG_HUMMING_FP8_MAX_M = EnvInt(64)
 
     # ===================================================================
     # FlashInfer, FlashMLA, and TRT-LLM

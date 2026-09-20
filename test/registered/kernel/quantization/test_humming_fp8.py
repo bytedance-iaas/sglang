@@ -191,6 +191,16 @@ class TestHummingFp8Linear(CustomTestCase):
                 )
                 torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
+            with (
+                mock.patch.object(humming_fp8, "_HUMMING_FP8_MAX_M", 65),
+                mock.patch.object(
+                    fp8, "humming_fp8_linear", wraps=humming_fp8.humming_fp8_linear
+                ) as run,
+            ):
+                out = layer.quant_method.apply(layer, large)
+            self.assertEqual(run.call_count, 1)
+            self._assert_close(out, self._reference(layer, large))
+
             deterministic = SimpleNamespace(
                 deterministic=SimpleNamespace(enable_deterministic_inference=True)
             )
