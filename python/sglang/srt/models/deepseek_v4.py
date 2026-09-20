@@ -115,6 +115,10 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
+from sglang.srt.layers.moe.dsv41_token_parallel import (
+    DSV41TokenParallel,
+    can_use_dsv41_token_parallel,
+)
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
@@ -2085,6 +2089,7 @@ class MQALayer(MqaAttentionBase):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         x_quant=None,
+        token_parallel: Optional[DSV41TokenParallel] = None,
     ) -> torch.Tensor:
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
             return x
@@ -2494,8 +2499,11 @@ class MQALayer(MqaAttentionBase):
         mhc = current_mhc_post_fusion()
         o, _ = self.wo_b(
             o if isinstance(o, Mxfp8SwizzledInput) else o.flatten(1),
-            skip_all_reduce=mhc is not None,
+            skip_all_reduce=mhc is not None or token_parallel is not None,
         )
+        if token_parallel is not None:
+            assert mhc is None and self.attn_tp_size == get_parallel().tp_size
+            return token_parallel.reduce_scatter(o)
         if mhc is not None:
             from sglang.kernels.ops.communication.all_reduce_mhc import (
                 all_reduce_mhc_norm,
@@ -3375,6 +3383,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         next_norm: Optional[RMSNorm] = None,
         next_input: Optional[list] = None,
         late_dp_layout: Optional[LateLayerDPLayout] = None,
+        token_parallel: Optional[DSV41TokenParallel] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Layer forward where each sublayer consumes the previous sublayer's
         pre-mix. Returns (hidden_states, ffn_pre)."""
@@ -3446,11 +3455,15 @@ class DeepseekV4DecoderLayer(nn.Module):
             use_mhc_post_fusion(attn_mhc) if attn_mhc is not None else nullcontext()
         )
         with context, self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            if token_parallel is not None:
+                assert attn_quantized is None and attn_mhc is None
+                x = token_parallel.gather(x)
             x = self.self_attn(
                 x=x,
                 positions=positions,
                 forward_batch=forward_batch,
                 x_quant=attn_quantized[0] if attn_quantized else None,
+                token_parallel=token_parallel,
             )
         if attn_mhc is not None:
             attn_mhc.materialize_stats()
@@ -3525,6 +3538,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     else input_ids
                 ),
                 input_ids_global=input_ids_global,
+                token_parallel=token_parallel,
             )
         if late_dp_layout is not None:
             x = x[: late_dp_layout.local_rows]
@@ -3550,7 +3564,18 @@ class DeepseekV4DecoderLayer(nn.Module):
         *,
         input_ids: Optional[torch.Tensor],
         input_ids_global: Optional[torch.Tensor],
+        token_parallel: Optional[DSV41TokenParallel] = None,
     ) -> torch.Tensor:
+        if token_parallel is not None:
+            # Attention already reduced and scattered these tokens. Both the
+            # shared expert and routed MegaMoE must consume this local slice.
+            assert hidden_states.shape[0] == token_parallel.local_rows
+            return self.mlp(
+                hidden_states,
+                forward_batch,
+                input_ids=input_ids,
+                input_ids_global=input_ids_global,
+            )
         _use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         _use_tp_moe_gather = (
             not _use_cp
@@ -4239,6 +4264,7 @@ class DeepseekV4Model(nn.Module):
         dspark_aux_hidden_states: List[torch.Tensor],
         prev_pre: Optional[torch.Tensor] = None,
         pp_tail_active: bool = False,
+        token_parallel: Optional[DSV41TokenParallel] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
         hash_ids = None
         cp_extend = (
@@ -4345,6 +4371,9 @@ class DeepseekV4Model(nn.Module):
                 hash_ids = tail.rows(hash_ids)
         precomputed_attn = None
         late_dp_layout = None
+        if token_parallel is not None:
+            assert tail is None and not cp_extend and not capture_dspark
+            hidden_states = token_parallel.local(hidden_states)
         for i in range(self.start_layer, self.end_layer):
             if tail is not None and not pp_tail_active and i == self.late_layer_start:
                 # Past the last kv_source layer a layer only owes its window KV,
@@ -4386,9 +4415,28 @@ class DeepseekV4Model(nn.Module):
                     main_stream = torch.cuda.current_stream()
                     main_stream.wait_event(self.engram_embed_prefetch_events[i])
                     # Join before WKV/gate; allocations belong to this stream.
+                    if token_parallel is not None:
+                        prefetched_embeddings = token_parallel.local(
+                            prefetched_embeddings
+                        )
                     kv = engram.project_from_embeddings(prefetched_embeddings)
                     hidden_states = engram.apply_gate(hidden_states, kv)
                     prefetched_embeddings = None
+                elif token_parallel is not None:
+                    layer_hash_ids = hash_ids[:, engram.layer_hash_index]
+                    # Sharded tables need identical IDs on every TP rank for
+                    # their reduction; shared tables can look up local rows.
+                    emb = engram.embed(
+                        token_parallel.local(layer_hash_ids)
+                        if engram.embed._shared
+                        else layer_hash_ids,
+                        forward_batch,
+                    )
+                    if not engram.embed._shared:
+                        emb = token_parallel.local(emb)
+                    hidden_states = engram.apply_gate(
+                        hidden_states, engram.project_from_embeddings(emb)
+                    )
                 else:
                     layer_hash_ids = hash_ids[:, engram.layer_hash_index]
                     # A TP-sharded Engram table also gathers across DP ranks.
@@ -4419,7 +4467,14 @@ class DeepseekV4Model(nn.Module):
                     and self.config.vision_n_layers > 0
                 ):
                     hidden_states = torch.where(
-                        (local_input_ids == self.config.image_token_id)[:, None, None],
+                        (
+                            (
+                                token_parallel.local(local_input_ids)
+                                if token_parallel is not None
+                                else local_input_ids
+                            )
+                            == self.config.image_token_id
+                        )[:, None, None],
                         before_engram,
                         hidden_states,
                     )
@@ -4469,14 +4524,23 @@ class DeepseekV4Model(nn.Module):
                 hidden_states, prev_pre = self.layers[i].forward_hc_pre_from_prev(
                     positions=positions,
                     hidden_states=hidden_states,
-                    input_ids=input_ids,
+                    input_ids=(
+                        token_parallel.local(input_ids)
+                        if token_parallel is not None
+                        else input_ids
+                    ),
                     forward_batch=forward_batch,
-                    input_ids_global=input_ids_global,
+                    input_ids_global=(
+                        token_parallel.local(input_ids_global)
+                        if token_parallel is not None
+                        else input_ids_global
+                    ),
                     prev_pre=prev_pre,
                     precomputed_attn=precomputed_attn,
                     next_norm=next_norm,
                     next_input=next_input,
                     late_dp_layout=late_dp_layout,
+                    token_parallel=token_parallel,
                 )
             precomputed_attn = next_input[0] if next_input else None
         if saved_full is not None:
@@ -4898,6 +4962,37 @@ class DeepseekV4Model(nn.Module):
             )
         last_pre = None
         tail = None
+        token_parallel = None
+        if envs.SGLANG_DSV41_MEGAMOE_REDUCE_SCATTER.get():
+            parallel = get_parallel()
+            if (
+                can_use_dsv41_token_parallel(
+                    enabled=True,
+                    model_type=self.config.model_type,
+                    sm90=get_platform().is_sm90,
+                    cuda=hidden_states.is_cuda,
+                    decode=forward_batch.forward_mode.is_decode(),
+                    capture_hidden=forward_batch.capture_hidden_mode.need_capture(),
+                    capture_dspark=capture_dspark,
+                    hc_pre_from_prev=self.hc_pre_from_prev_sublayer,
+                    pp_size=self.pp_group.world_size,
+                    tp_size=parallel.tp_size,
+                    attn_tp_size=parallel.attn_tp_size,
+                    attn_dp_size=parallel.attn_dp_size,
+                    attn_cp_size=parallel.attn_cp_size,
+                    moe_ep_size=parallel.moe_ep_size,
+                    moe_tp_size=parallel.moe_tp_size,
+                    megamoe=get_moe_a2a_backend().is_megamoe(),
+                    other_sp=get_forward().sp_active,
+                    rows=hidden_states.shape[0],
+                )
+                and not self.layers[
+                    self.start_layer
+                ].self_attn.accepts_mxfp8_swizzled_input()
+            ):
+                token_parallel = DSV41TokenParallel(
+                    parallel.attn_tp_group, hidden_states.shape[0]
+                )
         if self.hc_pre_from_prev_sublayer:
             assert not run_tbo, "two-batch overlap is not wired for this hc scheme"
             hidden_states, last_pre, tail = self._forward_layers_hc_pre_from_prev(
@@ -4910,6 +5005,7 @@ class DeepseekV4Model(nn.Module):
                 dspark_aux_hidden_states,
                 prev_pre,
                 pp_tail_active,
+                token_parallel=token_parallel,
             )
         elif run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
@@ -4992,6 +5088,11 @@ class DeepseekV4Model(nn.Module):
                 hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
             )
         hidden_states = self.norm(hidden_states)
+        if token_parallel is not None:
+            hidden_states = token_parallel.gather(hidden_states)
+            # Preserve the final model/logits-processor interface. The 4H
+            # residual is never gathered between decoder layers.
+            pre_hc_head = token_parallel.gather(pre_hc_head)
 
         if tail is not None and not capture_dspark:
             # The logits processor indexes rows by the full extend layout.
@@ -5050,9 +5151,22 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.dsv41_multimodal_enabled = _dsv41_multimodal_enabled(config)
         self.vision = None
         if _should_build_dsv41_vision(config, self.pp_group):
-            if not get_moe_a2a_backend().is_none():
+            moe_a2a_backend = get_moe_a2a_backend()
+            sm90_mega_moe = (
+                _is_cuda
+                and moe_a2a_backend.is_megamoe()
+                and get_platform().is_sm90
+                and get_parallel().attn_cp_size == 1
+                and get_parallel().attn_dp_size == 1
+                and get_parallel().moe_ep_size == self.tp_size
+                and self.tp_size <= 8
+            )
+            if not moe_a2a_backend.is_none() and not (
+                self.pp_group.world_size == 1 and sm90_mega_moe
+            ):
                 raise ValueError(
-                    "V4.1 vision on the first PP stage does not support MoE A2A"
+                    "V4.1 vision with PP supports MoE A2A=none; PP=1 also "
+                    "supports SM90 MegaMoE with TP=EP<=8 and attention CP=DP=1"
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)

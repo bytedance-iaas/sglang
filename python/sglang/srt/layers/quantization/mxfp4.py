@@ -399,7 +399,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         #                           W4A16 by default (PR #3084) or opt-in
         #                           Humming W4A8 (PR #3738/#4431)
         self._fi_kernel: Optional[str] = None
-        if self.use_flashinfer:
+        if self.use_flashinfer and not self.use_mega_moe:
             # precision=fp8 is an SM90 knob (Humming W4A8). The Blackwell
             # paths already run MXFP8 activations, so the flag is inert there
             # rather than an error -- one config can move across hardware.
@@ -615,6 +615,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
+        backend = getattr(layer, "fused_moe_backend", None)
+        if backend is not None:
+            backend.prepare_weights(layer)
+            return
         if self.use_marlin and not self.use_mega_moe:
             from sglang.srt.layers.quantization.marlin_utils import (
                 check_moe_marlin_supports_layer,

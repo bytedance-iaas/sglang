@@ -108,6 +108,7 @@ from sglang.srt.layers.dp_attention import (
     get_local_dp_buffer_len,
     set_local_dp_buffer_len,
 )
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.mem_cache.deepseek_v4_compress_state import KVAndScore
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -2828,6 +2829,20 @@ class DeepseekV4AttnBackend(
                 run_indexer=run_indexer,
             )
             return
+        if (
+            forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            and get_moe_a2a_backend().is_megamoe()
+            and not self._low_ratio_in_prefill_graph()
+        ):
+            # EP communication pads the token axis, but request lengths still
+            # describe only real rows. Do not feed dummy rows to the V4.1
+            # compressor/indexer or write them into a live request's state.
+            # TARGET_VERIFY uses its own request-major token layout and may
+            # have no extend lengths, including during DSpark graph capture.
+            num_tokens = sum(forward_batch.extend_seq_lens_cpu)
+            x = x[:num_tokens]
+            q_lora = q_lora[:num_tokens]
+            positions = positions[:num_tokens]
         meta = self.forward_metadata
         hoisted_req = getattr(meta, "low_ratio_req_indices", None)
         hoisted_pos = getattr(meta, "low_ratio_pos_i64", None)
