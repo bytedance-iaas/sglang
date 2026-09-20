@@ -1160,15 +1160,47 @@ class ModelRunner:
 
         from sglang.srt.models.gemma4_causal import Gemma4ForCausalLM
         from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
+        from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 
         if not isinstance(
-            self.model, (Gemma4ForCausalLM, Gemma4ForConditionalGeneration)
+            self.model,
+            (
+                Gemma4ForCausalLM,
+                Gemma4ForConditionalGeneration,
+                Qwen2_5_VLForConditionalGeneration,
+            ),
         ):
             raise RuntimeError(
-                "SiDP currently supports only Gemma4 causal or multimodal "
-                "models that use the Gemma4DecoderLayer hooks; "
+                "SiDP currently supports Gemma4 causal/multimodal and "
+                "Qwen2.5-VL models with SIDP decoder-layer hooks; "
                 f"loaded model type is {type(self.model).__name__}"
             )
+        if isinstance(self.model, Qwen2_5_VLForConditionalGeneration):
+            from sglang.srt.models.qwen2 import Qwen2DecoderLayer
+
+            args = self.server_args
+            if (
+                args.sidp_prefetch_policy != "compute"
+                or args.sidp_copy_backend != "dma"
+                or args.sidp_slot_sync != "event"
+                or args.sidp_coord_mode
+                or args.sidp_profile_dummy_compute
+                or self.model_config.quantization is not None
+            ):
+                raise RuntimeError(
+                    "Qwen2.5-VL SiDP supports unquantized FFN weights with "
+                    "compute + dma + event and coord_none; dummy compute is "
+                    "unsupported. Set --sidp-slot-sync event explicitly."
+                )
+            decoder = getattr(self.model, "model", None)
+            if decoder is None or not all(
+                type(decoder.layers[i]) is Qwen2DecoderLayer
+                for i in range(decoder.start_layer, decoder.end_layer)
+            ):
+                raise RuntimeError(
+                    "Qwen2.5-VL SiDP requires the standard Qwen2DecoderLayer "
+                    "with FFN hooks on every local PP stage layer."
+                )
 
         from sglang.srt.layers.sidp import (
             SidpConfig,

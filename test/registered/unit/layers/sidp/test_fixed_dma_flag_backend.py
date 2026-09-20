@@ -33,6 +33,7 @@ def test_manager_propagates_no_consume_wait_for_cycle_one():
     manager._uses_flag_sync = True
     manager._cycle_backend = _RecordingCycleBackend()
     manager.dma_slices = 1
+    manager.coord_mode = False
 
     manager._enqueue_cycle(1, wait_for_consume=False)
 
@@ -49,6 +50,7 @@ def test_manager_does_not_extend_other_flag_backend_interfaces():
     manager._uses_flag_sync = True
     manager._cycle_backend = _RecordingOtherFlagBackend()
     manager.dma_slices = 1
+    manager.coord_mode = False
 
     manager._enqueue_cycle(1, wait_for_consume=False)
 

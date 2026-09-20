@@ -37,6 +37,7 @@ before the next prefetch; that lifecycle is intentionally left as future work.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Mapping, Protocol, Sequence
@@ -61,10 +62,31 @@ class MaterializationSpec:
 
 
 @dataclass(frozen=True)
-class EncodedWeight:
-    """One encoded main tensor, named device extras, and host metadata."""
+class IpcTensorView:
+    """Copy-only view of remote CUDA storage mapped into the requester context.
 
-    tensor: torch.Tensor
+    This is deliberately not a torch.Tensor: constructing a source-device
+    tensor initializes a foreign primary context. The manager owns the mapping;
+    codecs may inspect this layout but compute only on local receive tensors.
+    """
+
+    pointer: int
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    nbytes: int
+
+    def data_ptr(self) -> int:
+        return self.pointer
+
+    def numel(self) -> int:
+        return math.prod(self.shape)
+
+
+@dataclass(frozen=True)
+class EncodedWeight:
+    """Encoded tensors (or copy-only remote views), extras, and host metadata."""
+
+    tensor: torch.Tensor | IpcTensorView
     extra_tensors: Mapping[str, torch.Tensor] = field(default_factory=dict)
     metadata: Any = None
 

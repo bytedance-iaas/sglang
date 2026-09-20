@@ -5,6 +5,7 @@ forward starts with cycle 0 resident, overlaps cycle c with prefetch(c + 1),
 and leaves the next forward's cycle 0 resident at graph/forward completion.
 """
 
+import atexit
 import logging
 import pickle
 from typing import Any, Dict, List, Tuple
@@ -38,6 +39,7 @@ from sglang.srt.layers.sidp.sync_strategy import (
 )
 from sglang.srt.layers.sidp.weight_codec import (
     EncodedWeight,
+    IpcTensorView,
     WeightComputeMode,
     build_weight_codec,
 )
@@ -244,6 +246,15 @@ class SidpManager:
         self.profile_dummy_compute = config.profile_dummy_compute
         self.transfer_dtype = config.transfer_dtype
         self.weight_codec = build_weight_codec(self.transfer_dtype)
+        # Fixed identity DMA needs only remote pointers, never a source-device
+        # torch.Tensor. Keep other transport/coordination paths unchanged.
+        self._uses_requester_weight_ipc = (
+            self.copy_backend == SidpCopyBackend.DMA.value
+            and self.prefetch_policy == SidpPrefetchPolicy.COMPUTE.value
+            and self.slot_sync == SidpSlotSync.EVENT.value
+            and not self.coord_mode
+            and self.weight_codec.name == "identity"
+        )
         self.peak_sync_strategy = config.peak_sync_strategy
         self.peak_sync_min_raw_bs = config.peak_sync_min_raw_bs
         self.peak_sync_max_replays = config.peak_sync_max_replays
@@ -285,6 +296,8 @@ class SidpManager:
         self._next_forward_cycle_zero_queued = False
         self._layers_ref: Dict[int, Any] = {}
         self._ipc_refs: List[torch.Tensor] = []
+        self._weight_ipc_bases: Dict[Tuple[int, bytes], int] = {}
+        self._weight_ipc_device = torch.cuda.current_device()
         self._local_encoded_weights: Dict[int, Dict[str, EncodedWeight]] = {}
         self._local_encoded_refs: List[torch.Tensor] = []
         self._graph_profiler: SidpGraphProfiler | None = None
@@ -295,6 +308,10 @@ class SidpManager:
             | None
         ) = None
         self._launch_sync_strategy = NoSyncStrategy()
+        if self._uses_requester_weight_ipc:
+            # Retain mappings and owner tensors for all graph replays. Normal
+            # process exit closes imports; SIGKILL is reclaimed by the driver.
+            atexit.register(self._close_weight_ipc_at_exit)
 
         # Direction A coordinated_static device barrier (Phase 2). Populated by
         # _setup_device_barrier() only when coord_mode is enabled.
@@ -329,15 +346,9 @@ class SidpManager:
         intentionally not mutated.
         """
 
-        # External-worker mode (Direction A) forms the SiDP group from N
-        # independent services. Cross-process CUDA IPC rebuilds a peer tensor on
-        # ``src_device = owner_of(lid) = owner member rank`` and enables peer
-        # access for ``dev in range(dp_size)``. Both use the member rank directly
-        # as a physical CUDA ordinal, so this only works when member rank equals
-        # the process's visible CUDA ordinal. server_args enforces
-        # base_gpu_id == member_rank; assert the resulting invariant here so a
-        # misconfigured launch fails loudly instead of doing silent cross-device
-        # IPC. (Native mode already satisfies rank == ordinal by construction.)
+        # External-worker mode uses member rank as the physical CUDA ordinal.
+        # Retain this topology contract even when raw weight IPC no longer
+        # creates source-device tensors. Cross-PP exchanges its own ordinal map.
         if self.external_mode:
             current_ordinal = torch.cuda.current_device()
             if current_ordinal != self.dp_rank:
@@ -569,6 +580,24 @@ class SidpManager:
             if owner_of(lid - self.layer_offset, self.dp_size) != self.dp_rank:
                 continue
             for pname, encoded in encoded_params.items():
+                if self._uses_requester_weight_ipc:
+                    if encoded.extra_tensors:
+                        raise RuntimeError("Raw identity IPC does not accept codec extras")
+                    descriptor = self.memcpy.export_ipc_pointer(
+                        encoded.tensor.data_ptr(), encoded.tensor.nbytes
+                    )
+                    descriptor.update(
+                        shape=tuple(encoded.tensor.shape), dtype=encoded.tensor.dtype
+                    )
+                    # Do not also call _reduce_tensor: every _share_cuda_ export
+                    # creates a consumer refcount even if no peer imports it.
+                    self.store.set(
+                        f"sidp/{self.dp_rank}/{lid}/{pname}",
+                        pickle.dumps(
+                            dict(version=4, codec="identity", tensor=descriptor)
+                        ),
+                    )
+                    continue
                 tensor_reduction = _reduce_tensor(encoded.tensor)
                 extra_reductions = {
                     name: _reduce_tensor(tensor)
@@ -628,10 +657,26 @@ class SidpManager:
             src_ordinal = self.member_ordinals[src]
             self.peer_views[lid] = {}
             self._peer_sm_ipc[lid] = {}
-            for pname, _ in self._get_ffn_params(layers[lid]):
+            for pname, param in self._get_ffn_params(layers[lid]):
                 key = f"sidp/{src}/{lid}/{pname}"
                 payload = self.store.get(key)
                 wire_payload = pickle.loads(payload)
+                if self._uses_requester_weight_ipc:
+                    if (
+                        not isinstance(wire_payload, dict)
+                        or wire_payload.get("version") != 4
+                        or wire_payload.get("codec") != "identity"
+                    ):
+                        raise RuntimeError(
+                            "Requester-context DMA IPC requires version 4 on all "
+                            "members; restart the entire SIDP group with matching code/config"
+                        )
+                    self.peer_views[lid][pname] = EncodedWeight(
+                        tensor=self._import_weight_ipc(
+                            src_ordinal, wire_payload["tensor"], param
+                        )
+                    )
+                    continue
                 # Accept the pre-codec identity payload for easier rolling
                 # upgrades, while all new ranks publish the versioned format.
                 if isinstance(wire_payload, dict):
@@ -700,6 +745,12 @@ class SidpManager:
                 f"[SiDP rank{self.dp_rank}] rebuilt "
                 f"{len(non_local_layers)} peer views"
             )
+            if self._uses_requester_weight_ipc:
+                logger.info(
+                    f"[SiDP rank{self.dp_rank}] weight IPC=requester_context_raw, "
+                    f"unique_allocations={len(self._weight_ipc_bases)}, "
+                    f"torch_peer_views={len(self._ipc_refs)}"
+                )
 
         # Allocate buffers BEFORE releasing weights (their shapes are still
         # needed here). Cycle overlap uses cycle_cache_depth * (D-k) slots;
@@ -761,16 +812,18 @@ class SidpManager:
         # pool therefore absorbs the freed HBM directly, leaving activation slack
         # untouched — total device usage stays close to baseline, only KV grows.
 
-        # D6: Enable peer access + prime P2P routes. Enable access to every other
-        # member's physical ordinal (in cross-PP the peers are the same-stage
-        # cards of the other PP groups, not ordinals [0, dp_size)).
+        # D6: Raw imports already establish access in the requester context.
+        # Explicit cudaDeviceEnablePeerAccess creates foreign primary contexts;
+        # retain it only for the legacy paths, then prime actual source routes.
         if self.enable_debug_logging:
             logger.info(
-                f"[SiDP rank{self.dp_rank}] enabling peer access + priming routes..."
+                f"[SiDP rank{self.dp_rank}] priming peer routes "
+                f"(requester_context_raw={self._uses_requester_weight_ipc})..."
             )
-        for ordinal in self.member_ordinals.values():
-            if ordinal != self.member_ordinals[self.dp_rank]:
-                self.memcpy.enable_peer_access(ordinal)
+        if not self._uses_requester_weight_ipc:
+            for ordinal in self.member_ordinals.values():
+                if ordinal != self.member_ordinals[self.dp_rank]:
+                    self.memcpy.enable_peer_access(ordinal)
         self._prime_routes(non_local_layers)
 
         if self._uses_conditional_dma:
@@ -816,6 +869,24 @@ class SidpManager:
             layer._sidp_dummy_compute = self.profile_dummy_compute
 
         if self.enable_debug_logging:
+            import json
+
+            logger.info(
+                f"[SiDP rank{self.dp_rank}] resolved layout: "
+                + json.dumps(
+                    {
+                        "member_rank": self.dp_rank,
+                        "pp_stage": self.pp_stage,
+                        "layer_offset": self.layer_offset,
+                        "owner_layers": [
+                            lid for lid in sorted(layers)
+                            if self.owner_of_layer(lid) == self.dp_rank
+                        ],
+                        "resident_layers": sorted(set(layers) - set(non_local_layers)),
+                        "fetch_layers": sorted(non_local_layers),
+                    }
+                )
+            )
             logger.info(f"[SiDP rank{self.dp_rank}] setup complete")
 
     def _setup_device_barrier(self):
@@ -1332,6 +1403,60 @@ class SidpManager:
     # Internal methods
     # ------------------------------------------------------------------
 
+    def _import_weight_ipc(
+        self, source_ordinal: int, descriptor: dict, parameter: torch.Tensor
+    ) -> IpcTensorView:
+        """Validate layout, then open each owner allocation once on this GPU."""
+        if torch.cuda.current_device() != self._weight_ipc_device:
+            raise RuntimeError("SiDP weight IPC must be opened in the requester context")
+        shape = tuple(descriptor["shape"])
+        dtype = descriptor["dtype"]
+        size = int(descriptor["nbytes"])
+        offset = int(descriptor["offset"])
+        allocation_size = int(descriptor["allocation_nbytes"])
+        handle = descriptor["handle"]
+        if (
+            shape != tuple(parameter.shape)
+            or dtype != parameter.dtype
+            or size != parameter.numel() * parameter.element_size()
+            or not parameter.is_contiguous()
+            or size <= 0
+            or offset < 0
+            or offset + size > allocation_size
+            or not isinstance(handle, bytes)
+            or len(handle) != 64
+        ):
+            raise ValueError("SiDP raw IPC descriptor does not match local FFN layout")
+        key = (source_ordinal, handle)
+        if key not in self._weight_ipc_bases:
+            self._weight_ipc_bases[key] = self.memcpy.open_ipc_allocation(handle)
+        return IpcTensorView(
+            pointer=self._weight_ipc_bases[key] + offset,
+            shape=shape,
+            dtype=dtype,
+            nbytes=size,
+        )
+
+    def close_weight_ipc(self) -> None:
+        """Shutdown only: no further forward/graph replay is allowed afterwards.
+
+        Owners must remain alive until readers finish. No per-forward collective
+        or host synchronization is introduced; mappings live with the service.
+        """
+        if not self._weight_ipc_bases:
+            return
+        with torch.cuda.device(self._weight_ipc_device):
+            torch.cuda.synchronize()
+            for key, base in list(self._weight_ipc_bases.items()):
+                self.memcpy.close_ipc_allocation(base)
+                del self._weight_ipc_bases[key]
+
+    def _close_weight_ipc_at_exit(self) -> None:
+        try:
+            self.close_weight_ipc()
+        except Exception:
+            logger.warning("SiDP IPC cleanup during CUDA shutdown failed", exc_info=True)
+
     def _validate_encoded_weight(
         self, encoded: EncodedWeight, *, context: str
     ) -> None:
@@ -1342,6 +1467,8 @@ class SidpManager:
                 raise ValueError(
                     f"SiDP encoded buffer names must be non-empty strings: {context}"
                 )
+            if isinstance(tensor, IpcTensorView):
+                continue  # Layout and allocation bounds checked when imported.
             if not tensor.is_cuda or not tensor.is_contiguous():
                 raise ValueError(
                     "SiDP encoded buffers must be contiguous CUDA tensors: "
@@ -1919,7 +2046,17 @@ class SidpManager:
             for pname, encoded in self.peer_views[lid].items():
                 pv = encoded.tensor
                 tmp = torch.empty(min(1024, pv.numel()), dtype=pv.dtype, device=device)
-                tmp.copy_(pv.flatten()[: tmp.numel()])
+                if self._uses_requester_weight_ipc:
+                    self.memcpy.async_copy(
+                        tmp.data_ptr(),
+                        pv.data_ptr(),
+                        tmp.nbytes,
+                        torch.cuda.current_stream().cuda_stream,
+                    )
+                    # Keep this scratch allocation alive until the DMA completes.
+                    torch.cuda.current_stream().synchronize()
+                else:
+                    tmp.copy_(pv.flatten()[: tmp.numel()])
                 del tmp
                 break  # one param per device is enough
             primed_devices.add(src_dev)

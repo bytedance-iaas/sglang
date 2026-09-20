@@ -247,6 +247,14 @@ class Qwen2DecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.start_layer = start_layer
+        self.layer_id = layer_id
+        # SidpManager binds these after loading/rebinding the FFN weights.
+        # The stage boundary flags also cover PP stages with nonzero offsets.
+        self._sidp_mgr = None
+        self._sidp_bound = False
+        self._sidp_begin_forward = False
+        self._sidp_end_forward = False
+        self._sidp_profile_enabled = False
         rope_theta, rope_scaling = get_rope_config(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         if hasattr(config, "original_num_attention_heads"):
@@ -288,6 +296,13 @@ class Qwen2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self._sidp_begin_forward:
+            self._sidp_mgr.begin_forward(
+                is_decode=forward_batch.forward_mode.is_decode()
+            )
+        if self._sidp_profile_enabled:
+            self._sidp_mgr.record_cycle_compute_start(self.layer_id)
+
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -302,7 +317,15 @@ class Qwen2DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if self._sidp_bound:
+            self._sidp_mgr.wait_prefetch(self.layer_id)
         hidden_states = self.mlp(hidden_states)
+        if self._sidp_bound:
+            self._sidp_mgr.record_compute_and_prefetch_next(self.layer_id)
+        if self._sidp_profile_enabled:
+            self._sidp_mgr.record_cycle_compute_end(self.layer_id)
+        if self._sidp_end_forward:
+            self._sidp_mgr.end_forward()
         return hidden_states, residual
 
 

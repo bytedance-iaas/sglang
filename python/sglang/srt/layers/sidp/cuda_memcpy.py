@@ -105,6 +105,11 @@ class SidpCudaMemcpy:
         ]
         self._ipc_open_mem_handle = open_handle
 
+        close_handle = self._driver.cuIpcCloseMemHandle
+        close_handle.restype = ctypes.c_int
+        close_handle.argtypes = [ctypes.c_uint64]
+        self._ipc_close_mem_handle = close_handle
+
     def async_copy(self, dst_ptr: int, src_ptr: int, nbytes: int, stream_ptr: int):
         rc = self._memcpy_async(
             dst_ptr, src_ptr, nbytes, self._CUDA_MEMCPY_DEFAULT, stream_ptr
@@ -166,7 +171,14 @@ class SidpCudaMemcpy:
             "handle": bytes(handle.reserved),
             "offset": offset,
             "nbytes": nbytes,
+            "allocation_nbytes": allocation_size.value,
         }
+
+    def close_ipc_allocation(self, allocation_base: int) -> None:
+        """Close a quiesced import in the same context that opened it."""
+        rc = self._ipc_close_mem_handle(allocation_base)
+        if rc != 0:
+            raise RuntimeError(f"cuIpcCloseMemHandle failed with error code {rc}")
 
     def open_ipc_pointer(self, descriptor: dict) -> int:
         """Open one raw IPC descriptor in the current CUDA device context."""
