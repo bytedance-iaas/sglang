@@ -1750,6 +1750,7 @@ class SchedulerPPMixin:
         mbs: List[ScheduleBatch],
         last_rank_comm_queue: deque,
         pp_outputs: PPProxyTensors | None,
+        propagate_skip_marker: bool = False,
     ) -> List[P2PWork]:
         send_output_work = []
         if self.pp_group.is_last_rank:
@@ -1759,6 +1760,8 @@ class SchedulerPPMixin:
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
                 if not target.forward_mode.is_prebuilt():
                     if _pp_can_skip_output_comm(target):
+                        if not propagate_skip_marker:
+                            return []
                         output_tensors = {"__skip__": True}
                     else:
                         self.device_module.current_stream().wait_event(q_event)
@@ -1819,12 +1822,18 @@ class SchedulerPPMixin:
                 mbs,
                 last_rank_comm_queue,
                 pp_outputs,
+                propagate_skip_marker=relay_output_immediately,
             )
 
         def _do_recv():
             nonlocal next_pp_outputs, batch_result, d2h_event
             target = mbs[next_mb_id]
             if target is None or target.forward_mode.is_prebuilt():
+                return
+            if not relay_output_immediately and _pp_can_skip_output_comm(target):
+                next_pp_outputs, batch_result, d2h_event = (
+                    self._pp_make_skip_output_result(target, mb_metadata[next_mb_id])
+                )
                 return
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
                 received_tensors = self._pp_recv_dict_from_prev_stage()
