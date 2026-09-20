@@ -471,7 +471,9 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
                 state, layer, x.weights, x.q, x.req, pos, group_size=group_size
             )
 
-        return SimpleNamespace(run=run, state=state, pages=pages, raw=raw, pos=pos)
+        return SimpleNamespace(
+            run=run, state=state, pages=pages, raw=raw, pos=pos, layer=layer
+        )
 
     def test_backend_topk_and_candidate_masks(self):
         from sglang.kernels.ops.attention.dsv4 import (

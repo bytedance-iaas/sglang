@@ -14,6 +14,10 @@ ragged verification, or late-layer-tail execution. Unsupported layouts keep
 the existing path. Enabling the flag is not a promise of a speedup on every
 Hopper configuration.
 
+An additional, separately gated 32-head optimization is described under
+**Length-aware 32-head indexer** below. The original grouped/mapped path's
+full-width logits and PyTorch TopK contracts apply when that second flag is off.
+
 ## Supported contract
 
 - Contiguous BF16, already fake-FP4 query `[rows, 32 or 64, 128]` and BF16 head
@@ -128,6 +132,138 @@ Capacity still affects the opt-in path through logits writes, fixed-grid launch
 work and full-width PyTorch TopK. Removing dense slots is the first step, not
 complete independence from the maximum context length.
 
+## Length-aware 32-head indexer
+
+Enable both flags before server startup / CUDA Graph capture:
+
+```bash
+export SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER=1
+export SGLANG_OPT_DSV41_SM90_LENGTH_AWARE_INDEXER=1
+```
+
+The second flag defaults to **off**. It supports the mapped path's 32-head,
+static-verification layouts, TopK 1..2048, and ratio 1 or 2. Candidate sources
+additionally require 1..2048 selected blocks and a power-of-two block size from
+1 through 128. Unsupported cases retain the original path.
+
+Persistent Triton CTAs read device-side visible lengths and loop only over
+reachable 64-position tiles. Request mapping, packed-K reads, scoring and score
+writes therefore follow the visible prefix instead of the model context limit.
+The existing non-cluster `topk_transform_ragged_v2` selects from those prefixes.
+The paged small-batch v2 dispatch is deliberately avoided: it can request a
+16-CTA cluster, exceeding the measured H20's maximum of eight.
+
+Candidate sources reduce block scores over the visible prefix and force its
+last block into the candidate set, preserving existing semantics. Consumers
+apply the candidate mask inside scoring and skip dot products for empty tiles.
+The final kernel sorts selected logical positions, filters masked selections,
+maps physical slots and writes the existing outputs, including `-1` padding.
+
+All graph shapes stay fixed; lengths and request mappings can grow or shrink
+between replays without host synchronization. FP32 score buffers retain their
+capacity-sized allocation, but only visible tiles and boundary padding are
+initialized. Every reader of these private buffers must use the device lengths.
+Candidate sources still zero a full-width bool mask to support subsequent
+fallback consumers. This optimization does **not** eliminate capacity-dependent
+allocation or that remaining mask write.
+
+Valid scores match the existing Triton implementation exactly. TopK is exact
+by selected score, but cutoff ties may select different positions from PyTorch.
+That also applies to candidate block selection. Tests compare score multisets,
+index uniqueness, validity and physical mappings, rather than requiring the
+same arbitrary tie choice. This is not a claim of bitwise-identical generation
+or a substitute for a model-quality evaluation.
+
+### H20 measurements
+
+Same H20 / PyTorch / Triton environment and timing method as the 32-head table
+above. Group size six, TopK 512, 32 heads; production candidate settings are
+2048 blocks of eight positions. Seed-11 median microseconds:
+
+| rows | capacity | visible | ratio | role | default | mapped only | length-aware |
+|---:|---:|---:|---:|---|---:|---:|---:|
+| 48 | 1048896 | 8192 | 1 | ordinary | 3794.20 | 1675.27 | 141.24 |
+| 48 | 1048896 | 8192 | 1 | candidate source | 4886.65 | 2768.39 | 168.03 |
+| 48 | 1048896 | 8192 | 1 | candidate consumer | 4100.93 | 1983.18 | 146.80 |
+| 48 | 524480 | 4096 | 2 | ordinary | 2010.66 | 928.50 | 80.30 |
+| 48 | 16384 | 8192 | 1 | ordinary | 293.41 | 206.82 | 139.81 |
+| 48 | 16384 | 8192 | 1 | candidate source | 363.92 | 275.69 | 147.35 |
+| 6 | 1048896 | 1048576 | 1 | ordinary | 2702.06 | 2201.06 | 2154.18 |
+| 6 | 1048896 | 1048576 | 1 | candidate source | 2923.06 | 2422.59 | 2199.25 |
+
+The primary cases also passed with independent seed-23 inputs. The 16K capacity
+rows are diagnostic comparisons, not a proposed context limit. The near-full
+1M rows show that short-prefix gains do not extrapolate to fully populated
+contexts. These measurements include candidate work but use prepared queries
+and weights; projection, RoPE, attention, MoE and serving are excluded.
+
+Nsight Systems on the ordinary 48-row / 1M-capacity / 8K-visible case confirms
+`_prefix_logits` and native ragged TopK replace the full-width score launch and
+PyTorch multi-block TopK. In that instrumented capture, prefix scoring accounts
+for about 88% of GPU kernel time and TopK about 3.5%; use the unprofiled table
+for latency comparisons.
+
+### Validation and reproduction
+
+The original 21-method suite passes with the final code. Six additional methods
+cover prefix scores, poisoned tails, cutoff ties, candidate roles and handoff
+to old/new consumers, optional raw output, unsupported-layout fallback, and
+changing lengths/mappings through graph replay. All six passed H20 memcheck
+with zero errors. A separate graph-replay initcheck covering ordinary, source
+and consumer paths passed without suppressions.
+
+```bash
+PYTHONPATH=python python3 test/registered/kernel/attention/dsv4/test_sm90_length_aware_indexer.py -v
+
+PYTHONPATH=python SM90_PREFIX_BENCH_SEED=11 \
+  SM90_PREFIX_BENCH_CASES='12:524480:4096:2:none,48:1048896:8192:1:none,48:1048896:8192:1:source,48:1048896:8192:1:consumer' \
+  SM90_PREFIX_BENCH_OUTPUT=/tmp/sm90-prefix-seed11.json \
+  python3 test/registered/kernel/attention/dsv4/bench_sm90_length_aware_indexer.py
+```
+
+Repeat with seed 23 and a new filename. The benchmark checks all three paths
+before randomized interleaved timing. For a serving comparison, keep the model
+maximum context, dataset/cache, concurrency, output length, speculative setup
+and warmup policy fixed; keep the grouped flag on in both runs and toggle only
+the length-aware flag across separate server startups.
+
+### Matched serving check
+
+On the measured 8xH20 decode node with a separate, unchanged prefill node,
+both arms retained context length 1048576, TP8/EP8/DP8, DeepGEMM + MegaMoE,
+DSPARK block size 5, static verification and the same Engram setup. Both used
+the existing model override allowing SM90 MegaMoE with DP attention; that
+override is not part of this indexer change. The grouped flag stayed on.
+
+The cached GSP workload used seed 5, one group, 256 prompts, system length
+6484, question length 16 and output length 1500; request concurrency 64 and
+unlimited arrival rate. Before each run, both idle worker caches were flushed,
+then 64 concurrent requests warmed up with 32 output tokens. No profiling ran
+during timed measurements.
+
+| path | output tok/s, run 1 / run 2 | mean TPOT ms, run 1 / run 2 |
+|---|---:|---:|
+| mapped only | 4879.67 / 4686.20 | 11.68 / 12.19 |
+| length-aware | 6181.57 / 6416.27 | 8.51 / 8.22 |
+
+Comparing the two-run arithmetic means gives 4782.93 -> 6298.92 output tok/s
+(+31.7%) and 11.936 -> 8.366 ms TPOT (-29.9%). Every run completed all 256
+requests, with 1698124 input tokens and 384000 generated tokens, and no request
+errors. Eight deterministic arithmetic/extraction/sorting checks per arm,
+including approximately 7.2K-token prompts, also passed with matching answers.
+
+These are two sequential trials per arm, with unlocked clocks, not a full
+quality evaluation or a statistical confidence interval. Even the two baseline
+runs produced different text on 115/256 requests, so byte-identical generation
+is not asserted. Router benchmark output did not expose aggregate acceptance
+length; server logs confirmed active speculative verification. Historical
+results obtained by reducing the context limit are not the baseline here.
+
+The baseline's optional Rust image processor timed out and fell back to PIL.
+The second arm selected PIL explicitly to avoid that startup delay; both
+executed text-only requests. The actual random seed, parallel configuration,
+context and KV capacity were checked against the running services.
+
 ## Historical 64-head H20 A/B
 
 Measured against the **unchanged default path in `dsv4.1` at `4c10906`**, not
@@ -207,7 +343,7 @@ ratios, groups and tail groups; scale/weight boundaries; unaligned cache views;
 poisoned invisible mappings; varying-length replay; default-off and unsupported
 backend dispatch; int32 metadata; candidate source/consumer masks; and TopK /
 physical-index equality, strided request metadata, non-power-of-two TopK sizes,
-optional raw-index output and the large-K fallback. It contains 18 methods and
+optional raw-index output and the large-K fallback. It contains 21 methods and
 uses the existing Triton implementation as its numerical-contract reference,
 plus an exact simple-score case. Tuning also used an independent FP64 reference
 for ordinary finite inputs.
@@ -217,7 +353,8 @@ before the test command, with `TOOL` in `memcheck`, `racecheck`, `initcheck`,
 `synccheck`. A zero sanitizer error summary is not sufficient if output
 assertions fail. Graph replay and numerical contract checks must also pass.
 
-The final candidate passed all 18 ordinary methods. Instrumented validation
+The historical 64-head candidate passed its then-current 18 methods.
+Instrumented validation
 covered these eight methods under each tool: `test_multitile_paths`,
 `test_length_aware_schedule`, `test_backend_graph_replay`,
 `test_backend_long_graph_replay`, `test_backend_topk_sizes_and_optional_raw`,
