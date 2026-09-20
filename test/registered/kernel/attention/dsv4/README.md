@@ -6,16 +6,18 @@ Enable before server startup / CUDA Graph capture:
 export SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER=1
 ```
 
-The default is **off**. This adds a request-grouped logits path to DeepSeek-V4.1
-static target verification on Hopper. It does not change ordinary decode,
-prefill, SM100+, DSpark draft execution, ragged verification, or late-layer-tail
-execution. The backend also retains its existing path for unsupported layouts,
-including 32-head indexers. Enabling the flag is not a promise of a speedup on
-every Hopper configuration.
+The default is **off**. This adds fused-mapping logits to DeepSeek-V4.1 static
+target verification on Hopper. 32-head indexers use mapped Triton at every
+capacity; 64-head indexers also use request-grouped CUDA where profitable.
+It does not change ordinary decode, prefill, SM100+, DSpark draft execution,
+ragged verification, or late-layer-tail execution. Unsupported layouts keep
+the existing path. Enabling the flag is not a promise of a speedup on every
+Hopper configuration.
 
 ## Supported contract
 
-- Contiguous BF16, already fake-FP4 query `[rows, 64, 128]` and BF16 head weights.
+- Contiguous BF16, already fake-FP4 query `[rows, 32 or 64, 128]` and BF16 head
+  weights. Native CUDA WGMMA and K reuse remain specialized for 64 heads.
 - Request-major static verification groups; ratio 1 or 2 and the existing
   packed E2M1 / UE8M0 index-K page layout. The direct operator supports a partial
   final group; the backend requires metadata proving complete static groups.
@@ -30,7 +32,9 @@ against its fixed `56ad1a2` snapshot and then integrated into `dsv4.1`.
 
 ## Selected implementation
 
-1. Use mapped Triton for short shapes; it avoids Q packing and dense slots.
+1. Use mapped Triton for all 32-head and short 64-head shapes; it avoids Q
+   packing and dense slots. Fully invisible tiles only write `-inf`, skipping
+   mapping/Q/K loads, dequantization, dot products and reduction.
 2. Use an 8-head/CTA Q pack for the CUDA branch, matching fake quant's scale floor.
 3. Reuse K across grouped queries, vectorize packed-FP4 conversion, specialize
    aligned page64/ratio2 addressing, and retain a generic unaligned path.
@@ -48,7 +52,83 @@ visibility, maps slots and publishes both outputs. TopK selection/tie-breaking
 remains in PyTorch; larger K retains the torch epilogue. The opt-in path does not
 materialize a dense `[rows, width]` slot matrix.
 
-## H20 A/B
+Both score implementations still produce capacity-width FP32 logits, and
+PyTorch TopK still selects over that width. This change removes dense address
+preparation; it does not add length-aware TopK or candidate-only scoring.
+
+## 32-head validation and A/B
+
+The historical timings below are **64-head** results against `4c10906`, before
+the default invisible-tile optimization. They are not a speedup estimate for
+32-head Flash. Measure against the current default with identical lengths,
+capacity, request groups and candidate roles.
+
+Run the correctness suite first. The 32-head cases check exact logits, selected
+indices, candidate source/consumer masks, insufficient valid positions, optional
+raw output, large-K fallback, poisoned invisible mappings and changing lengths
+and page mappings across CUDA Graph replay. Native 64-head dispatch remains
+covered by the existing tests.
+
+```bash
+PYTHONPATH=python python3 test/registered/kernel/attention/dsv4/test_sm90_fp4_grouped_indexer.py -v
+
+PYTHONPATH=python SM90_INDEXER_BENCH_HEADS=32 SM90_INDEXER_BENCH_RATIO=1 \
+  SM90_INDEXER_BENCH_CASES='12:16384:0.5,48:16384:0.5,12:1048896:0.00781031,48:1048896:0.00781031' \
+  SM90_INDEXER_BENCH_OUTPUT=/tmp/sm90-indexer-32-heads-ratio1.json \
+  python3 test/registered/kernel/attention/dsv4/bench_sm90_fp4_grouped_indexer.py
+
+PYTHONPATH=python SM90_INDEXER_BENCH_HEADS=32 SM90_INDEXER_BENCH_RATIO=2 \
+  SM90_INDEXER_BENCH_CASES='12:8192:0.5,48:8192:0.5,12:524480:0.00781,48:524480:0.00781' \
+  SM90_INDEXER_BENCH_OUTPUT=/tmp/sm90-indexer-32-heads-ratio2.json \
+  python3 test/registered/kernel/attention/dsv4/bench_sm90_fp4_grouped_indexer.py
+```
+
+`width` is measured after compression. Repeat with seed 23 and new output
+filenames. These microbenchmarks include preparation and TopK/epilogue but do
+not include candidate source/consumer selection or serving overhead. For the
+serving A/B, keep context limit, GSP seed/data, 256 requests, concurrency 64,
+output length and speculative settings fixed; toggle only the indexer flag
+before separate server startups/graph captures. Record throughput, TPOT and
+acceptance length without profiling; use a separate short trace to verify
+removal of dense slots preparation and presence of `_sort_map_topk`.
+
+### Measured 32-head H20 results
+
+Measured against the flag-off path at `b8b8fcf2bf` (which already skips
+invisible score tiles), on H20 with PyTorch 2.13.0+cu130 and Triton 3.7.1.
+Clocks were not locked. Group size 6, head dimension 128, page size 64,
+TopK 512; 20 calls per CUDA Graph, nine randomized interleaved rounds,
+100 ms target per path/round. Values below are seed-11 median microseconds.
+All eight cases also passed exact checks and retained the improvement with
+independent seed-23 inputs.
+
+| ratio | rows | capacity width | maximum visible positions | default backend | opt-in backend | reduction |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 12 | 16384 | 8192 | 202.51 | 135.20 | 33.2% |
+| 1 | 48 | 16384 | 8192 | 293.41 | 206.42 | 29.6% |
+| 1 | 12 | 1048896 | 8192 | 1185.92 | 537.55 | 54.7% |
+| 1 | 48 | 1048896 | 8192 | 3793.87 | 1674.62 | 55.9% |
+| 2 | 12 | 8192 | 4096 | 145.34 | 79.83 | 45.1% |
+| 2 | 48 | 8192 | 4096 | 199.93 | 127.96 | 36.0% |
+| 2 | 12 | 524480 | 4096 | 592.23 | 238.01 | 59.8% |
+| 2 | 48 | 524480 | 4096 | 2009.73 | 927.34 | 53.9% |
+
+The two large capacities match the padded bounds observed with a 1,048,576
+model context limit; small capacities are diagnostic comparisons, not a proposed
+serving limit. Within each six-row group, visible lengths decrease by 0..5.
+The 48-row case represents eight requests times six verification tokens on one
+rank, not 48 requests. A separate near-full-prefix check (seed 23, ratio 1,
+6 x 1048896) also passed exact output checks: 2696.37 -> 2198.55 us (18.5%).
+
+All 21 tests passed on H20. The three new 32-head tests also passed
+Compute Sanitizer memcheck with zero reported errors. These measurements use
+prepared queries/weights and exclude candidate source/consumer work, attention,
+MoE and serving overhead; they do not establish an end-to-end throughput gain.
+Capacity still affects the opt-in path through logits writes, fixed-grid launch
+work and full-width PyTorch TopK. Removing dense slots is the first step, not
+complete independence from the maximum context length.
+
+## Historical 64-head H20 A/B
 
 Measured against the **unchanged default path in `dsv4.1` at `4c10906`**, not
 against the unmodified CUDA kernel from PR #40062. GPU: H20, 78 SM; CUDA 13.0,

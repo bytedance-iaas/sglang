@@ -10,7 +10,7 @@ import torch
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 @unittest.skipUnless(
@@ -18,7 +18,9 @@ register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-l
     "requires an SM90 GPU",
 )
 class TestSm90Fp4GroupedIndexer(CustomTestCase):
-    def make_inputs(self, rows=13, width=131, group=6, page=64, ratio=2, seed=11):
+    def make_inputs(
+        self, rows=13, width=131, group=6, page=64, ratio=2, seed=11, heads=64
+    ):
         from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
             store_fp4_index_k_cache,
         )
@@ -30,11 +32,16 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
         pages = groups * pages_per_group
         q = fake_quant_fp4(
             torch.randn(
-                rows, 64, 128, device="cuda", dtype=torch.bfloat16, generator=generator
+                rows,
+                heads,
+                128,
+                device="cuda",
+                dtype=torch.bfloat16,
+                generator=generator,
             )
         )
         weights = torch.randn(
-            rows, 64, device="cuda", dtype=torch.bfloat16, generator=generator
+            rows, heads, device="cuda", dtype=torch.bfloat16, generator=generator
         )
         req = torch.arange(groups, device="cuda", dtype=torch.int64).repeat_interleave(
             group
@@ -161,6 +168,30 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
                 self.assertFalse(_prefer_triton(rows, width))
         self.assertTrue(_prefer_triton(23, 512))
         self.assertFalse(_prefer_triton(95, 512))
+
+    def test_32_head_mapped_logits(self):
+        from sglang.kernels.ops.attention.dsv4 import (
+            sm90_fp4_grouped_indexer as grouped,
+        )
+
+        # Cover tile boundaries, partial groups and poisoned invisible mappings.
+        # Long 32-head rows must never enter the 64-head native kernel.
+        for width, page, ratio in ((257, 16, 1), (65536, 64, 2)):
+            with self.subTest(width=width, page=page, ratio=ratio):
+                x = self.make_inputs(width=width, page=page, ratio=ratio, heads=32)
+                x.lens.copy_(
+                    torch.tensor(
+                        [0, 1, 63, 64, 65, 127, 0, 1, 63, 64, 65, 127, width],
+                        device="cuda",
+                    )
+                )
+                x.mapping[:2, 127 * ratio :] = 2**30
+                with patch.object(
+                    grouped,
+                    "_sm90_fp4_grouped_indexer_op",
+                    side_effect=AssertionError("32 heads entered native WGMMA"),
+                ):
+                    self.check(x)
 
     def test_multitile_paths(self):
         # Exercise TPC=2/4/8 and resident-Q reuse, including under sanitizers.
@@ -484,7 +515,7 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
         )
         from sglang.srt.environ import envs
 
-        for heads, group_size in ((32, 6), (64, 1)):
+        for heads, group_size in ((16, 6), (32, 1), (64, 1)):
             with self.subTest(heads=heads, group_size=group_size):
                 x = self.make_inputs(rows=12, width=512)
                 x.q = x.q[:, :heads].contiguous()
@@ -504,6 +535,64 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
                     case.run(group_size)
                 torch.testing.assert_close(case.pages, pages, atol=0, rtol=0)
                 torch.testing.assert_close(case.raw, raw, atol=0, rtol=0)
+
+    def test_backend_32_head_mapped_outputs(self):
+        from sglang.kernels.ops.attention.dsv4 import (
+            sm90_fp4_grouped_indexer as grouped,
+        )
+        from sglang.kernels.ops.attention.dsv4 import (
+            sm90_fp4_topk,
+        )
+        from sglang.srt.environ import envs
+
+        option = envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER
+        for ratio, role, topk, has_raw in (
+            (1, "none", 512, True),
+            (2, "source", 512, True),
+            (1, "consumer", 513, True),
+            (2, "consumer", 31, False),
+            (2, "none", 1025, True),
+        ):
+            with self.subTest(ratio=ratio, role=role, topk=topk, has_raw=has_raw):
+                x = self.make_inputs(rows=12, width=4096, ratio=ratio, heads=32)
+                x.lens[:6] = torch.arange(6, device="cuda") * 17
+                case = self.make_backend_case(x, role, topk)
+                if not has_raw:
+                    case.state.forward_metadata.core_metadata.sparse_raw_indices = (
+                        lambda _: None
+                    )
+                with option.override(False):
+                    case.run()
+                pages = case.pages.clone()
+                raw = case.raw.clone() if has_raw else None
+                mask = case.state.forward_metadata.candidate_metadata.mask.clone()
+                with (
+                    option.override(True),
+                    patch.object(
+                        grouped,
+                        "_sm90_fp4_grouped_indexer_op",
+                        side_effect=AssertionError("32 heads entered native WGMMA"),
+                    ),
+                    patch.object(
+                        grouped,
+                        "fp4_index_logits_grouped_sm90",
+                        wraps=grouped.fp4_index_logits_grouped_sm90,
+                    ) as score,
+                    patch.object(
+                        sm90_fp4_topk,
+                        "sort_map_topk",
+                        wraps=sm90_fp4_topk.sort_map_topk,
+                    ) as epilogue,
+                ):
+                    case.run()
+                    score.assert_called_once()
+                    self.assertEqual(epilogue.call_count, int(topk <= 1024))
+                torch.testing.assert_close(case.pages, pages, atol=0, rtol=0)
+                if has_raw:
+                    torch.testing.assert_close(case.raw, raw, atol=0, rtol=0)
+                torch.testing.assert_close(
+                    case.state.forward_metadata.candidate_metadata.mask, mask
+                )
 
     def test_backend_int32_metadata(self):
         from sglang.srt.environ import envs
@@ -569,11 +658,14 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
     def test_backend_long_graph_replay(self):
         self.check_backend_graph_replay(131072)
 
-    def check_backend_graph_replay(self, width):
+    def test_backend_32_head_graph_replay(self):
+        self.check_backend_graph_replay(131072, heads=32)
+
+    def check_backend_graph_replay(self, width, heads=64):
         from sglang.srt.environ import envs
 
         option = envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER
-        x = self.make_inputs(rows=12, width=width)
+        x = self.make_inputs(rows=12, width=width, heads=heads)
         case = self.make_backend_case(x, topk=512)
         with option.override(True):
             for _ in range(3):

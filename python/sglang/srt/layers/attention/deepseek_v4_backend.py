@@ -3617,7 +3617,7 @@ class DeepseekV4AttnBackend(
             and torch.version.cuda is not None
             and torch.cuda.get_device_capability(q.device)[0] == 9
             and q.dtype == weights.dtype == torch.bfloat16
-            and q.shape[1:] == (64, 128)
+            and q.shape[1:] in ((32, 128), (64, 128))
             and q.is_contiguous()
             and weights.is_contiguous()
             and self.req_to_token.dtype == torch.int32

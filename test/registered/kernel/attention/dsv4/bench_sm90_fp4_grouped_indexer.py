@@ -8,7 +8,10 @@ inputs, so these numbers are not end-to-end serving latency.
 
 Optional environment variables: SM90_INDEXER_BENCH_CASES (comma-separated
 rows:width:visible_fraction), SM90_INDEXER_BENCH_SEED, SM90_INDEXER_BENCH_ROUNDS,
-SM90_INDEXER_BENCH_MS, and SM90_INDEXER_BENCH_OUTPUT (a new JSON filename).
+SM90_INDEXER_BENCH_MS, SM90_INDEXER_BENCH_HEADS (32 or 64, default 64),
+SM90_INDEXER_BENCH_RATIO (1 or 2, default 2), and SM90_INDEXER_BENCH_OUTPUT
+(a new JSON filename). Set HEADS=32 for the Flash workload; its opt-in path
+uses mapped Triton, not the 64-head grouped CUDA kernel.
 """
 
 import json
@@ -85,6 +88,10 @@ def benchmark():
     if output and Path(output).exists():
         raise FileExistsError(f"Refusing to overwrite benchmark results: {output}")
     seed = int(os.getenv("SM90_INDEXER_BENCH_SEED", "11"))
+    heads = int(os.getenv("SM90_INDEXER_BENCH_HEADS", "64"))
+    ratio = int(os.getenv("SM90_INDEXER_BENCH_RATIO", "2"))
+    if heads not in (32, 64) or ratio not in (1, 2):
+        raise ValueError("HEADS must be 32 or 64 and RATIO must be 1 or 2")
     rounds = int(os.getenv("SM90_INDEXER_BENCH_ROUNDS", "9"))
     target_ms = float(os.getenv("SM90_INDEXER_BENCH_MS", "100"))
     cases = get_benchmark_range(
@@ -115,7 +122,9 @@ def benchmark():
             raise ValueError(
                 "Backend benchmark requires full groups of 6 and width > 0"
             )
-        x = fixture.make_inputs(rows=rows, width=width, seed=seed)
+        x = fixture.make_inputs(
+            rows=rows, width=width, seed=seed, heads=heads, ratio=ratio
+        )
         x.lens.copy_(
             (int(width * fraction) - torch.arange(rows, device="cuda") % 6).clamp_min(0)
         )
@@ -158,8 +167,9 @@ def benchmark():
             "case": shape,
             "seed": seed,
             "group": 6,
+            "heads": heads,
             "page": 64,
-            "ratio": 2,
+            "ratio": ratio,
             "topk": 512,
             "correct": True,
             "times": times,
