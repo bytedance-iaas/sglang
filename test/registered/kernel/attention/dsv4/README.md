@@ -264,6 +264,78 @@ The second arm selected PIL explicitly to avoid that startup delay; both
 executed text-only requests. The actual random seed, parallel configuration,
 context and KV capacity were checked against the running services.
 
+## Compact candidates on the length-aware path
+
+This selectively adopts the compact-candidate idea from iaas PR #796 while
+retaining persistent prefix scoring and the H20-safe non-cluster ragged TopK.
+Enable the additional, default-off switch before graph capture:
+
+```bash
+export SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER=1
+export SGLANG_OPT_DSV41_SM90_LENGTH_AWARE_INDEXER=1
+export SGLANG_OPT_DSV41_SM90_COMPACT_CANDIDATES=1
+```
+
+Sources reuse their prefix scores for both block selection and final token
+TopK. They publish sorted int32 block IDs instead of a capacity-width bool
+mask. When all visible blocks fit the budget, the device builds the ordered
+prefix directly; rows containing excluded blocks still compact correctly.
+
+Consumers score only positions in the selected blocks, with a score allocation
+bounded by `topk_blocks * block_size`. Contiguous-prefix lists avoid the block
+gather. A small preparation kernel fuses visible/compact length calculation,
+and the final publish kernel maps compact indices back to logical and physical
+positions. With the production 2048 x 8 budget, consumer scores use at most
+16384 positions per row even when the model capacity is 1M.
+
+Lengths, block IDs and prefix flags remain on the GPU and may change between
+graph replays. The same captured graph supports both short and sparse long
+contexts. The model context limit is unchanged. Ordinary/source score buffers
+and block-score buffers still have capacity-sized allocations, but only their
+valid prefixes are initialized/read. Full bool masks are generated only when
+a subsequent layer requires the older fallback path; they are not cached
+across graph replays.
+
+Four additional regression methods cover the H20 6-row / 1M-capacity shape,
+compact-to-mask handoff, excluded blocks, partial blocks, non-power-of-two K,
+underfilled TopK without raw output, and graph replay across dense/sparse/empty
+candidate layouts. They extend the same length-aware test file above.
+
+```bash
+PYTHONPATH=python python3 test/registered/kernel/attention/dsv4/test_sm90_length_aware_indexer.py -v
+
+PYTHONPATH=python SM90_COMPACT_BENCH_SEED=11 \
+  SM90_COMPACT_BENCH_OUTPUT=/tmp/sm90-compact-seed11.json \
+  python3 test/registered/kernel/attention/dsv4/bench_sm90_compact_candidates.py
+```
+
+The benchmark compares the existing full-mask path with the compact path on
+identical inputs and candidate sets. Its default cases use 8K and 128K visible
+prefixes with 1M capacity. `SM90_COMPACT_BENCH_CASES` accepts comma-separated
+`rows:capacity:visible:ratio:source|consumer` entries. Projection, RoPE,
+attention, MoE and serving are excluded, so these timings are not serving
+throughput or model-quality measurements.
+
+On H20, seven interleaved rounds with ten calls per CUDA Graph gave the
+following median microseconds (32 heads, TopK 512, 2048 x 8 candidates):
+
+| rows | capacity | visible | ratio | role | full mask | compact |
+|---:|---:|---:|---:|---|---:|---:|
+| 48 | 1048896 | 8192 | 1 | source | 168.93 | 143.98 |
+| 48 | 1048896 | 8192 | 1 | consumer | 147.79 | 143.84 |
+| 48 | 1048896 | 131072 | 1 | source | 2066.53 | 2058.65 |
+| 48 | 1048896 | 131072 | 1 | consumer | 1531.54 | 300.54 |
+| 48 | 524480 | 4096 | 2 | source | 95.55 | 82.73 |
+| 48 | 524480 | 4096 | 2 | consumer | 84.11 | 82.29 |
+| 6 | 1048896 | 8192 | 1 | source | 41.19 | 36.43 |
+| 6 | 1048896 | 8192 | 1 | consumer | 35.38 | 32.56 |
+| 6 | 1048896 | 1048576 | 1 | consumer | 576.53 | 52.84 |
+
+The original 21-method suite and all ten length-aware methods pass. The ten
+length-aware methods also pass Compute Sanitizer memcheck with zero errors.
+A separate initcheck replay of source, compact consumer and mask fallback,
+covering both ratios, passes with zero errors and no suppressions.
+
 ## Historical 64-head H20 A/B
 
 Measured against the **unchanged default path in `dsv4.1` at `4c10906`**, not
