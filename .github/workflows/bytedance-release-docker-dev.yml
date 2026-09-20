@@ -1,5 +1,9 @@
 name: Bytedance Build and Push Development Docker Images
 
+permissions:
+  actions: read
+  contents: read
+
 on:
   workflow_dispatch:
     inputs:
@@ -37,6 +41,11 @@ on:
         required: false
         type: boolean
         default: true
+      kernel_artifact_run_id:
+        description: "Reuse sgl-kernel-x86-cu13 from this workflow run ID instead of rebuilding it"
+        required: false
+        type: string
+        default: ""
       image_formats:
         description: "Volcengine fork only: CSV of image formats to build (oci, zstd, nydus)."
         required: false
@@ -289,7 +298,7 @@ jobs:
             --push .
 
   build-dev-kernel-wheel:
-    if: ${{ github.repository == 'bytedance-iaas/sglang' && !inputs.private_debug_base_only && inputs.private_debug_verify_image == '' && (github.event_name == 'schedule' || inputs.compile_kernel) }}
+    if: ${{ github.repository == 'bytedance-iaas/sglang' && !inputs.private_debug_base_only && inputs.private_debug_verify_image == '' && inputs.kernel_artifact_run_id == '' && (github.event_name == 'schedule' || inputs.compile_kernel) }}
     strategy:
       fail-fast: false
       matrix:
@@ -327,12 +336,13 @@ jobs:
       tag_mode: ${{ github.event_name == 'schedule' && 'nightly' || 'manual' }}
       tag_value: ${{ inputs.tag }}
       use_environment: prod
-      artifact_name: ${{ (github.event_name == 'schedule' || inputs.compile_kernel) && matrix.artifact_name || '' }}
+      artifact_name: ${{ (inputs.kernel_artifact_run_id != '' || github.event_name == 'schedule' || inputs.compile_kernel) && matrix.artifact_name || '' }}
+      artifact_run_id: ${{ inputs.kernel_artifact_run_id }}
       image_formats: ${{ github.event_name == 'schedule' && 'oci,zstd,nydus' || inputs.image_formats }}
       extra_build_args: >-
         --build-arg BRANCH_TYPE=local
         --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
-        --build-arg INSTALL_LOCAL_SGL_KERNEL_WHEEL=${{ (github.event_name == 'schedule' || inputs.compile_kernel) && '1' || '0' }}
+        --build-arg INSTALL_LOCAL_SGL_KERNEL_WHEEL=${{ (inputs.kernel_artifact_run_id != '' || github.event_name == 'schedule' || inputs.compile_kernel) && '1' || '0' }}
         --build-arg HTTP_PROXY=http://100.68.162.211:3128
         --build-arg HTTPS_PROXY=http://100.68.162.211:3128
         --build-arg ALL_PROXY=http://100.68.162.211:3128
