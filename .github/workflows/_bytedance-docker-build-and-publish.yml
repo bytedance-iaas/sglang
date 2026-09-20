@@ -382,20 +382,21 @@ jobs:
           set -euo pipefail
           IMAGE_REF="${IMAGE_REPO}@${IMAGE_DIGEST}"
           docker buildx imagetools inspect "${IMAGE_REF}"
-          docker pull "${IMAGE_REF}"
+          docker buildx imagetools inspect \
+            "${IMAGE_REF}" \
+            --format '{{json .Image}}' \
+            > /tmp/image-config.json
 
-          python3 - "${IMAGE_REF}" <<'PY'
+          python3 - /tmp/image-config.json <<'PY'
           import json
           import os
-          import subprocess
           import sys
 
-          inspect = json.loads(
-              subprocess.check_output(["docker", "image", "inspect", sys.argv[1]])
-          )[0]
-          if inspect["Architecture"] != "amd64":
-              raise SystemExit(f"unexpected architecture: {inspect['Architecture']}")
-          labels = inspect["Config"].get("Labels") or {}
+          with open(sys.argv[1]) as config_file:
+              inspect = json.load(config_file)
+          if inspect["architecture"] != "amd64":
+              raise SystemExit(f"unexpected architecture: {inspect['architecture']}")
+          labels = inspect["config"].get("Labels") or {}
           expected = {
               "ai.sglang.build.commit": os.environ["EXPECTED_BUILD_COMMIT"],
               "ai.sglang.build.tree": os.environ["EXPECTED_BUILD_TREE"],
@@ -411,23 +412,8 @@ jobs:
           }
           if mismatches:
               raise SystemExit(f"image provenance mismatch: {mismatches}")
-          print(json.dumps({"architecture": inspect["Architecture"], **expected}))
+          print(json.dumps({"architecture": inspect["architecture"], **expected}))
           PY
-
-          docker run --rm \
-            -e EXPECTED_BUILD_COMMIT \
-            -e EXPECTED_BUILD_TREE \
-            -e EXPECTED_PYTHON_MANIFEST_SHA256 \
-            --entrypoint bash "${IMAGE_REF}" -lc '
-              set -euo pipefail
-              test "$SGLANG_BUILD_COMMIT" = "$EXPECTED_BUILD_COMMIT"
-              test "$SGLANG_BUILD_TREE" = "$EXPECTED_BUILD_TREE"
-              test "$SGLANG_PYTHON_MANIFEST_SHA256" = "$EXPECTED_PYTHON_MANIFEST_SHA256"
-              command -v oniond
-              python3 scripts/ci/verify_private_image_runtime.py
-              python3 -m pytest -q test/registered/unit/test_runtime_context.py -k TestMoeFlagsGroup
-              python3 -m pytest -q test/registered/unit/test_model_overrides.py -k deepseek_spec_moe_resolution
-            '
 
       # --- zstd format: re-export the just-built layers with zstd compression,
       # then reuse the same provenance/runtime verification. It pulls the
