@@ -1,0 +1,270 @@
+{
+  "decode-baseline": {
+    "source_trace": "raw/baseline/decode/baseline-decode-1789585247.6273081-TP-7-DP-7-EP-7.trace.json.gz",
+    "source_sha256": "a37dec8af50fcb3dd230460f2531c1755d33e240894d673097950b2166c3f385",
+    "png_sha256": "52df53c39a0e1cafc8313db8b63d57b5f7470723626580cab763cb6b5c2f5dfc",
+    "expected_compute_kernels": 9,
+    "all_selected_kernels_preserved": true,
+    "source_first_kernel": {
+      "id": "563390",
+      "name": "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT",
+      "ts": "6617465174574394",
+      "dur": "58559",
+      "track_id": "9"
+    },
+    "original_track_name": "stream 100  100",
+    "original_track_uri": "/slice_9",
+    "source_selected_start_ns": "6617465174574394",
+    "source_selected_end_ns": "6617465174660377",
+    "viewport_start_ns": "6617465174570394",
+    "viewport_end_ns": "6617465174670394",
+    "import_errors": [
+      {
+        "name": "slice_spill_overlapping_complete_event",
+        "value": "781"
+      }
+    ],
+    "imported_kernels": [
+      {
+        "name": "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT",
+        "ts": "6617465174574394",
+        "dur": "58559",
+        "track_id": "9"
+      },
+      {
+        "name": "nvjet_sm90_tst_64x8_64x16_1x1_h_bz_splitK_TNT",
+        "ts": "6617465174633561",
+        "dur": "4288",
+        "track_id": "9"
+      },
+      {
+        "name": "void cublasLt::splitKreduce_kernel<32, 16, int, float, __nv_bfloat16, float, __nv_bfloat16, false, float, __nv_bfloat16, __nv_bfloat16, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, __nv_bfloat16 const*, float*, __nv_bfloat16*, float const*, float const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)",
+        "ts": "6617465174638201",
+        "dur": "1568",
+        "track_id": "9"
+      },
+      {
+        "name": "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_splitK_TNT",
+        "ts": "6617465174640217",
+        "dur": "5056",
+        "track_id": "9"
+      },
+      {
+        "name": "void cublasLt::splitKreduce_kernel<32, 16, int, float, __nv_bfloat16, float, __nv_bfloat16, false, float, __nv_bfloat16, __nv_bfloat16, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, __nv_bfloat16 const*, float*, __nv_bfloat16*, float const*, float const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)",
+        "ts": "6617465174645369",
+        "dur": "1472",
+        "track_id": "9"
+      },
+      {
+        "name": "nvjet_sm90_tst_128x8_64x12_2x1_v_bz_TNT",
+        "ts": "6617465174647321",
+        "dur": "3264",
+        "track_id": "9"
+      },
+      {
+        "name": "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_splitK_TNT",
+        "ts": "6617465174651033",
+        "dur": "4320",
+        "track_id": "9"
+      },
+      {
+        "name": "void cublasLt::splitKreduce_kernel<32, 16, int, float, __nv_bfloat16, float, __nv_bfloat16, false, float, __nv_bfloat16, __nv_bfloat16, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, __nv_bfloat16 const*, float*, __nv_bfloat16*, float const*, float const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)",
+        "ts": "6617465174655481",
+        "dur": "1440",
+        "track_id": "9"
+      },
+      {
+        "name": "nvjet_sm90_tst_128x8_64x12_2x1_v_bz_TNT",
+        "ts": "6617465174657401",
+        "dur": "2976",
+        "track_id": "9"
+      }
+    ],
+    "step_name": "step[DECODE bs=1 g_sq=1 g_sqsq=1 g_sqsk=49183 g_sk=49183]",
+    "screenshot_clip": {
+      "x": 230,
+      "y": 114,
+      "width": 1570,
+      "height": 136
+    },
+    "selection_kind": "area",
+    "selected_span_us": 85.983
+  },
+  "decode-candidate": {
+    "source_trace": "raw/candidate/decode/candidate-decode-1789585654.065437-TP-7-DP-7-EP-7.trace.json.gz",
+    "source_sha256": "666ae0d66ef4d456eaddfc83b0c2ba20f39e00f96193e0cb69a81640cf0ff9ba",
+    "png_sha256": "c59ec416377d17460968d2aeb2703c8b7ad75010fec017caada54b930925f4d7",
+    "expected_compute_kernels": 2,
+    "all_selected_kernels_preserved": true,
+    "source_first_kernel": {
+      "id": "567337",
+      "name": "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT",
+      "ts": "6617871643073339",
+      "dur": "59488",
+      "track_id": "9"
+    },
+    "original_track_name": "stream 100  100",
+    "original_track_uri": "/slice_9",
+    "source_selected_start_ns": "6617871643073339",
+    "source_selected_end_ns": "6617871643137339",
+    "viewport_start_ns": "6617871643069339",
+    "viewport_end_ns": "6617871643169339",
+    "import_errors": [
+      {
+        "name": "slice_spill_overlapping_complete_event",
+        "value": "832"
+      }
+    ],
+    "imported_kernels": [
+      {
+        "name": "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT",
+        "ts": "6617871643073339",
+        "dur": "59488",
+        "track_id": "9"
+      },
+      {
+        "name": "nvjet_sm90_tst_256x8_64x6_2x1_v_bz_TNT",
+        "ts": "6617871643133435",
+        "dur": "3904",
+        "track_id": "9"
+      }
+    ],
+    "step_name": "step[DECODE bs=1 g_sq=1 g_sqsq=1 g_sqsk=49183 g_sk=49183]",
+    "screenshot_clip": {
+      "x": 230,
+      "y": 114,
+      "width": 1570,
+      "height": 136
+    },
+    "selection_kind": "area",
+    "selected_span_us": 64
+  },
+  "prefill-baseline": {
+    "source_trace": "raw/baseline/prefill/baseline-prefill-1789585234.631419-TP-0-EP-0.trace.json.gz",
+    "source_sha256": "b2dd9f8e384fca2f1a9211021bee78c72fb986dc0dc05ffe58d7bda6005b06fc",
+    "png_sha256": "b64cd050d5a9c273e255c7b1534a54a13683f19d124161a245a5516296b77a9f",
+    "expected_compute_kernels": 7,
+    "all_selected_kernels_preserved": true,
+    "source_first_kernel": {
+      "id": "89729",
+      "name": "nvjet_sm90_tst_192x192_64x4_2x1_v_bz_coopB_TNN",
+      "ts": "6617449184476803",
+      "dur": "1495237",
+      "track_id": "9"
+    },
+    "original_track_name": "stream 100  100",
+    "original_track_uri": "/slice_9",
+    "source_selected_start_ns": "6617449184476803",
+    "source_selected_end_ns": "6617449186209544",
+    "viewport_start_ns": "6617449184426803",
+    "viewport_end_ns": "6617449186326803",
+    "import_errors": [
+      {
+        "name": "slice_spill_overlapping_complete_event",
+        "value": "327"
+      }
+    ],
+    "imported_kernels": [
+      {
+        "name": "nvjet_sm90_tst_192x192_64x4_2x1_v_bz_coopB_TNN",
+        "ts": "6617449184476803",
+        "dur": "1495237",
+        "track_id": "9"
+      },
+      {
+        "name": "nvjet_sm90_tst_8x64_64x16_1x2_h_bz_splitK_TNN",
+        "ts": "6617449185975976",
+        "dur": "24192",
+        "track_id": "9"
+      },
+      {
+        "name": "void cublasLt::splitKreduce_kernel<32, 16, int, float, __nv_bfloat16, float, __nv_bfloat16, false, float, __nv_bfloat16, __nv_bfloat16, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, __nv_bfloat16 const*, float*, __nv_bfloat16*, float const*, float const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)",
+        "ts": "6617449186000520",
+        "dur": "4480",
+        "track_id": "9"
+      },
+      {
+        "name": "nvjet_sm90_tst_128x128_64x6_1x2_h_bz_TNT",
+        "ts": "6617449186006440",
+        "dur": "77952",
+        "track_id": "9"
+      },
+      {
+        "name": "nvjet_sm90_tst_176x128_64x5_1x2_h_bz_TNN",
+        "ts": "6617449186088840",
+        "dur": "19296",
+        "track_id": "9"
+      },
+      {
+        "name": "nvjet_sm90_tst_128x128_64x6_1x2_h_bz_TNT",
+        "ts": "6617449186109448",
+        "dur": "77344",
+        "track_id": "9"
+      },
+      {
+        "name": "nvjet_sm90_tst_176x128_64x5_1x2_h_bz_TNN",
+        "ts": "6617449186190632",
+        "dur": "18912",
+        "track_id": "9"
+      }
+    ],
+    "step_name": "step[EXTEND bs=1 toks=8192 c_sq=8192 c_sqsq=67108864 c_sqsk=201326592 c_sk=24576]",
+    "screenshot_clip": {
+      "x": 230,
+      "y": 114,
+      "width": 1570,
+      "height": 172
+    },
+    "selection_kind": "area",
+    "selected_span_us": 1732.741
+  },
+  "prefill-candidate": {
+    "source_trace": "raw/candidate/prefill/candidate-prefill-1789585641.355409-TP-0-EP-0.trace.json.gz",
+    "source_sha256": "777429b9aa856cbd7de0fa290d4e6f309cbba810cd726ed21ac28d65f6f0b954",
+    "png_sha256": "a687c14b8e0949d60c46aa4b7cb3cc203dd504c01faaf0844b32a5cee0bebd77",
+    "expected_compute_kernels": 2,
+    "all_selected_kernels_preserved": true,
+    "source_first_kernel": {
+      "id": "88664",
+      "name": "nvjet_sm90_tst_160x256_64x4_1x2_h_bz_coopA_TNN",
+      "ts": "6617855910569804",
+      "dur": "1661670",
+      "track_id": "9"
+    },
+    "original_track_name": "stream 100  100",
+    "original_track_uri": "/slice_9",
+    "source_selected_start_ns": "6617855910569804",
+    "source_selected_end_ns": "6617855912272370",
+    "viewport_start_ns": "6617855910519804",
+    "viewport_end_ns": "6617855912419804",
+    "import_errors": [
+      {
+        "name": "slice_spill_overlapping_complete_event",
+        "value": "307"
+      }
+    ],
+    "imported_kernels": [
+      {
+        "name": "nvjet_sm90_tst_160x256_64x4_1x2_h_bz_coopA_TNN",
+        "ts": "6617855910569804",
+        "dur": "1661670",
+        "track_id": "9"
+      },
+      {
+        "name": "nvjet_sm90_tst_128x192_64x5_2x1_v_bz_coopB_TNN",
+        "ts": "6617855912236786",
+        "dur": "35584",
+        "track_id": "9"
+      }
+    ],
+    "step_name": "step[EXTEND bs=1 toks=8192 c_sq=8192 c_sqsq=67108864 c_sqsk=201326592 c_sk=24576]",
+    "screenshot_clip": {
+      "x": 230,
+      "y": 114,
+      "width": 1570,
+      "height": 172
+    },
+    "selection_kind": "area",
+    "selected_span_us": 1702.566
+  }
+}
