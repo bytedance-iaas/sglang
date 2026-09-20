@@ -1533,6 +1533,11 @@ class Envs:
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
+    # Reuse each decoded FP4 K tile across request-major target-verify rows on
+    # SM90. Unsupported layouts and non-static verify keep the Triton path.
+    SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER = EnvBool(False)
+    # Grouped kernel implementation: auto, persistent, or pipeline.
+    SGLANG_DSV41_SM90_GROUPED_INDEXER_MODE = EnvStr("auto")
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)

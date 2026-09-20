@@ -84,7 +84,6 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
 from sglang.srt.layers.attention.dsv4.indexer import (
     C4IndexerBackendMixin,
     deep_gemm_fp4_paged_mqa_logits,
-    select_candidate_blocks,
     topk_transform_paged_from_metadata,
 )
 from sglang.srt.layers.attention.dsv4.metadata import (
@@ -3595,6 +3594,23 @@ class DeepseekV4AttnBackend(
         q = indexer.queries(q_lora, layer.freqs_cis[pos])
         weights = indexer.head_weights(x)
         logical_forward_mode = _get_logical_forward_mode(forward_batch)
+        group_size = 1
+        if (
+            envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER.get()
+            and logical_forward_mode.is_target_verify()
+            and not self.is_dspark_draft
+            and read_ragged_verify_mode() is RaggedVerifyMode.STATIC
+            and self.forward_metadata.late_layer_tail is None
+            and self.speculative_num_draft_tokens is not None
+            and self.speculative_num_draft_tokens > 1
+            and forward_batch.spec_info.draft_token_num
+            == self.speculative_num_draft_tokens
+            and req.shape[0]
+            == forward_batch.batch_size * self.speculative_num_draft_tokens
+            and x.shape[0] == q_lora.shape[0] == req.shape[0]
+        ):
+            # Static verify is request-major with a fixed number of rows.
+            group_size = self.speculative_num_draft_tokens
         compact = (
             (
                 logical_forward_mode.is_decode()
@@ -3655,17 +3671,52 @@ class DeepseekV4AttnBackend(
             )
         else:
             table = pool.get_index_k_with_scale_buffer(layer.layer_id)
-            s = fp4_index_logits_req_to_token(
-                q,
-                weights,
-                self.req_to_token,
-                req,
-                lens,
-                table,
-                table.shape[1] // 68,
-                ratio,
-                lmax,
+            use_grouped = (
+                group_size > 1
+                and ratio in (1, 2)
+                and q.is_cuda
+                and torch.version.cuda is not None
+                and torch.cuda.get_device_capability(q.device)[0] == 9
+                and q.dtype == weights.dtype == torch.bfloat16
+                and q.shape[1:] == (64, 128)
+                and q.is_contiguous()
+                and weights.is_contiguous()
+                and self.req_to_token.dtype == torch.int32
+                and self.req_to_token.stride(1) == 1
+                and table.dtype == torch.uint8
+                and table.dim() == 2
+                and table.stride(1) == 1
             )
+            if use_grouped:
+                from sglang.kernels.ops.attention.dsv4.sm90_fp4_grouped_indexer import (
+                    fp4_index_logits_grouped_sm90,
+                )
+
+                s = fp4_index_logits_grouped_sm90(
+                    q,
+                    weights,
+                    self.req_to_token,
+                    req.to(torch.int64).contiguous(),
+                    lens.to(torch.int64).contiguous(),
+                    table,
+                    table.shape[1] // 68,
+                    ratio,
+                    lmax,
+                    group_size,
+                    implementation=envs.SGLANG_DSV41_SM90_GROUPED_INDEXER_MODE.get(),
+                )
+            else:
+                s = fp4_index_logits_req_to_token(
+                    q,
+                    weights,
+                    self.req_to_token,
+                    req,
+                    lens,
+                    table,
+                    table.shape[1] // 68,
+                    ratio,
+                    lmax,
+                )
         if indexer.is_candidate_source and not compact:
             self.candidate_masks = select_candidate_blocks(
                 s,
