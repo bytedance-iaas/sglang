@@ -286,7 +286,11 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "--enable-encoder-swa-bounded-replay requires DeepSeek-V4.1"
             )
         return
-    if cfg.pp_size > 1 and not envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
+    if (
+        cfg.pp_size > 1
+        and not envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.is_set()
+        and not envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get()
+    ):
         envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.set(True)
         logger.info(
             "Using host-resident DeepSeek-V4.1 Engram tables for pipeline "

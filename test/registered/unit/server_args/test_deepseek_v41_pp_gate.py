@@ -83,7 +83,7 @@ class TestDeepSeekV41PPGate(unittest.TestCase):
                         )
 
     def test_execution_options_do_not_restrict_pp_deployment(self):
-        self.assertTrue(
+        self.assertFalse(
             _validate(
                 _config(disable_flashinfer_autotune=False, pp_async_batch_depth=2),
                 host_engram=False,
