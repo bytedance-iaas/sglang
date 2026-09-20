@@ -848,6 +848,13 @@ class SchedulerPPMixin:
         self.send_req_work = []
         self.send_proxy_work = []
         self.send_output_work = []
+        # In the depth-zero disaggregated Prefill loop, the last stage starts
+        # an output relay in slot i, but rank 0 does not receive that payload
+        # until slot (i - 1) % pp_loop_size. A single work list is sufficient
+        # for PP2, where that is the next slot, but waits too early for deeper
+        # pipelines. Keep each origin send alive until its matching result has
+        # completed the full ring.
+        self.pp_origin_output_work = [[] for _ in range(self.pp_loop_size)]
         self.launch_event = None
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
             defaultdict(deque)
@@ -1265,12 +1272,14 @@ class SchedulerPPMixin:
         Optional[GenerationBatchResult],
         Optional[torch.Event],
     ]:
-        self._pp_commit_comm_work(work=self.send_output_work)
+        defer_origin_send = relay_output_immediately and self.pp_group.is_last_rank
+        if not defer_origin_send:
+            self._pp_commit_comm_work(work=self.send_output_work)
         (
             next_pp_outputs,
             next_batch_result,
             d2h_event,
-            self.send_output_work,
+            new_send_output_work,
         ) = self._pp_send_recv_and_preprocess_output_tensors(
             next_first_rank_mb_id,
             next_mb_id,
@@ -1280,6 +1289,18 @@ class SchedulerPPMixin:
             self.pp_outputs,
             relay_output_immediately=relay_output_immediately,
         )
+        if defer_origin_send:
+            if next_pp_outputs is not None:
+                self._pp_commit_comm_work(work=self.pp_origin_output_work[next_mb_id])
+            if new_send_output_work:
+                assert not self.pp_origin_output_work[next_first_rank_mb_id], (
+                    "PP output origin slot reused before its previous send "
+                    f"completed: slot={next_first_rank_mb_id}"
+                )
+                self.pp_origin_output_work[next_first_rank_mb_id] = new_send_output_work
+            self.send_output_work = []
+        else:
+            self.send_output_work = new_send_output_work
         return next_pp_outputs, next_batch_result, d2h_event
 
     def _pp_send_pyobj_to_next_stage(

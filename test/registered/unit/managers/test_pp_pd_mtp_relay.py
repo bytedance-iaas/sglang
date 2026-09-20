@@ -515,6 +515,67 @@ def test_pp_disagg_output_origin_send_survives_empty_return_slot():
     scheduler._pp_commit_comm_work.assert_not_called()
 
 
+def test_pp_disagg_output_origin_send_waits_for_its_return_slot():
+    old_origin_work = [object()]
+    new_origin_work = [object()]
+    returned_output = object()
+    scheduler = SimpleNamespace(
+        pp_group=SimpleNamespace(is_last_rank=True),
+        send_output_work=[],
+        pp_origin_output_work=[old_origin_work, [], [], []],
+        pp_outputs=None,
+        mbs=[object()] * 4,
+        mb_metadata=[object()] * 4,
+        last_rank_comm_queue=deque(),
+        _pp_send_recv_and_preprocess_output_tensors=Mock(
+            return_value=(returned_output, object(), object(), new_origin_work)
+        ),
+        _pp_commit_comm_work=Mock(side_effect=lambda work: work.clear()),
+    )
+
+    SchedulerPPMixin._pp_commit_send_output_work_and_preprocess_output_tensors(
+        scheduler,
+        next_first_rank_mb_id=3,
+        next_mb_id=0,
+        relay_output_immediately=True,
+    )
+
+    scheduler._pp_commit_comm_work.assert_called_once_with(work=old_origin_work)
+    assert scheduler.pp_origin_output_work[0] == []
+    assert scheduler.pp_origin_output_work[3] is new_origin_work
+    assert scheduler.send_output_work == []
+
+
+def test_pp_disagg_output_origin_send_is_not_waited_before_return():
+    old_origin_work = [object()]
+    new_origin_work = [object()]
+    scheduler = SimpleNamespace(
+        pp_group=SimpleNamespace(is_last_rank=True),
+        send_output_work=[],
+        pp_origin_output_work=[old_origin_work, [], [], []],
+        pp_outputs=None,
+        mbs=[object()] * 4,
+        mb_metadata=[object()] * 4,
+        last_rank_comm_queue=deque(),
+        _pp_send_recv_and_preprocess_output_tensors=Mock(
+            return_value=(None, None, None, new_origin_work)
+        ),
+        _pp_commit_comm_work=Mock(),
+    )
+
+    SchedulerPPMixin._pp_commit_send_output_work_and_preprocess_output_tensors(
+        scheduler,
+        next_first_rank_mb_id=1,
+        next_mb_id=2,
+        relay_output_immediately=True,
+    )
+
+    scheduler._pp_commit_comm_work.assert_not_called()
+    assert scheduler.pp_origin_output_work[0] is old_origin_work
+    assert scheduler.pp_origin_output_work[1] is new_origin_work
+    assert scheduler.send_output_work == []
+
+
 def test_pp_prefill_rebuilds_one_authoritative_draft_input():
     topk_p = torch.randn(2, 1)
     topk_index = torch.tensor([[3], [7]], dtype=torch.int64)
