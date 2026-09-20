@@ -1401,11 +1401,7 @@ def _dsv4_swa_ring_component_layer_ids(pool) -> List[int]:
 
 
 def _dsv4_c128_component_layer_ids(pool) -> List[int]:
-    return [
-        layer_id
-        for layer_id in _dsv4_stage_layer_ids(pool)
-        if pool.compression_ratios[layer_id] == 128
-    ]
+    return pool.get_request_state_layer_ids()
 
 
 def _remap_draft_state_layer_ids(
@@ -1810,9 +1806,7 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
         state_type in (StateType.SWA, StateType.SWA_RING)
         for state_type in kv_args.state_types
     ):
-        raise RuntimeError(
-            "DeepSeek-V4.1 DSpark PD requires an SWA state component"
-        )
+        raise RuntimeError("DeepSeek-V4.1 DSpark PD requires an SWA state component")
 
     return {
         "protocol_version": 2,

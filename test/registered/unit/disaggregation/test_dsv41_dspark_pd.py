@@ -18,7 +18,10 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVManager,
     CommonKVSender,
 )
-from sglang.srt.disaggregation.utils import get_dsv41_spec_layout
+from sglang.srt.disaggregation.utils import (
+    _dsv4_c128_component_layer_ids,
+    get_dsv41_spec_layout,
+)
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     request_scoped_state_transfer_indices,
 )
@@ -45,6 +48,14 @@ def make_layout():
 
 
 class TestDSV41DSparkPD(CustomTestCase):
+    def test_request_state_layer_ids_include_all_request_scoped_ratios(self):
+        pool = SimpleNamespace(
+            compression_ratios=[2, 4, 128],
+            get_request_state_layer_ids=Mock(return_value=[0, 2]),
+        )
+
+        self.assertEqual(_dsv4_c128_component_layer_ids(pool), [0, 2])
+
     def test_dp_attention_allowed_with_static_mooncake_pd(self):
         from sglang.srt.arg_groups import deepseek_v4_hook as hook
         from sglang.srt.model_executor.cuda_graph_config import Backend

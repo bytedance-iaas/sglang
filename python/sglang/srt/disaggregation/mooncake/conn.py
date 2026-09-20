@@ -822,6 +822,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         src_data_ptrs, dst_data_ptrs, state_type
                     )
                 )
+                if layers_current_pp_stage > len(dst_kv_ptrs):
+                    raise RuntimeError(
+                        "PP-local transfer mapping produced fewer destination "
+                        f"buffers than sources: state_type={state_type}, "
+                        f"src={len(src_kv_ptrs)}, dst={len(dst_kv_ptrs)}, "
+                        f"prefill_range=[{self.kv_args.prefill_start_layer}, "
+                        f"{self.kv_args.prefill_end_layer})."
+                    )
                 layers_params = [
                     (
                         src_kv_ptrs[layer_id],
