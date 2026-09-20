@@ -557,6 +557,7 @@ class TestDSV41DSparkPD(CustomTestCase):
         torch.nn.Module.__init__(model)
         model.vision = torch.nn.Identity()
         model.config = SimpleNamespace(image_token_id=-1)
+        model.dsv41_multimodal_enabled = True
         model.dsa_enable_prefill_cp = False
         model.pp_group = SimpleNamespace(is_last_rank=False)
         model.model = Mock()

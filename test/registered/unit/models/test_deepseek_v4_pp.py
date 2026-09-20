@@ -113,6 +113,7 @@ class TestDeepSeekV41PP(unittest.TestCase):
             config=SimpleNamespace(model_type="deepseek_v41"),
             pp_group=SimpleNamespace(world_size=4),
             engram_hasher=None,
+            engram_embed_prefetch_stream=None,
             late_layer_start=21,
             start_layer=30,
             end_layer=31,

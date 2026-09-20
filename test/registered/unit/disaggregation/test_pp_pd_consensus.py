@@ -65,12 +65,14 @@ class TestPPPDConsensus(CustomTestCase):
         queue.pp_size = 2
         queue.scheduler = SimpleNamespace(
             ps=SimpleNamespace(dp_rank=0, gpu_id=0),
+            rust_server=None,
             server_args=SimpleNamespace(disaggregation_ib_device=None),
             tp_worker=SimpleNamespace(
                 model_runner=SimpleNamespace(kv_cache_dtype_str="auto")
             ),
             model_config=SimpleNamespace(
                 num_hidden_layers=8,
+                hf_text_config=SimpleNamespace(full_attention_layer_ids=[]),
                 get_total_num_kv_heads=lambda: 1,
             ),
             req_to_token_pool=None,
@@ -189,6 +191,7 @@ class TestPPPDConsensus(CustomTestCase):
         handle_failure = Mock()
         scheduler = SimpleNamespace(
             disagg_prefill_inflight_queue=[req],
+            scheduler_stage_metrics=None,
             attn_cp_cpu_group=object(),
             attn_tp_cpu_group=object(),
             ps=SimpleNamespace(pp_rank=1),
