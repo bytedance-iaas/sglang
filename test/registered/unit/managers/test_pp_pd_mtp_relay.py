@@ -457,7 +457,7 @@ def test_pp_disagg_output_ring_last_stage_starts_relay_chain():
             current_stream=Mock(return_value=object()),
         ),
         _pp_send_output_to_next_stage=Mock(
-            side_effect=lambda *args, **kwargs: events.append("send") or send_work
+            side_effect=lambda *args: events.append("send") or send_work
         ),
         _pp_recv_dict_from_prev_stage=Mock(
             side_effect=lambda: events.append("recv") or {"next_token_ids": object()}
@@ -652,7 +652,6 @@ def test_pp_disagg_output_ring_last_stage_sends_explicit_skip_marker():
             mbs=[target],
             last_rank_comm_queue=deque([(q_event, queued_outputs)]),
             pp_outputs=None,
-            propagate_skip_marker=True,
         )
 
     assert work is send_work
