@@ -16,6 +16,8 @@ The below examples will mostly need you to start a server in a separate terminal
 * `chain_of_verification.py`: An example of [Chain-of-Verification (CoVe)](https://arxiv.org/abs/2309.11495) to reduce hallucinations. The model drafts an answer, then verifies it in a **fresh, isolated session** (no shared KV-cache) to avoid self-confirmation bias, and refines if needed.
 ## Engine
 
+* [DeepSeek-V4.1-Flash with SM90 MegaMoE](deepseek_v41_megamoe/README.md): Plugin installation, TP8/EP8 deployment, DSPARK, and the optional ReduceScatter path on eight H20 GPUs.
+
 The `engine` folder contains that examples that show how to use [Offline Engine API](https://docs.sglang.io/basic_usage/offline_engine_api.html#Offline-Engine-API) for common workflows.
 
 * `custom_server.py`: An example how to deploy a custom server.
