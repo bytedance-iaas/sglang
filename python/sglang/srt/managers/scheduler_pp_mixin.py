@@ -1757,14 +1757,15 @@ class SchedulerPPMixin:
             target = mbs[next_first_rank_mb_id]
             if target is not None:
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
-                if (
-                    not target.forward_mode.is_prebuilt()
-                    and not _pp_can_skip_output_comm(target)
-                ):
-                    self.device_module.current_stream().wait_event(q_event)
+                if not target.forward_mode.is_prebuilt():
+                    if _pp_can_skip_output_comm(target):
+                        output_tensors = {"__skip__": True}
+                    else:
+                        self.device_module.current_stream().wait_event(q_event)
+                        output_tensors = pp_outputs_to_send.tensors
                     with torch.profiler.record_function("send_res_dict_to_next_stage"):
                         send_output_work = self._pp_send_dict_to_next_stage(
-                            pp_outputs_to_send.tensors,
+                            output_tensors,
                             async_send=True,
                             msg_type="output",
                         )
@@ -1825,13 +1826,18 @@ class SchedulerPPMixin:
             target = mbs[next_mb_id]
             if target is None or target.forward_mode.is_prebuilt():
                 return
-            if _pp_can_skip_output_comm(target):
-                next_pp_outputs, batch_result, d2h_event = (
-                    self._pp_make_skip_output_result(target, mb_metadata[next_mb_id])
-                )
-                return
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
-                next_pp_outputs = PPProxyTensors(self._pp_recv_dict_from_prev_stage())
+                received_tensors = self._pp_recv_dict_from_prev_stage()
+            if received_tensors.get("__skip__"):
+                _, batch_result, d2h_event = self._pp_make_skip_output_result(
+                    target, mb_metadata[next_mb_id]
+                )
+                # Keep the marker as the ring payload.  Returning None here
+                # would make this intermediate rank suppress its forward and
+                # strand the origin send.
+                next_pp_outputs = PPProxyTensors(received_tensors)
+                return
+            next_pp_outputs = PPProxyTensors(received_tensors)
             with self.copy_stream_ctx:
                 self.copy_stream.wait_stream(self.schedule_stream)
                 batch_result = self._pp_prep_batch_result(
@@ -1869,7 +1875,8 @@ class SchedulerPPMixin:
                 # every tensor in the incoming dictionary must be complete before
                 # the first reverse send is enqueued.  Otherwise the two peers can
                 # assign opposite-direction sends to the same NCCL P2P sequence.
-                self.schedule_stream.synchronize()
+                if not next_pp_outputs.tensors.get("__skip__"):
+                    self.schedule_stream.synchronize()
                 send_output_work = self._pp_send_dict_to_next_stage(
                     next_pp_outputs.tensors,
                     async_send=True,
