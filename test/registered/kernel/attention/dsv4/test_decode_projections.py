@@ -13,7 +13,7 @@ register_cuda_ci(est_time=35, stage="base-b-kernel-unit", runner_config="1-gpu-l
 
 class TestHopperCandidateScoring(CustomTestCase):
     def test_fp4_indexer_direct_mapping_matches_explicit_slots(self):
-        from sglang.kernels.ops.attention.dsv4.sm90_fp4_indexer import (
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
             fp4_index_logits_candidate_blocks,
             fp4_index_logits_decode,
             fp4_index_logits_req_to_token,
