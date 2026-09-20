@@ -151,8 +151,9 @@ class _FakeFutureMap:
     def __init__(self):
         self.stashes = []
 
-    def stash(self, indices, values):
-        self.stashes.append((indices.clone(), values.clone()))
+    def stash(self, indices, payload):
+        # payload is a RelayPayload; record its bonus_tokens for assertions.
+        self.stashes.append((indices.clone(), payload.bonus_tokens.clone()))
 
 
 class _FakeDecodeBatch:
