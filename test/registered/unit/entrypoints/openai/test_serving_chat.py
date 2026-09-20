@@ -3995,6 +3995,7 @@ class ServingChatTestCase(unittest.TestCase):
                 self.assertIn("does not support enable_thinking=false", error)
 
     def test_glm53_accepts_default_and_explicit_thinking(self):
+        self.chat.reasoning_parser = "glm45"
         self.template_manager.reasoning_config = ReasoningToggleConfig(
             special_case="always", unsupported_toggle_param="enable_thinking"
         )

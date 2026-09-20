@@ -89,7 +89,7 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
             template, ["<tool_call>", "<arg_key>", "<arg_value>"]
         )
 
-        self.assertFalse(force)
+        self.assertTrue(force)
         self.assertEqual(
             config,
             ReasoningToggleConfig(

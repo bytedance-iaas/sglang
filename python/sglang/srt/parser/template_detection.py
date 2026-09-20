@@ -362,6 +362,11 @@ def _is_glm_family(ctx):
     return _is_glm45(ctx) or _is_glm53(ctx)
 
 
+def _is_glm_reasoning(ctx):
+    """GLM-4.5/5.3 share the ``<think>`` reasoning parser format."""
+    return _is_glm45(ctx) or _is_glm53(ctx)
+
+
 def _is_glm47(ctx):
     return _is_glm_family(ctx) and ctx.has_pattern(
         r"\{\{[-\s]*['\"]<tool_call>['\"]\s*[+~]\s*tc\.name"
@@ -512,7 +517,7 @@ REASONING_PARSER_RULES = (
     DetectionRule(name="gpt_oss", value="gpt-oss", predicate=_is_gpt_oss),
     DetectionRule(name="kimi_k2", value="kimi_k2", predicate=_is_kimi_k2),
     DetectionRule(name="nemotron_3", value="nemotron_3", predicate=_is_nemotron_3),
-    DetectionRule(name="glm45", value="glm45", predicate=_is_glm45),
+    DetectionRule(name="glm45", value="glm45", predicate=_is_glm_reasoning),
     DetectionRule(name="hunyuan", value="hunyuan", predicate=_is_hunyuan),
     DetectionRule(name="poolside_v1", value="poolside_v1", predicate=_is_poolside_v1),
     DetectionRule(name="mimo", value="mimo", predicate=_is_mimo),
