@@ -77,6 +77,27 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
         )
         self.assertEqual(parser, "glm45")
 
+    def test_glm53_detects_always_on_reasoning(self):
+        template = """
+        [gMASK]<sop>
+        Reasoning Effort: Absolute maximum with no shortcuts permitted.
+        {% if add_generation_prompt %}<think>{% endif %}
+        {{ '<tool_call>' ~ tc.name }}
+        <arg_key>{{ key }}</arg_key><arg_value>{{ value }}</arg_value>
+        """
+        force, config, parser = self._detect(
+            template, ["<tool_call>", "<arg_key>", "<arg_value>"]
+        )
+
+        self.assertFalse(force)
+        self.assertEqual(
+            config,
+            ReasoningToggleConfig(
+                special_case="always", unsupported_toggle_param="enable_thinking"
+            ),
+        )
+        self.assertEqual(parser, "glm45")
+
     def test_interns1_detects_enable_thinking_default_true(self):
         template = """
         {% set default_thinking_sys %}...<think>...</think>{% endset %}

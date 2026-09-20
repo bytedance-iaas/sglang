@@ -3979,6 +3979,51 @@ class ServingChatTestCase(unittest.TestCase):
         req.reasoning_effort = "medium"
         self.assertTrue(self.chat._get_reasoning_from_request(req))
 
+    def test_glm53_rejects_unsupported_enable_thinking_false(self):
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            special_case="always", unsupported_toggle_param="enable_thinking"
+        )
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                request = ChatCompletionRequest(
+                    model="GLM-5.3-Flash",
+                    messages=[{"role": "user", "content": "1+1"}],
+                    stream=stream,
+                    chat_template_kwargs={"enable_thinking": False},
+                )
+                error = self.chat._validate_request(request)
+                self.assertIn("does not support enable_thinking=false", error)
+
+    def test_glm53_accepts_default_and_explicit_thinking(self):
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            special_case="always", unsupported_toggle_param="enable_thinking"
+        )
+        for kwargs in (None, {}, {"enable_thinking": True}):
+            with self.subTest(kwargs=kwargs):
+                request = ChatCompletionRequest(
+                    model="GLM-5.3-Flash",
+                    messages=[{"role": "user", "content": "1+1"}],
+                    chat_template_kwargs=kwargs,
+                )
+                self.assertIsNone(self.chat._validate_request(request))
+                self.assertTrue(self.chat._get_reasoning_from_request(request))
+
+    def test_glm53_rejects_unsupported_server_default(self):
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            special_case="always", unsupported_toggle_param="enable_thinking"
+        )
+        self.chat.default_chat_template_kwargs = {"enable_thinking": False}
+        request = ChatCompletionRequest(
+            model="GLM-5.3-Flash",
+            messages=[{"role": "user", "content": "1+1"}],
+        )
+
+        error = self.chat._validate_request(request)
+        self.assertIn("does not support enable_thinking=false", error)
+
+        request.chat_template_kwargs = {"enable_thinking": True}
+        self.assertIsNone(self.chat._validate_request(request))
+
     # --- fallback path tests (config=None, uses reasoning_default) ---
 
     def _setup_fallback(self, parser_name):

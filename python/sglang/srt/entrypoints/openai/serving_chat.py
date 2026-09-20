@@ -947,6 +947,25 @@ class OpenAIServingChat(OpenAIServingBase):
         if not request.messages:
             return "Messages cannot be empty."
 
+        reasoning_config = self.template_manager.reasoning_config
+        unsupported_toggle = (
+            reasoning_config.unsupported_toggle_param
+            if reasoning_config is not None
+            else None
+        )
+        effective_toggle = (request.chat_template_kwargs or {}).get(
+            unsupported_toggle,
+            self.default_chat_template_kwargs.get(unsupported_toggle),
+        )
+        if (
+            unsupported_toggle is not None
+            and effective_toggle is False
+        ):
+            return (
+                f"This model's chat template does not support "
+                f"{unsupported_toggle}=false; reasoning is always enabled."
+            )
+
         if request.return_sampling_mask and not request.return_meta_info:
             return "return_sampling_mask requires return_meta_info=true."
 

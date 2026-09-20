@@ -68,6 +68,7 @@ class ReasoningToggleConfig:
     default_enabled: Optional[bool] = None
     special_case: Optional[str] = None
     effort_kwarg: Optional[str] = None
+    unsupported_toggle_param: Optional[str] = None
 
     @property
     def always_on(self) -> bool:
@@ -167,6 +168,14 @@ REASONING_MODE_RULES = (
             and not ctx.has_text("enable_thinking")
             and not ctx.has_text("thinking")
         ),
+    ),
+    DetectionRule(
+        name="glm53_always_think",
+        value=ReasoningToggleConfig(
+            special_case="always", unsupported_toggle_param="enable_thinking"
+        ),
+        # GLM-5.3 opens <think> unconditionally and exposes no template toggle.
+        predicate=lambda ctx: _is_glm53(ctx),
     ),
     DetectionRule(
         name="mistral_reasoning_effort",
@@ -336,9 +345,26 @@ def _is_glm45(ctx):
     )
 
 
+def _is_glm53(ctx):
+    # GLM-5.3 keeps the GLM tool-call format but replaces enable_thinking with
+    # an always-on "Reasoning Effort:" header and unconditional <think> prompt.
+    return (
+        ctx.has_text("[gMASK]<sop>")
+        and ctx.has_text("Reasoning Effort:")
+        and not ctx.has_text("enable_thinking")
+        and ctx.has_text("<tool_call>")
+        and ctx.has_text("<arg_key>")
+        and ctx.has_text("<arg_value>")
+    )
+
+
+def _is_glm_family(ctx):
+    return _is_glm45(ctx) or _is_glm53(ctx)
+
+
 def _is_glm47(ctx):
-    return _is_glm45(ctx) and ctx.has_pattern(
-        r"\{\{[-\s]*['\"]<tool_call>['\"]\s*\+\s*tc\.name"
+    return _is_glm_family(ctx) and ctx.has_pattern(
+        r"\{\{[-\s]*['\"]<tool_call>['\"]\s*[+~]\s*tc\.name"
     )
 
 
