@@ -4126,8 +4126,6 @@ class DeepseekV4Model(nn.Module):
             unavailable = []
             if not _is_cuda:
                 unavailable.append("CUDA is required")
-            if self.pp_group.world_size != 1:
-                unavailable.append("PP must be 1")
             # Vision-capable checkpoints can prefetch rows too: WKV and gate
             # stay on the main stream, followed by the common image-token mask
             # in _forward_layers_hc_pre_from_prev.
