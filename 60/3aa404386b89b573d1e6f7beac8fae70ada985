@@ -1,9 +1,73 @@
+python/sglang/srt/disaggregation/decode.py
+  s_6ab00bf1e68681::t_b6ee2e962c9ddd 2380 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a5a06f1a9cf4e03972da66f","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Single":2380}]}]}
+  s_6ab00bf1e68681::t_9fd1a3fc44aa79 2401-2407 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a5a0702a9cf4e03972da696","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Range":[2401,2407]}]}]}
 ---
 {
   "schema_version": "authorship/3.0.0",
   "git_ai_version": "1.6.10",
   "base_commit_sha": "603aa404386b89b573d1e6f7beac8fae70ada985",
   "prompts": {},
-  "attestation_metadata": {},
+  "sessions": {
+    "s_6ab00bf1e68681": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a56edf31456988efbe220a0",
+        "model": "gpt-5.5__max"
+      },
+      "human_author": "zhangxiaolei <zhangxiaolei.666@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {
+    "python/sglang/srt/disaggregation/decode.py": [
+      {
+        "hash": "s_6ab00bf1e68681::t_b6ee2e962c9ddd",
+        "line_ranges": [
+          {
+            "Single": 2380
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a5a06f1a9cf4e03972da66f",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Single": 2380
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "hash": "s_6ab00bf1e68681::t_9fd1a3fc44aa79",
+        "line_ranges": [
+          {
+            "Range": [
+              2401,
+              2407
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a5a0702a9cf4e03972da696",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Range": [
+                  2401,
+                  2407
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
   "remote_transcripts": {}
 }
