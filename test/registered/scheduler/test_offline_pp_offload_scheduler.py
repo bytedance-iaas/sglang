@@ -6,6 +6,7 @@ import torch
 
 import sglang.srt.managers.scheduler as scheduler_mod
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.schedule_batch import NextBatchPlan
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -180,7 +181,9 @@ def test_prefill_batch_offload_is_consumed_only_once():
         waiting_queue=[],
         chunked_req=None,
         offline_pp_offload_manager=mgr,
-        get_new_batch_prefill=lambda: None,
+        get_new_batch_prefill=lambda running_batch: NextBatchPlan(
+            batch_to_run=None, running_batch=running_batch
+        ),
         token_to_kv_pool_allocator=SimpleNamespace(available_size=lambda: 1024),
     )
 
@@ -198,9 +201,9 @@ def test_draining_epoch_does_not_insert_new_prefill():
     mgr.filling = False
     calls = {"prefill": 0}
 
-    def _get_new_batch_prefill():
+    def _get_new_batch_prefill(running_batch):
         calls["prefill"] += 1
-        return object()
+        return NextBatchPlan(batch_to_run=object(), running_batch=running_batch)
 
     sched = SimpleNamespace(
         last_batch=None,
@@ -229,7 +232,9 @@ def test_filling_epoch_prefill_dispatch_is_marked_inflight():
         current_pp_mb_id=5,
         offline_pp_offload_manager=mgr,
         server_args=SimpleNamespace(prefill_max_requests=8),
-        get_new_batch_prefill=lambda: batch,
+        get_new_batch_prefill=lambda running_batch: NextBatchPlan(
+            batch_to_run=batch, running_batch=running_batch
+        ),
         token_to_kv_pool_allocator=SimpleNamespace(available_size=lambda: 1024),
     )
 
@@ -252,7 +257,7 @@ def test_filling_epoch_prefill_wait_blocks_partial_prefill():
         chunked_req=None,
         offline_pp_offload_manager=mgr,
         server_args=SimpleNamespace(prefill_max_requests=8),
-        get_new_batch_prefill=lambda: (_ for _ in ()).throw(
+        get_new_batch_prefill=lambda running_batch: (_ for _ in ()).throw(
             AssertionError("prefill wait should block prefill dispatch")
         ),
         token_to_kv_pool_allocator=SimpleNamespace(available_size=lambda: 1024),
@@ -269,9 +274,11 @@ def test_fill_stop_request_blocks_new_prefill_until_inflight_offloads():
     mgr.inflight_prefill_mbs = {2}
     calls = {"prefill": 0}
 
-    def _get_new_batch_prefill():
+    def _get_new_batch_prefill(running_batch):
         calls["prefill"] += 1
-        return _FakeBatch([_FakeReq()])
+        return NextBatchPlan(
+            batch_to_run=_FakeBatch([_FakeReq()]), running_batch=running_batch
+        )
 
     sched = SimpleNamespace(
         last_batch=None,
@@ -307,7 +314,7 @@ def test_last_prefill_offload_closes_inflight_before_draining():
         waiting_queue=[_FakeReq("waiting")],
         chunked_req=None,
         offline_pp_offload_manager=mgr,
-        get_new_batch_prefill=lambda: (_ for _ in ()).throw(
+        get_new_batch_prefill=lambda running_batch: (_ for _ in ()).throw(
             AssertionError("must not dispatch new prefill after fill stop")
         ),
         token_to_kv_pool_allocator=SimpleNamespace(available_size=lambda: 1024),
@@ -324,12 +331,19 @@ def test_last_prefill_offload_closes_inflight_before_draining():
 def test_offline_pp_work_blocks_default_scheduler_fallback():
     mgr = _FakeOfflinePPManager()
     mgr.active_epoch_waves = True
+    running_batch = _EmptyBatch()
     sched = SimpleNamespace(
         offline_pp_offload_manager=mgr,
+        running_batch=running_batch,
+        last_batch=None,
+        process_pending_chunked_abort=lambda: None,
         _get_next_batch_offline_pp=lambda: None,
     )
 
-    assert Scheduler.get_next_batch_to_run(sched) is None
+    plan = Scheduler.get_next_batch_to_run(
+        sched, running_batch=running_batch, last_batch=None
+    )
+    assert plan.batch_to_run is None
 
 
 def test_pp_fill_stop_reason_sync_does_not_collect_in_scheduler_hot_path():
