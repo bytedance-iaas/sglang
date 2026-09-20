@@ -283,6 +283,9 @@ jobs:
       - name: Set up Docker Buildx with local Docker Hub mirror
         uses: docker/setup-buildx-action@v3
         with:
+          name: sgl-private-image-builder
+          keep-state: true
+          cleanup: false
           driver-opts: |
             network=host
           buildkitd-config-inline: |
@@ -341,7 +344,6 @@ jobs:
             ${{ inputs.extra_build_args }} \
             "${CACHE_ARGS[@]}" \
             --metadata-file /tmp/metadata.json \
-            --no-cache \
             .
 
           DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata.json'))['containerimage.digest'])")
