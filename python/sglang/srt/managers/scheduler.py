@@ -3238,7 +3238,9 @@ class Scheduler(
             dtype=torch.int64,
             device=device,
         )
-        self.future_map.stash(batch.req_pool_indices, last_tokens)
+        self.future_map.stash(
+            batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
+        )
         batch.input_ids = None
         batch.multimodal_inputs = [r.multimodal_inputs for r in reqs]
 

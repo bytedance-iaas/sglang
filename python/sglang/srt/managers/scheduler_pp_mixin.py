@@ -1372,7 +1372,7 @@ class SchedulerPPMixin:
         mb_metadata: List[Optional[PPBatchMetadata]],
         last_rank_comm_queue: deque,
     ):
-        nvtx_message = _offline_pp_batch_nvtx_message(self, self.cur_batch, mb_id)
+        nvtx_message = _offline_pp_batch_nvtx_message(self, cur_batch, mb_id)
         nvtx_range = getattr(self.offline_pp_offload_manager, "nvtx_range", None)
         nvtx_ctx = (
             nvtx_range(nvtx_message)
