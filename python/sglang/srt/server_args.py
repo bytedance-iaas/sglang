@@ -3266,6 +3266,64 @@ class ServerArgs:
         Optional[str], "Path to the LMCache YAML configuration file", NS("memory")
     ] = None
 
+    # Offline PP state offload (prefill async offload + decode async prefetch).
+    # Targets throughput-oriented offline PP serving; offloads KV (and mamba
+    # state for hybrid models) to host after prefill and prefetches it back
+    # wave-by-wave during decode. double-buffer (=2 resident waves) is a
+    # structural constant and intentionally NOT exposed as a knob.
+    enable_offline_pp_offload: A[
+        bool,
+        "Enable offline pipeline-parallel state offload: after prefill, "
+        "asynchronously offload KV (and mamba state for hybrid models) to host "
+        "and free GPU slots; during decode, prefetch each wave back "
+        "wave-by-wave. Requires --pp-size > 1 and non-disaggregated mode. "
+        "Targets offline throughput, not latency.",
+        NS("exec.offload"),
+    ] = False
+    offline_pp_prefetch_stall_ticks: A[
+        int,
+        "Legacy no-progress tick counter for offline PP prefetch. Normal "
+        "resource backpressure no longer rolls back on this counter; hard "
+        "timeouts are controlled by --offline-pp-prefetch-hard-timeout-sec.",
+        NS("exec.offload"),
+    ] = 64
+    offline_pp_prefetch_hard_timeout_sec: A[
+        float,
+        "Wall-clock seconds a blocked offline PP prefetch wave may wait before "
+        "hard deadlock protection rolls it back.",
+        NS("exec.offload"),
+    ] = 300.0
+    offline_pp_prefill_wait_timeout_ticks: A[
+        int,
+        "Logical scheduler ticks to wait in offline PP filling when the current "
+        "waiting queue is below --prefill-max-requests, or briefly empty before "
+        "the epoch is full. 0 disables prefill waiting.",
+        NS("exec.offload"),
+    ] = 0
+    offline_pp_max_host_memory_gb: A[
+        Optional[float],
+        "Per-rank pinned host memory budget for offline PP offloaded state. "
+        "Unset keeps the historical unlimited behavior.",
+        NS("exec.offload"),
+    ] = None
+    offline_pp_min_prefill_waves: A[
+        Optional[int],
+        "Minimum waves to accumulate before draining an offline PP epoch. "
+        "Unset defaults to --pp-size.",
+        NS("exec.offload"),
+    ] = None
+    offline_pp_max_prefill_waves: A[
+        Optional[int],
+        "Optional hard cap on waves accumulated in one offline PP epoch.",
+        NS("exec.offload"),
+    ] = None
+    offline_pp_gpu_resident_factor: A[
+        float,
+        "Resident GPU budget divisor for offline PP wave sizing. The default 2 "
+        "reserves decode/prefetch double buffering.",
+        NS("exec.offload"),
+    ] = 2.0
+
     # -------------------------------------------------------------------------
     # FlexKV
     # -------------------------------------------------------------------------
@@ -8673,6 +8731,70 @@ class ServerArgs:
             if self.hicache_storage_backend is None:
                 raise ValueError(
                     "The argument disaggregation-decode-enable-offload-kvcache is only supported when hicache-storage-backend is provided."
+                )
+
+        if self.enable_offline_pp_offload:
+            if self.pp_size <= 1:
+                raise ValueError(
+                    "--enable-offline-pp-offload requires --pp-size > 1."
+                )
+            if self.disaggregation_mode != "null":
+                raise ValueError(
+                    "--enable-offline-pp-offload is for non-disaggregated offline PP "
+                    "serving and is incompatible with --disaggregation-mode."
+                )
+            if self.disaggregation_decode_enable_offload_kvcache:
+                raise ValueError(
+                    "--enable-offline-pp-offload and "
+                    "--disaggregation-decode-enable-offload-kvcache are mutually exclusive."
+                )
+            if self.enable_hisparse:
+                raise ValueError(
+                    "--enable-offline-pp-offload and --enable-hisparse are "
+                    "mutually exclusive because both own the prefill-to-decode "
+                    "KV lifecycle."
+                )
+            if (
+                self.offline_pp_max_host_memory_gb is not None
+                and self.offline_pp_max_host_memory_gb <= 0
+            ):
+                raise ValueError(
+                    "--offline-pp-max-host-memory-gb must be positive when set."
+                )
+            if (
+                self.offline_pp_min_prefill_waves is not None
+                and self.offline_pp_min_prefill_waves <= 0
+            ):
+                raise ValueError("--offline-pp-min-prefill-waves must be positive.")
+            if (
+                self.offline_pp_max_prefill_waves is not None
+                and self.offline_pp_max_prefill_waves <= 0
+            ):
+                raise ValueError("--offline-pp-max-prefill-waves must be positive.")
+            offline_pp_effective_min_prefill_waves = (
+                self.offline_pp_min_prefill_waves or self.pp_size
+            )
+            if (
+                self.offline_pp_max_prefill_waves is not None
+                and self.offline_pp_max_prefill_waves
+                < offline_pp_effective_min_prefill_waves
+            ):
+                raise ValueError(
+                    "--offline-pp-max-prefill-waves must be >= "
+                    "--offline-pp-min-prefill-waves (default: --pp-size)."
+                )
+            if self.offline_pp_gpu_resident_factor < 2:
+                raise ValueError(
+                    "--offline-pp-gpu-resident-factor must be >= 2 to preserve "
+                    "decode/prefetch double buffering."
+                )
+            if self.offline_pp_prefetch_hard_timeout_sec <= 0:
+                raise ValueError(
+                    "--offline-pp-prefetch-hard-timeout-sec must be positive."
+                )
+            if self.offline_pp_prefill_wait_timeout_ticks < 0:
+                raise ValueError(
+                    "--offline-pp-prefill-wait-timeout-ticks must be non-negative."
                 )
 
         # Validate the effective ratio: model branches may declare a reset

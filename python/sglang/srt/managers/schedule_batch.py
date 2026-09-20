@@ -1957,6 +1957,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     inner_idle_batch: Optional[ScheduleBatch] = None
     # Decode requests carried alongside a chunked-prefill batch
     decoding_reqs: List[Req] = None
+    # Offline PP offload bookkeeping: the active wave represented by this batch.
+    offline_pp_wave_id: Optional[int] = None
+    # Offline PP prefill bookkeeping: the epoch/microbatch that dispatched this
+    # prefill batch. Used only by the scheduler to close epoch boundaries after
+    # in-flight prefill microbatches have been offloaded.
+    offline_pp_prefill_epoch_id: Optional[int] = None
+    offline_pp_prefill_mb_id: Optional[int] = None
 
     # For split prefill
     split_index: int = 0
@@ -2999,7 +3006,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.req_pool_indices_cpu,
             )
 
-        if server_args.enable_mamba_extra_buffer():
+        if (
+            server_args.enable_mamba_extra_buffer()
+            and self.offline_pp_wave_id is None
+        ):
             mamba_track_interval = get_exec().mamba.mamba_track_interval
 
             if len(self.reqs) == 0:
@@ -3017,6 +3027,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 .pin_memory()
                 .to(device=self.device, non_blocking=True)
             )
+        elif self.offline_pp_wave_id is not None:
+            # Offline PP disables radix/prefix-cache insertion for clear KV/mamba
+            # ownership, so the mamba extra tracking buffer is not consumed.
+            # Skipping it also avoids writing into ping-pong slots that were
+            # released during offload and reallocated during prefetch.
+            self.mamba_track_indices = None
+            self.mamba_track_mask = None
+            self.mamba_track_seqlens = None
 
     def filter_batch(
         self,
@@ -3202,6 +3220,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             forward_iter=self.forward_iter,
             launch_ts=self.launch_ts,
             extend_num_tokens=self.extend_num_tokens,
+            offline_pp_wave_id=self.offline_pp_wave_id,
+            offline_pp_prefill_epoch_id=self.offline_pp_prefill_epoch_id,
+            offline_pp_prefill_mb_id=self.offline_pp_prefill_mb_id,
         )
 
     def maybe_evict_swa(self):

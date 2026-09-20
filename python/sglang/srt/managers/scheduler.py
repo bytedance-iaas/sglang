@@ -557,6 +557,19 @@ class Scheduler(
         else:
             self.decode_offload_manager = None
 
+        if self.server_args.enable_offline_pp_offload:
+            from sglang.srt.managers.offline_pp_offload_manager import (
+                OfflinePPStateOffloadManager,
+            )
+
+            self.offline_pp_offload_manager = OfflinePPStateOffloadManager(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                server_args=self.server_args,
+            )
+        else:
+            self.offline_pp_offload_manager = None
+
         # Register draft KV pool (when spec + HiCache co-enabled).
         kv_cache_builder.maybe_register_hicache_draft(
             tree_cache=self.tree_cache,
@@ -3030,6 +3043,7 @@ class Scheduler(
             batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
         )
         batch.input_ids = None
+        batch.multimodal_inputs = [r.multimodal_inputs for r in reqs]
 
         if batch.return_logprob:
             batch.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
@@ -3041,11 +3055,226 @@ class Scheduler(
         # todo hisparse, maybe other info to contain for the new batch
         return batch
 
+    def _offline_pp_sync_fill_stop_reason(
+        self, local_reason: Optional[str]
+    ) -> Optional[str]:
+        """Make the FILLING->DRAINING decision consistent across PP ranks."""
+        # Do not introduce a fresh PP collective in the hot scheduler path.
+        # PP ranks can be at different points in the event loop while P2P
+        # send/recv work is in flight, so an ad-hoc all_gather here can block
+        # startup or warmup. Keep the hook local for now; rank-wide agreement
+        # should be wired through an existing PP synchronization point.
+        return local_reason
+
+    def _get_next_batch_offline_pp(self) -> Optional[ScheduleBatch]:
+        """Offline-PP batch formation (plan §3.3, gated by the manager).
+
+        Priority each iteration:
+          1. If the last batch just finished prefill, offload it to host and
+             free its slots (it does NOT continue to decode in place).
+          2. In FILLING, run prefill until the epoch budget/queue says drain.
+          3. In DRAINING, continue the current DECODING wave's decode step.
+          4. In DRAINING, promote a DECODE_READY wave and start its decode.
+
+        Returns None to fall back to the default path when nothing applies
+        (e.g. before any wave exists), which keeps behaviour safe at startup.
+        """
+        mgr = self.offline_pp_offload_manager
+
+        # Step 1: a freshly prefilled batch -> offload instead of decoding it.
+        if (
+            self.last_batch is not None
+            and self.last_batch.forward_mode.is_extend()
+            and not self.last_batch.is_empty()
+        ):
+            prefilled_batch = self.last_batch
+            offline_pp_prefill_mb_id = getattr(
+                prefilled_batch, "offline_pp_prefill_mb_id", None
+            )
+            prefilled = [r for r in prefilled_batch.reqs if not r.finished()]
+            self.last_batch = None
+            if prefilled:
+                mgr.offload_prefilled_wave(
+                    prefilled,
+                    source_stream=getattr(self, "forward_stream", None),
+                )
+            if offline_pp_prefill_mb_id is not None:
+                mgr.note_prefill_offloaded(offline_pp_prefill_mb_id)
+            prefilled_batch.filter_batch(keep_indices=[])
+            mgr.maybe_enter_draining()
+
+        waiting_queue_empty = len(self.waiting_queue) == 0 and self.chunked_req is None
+
+        if mgr.is_filling():
+            local_reason = mgr.local_fill_stop_reason(waiting_queue_empty)
+            sync_fill_stop_reason = getattr(
+                self, "_offline_pp_sync_fill_stop_reason", None
+            )
+            reason = (
+                sync_fill_stop_reason(local_reason)
+                if sync_fill_stop_reason is not None
+                else local_reason
+            )
+            if reason is not None:
+                mgr.request_draining(reason)
+
+        # Step 2: keep prefilling only while the epoch is accepting new work.
+        if mgr.can_dispatch_prefill():
+            if mgr.should_wait_for_prefill(
+                waiting_queue_len=len(self.waiting_queue),
+                has_chunked_req=self.chunked_req is not None,
+                base_prefill_max_requests=self.server_args.prefill_max_requests,
+            ):
+                return None
+
+            prefill_plan = self.get_new_batch_prefill(self.running_batch)
+            new_batch = prefill_plan.batch_to_run
+            self.running_batch = prefill_plan.running_batch
+            if new_batch is not None:
+                mb_id = getattr(self, "current_pp_mb_id", None)
+                new_batch.offline_pp_prefill_epoch_id = mgr.current_epoch_id
+                new_batch.offline_pp_prefill_mb_id = mb_id
+                mgr.note_prefill_dispatched(mb_id)
+                return new_batch
+
+            if mgr.has_active_epoch_waves():
+                waiting_queue_empty = (
+                    len(self.waiting_queue) == 0 and self.chunked_req is None
+                )
+                local_reason = "waiting_empty" if waiting_queue_empty else "prefill_none"
+                sync_fill_stop_reason = getattr(
+                    self, "_offline_pp_sync_fill_stop_reason", None
+                )
+                reason = (
+                    sync_fill_stop_reason(local_reason)
+                    if sync_fill_stop_reason is not None
+                    else local_reason
+                )
+                mgr.request_draining(reason or local_reason)
+        else:
+            mgr.maybe_enter_draining()
+
+        # Step 3: continue decoding the active wave, if any.
+        if not self.running_batch.is_empty():
+            active_wave_id = self.running_batch.offline_pp_wave_id
+            self.running_batch = self.update_running_batch(self.running_batch)
+            if active_wave_id is not None:
+                if self.running_batch.is_empty():
+                    mgr.retire_wave_by_id(active_wave_id)
+                else:
+                    self.running_batch.offline_pp_wave_id = active_wave_id
+            if not self.running_batch.is_empty():
+                return self.running_batch
+
+        # Step 4: promote a fully-prefetched wave into a decode batch.
+        if mgr.has_decoding_wave():
+            return None
+
+        mgr.ensure_decode_ready_for_schedule(
+            self.token_to_kv_pool_allocator.available_size()
+        )
+        wave = mgr.take_decode_ready_wave(
+            mb_id=getattr(self, "current_pp_mb_id", None)
+        )
+        if wave is not None:
+            self.running_batch = self._build_offline_pp_decode_batch(wave)
+            return self.running_batch
+
+        return None
+
+    def _build_offline_pp_decode_batch(self, wave) -> ScheduleBatch:
+        """Build a decode ScheduleBatch from a prefetched (resident) wave.
+
+        The wave's requests already have their committed KV/mamba state restored
+        on device and their req_to_token rows rebuilt by prefetch_step.
+        """
+        reqs = wave.reqs
+        device = self.device
+
+        nvtx_range = getattr(self.offline_pp_offload_manager, "nvtx_range", None)
+        nvtx_ctx = (
+            nvtx_range(
+                "offline_pp.decode_batch_prepare "
+                f"epoch={getattr(wave, 'epoch_id', 'unknown')} "
+                f"wave={wave.wave_id} bs={len(reqs)}"
+            )
+            if nvtx_range is not None
+            else nullcontext()
+        )
+        with nvtx_ctx:
+            self.offline_pp_offload_manager.wait_prefetch_for_decode(wave)
+
+        batch = ScheduleBatch.init_new(
+            reqs=reqs,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            model_config=self.model_config,
+            enable_overlap=self.enable_overlap,
+            spec_algorithm=self.spec_algorithm,
+        )
+        req_pool_indices_cpu = torch.tensor(
+            [r.req_pool_idx for r in reqs], dtype=torch.int64
+        )
+        seq_lens_cpu = torch.tensor(
+            [wave.entries[r.rid].committed_len for r in reqs],
+            dtype=torch.int64,
+        )
+        batch.req_pool_indices = torch.tensor(
+            [r.req_pool_idx for r in reqs], dtype=torch.int64, device=device
+        )
+        batch.req_pool_indices_cpu = req_pool_indices_cpu
+        batch.seq_lens = seq_lens_cpu.to(device=device, non_blocking=True)
+        batch.seq_lens_cpu = seq_lens_cpu
+        batch.orig_seq_lens = seq_lens_cpu.to(dtype=torch.int32, device=device)
+        batch.seq_lens_sum = int(seq_lens_cpu.sum().item())
+        batch.forward_mode = ForwardMode.DECODE
+
+        last_tokens = torch.tensor(
+            [
+                r.output_ids[-1] if len(r.output_ids) else r.origin_input_ids[-1]
+                for r in reqs
+            ],
+            dtype=torch.int64,
+            device=device,
+        )
+        self.future_map.stash(batch.req_pool_indices, last_tokens)
+        batch.input_ids = None
+        batch.multimodal_inputs = [r.multimodal_inputs for r in reqs]
+
+        if batch.return_logprob:
+            batch.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
+            batch.token_ids_logprobs = [list(r.origin_input_ids) for r in reqs]
+
+        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            batch, self.model_config.vocab_size
+        )
+        batch.offline_pp_wave_id = wave.wave_id
+        batch.prepare_for_decode()
+        return batch
+
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
         self.process_pending_chunked_abort()
+
+        # Offline-PP takes over batch formation via its own wave state machine.
+        # It manages self.running_batch / self.last_batch internally, so keep
+        # them in sync with the passed-in state before delegating.
+        if self.offline_pp_offload_manager is not None:
+            self.running_batch = running_batch
+            self.last_batch = last_batch
+            ret = self._get_next_batch_offline_pp()
+            if ret is not None:
+                return NextBatchPlan(
+                    batch_to_run=ret, running_batch=self.running_batch
+                )
+            if self.offline_pp_offload_manager.has_offline_work():
+                return NextBatchPlan(
+                    batch_to_run=None, running_batch=self.running_batch
+                )
+            running_batch = self.running_batch
 
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
@@ -3329,6 +3558,18 @@ class Scheduler(
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
 
+        effective_max_prefill_tokens = self.max_prefill_tokens
+        effective_prefill_max_requests = get_schedule().prefill_max_requests
+        offline_mgr = self.offline_pp_offload_manager
+        if offline_mgr is not None and offline_mgr.can_dispatch_prefill():
+            offline_budget = offline_mgr.prefill_budget_for_waiting_queue(
+                self.waiting_queue,
+                self.max_prefill_tokens,
+                get_schedule().prefill_max_requests,
+            )
+            effective_max_prefill_tokens = offline_budget.max_prefill_tokens
+            effective_prefill_max_requests = offline_budget.prefill_max_requests
+
         # Prefill policy
         adder = PrefillAdder(
             self.page_size,
@@ -3336,13 +3577,13 @@ class Scheduler(
             self.token_to_kv_pool_allocator,
             running_batch,
             self.new_token_ratio_tracker.current,
-            self.max_prefill_tokens,
+            effective_max_prefill_tokens,
             chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=int(self.max_prefill_bs),
             max_running_requests=self.max_running_requests,
-            prefill_max_requests=get_schedule().prefill_max_requests,
+            prefill_max_requests=effective_prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
@@ -4156,6 +4397,11 @@ class Scheduler(
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
         idle &= len(self.waiting_queue) == 0
+        if self.offline_pp_offload_manager is not None:
+            if hasattr(self.offline_pp_offload_manager, "has_offline_work"):
+                idle &= not self.offline_pp_offload_manager.has_offline_work()
+            else:
+                idle &= not self.offline_pp_offload_manager.has_active_waves()
 
         if (
             for_health_check

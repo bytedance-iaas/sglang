@@ -5,6 +5,7 @@ import math
 import time
 from array import array
 from collections import defaultdict, deque
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -23,6 +24,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     set_is_extend_in_batch,
 )
+from sglang.srt.managers.offline_pp_offload_manager import WaveState
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.utils import (
@@ -42,6 +44,35 @@ from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_py
 from sglang.srt.utils.common import get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
+
+
+def _offline_pp_batch_nvtx_message(
+    scheduler, batch: Optional[ScheduleBatch], mb_id: int
+):
+    mgr = getattr(scheduler, "offline_pp_offload_manager", None)
+    if mgr is None or batch is None:
+        return None
+
+    wave_id = getattr(batch, "offline_pp_wave_id", None)
+    if wave_id is not None:
+        wave = getattr(mgr, "waves", {}).get(wave_id)
+        epoch_id = getattr(wave, "epoch_id", "unknown")
+        return (
+            "offline_pp.decode_forward "
+            f"epoch={epoch_id} wave={wave_id} mb={mb_id} bs={len(batch.reqs)}"
+        )
+
+    epoch_id = getattr(batch, "offline_pp_prefill_epoch_id", None)
+    if epoch_id is not None:
+        prefill_mb_id = getattr(batch, "offline_pp_prefill_mb_id", None)
+        return (
+            "offline_pp.prefill_forward "
+            f"epoch={epoch_id} mb={prefill_mb_id} "
+            f"loop_mb={mb_id} bs={len(batch.reqs)}"
+        )
+
+    return None
+
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -94,6 +125,7 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                self.current_pp_mb_id = mb_id
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
@@ -170,9 +202,66 @@ class SchedulerPPMixin:
 
                 self.pp_outputs = next_pp_outputs
 
+            # Drive the offline-PP offload/prefetch state machine once per
+            # scheduler iteration (drip-prefetch + progress checks + stall
+            # rollback). No-op unless --enable-offline-pp-offload.
+            if self.offline_pp_offload_manager is not None:
+                self._offline_pp_offload_step()
+
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
                 self.on_idle()
+
+    def _offline_pp_offload_step(self: Scheduler):
+        """Advance the offline-PP wave state machine (plan §3.3 B/D, §3.3.1).
+
+        Steps performed each iteration:
+          - tick the logical clock;
+          - promote PREFILLING waves whose state finished offloading to host
+            (free their GPU slots → OFFLOADED queue);
+          - during DRAINING, maintain a single PREFETCHING wave: admit one from
+            the OFFLOADED queue if none is active, then drip-prefetch using the
+            currently free slot budget;
+          - keep partial prefetch state on normal resource backpressure, and
+            roll back only on hard deadlock protection.
+
+        Wave registration at prefill completion and consumption of DECODE_READY
+        waves are driven by the batch-formation path via the shared manager
+        wave registry.
+        """
+        mgr = self.offline_pp_offload_manager
+        mgr.tick()
+
+        # Promote finished-offload prefill waves to OFFLOADED.
+        for wave in list(mgr.waves.values()):
+            if wave.state == WaveState.PREFILLING and mgr.is_wave_offload_ready(wave):
+                mgr.mark_wave_offloaded(wave)
+
+        mgr.maybe_enter_draining()
+        if mgr.is_filling():
+            return
+
+        # Maintain at most one in-flight PREFETCHING wave.
+        prefetching = [
+            w for w in mgr.waves.values() if w.state == WaveState.PREFETCHING
+        ]
+        if not prefetching:
+            wave = mgr.pop_next_offloaded()
+            if wave is not None and mgr.admit_wave(wave):
+                mgr.start_prefetching(wave)
+                prefetching = [wave]
+
+        for wave in prefetching:
+            free_slots = self.token_to_kv_pool_allocator.available_size()
+            result = None
+            if free_slots > 0:
+                result = mgr.prefetch_step(wave, free_slots)
+            elif not all(entry.prefetched for entry in wave.entries.values()):
+                mgr.mark_prefetch_blocked(wave, "kv_slots")
+            if mgr.is_wave_decode_ready(wave):
+                continue
+            if mgr.is_hard_blocked(wave, result):
+                mgr.handle_hard_prefetch_block(wave, result)
 
     @DynamicGradMode()
     def event_loop_pp_disagg_prefill(self: Scheduler):
@@ -1283,7 +1372,14 @@ class SchedulerPPMixin:
         mb_metadata: List[Optional[PPBatchMetadata]],
         last_rank_comm_queue: deque,
     ):
-        with torch.profiler.record_function("run_batch"):
+        nvtx_message = _offline_pp_batch_nvtx_message(self, self.cur_batch, mb_id)
+        nvtx_range = getattr(self.offline_pp_offload_manager, "nvtx_range", None)
+        nvtx_ctx = (
+            nvtx_range(nvtx_message)
+            if nvtx_message is not None and nvtx_range is not None
+            else nullcontext()
+        )
+        with torch.profiler.record_function("run_batch"), nvtx_ctx:
             with self.forward_stream_ctx:
                 self.forward_stream.wait_stream(self.schedule_stream)
                 set_time_batch(

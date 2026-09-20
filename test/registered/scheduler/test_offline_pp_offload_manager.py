@@ -1,0 +1,524 @@
+from __future__ import annotations
+
+from contextlib import nullcontext
+from types import SimpleNamespace
+
+import torch
+
+from sglang.srt.managers.offline_pp_offload_manager import (
+    EpochState,
+    OfflinePPStateOffloadManager,
+    StateCodec,
+    WaveState,
+)
+
+
+class _FakeStream:
+    def wait_stream(self, _stream):
+        pass
+
+    def synchronize(self):
+        pass
+
+
+class _FakeEvent:
+    def record(self, _stream):
+        pass
+
+    def query(self):
+        return True
+
+    def synchronize(self):
+        pass
+
+
+class _FakeDeviceModule:
+    def __init__(self):
+        self._stream = _FakeStream()
+
+    def current_stream(self):
+        return self._stream
+
+    def stream(self, _stream):
+        return nullcontext()
+
+    def Event(self):
+        return _FakeEvent()
+
+
+class _FakeKVCache:
+    layer_num = 1
+
+    def __init__(self):
+        self.loads = []
+
+    def get_cpu_copy(self, kv_indices, mamba_indices=None, **kwargs):
+        return kv_indices.clone()
+
+    def load_cpu_copy(self, cpu_state, kv_indices, mamba_indices=None, **kwargs):
+        self.loads.append((cpu_state, kv_indices.clone(), mamba_indices))
+
+
+class _FakeKVAllocator:
+    def __init__(self, *, size=64, page_size=1, fail_alloc=False):
+        self.size = size
+        self.page_size = page_size
+        self.fail_alloc = fail_alloc
+        self.kv_cache = _FakeKVCache()
+        self.free_indices = torch.arange(1, size + 1, dtype=torch.int64)
+        self.alloc_calls = []
+        self.freed = []
+
+    def get_kvcache(self):
+        return self.kv_cache
+
+    def available_size(self):
+        return int(self.free_indices.numel())
+
+    def alloc(self, need_size):
+        self.alloc_calls.append(need_size)
+        if self.fail_alloc or need_size > self.free_indices.numel():
+            return None
+        out = self.free_indices[:need_size].clone()
+        self.free_indices = self.free_indices[need_size:]
+        return out
+
+    def free(self, indices):
+        self.freed.append(indices.clone())
+        if indices.numel() > 0:
+            self.free_indices = torch.cat([indices.to(torch.int64), self.free_indices])
+
+
+class _FakeReqToTokenPool:
+    device = "cpu"
+
+    def __init__(self, *, fail_alloc=False):
+        self.fail_alloc = fail_alloc
+        self.req_to_token = torch.zeros((16, 128), dtype=torch.int64)
+        self.free_slots = list(range(1, 16))
+        self.writes = []
+        self.freed = []
+
+    def alloc(self, reqs):
+        if self.fail_alloc or len(reqs) > len(self.free_slots):
+            return None
+        selected = self.free_slots[: len(reqs)]
+        self.free_slots = self.free_slots[len(reqs) :]
+        for req, idx in zip(reqs, selected):
+            req.req_pool_idx = idx
+        return selected
+
+    def available_size(self):
+        return len(self.free_slots)
+
+    def write(self, indices, values):
+        self.writes.append((indices, values.clone()))
+        self.req_to_token[indices] = values
+
+    def free(self, req):
+        self.freed.append(req.req_pool_idx)
+        self.free_slots.append(req.req_pool_idx)
+        req.req_pool_idx = None
+
+
+def _req(rid, prompt_len, *, max_new_tokens=4, req_pool_idx=None):
+    return SimpleNamespace(
+        rid=rid,
+        origin_input_ids=list(range(prompt_len)),
+        sampling_params=SimpleNamespace(max_new_tokens=max_new_tokens),
+        req_pool_idx=req_pool_idx,
+        mamba_pool_idx=None,
+        kv_committed_len=prompt_len,
+    )
+
+
+def _manager(*, kv_allocator=None, req_pool=None):
+    kv_allocator = kv_allocator or _FakeKVAllocator()
+    req_pool = req_pool or _FakeReqToTokenPool()
+    mgr = OfflinePPStateOffloadManager.__new__(OfflinePPStateOffloadManager)
+    mgr.req_to_token_pool = req_pool
+    mgr.token_to_kv_pool_allocator = kv_allocator
+    mgr.kv_cache = kv_allocator.get_kvcache()
+    mgr.codec = StateCodec()
+    mgr.stall_ticks = 2
+    mgr.prefetch_hard_timeout_sec = 300
+    mgr.gpu_resident_factor = 2.0
+    mgr.min_prefill_waves = 2
+    mgr.max_prefill_waves = None
+    mgr.server_args = SimpleNamespace(prefill_max_requests=8)
+    mgr.prefill_wait_timeout_ticks = 1
+    mgr._prefill_wait_start_time = None
+    mgr._prefill_wait_start_tick = None
+    mgr._prefill_wait_reason = None
+    mgr._prefill_wait_timeout_logged = False
+    mgr.host_limit_bytes = None
+    mgr.is_hybrid = False
+    mgr.offload_stream = _FakeStream()
+    mgr.prefetch_stream = _FakeStream()
+    mgr.device_module = _FakeDeviceModule()
+    mgr.layer_num = mgr.kv_cache.layer_num
+    mgr._next_wave_id = 0
+    mgr.waves = {}
+    mgr.offloaded_queue = []
+    mgr._tick = 0
+    mgr.epoch_state = EpochState.FILLING
+    mgr.current_epoch_id = 0
+    mgr.fill_stop_requested = False
+    mgr.fill_stop_reason = None
+    mgr.inflight_prefill_mbs = set()
+    mgr.host_pinned_bytes = 0
+    mgr._host_bytes_per_committed_token = None
+    mgr._host_bytes_samples = 0
+    return mgr
+
+
+def test_infer_layer_num_from_hybrid_linear_pool_shape():
+    mgr = OfflinePPStateOffloadManager.__new__(OfflinePPStateOffloadManager)
+    mgr.kv_cache = SimpleNamespace(
+        full_layer_nums=12,
+        mamba_pool=SimpleNamespace(num_mamba_layers=16),
+    )
+
+    assert mgr._infer_layer_num() == 28
+
+
+def test_admit_wave_split_preserves_cpu_state():
+    mgr = _manager(kv_allocator=_FakeKVAllocator(size=20))
+    reqs = [_req("r0", 3), _req("r1", 3), _req("r2", 3)]
+    wave = mgr.new_wave(reqs)
+    wave.state = WaveState.OFFLOADED
+    wave.offload_ready = True
+    for req in reqs:
+        wave.entries[req.rid].cpu_state = f"cpu-{req.rid}"
+
+    assert mgr.admit_wave(wave) is True
+
+    assert [req.rid for req in wave.reqs] == ["r0"]
+    assert wave.entries["r0"].cpu_state == "cpu-r0"
+    remainder = mgr.waves[mgr.offloaded_queue[-1]]
+    assert [req.rid for req in remainder.reqs] == ["r1", "r2"]
+    assert remainder.entries["r1"].cpu_state == "cpu-r1"
+    assert remainder.entries["r2"].cpu_state == "cpu-r2"
+
+
+def test_prefetch_req_alloc_failure_frees_kv_allocation():
+    kv_allocator = _FakeKVAllocator(size=16)
+    req_pool = _FakeReqToTokenPool(fail_alloc=True)
+    mgr = _manager(kv_allocator=kv_allocator, req_pool=req_pool)
+    req = _req("r0", 5)
+    wave = mgr.new_wave([req])
+    wave.entries[req.rid].cpu_state = torch.arange(5)
+
+    result = mgr.prefetch_step(wave, free_slots=16)
+
+    assert result.consumed_slots == 0
+    assert result.blocked_reason == "req_slots"
+    assert wave.entries[req.rid].device_kv_indices is None
+    assert req.req_pool_idx is None
+    assert kv_allocator.freed[-1].numel() == 5
+
+
+def test_prefetch_kv_alloc_failure_does_not_allocate_req_slot():
+    kv_allocator = _FakeKVAllocator(size=16, fail_alloc=True)
+    req_pool = _FakeReqToTokenPool()
+    mgr = _manager(kv_allocator=kv_allocator, req_pool=req_pool)
+    req = _req("r0", 5)
+    wave = mgr.new_wave([req])
+    wave.entries[req.rid].cpu_state = torch.arange(5)
+
+    result = mgr.prefetch_step(wave, free_slots=16)
+
+    assert result.consumed_slots == 0
+    assert result.blocked_reason == "kv_slots"
+    assert req.req_pool_idx is None
+    assert req_pool.freed == []
+    assert req_pool.writes == []
+
+
+def test_prefetch_page_aligned_allocation_maps_committed_only():
+    kv_allocator = _FakeKVAllocator(size=32, page_size=4)
+    req_pool = _FakeReqToTokenPool()
+    mgr = _manager(kv_allocator=kv_allocator, req_pool=req_pool)
+    req = _req("r0", 5)
+    wave = mgr.new_wave([req])
+    wave.entries[req.rid].cpu_state = torch.arange(5)
+
+    result = mgr.prefetch_step(wave, free_slots=32)
+
+    assert result.consumed_slots == 8
+    assert kv_allocator.alloc_calls[-1] == 8
+    assert wave.entries[req.rid].device_kv_indices.numel() == 8
+    assert req_pool.writes[-1][1].numel() == 5
+    assert kv_allocator.kv_cache.loads[-1][1].numel() == 5
+
+
+def test_stall_rollback_frees_partial_prefetch_and_requeues_wave():
+    kv_allocator = _FakeKVAllocator(size=16)
+    req_pool = _FakeReqToTokenPool()
+    mgr = _manager(kv_allocator=kv_allocator, req_pool=req_pool)
+    req = _req("r0", 4)
+    wave = mgr.new_wave([req])
+    wave.entries[req.rid].cpu_state = torch.arange(4)
+    wave.state = WaveState.PREFETCHING
+    mgr.prefetch_step(wave, free_slots=16)
+
+    mgr.rollback_wave(wave)
+
+    assert wave.state == WaveState.OFFLOADED
+    assert wave.retry_count == 1
+    assert mgr.offloaded_queue[0] == wave.wave_id
+    assert wave.entries[req.rid].device_kv_indices is None
+    assert req.req_pool_idx is None
+
+
+def test_partial_prefetch_block_keeps_resident_state_when_earlier_wave_can_free():
+    mgr = _manager(kv_allocator=_FakeKVAllocator(size=32))
+    earlier = mgr.new_wave([_req("earlier", 1)])
+    earlier.state = WaveState.DECODE_READY
+    reqs = [_req("r0", 4), _req("r1", 8)]
+    wave = mgr.new_wave(reqs)
+    wave.state = WaveState.PREFETCHING
+    for req in reqs:
+        wave.entries[req.rid].cpu_state = torch.arange(
+            wave.entries[req.rid].committed_len
+        )
+
+    result = mgr.prefetch_step(wave, free_slots=4)
+
+    assert result.consumed_slots == 4
+    assert result.blocked_reason == "kv_slots"
+    assert wave.entries["r0"].prefetched is True
+    assert wave.entries["r1"].prefetched is False
+    assert wave.state == WaveState.PREFETCHING
+    assert mgr.is_hard_blocked(wave, result) is False
+
+
+def test_prefetch_block_without_earlier_resident_wave_is_hard_deadlock():
+    mgr = _manager(kv_allocator=_FakeKVAllocator(size=16))
+    req = _req("r0", 8)
+    wave = mgr.new_wave([req])
+    wave.state = WaveState.PREFETCHING
+    wave.entries[req.rid].cpu_state = torch.arange(8)
+
+    result = mgr.prefetch_step(wave, free_slots=4)
+
+    assert result.blocked_reason == "kv_slots"
+    assert mgr.is_hard_blocked(wave, result) is True
+    assert mgr.hard_block_reason(wave, result) == "no_earlier_resident_wave"
+
+
+def test_epoch_drains_all_waves_before_next_fill():
+    mgr = _manager()
+    wave0 = mgr.new_wave([_req("r0", 2)])
+    wave1 = mgr.new_wave([_req("r1", 2)])
+    mgr.max_prefill_waves = 2
+
+    assert mgr.local_fill_stop_reason(waiting_queue_empty=False) == "max_waves"
+    mgr.enter_draining("max_waves")
+    assert mgr.is_draining()
+
+    mgr.retire_wave(wave0)
+    assert mgr.is_draining()
+    mgr.retire_wave(wave1)
+
+    assert mgr.is_filling()
+    assert mgr.current_epoch_id == 1
+
+
+def test_fill_stop_counts_inflight_prefill_against_max_waves():
+    mgr = _manager()
+    mgr.max_prefill_waves = 2
+    mgr.new_wave([_req("r0", 2)])
+    mgr.note_prefill_dispatched(0)
+
+    assert mgr.pending_epoch_wave_count() == 2
+    assert mgr.local_fill_stop_reason(waiting_queue_empty=False) == "max_waves"
+
+
+def test_fill_stop_counts_inflight_prefill_before_wave_materializes():
+    mgr = _manager()
+    mgr.max_prefill_waves = 1
+    mgr.note_prefill_dispatched(0)
+
+    assert mgr.pending_epoch_wave_count() == 1
+    assert mgr.local_fill_stop_reason(waiting_queue_empty=False) == "max_waves"
+
+
+def test_request_draining_waits_for_inflight_prefill_to_offload():
+    mgr = _manager()
+    wave = mgr.new_wave([_req("r0", 2)])
+    mgr.note_prefill_dispatched(0)
+
+    mgr.request_draining("host")
+
+    assert mgr.is_filling()
+    assert mgr.fill_stop_requested is True
+    assert mgr.fill_stop_reason == "host"
+    assert mgr.inflight_prefill_count == 1
+
+    mgr.note_prefill_offloaded(0)
+
+    assert mgr.is_draining()
+    assert mgr.inflight_prefill_count == 0
+    assert mgr.has_active_epoch_waves()
+    assert wave.epoch_id == 0
+
+
+def test_epoch_reset_clears_fill_stop_and_inflight_state():
+    mgr = _manager()
+    wave = mgr.new_wave([_req("r0", 2)])
+    mgr.note_prefill_dispatched(0)
+    mgr.request_draining("host")
+    mgr.note_prefill_offloaded(0)
+
+    assert mgr.is_draining()
+
+    mgr.retire_wave(wave)
+
+    assert mgr.is_filling()
+    assert mgr.current_epoch_id == 1
+    assert mgr.fill_stop_requested is False
+    assert mgr.fill_stop_reason is None
+    assert mgr.inflight_prefill_mbs == set()
+
+
+def test_host_state_bytes_are_counted_and_released_when_decode_ready():
+    mgr = _manager()
+    req = _req("r0", 4)
+    wave = mgr.new_wave([req])
+    entry = wave.entries[req.rid]
+    mgr._set_entry_host_state(wave, entry, torch.arange(4, dtype=torch.int32))
+
+    assert wave.host_bytes_exact == 16
+    assert mgr.host_pinned_bytes == 16
+
+    entry.prefetched = True
+    wave.prefetch_done_event = _FakeEvent()
+    assert mgr.is_wave_decode_ready(wave) is True
+
+    assert wave.host_bytes_exact == 0
+    assert mgr.host_pinned_bytes == 0
+
+
+def test_prefill_waits_for_underfilled_wave_before_timeout():
+    mgr = _manager()
+    mgr.prefill_wait_timeout_ticks = 60
+
+    assert (
+        mgr.should_wait_for_prefill(
+            waiting_queue_len=7,
+            has_chunked_req=False,
+            base_prefill_max_requests=8,
+        )
+        is True
+    )
+    assert mgr.has_offline_work() is True
+
+
+def test_prefill_wait_timeout_allows_underfilled_wave():
+    mgr = _manager()
+    mgr.prefill_wait_timeout_ticks = 2
+
+    assert mgr.should_wait_for_prefill(7, False, 8) is True
+    mgr._tick += 2
+
+    assert mgr.should_wait_for_prefill(7, False, 8) is False
+
+
+def test_prefill_wait_full_wave_resets_wait():
+    mgr = _manager()
+    mgr.prefill_wait_timeout_ticks = 60
+
+    assert mgr.should_wait_for_prefill(7, False, 8) is True
+    assert mgr.should_wait_for_prefill(8, False, 8) is False
+    assert mgr._prefill_wait_start_tick is None
+
+
+def test_waiting_empty_waits_before_draining_when_epoch_has_room():
+    mgr = _manager()
+    mgr.prefill_wait_timeout_ticks = 60
+    mgr.max_prefill_waves = 4
+    mgr.new_wave([_req("r0", 2)])
+
+    assert mgr.local_fill_stop_reason(waiting_queue_empty=True) is None
+
+
+def test_waiting_empty_drains_after_wait_timeout():
+    mgr = _manager()
+    mgr.prefill_wait_timeout_ticks = 2
+    mgr.max_prefill_waves = 4
+    mgr.new_wave([_req("r0", 2)])
+
+    assert mgr.local_fill_stop_reason(waiting_queue_empty=True) is None
+    mgr._tick += 2
+
+    assert mgr.local_fill_stop_reason(waiting_queue_empty=True) == "waiting_empty"
+
+
+def test_prefill_budget_uses_decode_tokens_for_gpu_and_prompt_bytes_for_host():
+    mgr = _manager(kv_allocator=_FakeKVAllocator(size=40))
+    mgr.host_limit_bytes = 200
+    mgr.min_prefill_waves = 2
+    mgr._host_bytes_per_committed_token = 10
+    reqs = [
+        _req("r0", 8, max_new_tokens=32),
+        _req("r1", 8, max_new_tokens=32),
+    ]
+
+    budget = mgr.prefill_budget_for_waiting_queue(
+        reqs,
+        base_max_prefill_tokens=1024,
+        base_prefill_max_requests=None,
+    )
+
+    assert budget.prefill_max_requests == 1
+    assert budget.limited_by in {"gpu_double_buffer", "host"}
+    assert budget.kv_decode_slots == 40
+    assert budget.kv_prefetch_slots == 8
+    assert budget.host_bytes_est == 80
+
+
+def test_prefill_budget_marks_waiting_queue_limited_underfill():
+    mgr = _manager(kv_allocator=_FakeKVAllocator(size=1024))
+    reqs = [_req(f"r{i}", 4) for i in range(7)]
+
+    budget = mgr.prefill_budget_for_waiting_queue(
+        reqs,
+        base_max_prefill_tokens=1024,
+        base_prefill_max_requests=8,
+    )
+
+    assert budget.prefill_max_requests == 7
+    assert budget.limited_by == "waiting_queue"
+
+
+def test_prefill_budget_resource_limit_does_not_report_waiting_queue():
+    mgr = _manager(kv_allocator=_FakeKVAllocator(size=80))
+    reqs = [_req(f"r{i}", 4, max_new_tokens=1) for i in range(8)]
+
+    budget = mgr.prefill_budget_for_waiting_queue(
+        reqs,
+        base_max_prefill_tokens=1024,
+        base_prefill_max_requests=8,
+    )
+
+    assert budget.prefill_max_requests == 7
+    assert budget.limited_by == "gpu_double_buffer"
+
+
+def test_prefill_budget_can_be_limited_by_mamba_slots():
+    req_pool = _FakeReqToTokenPool()
+    req_pool.get_mamba_indices = lambda _indices: torch.tensor([1])
+    req_pool.mamba_pool = SimpleNamespace(size=4)
+    mgr = _manager(req_pool=req_pool)
+    mgr.is_hybrid = True
+    reqs = [_req("r0", 2), _req("r1", 2)]
+
+    budget = mgr.prefill_budget_for_waiting_queue(
+        reqs,
+        base_max_prefill_tokens=1024,
+        base_prefill_max_requests=None,
+    )
+
+    assert budget.prefill_max_requests == 1
+    assert budget.limited_by == "mamba_slots"
