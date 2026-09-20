@@ -430,6 +430,7 @@ class FusedMoE(torch.nn.Module):
             self.quant_config is not None
             and self.quant_config.get_name() == "mxfp4"
             and self.use_flashinfer_mxfp4_moe
+            and not get_moe_a2a_backend().is_megamoe()
         ):
             hidden_size = round_up(hidden_size, 256)
         self.hidden_size = hidden_size
@@ -516,10 +517,26 @@ class FusedMoE(torch.nn.Module):
             moe_intermediate_size=intermediate_size,
         )
 
-        self.quant_method.create_moe_runner(self, self.moe_runner_config)
-        self.dispatcher = create_moe_dispatcher(
-            self.moe_runner_config, quant_method=self.quant_method
+        from sglang.srt.plugins.fused_moe import create_fused_moe_backend
+
+        self.fused_moe_backend = create_fused_moe_backend(
+            get_moe_a2a_backend().value,
+            (
+                torch.cuda.get_device_capability()
+                if not _is_cpu and torch.version.cuda and torch.cuda.is_available()
+                else (0, 0)
+            ),
+            self,
         )
+        if self.fused_moe_backend is None:
+            self.quant_method.create_moe_runner(self, self.moe_runner_config)
+            self.dispatcher = create_moe_dispatcher(
+                self.moe_runner_config, quant_method=self.quant_method
+            )
+        else:
+            self.quant_method.moe_runner_config = self.moe_runner_config
+            self.quant_method.runner = None
+            self.dispatcher = None
         # Dispatchers are not nn.Modules, so they cannot register their own
         # buffers; the AITER expert mask would not survive a memory-saver resume.
         expert_mask = getattr(self.dispatcher, "expert_mask_gpu", None)
@@ -1548,6 +1565,11 @@ class FusedMoE(torch.nn.Module):
         topk_output: TopKOutput,
         pre_quant_input: Optional[Tuple] = None,
     ):
+        if self.fused_moe_backend is not None:
+            if self._dwdp_bound:
+                raise RuntimeError("Fused MoE extensions do not support DWDP offload")
+            return self.fused_moe_backend.forward(self, hidden_states, topk_output)
+
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 

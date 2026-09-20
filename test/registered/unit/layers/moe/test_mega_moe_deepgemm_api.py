@@ -244,6 +244,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             layer_id=0,
             routed_scaling_factor=1.0,
         )
+        moe.gate.e_score_correction_bias_vl = None
 
         with (
             patch.dict(sys.modules, {"deep_gemm": deep_gemm}),

@@ -1525,6 +1525,9 @@ class Envs:
     # Bound all early-live BF16 embedding buffers per rank/forward (128 MiB).
     # Reserve L14 first; layers exceeding the budget use sync lookup. 0 disables.
     SGLANG_DSV41_ENGRAM_EMBED_PREFETCH_MAX_BYTES = EnvInt(128 * 1024 * 1024)
+    # Keep mHC residuals token-sharded between Attention ReduceScatter and the
+    # next Attention input AllGather. Opt-in: DSV4.1 SM90 TP8/EP8 MegaMoE decode.
+    SGLANG_DSV41_MEGAMOE_REDUCE_SCATTER = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 

@@ -2370,6 +2370,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             align_mxfp8_moe_weights_for_flashinfer_trtllm(layer)
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        backend = getattr(layer, "fused_moe_backend", None)
+        if backend is not None:
+            backend.prepare_weights(layer)
+            return
         if _is_hip and _use_hip_int4:
             self.process_weights_hip_int4(layer)
 
