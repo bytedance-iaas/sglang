@@ -29,6 +29,38 @@ if TYPE_CHECKING:
 _GROUP_SIZE = 32
 
 
+def _preprocess_humming_mxfp4_by_expert(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Convert Humming weights in place with one expert's temporary storage."""
+    from flashinfer.fused_moe import (
+        preprocess_moe_weights_for_sm90_mixed_gemm_humming,
+    )
+
+    residual = torch.empty(weight.shape[0], dtype=torch.float32, device=weight.device)
+    weight_shape = None
+    scale_shape = None
+    with torch.no_grad():
+        for expert_id in range(weight.shape[0]):
+            weight_out, scale_out, expert_residual = (
+                preprocess_moe_weights_for_sm90_mixed_gemm_humming(
+                    weight[expert_id : expert_id + 1],
+                    scale[expert_id : expert_id + 1],
+                )
+            )
+            weight_shape = weight_out.shape[1:]
+            scale_shape = scale_out.shape[1:]
+            weight[expert_id].view(-1).copy_(weight_out.view(-1))
+            scale[expert_id].view(-1).copy_(scale_out.view(-1))
+            residual[expert_id].copy_(expert_residual[0])
+    return (
+        weight.view(weight.shape[0], *weight_shape),
+        scale.view(scale.shape[0], *scale_shape),
+        residual,
+    )
+
+
 class Mxfp4FlashinferCutlassMoEMethod:
     """FlashInfer MXFP4 MoE: W4A16/W4A8 on SM90 and W4A8 on SM120."""
 
@@ -161,21 +193,13 @@ class Mxfp4FlashinferCutlassMoEMethod:
                 scale_u8.copy_(block_scale_interleave(scale_u8).reshape_as(scale_u8))
         else:
             if self._use_sm90_humming:
-                from flashinfer.fused_moe import (
-                    preprocess_moe_weights_for_sm90_mixed_gemm_humming,
+                w13_il, w13_s_il, w13_residual = _preprocess_humming_mxfp4_by_expert(
+                    layer.w13_weight.data.view(torch.uint8).contiguous(),
+                    w13_scale_u8,
                 )
-
-                w13_il, w13_s_il, w13_residual = (
-                    preprocess_moe_weights_for_sm90_mixed_gemm_humming(
-                        layer.w13_weight.data.view(torch.uint8).contiguous(),
-                        w13_scale_u8,
-                    )
-                )
-                w2_il, w2_s_il, w2_residual = (
-                    preprocess_moe_weights_for_sm90_mixed_gemm_humming(
-                        layer.w2_weight.data.view(torch.uint8).contiguous(),
-                        w2_scale_u8,
-                    )
+                w2_il, w2_s_il, w2_residual = _preprocess_humming_mxfp4_by_expert(
+                    layer.w2_weight.data.view(torch.uint8).contiguous(),
+                    w2_scale_u8,
                 )
                 layer.w13_humming_residual_scale = Parameter(
                     (w13_residual * 64.0).contiguous(), requires_grad=False
