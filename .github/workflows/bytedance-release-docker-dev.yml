@@ -63,7 +63,9 @@ on:
 
 concurrency:
   group: release-docker-dev-${{ inputs.private_debug_verify_image != '' && format('verify-{0}', github.run_id) || inputs.tag || inputs.pr_number || 'nightly' }}
-  cancel-in-progress: true
+  # Kernel/image cold builds can take over an hour. Queue duplicate triggers
+  # instead of discarding all completed download and compile work.
+  cancel-in-progress: false
 
 jobs:
   prepare:
