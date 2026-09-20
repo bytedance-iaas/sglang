@@ -333,36 +333,54 @@ class TestDSV41DSparkPD(CustomTestCase):
         self.assertEqual(info.required_dst_info_num, 8)
         self.assertEqual(info.required_prefill_response_num, 8)
 
-    def test_bootstrap_rejects_mismatched_total_attention_width(self):
+    def test_bootstrap_accepts_cp4_pp2_to_decode_tp8(self):
         manager = object.__new__(CommonKVManager)
         manager.prefill_info_table = {}
-        manager.kv_args = SimpleNamespace(page_size=256)
+        manager.kv_args = SimpleNamespace(page_size=256, engine_rank=3)
         manager.kv_cache_dtype_str = "fp8_e4m3"
         manager.dsv41_spec_layout = make_layout()
         manager.attn_tp_size = 8
         manager.attn_cp_size = 1
+        manager.attn_cp_rank = 0
         manager.dcp_size = 1
-        manager._resolve_rank_mapping = Mock()
+        manager.pp_size = 1
+        manager.pp_rank = 0
+        manager.is_mla_backend = True
+        manager.is_hybrid_mla_backend = False
+        manager.enable_all_cp_ranks_for_transfer = True
         response = Mock(status_code=200)
         response.json.return_value = dict(
             attn_tp_size=1,
             attn_cp_size=4,
             dp_size=1,
-            pp_size=1,
+            pp_size=2,
             page_size=256,
             kv_cache_dtype="fp8_e4m3",
             follow_bootstrap_room=True,
             dsv41_spec_layout=manager.dsv41_spec_layout,
         )
-        with (
-            patch(
-                "sglang.srt.disaggregation.common.conn.requests.get",
-                return_value=response,
-            ),
-            self.assertRaisesRegex(RuntimeError, "attention parallel width"),
+        with patch(
+            "sglang.srt.disaggregation.common.conn.requests.get",
+            return_value=response,
         ):
-            manager.try_ensure_parallel_info("prefill:8998")
-        manager._resolve_rank_mapping.assert_not_called()
+            self.assertTrue(manager.try_ensure_parallel_info("prefill:8998"))
+
+        info = manager.prefill_info_table["prefill:8998"]
+        self.assertEqual(info.target_tp_rank, 0)
+        self.assertEqual(info.target_tp_ranks, [0])
+        self.assertEqual(info.target_cp_ranks, list(range(4)))
+        self.assertEqual(info.target_pp_ranks, [0, 1])
+        self.assertEqual(info.required_dst_info_num, 8)
+        self.assertEqual(info.required_prefill_response_num, 8)
+
+    def test_bootstrap_rejects_non_divisible_attention_tp(self):
+        manager = object.__new__(CommonKVManager)
+        manager.kv_args = SimpleNamespace(engine_rank=0)
+        manager.attn_tp_size = 6
+        info = SimpleNamespace(attn_tp_size=4)
+
+        with self.assertRaisesRegex(RuntimeError, "must divide evenly"):
+            manager._resolve_rank_mapping(info)
 
     def test_prefill_cp_partitions_every_kv_page_once(self):
         pages = np.arange(11, dtype=np.int32)

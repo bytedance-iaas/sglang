@@ -363,7 +363,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, "
                 "DCP=1, and Decode CP=1. Prefill may use canonical interleave "
                 "CP with DP=1. Both servers must enable DSpark with the same "
-                "block size and total attention parallel width."
+                "block size."
             )
 
     from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
