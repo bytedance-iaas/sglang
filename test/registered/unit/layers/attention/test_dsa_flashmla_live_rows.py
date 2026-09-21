@@ -185,6 +185,60 @@ class TestDSAFlashMLALiveRows(CustomTestCase):
         self.assertEqual(captured["indices"].shape[0], 1)
         self.assertEqual(output.shape, (1, 1, 2, 2))
 
+    def test_flashmla_uses_scheduler_rows_and_restores_physical_output(self):
+        """Scheduler metadata owns the logical axis for every call mode."""
+        captured = {}
+        flashmla = ModuleType("sgl_kernel.flash_mla")
+
+        def fake_flash_mla_with_kvcache(**kwargs):
+            captured.update(kwargs)
+            return torch.ones((4, 1, 2, 2)), None
+
+        flashmla.flash_mla_with_kvcache = fake_flash_mla_with_kvcache
+        sgl_kernel = ModuleType("sgl_kernel")
+        sgl_kernel.flash_mla = flashmla
+        backend = SimpleNamespace(
+            flashmla_kv_num_q_heads=2,
+            real_page_size=64,
+            kv_cache_dim=3,
+            dsa_kv_cache_store_fp8=True,
+            dsa_index_topk=2,
+        )
+        metadata = SimpleNamespace(
+            dsa_cache_seqlens_int32=torch.tensor(
+                [8, 9, 10, 11, 0, 0, 0, 0], dtype=torch.int32
+            ),
+            flashmla_metadata=SimpleNamespace(
+                flashmla_metadata=torch.empty((1,), dtype=torch.int32),
+                num_splits=torch.empty((5,), dtype=torch.int32),
+            ),
+        )
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "sgl_kernel": sgl_kernel,
+                "sgl_kernel.flash_mla": flashmla,
+            },
+        ):
+            output = DeepseekSparseAttnBackend._forward_flashmla_kv(
+                backend,
+                q_all=torch.empty((8, 2, 3)),
+                kv_cache=torch.empty((64, 3)),
+                v_head_dim=2,
+                sm_scale=1.0,
+                layer=SimpleNamespace(tp_q_head_num=2, head_dim=3),
+                metadata=metadata,
+                page_table_1=torch.zeros((8, 2), dtype=torch.int32),
+            )
+
+        self.assertEqual(captured["q"].shape[0], 4)
+        self.assertEqual(captured["cache_seqlens"].tolist(), [8, 9, 10, 11])
+        self.assertEqual(captured["indices"].shape[0], 4)
+        self.assertEqual(output.shape, (8, 1, 2, 2))
+        self.assertTrue(torch.equal(output[:4], torch.ones_like(output[:4])))
+        self.assertTrue(torch.equal(output[4:], torch.zeros_like(output[4:])))
+
     def test_draft_extend_trims_eager_padding_and_restores_output(self):
         """MTP draft attention uses logical rows and restores MLP padding."""
         captured = {}

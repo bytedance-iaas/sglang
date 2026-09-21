@@ -2261,18 +2261,7 @@ class DeepseekSparseAttnBackend(
         elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
-            num_extend_padding_rows = 0
-            if forward_batch.forward_mode.is_draft_extend_v2():
-                assert metadata.flashmla_metadata is not None
-                scheduled_num_tokens = (
-                    metadata.flashmla_metadata.num_splits.shape[0] - 1
-                )
-                q_all, page_table_1, num_extend_padding_rows = (
-                    _trim_dsa_dp_padding(
-                        q_all, page_table_1, scheduled_num_tokens
-                    )
-                )
-            output = self._forward_flashmla_kv(
+            return self._forward_flashmla_kv(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 sm_scale=layer.scaling,
@@ -2281,9 +2270,6 @@ class DeepseekSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
-            )
-            return _restore_dsa_dp_padding(
-                output, num_extend_padding_rows
             )
         elif dsa_impl == "fa3":
             return self._forward_fa3(
@@ -2938,15 +2924,19 @@ class DeepseekSparseAttnBackend(
     ) -> torch.Tensor:
         from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
+        assert metadata.flashmla_metadata is not None
+        num_splits = metadata.flashmla_metadata.num_splits
+        scheduled_num_tokens = num_splits.shape[0] - 1
+        q_all, page_table_1, num_padding_rows = _trim_dsa_dp_padding(
+            q_all, page_table_1, scheduled_num_tokens
+        )
         live_num_tokens = q_all.shape[0]
         cache_seqlens = metadata.dsa_cache_seqlens_int32[:live_num_tokens]
-        assert metadata.flashmla_metadata is not None
         if cache_seqlens.shape[0] != live_num_tokens:
             raise RuntimeError(
                 "FlashMLA length rows must match the live DSA query axis: "
                 f"q_tokens={live_num_tokens}, length_rows={cache_seqlens.shape[0]}"
             )
-        num_splits = metadata.flashmla_metadata.num_splits
         if num_splits.shape[0] != live_num_tokens + 1:
             raise RuntimeError(
                 "FlashMLA scheduler rows must match the live DSA query axis: "
@@ -3002,7 +2992,7 @@ class DeepseekSparseAttnBackend(
         if target_q_heads != num_q_heads:
             o = o[:, :, :num_q_heads, :]
 
-        return o
+        return _restore_dsa_dp_padding(o, num_padding_rows)
 
     def _forward_standard_mha(
         self,
