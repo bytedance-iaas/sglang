@@ -444,15 +444,23 @@ def commit_kv_proj_fused(
             bias=None,
         )
     elif stacked.fp8_scale is not None:
-        quant_method = wkv_linears[0].quant_method
-        kv_all = quant_method.w8a8_block_fp8_linear(
-            input=main_x,
-            weight=stacked.weight,
-            block_size=quant_method.quant_config.weight_block_size,
-            weight_scale=stacked.fp8_scale,
-            input_scale=None,
-            bias=None,
+        from sglang.srt.layers.quantization.humming_fp8 import (
+            can_use_packed_humming_fp8,
+            packed_humming_fp8_linear,
         )
+
+        if can_use_packed_humming_fp8(stacked.humming, main_x, stacked.weight.shape[1]):
+            kv_all = packed_humming_fp8_linear(stacked.humming, main_x)
+        else:
+            quant_method = wkv_linears[0].quant_method
+            kv_all = quant_method.w8a8_block_fp8_linear(
+                input=main_x,
+                weight=stacked.weight,
+                block_size=quant_method.quant_config.weight_block_size,
+                weight_scale=stacked.fp8_scale,
+                input_scale=None,
+                bias=None,
+            )
     else:
         kv_all = torch.nn.functional.linear(main_x, stacked.weight)
 
@@ -465,6 +473,7 @@ class _StackedWkvWeight(msgspec.Struct):
     weight: torch.Tensor
     fp8_scale: Optional[torch.Tensor]
     mxfp8_scale: Optional[torch.Tensor] = None
+    humming: object = None
 
 
 def _stacked_wkv_weight(*, wkv_linears: list[torch.nn.Module]) -> _StackedWkvWeight:
@@ -553,7 +562,14 @@ def _build_stacked_wkv_weight(
         scale = torch.cat([linear.weight_scale_inv for linear in wkv_linears], dim=0)
         if scale.dim() >= 2 and scale.stride(-2) != 1:
             scale = scale.transpose(-2, -1).contiguous().transpose(-2, -1)
-        return _StackedWkvWeight(weight=weight, fp8_scale=scale)
+        humming = None
+        if getattr(wkv_linears[0].quant_method, "use_humming", False):
+            from sglang.srt.layers.quantization.humming_fp8 import (
+                pack_humming_fp8_weights,
+            )
+
+            humming = pack_humming_fp8_weights(weight, scale)
+        return _StackedWkvWeight(weight=weight, fp8_scale=scale, humming=humming)
     weight = torch.cat(
         [_dequant_linear_weight(linear) for linear in wkv_linears], dim=0
     )

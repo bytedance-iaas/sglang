@@ -27,20 +27,13 @@ def _requires_deterministic_gemm() -> bool:
 
 
 @torch.no_grad()
-def prepare_humming_fp8_linear(layer: torch.nn.Module) -> None:
-    layer.humming_fp8_ready = False
-    if (
-        getattr(layer, "keep_plain_weight_layout", False)
-        or layer.orig_dtype != torch.bfloat16
-        or layer.weight.dtype != torch.float8_e4m3fn
-        or _requires_deterministic_gemm()
-    ):
-        return
-
-    n, k = layer.weight.shape
+def pack_humming_fp8_weights(
+    weight: torch.Tensor, weight_scale: torch.Tensor
+) -> torch.nn.Module | None:
+    n, k = weight.shape
     packed_k = _HUMMING_FP8_PADDED_K.get((n, k), k)
     if n % 32 or k % 32 or packed_k < 1024 or packed_k % 128:
-        return
+        return None
 
     try:
         from humming.layer import HummingLayer
@@ -50,15 +43,14 @@ def prepare_humming_fp8_linear(layer: torch.nn.Module) -> None:
             "install the version pinned in python/pyproject.toml"
         ) from exc
 
-    weight = layer.weight
-    weight_scale = layer.weight_scale_inv.float()
+    weight_scale = weight_scale.float()
     if packed_k != k:
         # Humming requires its logical K to match the padded activation. Keep
         # the checkpoint tensors unchanged and pad only this derived cache.
         weight = F.pad(weight, (0, packed_k - k))
         weight_scale = F.pad(weight_scale, (0, packed_k // 32 - k // 32), value=1.0)
 
-    with torch.device(layer.weight.device):
+    with torch.device(weight.device):
         packed = HummingLayer(
             shape_n=n,
             shape_k=packed_k,
@@ -74,6 +66,23 @@ def prepare_humming_fp8_linear(layer: torch.nn.Module) -> None:
         )
     packed.load_from_tensors({"weight": weight, "weight_scale_inv": weight_scale})
     packed.transform()
+    return packed
+
+
+@torch.no_grad()
+def prepare_humming_fp8_linear(layer: torch.nn.Module) -> None:
+    layer.humming_fp8_ready = False
+    if (
+        getattr(layer, "keep_plain_weight_layout", False)
+        or layer.orig_dtype != torch.bfloat16
+        or layer.weight.dtype != torch.float8_e4m3fn
+        or _requires_deterministic_gemm()
+    ):
+        return
+
+    packed = pack_humming_fp8_weights(layer.weight, layer.weight_scale_inv)
+    if packed is None:
+        return
 
     for name in ("weight", "weight_scale", "locks"):
         tensor = getattr(packed, name).detach()
@@ -91,7 +100,7 @@ def prepare_humming_fp8_linear(layer: torch.nn.Module) -> None:
         else:
             layer.register_buffer(cache_name, tensor, persistent=False)
     layer._humming_fp8_config = packed.humming_config
-    layer._humming_fp8_input_padding = packed_k - k
+    layer._humming_fp8_input_padding = packed.shape_k - layer.weight.shape[1]
     layer.humming_fp8_ready = True
 
 
@@ -110,6 +119,30 @@ def can_use_humming_fp8_linear(layer: torch.nn.Module, x) -> bool:
         else 1
     )
     return min_m <= m <= _HUMMING_FP8_MAX_M and not _requires_deterministic_gemm()
+
+
+def can_use_packed_humming_fp8(
+    packed: torch.nn.Module | None, x, logical_k: int, *, min_m: int = 1
+) -> bool:
+    if packed is None or not isinstance(x, torch.Tensor) or x.dtype != torch.bfloat16:
+        return False
+    if x.shape[-1] != logical_k:
+        return False
+    m = x.numel() // logical_k
+    return min_m <= m <= _HUMMING_FP8_MAX_M and not _requires_deterministic_gemm()
+
+
+def packed_humming_fp8_linear(packed: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+    from sglang.kernels.ops.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
+
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+    if packed.shape_k != x_2d.shape[1]:
+        x_2d = F.pad(x_2d, (0, packed.shape_k - x_2d.shape[1]))
+    q_input, input_scale = sglang_per_token_group_quant_fp8(x_2d, 32, scale_ue8m0=True)
+    output = packed(q_input, input_scale=input_scale)
+    return output.reshape(*x.shape[:-1], packed.shape_n)
 
 
 def humming_fp8_linear(

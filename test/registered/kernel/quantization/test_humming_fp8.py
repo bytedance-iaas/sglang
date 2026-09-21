@@ -6,6 +6,7 @@ from unittest import mock
 
 import torch
 
+from sglang.kernels.ops.speculative.dspark import dspark_draft_model
 from sglang.srt.layers.quantization import fp8, fp8_utils, humming_fp8
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_utils import Fp8GemmRunnerBackend
@@ -160,6 +161,32 @@ class TestHummingFp8Linear(CustomTestCase):
                 large_out, _ = layer(large)
             self.assertEqual(run.call_count, 1)
             self._assert_close(large_out, self._reference(layer, large))
+
+    def test_dspark_stacked_kv_projection_uses_humming(self):
+        with (
+            torch.no_grad(),
+            mock.patch.object(humming_fp8, "_HUMMING_FP8_MAX_M", 8192),
+        ):
+            layers = [self._make_layer(n=512, k=5120) for _ in range(3)]
+            x = torch.randn((128, 5120), device="cuda", dtype=torch.bfloat16)
+            dspark_draft_model._STACKED_WEIGHT_CACHE.clear()
+            self.addCleanup(dspark_draft_model._STACKED_WEIGHT_CACHE.clear)
+
+            with mock.patch.object(
+                humming_fp8,
+                "packed_humming_fp8_linear",
+                wraps=humming_fp8.packed_humming_fp8_linear,
+            ) as run:
+                outputs = dspark_draft_model.commit_kv_proj_fused(
+                    main_x=x, wkv_linears=layers
+                )
+
+            self.assertEqual(run.call_count, 1)
+            packed = dspark_draft_model._stacked_wkv_weight(wkv_linears=layers)
+            self.assertIsNotNone(packed.humming)
+            self.assertEqual(packed.weight.shape, (1536, 5120))
+            for output, layer in zip(outputs, layers):
+                self._assert_close(output, self._reference(layer, x))
 
     def test_bias_leading_dims_noncontiguous_and_cuda_graph(self):
         with torch.no_grad():
