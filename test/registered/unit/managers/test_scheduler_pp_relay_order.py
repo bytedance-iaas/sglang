@@ -25,10 +25,11 @@ class _FakeStream:
 
 
 class TestSchedulerPPRelayOrder(unittest.TestCase):
-    def _make_scheduler(self, is_last_rank):
+    def _make_scheduler(self, is_last_rank, pp_rank=0, speculative=False):
         scheduler = SchedulerPPMixin()
         scheduler.pp_group = SimpleNamespace(is_last_rank=is_last_rank)
-        scheduler.ps = SimpleNamespace(pp_rank=0)
+        scheduler.ps = SimpleNamespace(pp_rank=pp_rank)
+        scheduler.spec_algorithm = SimpleNamespace(is_none=lambda: not speculative)
         scheduler.copy_stream_ctx = nullcontext()
         scheduler.copy_stream = _FakeStream()
         scheduler.schedule_stream = _FakeStream()
@@ -38,8 +39,8 @@ class TestSchedulerPPRelayOrder(unittest.TestCase):
         )
         return scheduler
 
-    def _run_relay(self, is_last_rank):
-        scheduler = self._make_scheduler(is_last_rank)
+    def _run_relay(self, is_last_rank, pp_rank=0, speculative=False):
+        scheduler = self._make_scheduler(is_last_rank, pp_rank, speculative)
         events = []
         target = SimpleNamespace(
             forward_mode=SimpleNamespace(is_prebuilt=lambda: False)
@@ -80,6 +81,28 @@ class TestSchedulerPPRelayOrder(unittest.TestCase):
     def test_non_last_rank_leaves_prior_output_send_pending(self):
         events, send_work = self._run_relay(is_last_rank=False)
 
+        self.assertEqual(events, ["send", "recv", "prep"])
+        self.assertEqual(send_work, ["output-work"])
+
+    def test_speculative_output_pairs_adjacent_ranks_without_waiting(self):
+        for pp_rank in range(4):
+            with self.subTest(pp_rank=pp_rank):
+                events, send_work = self._run_relay(
+                    is_last_rank=pp_rank == 3,
+                    pp_rank=pp_rank,
+                    speculative=True,
+                )
+                expected = (
+                    ["recv", "prep", "send"]
+                    if pp_rank % 2
+                    else ["send", "recv", "prep"]
+                )
+                self.assertEqual(events, expected)
+                self.assertEqual(send_work, ["output-work"])
+
+    def test_non_speculative_cuda_odd_rank_keeps_send_first(self):
+        with patch("sglang.srt.managers.scheduler_pp_mixin.is_xpu", return_value=False):
+            events, send_work = self._run_relay(is_last_rank=True, pp_rank=1)
         self.assertEqual(events, ["send", "recv", "prep"])
         self.assertEqual(send_work, ["output-work"])
 
