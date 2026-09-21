@@ -1,0 +1,20 @@
+{
+  "model": "glm-5.3",
+  "messages": [
+    {
+      "role": "user",
+      "content": "返回一个 JSON 对象，字段 answer 的整数值为 2，不要输出其他文本。"
+    }
+  ],
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  },
+  "max_tokens": 512,
+  "thinking": {
+    "type": "disabled"
+  },
+  "response_format": {
+    "type": "json_object"
+  }
+}

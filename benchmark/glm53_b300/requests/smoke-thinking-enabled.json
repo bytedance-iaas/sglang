@@ -1,0 +1,17 @@
+{
+  "model": "glm-5.3",
+  "messages": [
+    {
+      "role": "user",
+      "content": "请简短回答：1+1等于几？"
+    }
+  ],
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  },
+  "max_tokens": 512,
+  "thinking": {
+    "type": "enabled"
+  }
+}

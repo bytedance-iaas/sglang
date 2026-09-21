@@ -1,0 +1,17 @@
+{
+  "model_path": "/models/GLM-5.3",
+  "transformers_version": "5.12.1",
+  "chat_template_sha256": "69bb3ab52067898e2466b855407636de559568947f367945842aabcb7fcc1705",
+  "warm": {
+    "path": "cache-warm.json",
+    "sha256": "8027aaf90aaf94d695b18935a32f5dc08d7732deecc5832a499b02d940d00ca3",
+    "prompt_tokens_with_template": 71667
+  },
+  "probe": {
+    "path": "cache-probe.json",
+    "sha256": "d89e2f377c70f357a3b6dca735b6c36e9fad0410e78f45bc39e59d59f9a8fc53",
+    "prompt_tokens_with_template": 71667
+  },
+  "longest_common_prefix_tokens": 64499,
+  "shared_prefix_ratio_of_probe": 0.8999818605494858
+}

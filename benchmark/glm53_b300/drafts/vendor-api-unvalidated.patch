@@ -1,0 +1,359 @@
+diff --git a/python/sglang/srt/entrypoints/openai/protocol.py b/python/sglang/srt/entrypoints/openai/protocol.py
+index 109542667f..8529fa5631 100644
+--- a/python/sglang/srt/entrypoints/openai/protocol.py
++++ b/python/sglang/srt/entrypoints/openai/protocol.py
+@@ -206,10 +206,20 @@ class UsageInfo(BaseModel):
+     prompt_tokens: int = 0
+     total_tokens: int = 0
+     completion_tokens: Optional[int] = 0
++    # Vendor-compatible alias for prompt_tokens_details.cached_tokens.
++    # Omitted unless cache reporting produced a concrete count.
++    cached_tokens: Optional[int] = None
+     # Used to return cached tokens info when --enable-cache-report is set
+     prompt_tokens_details: Optional[PromptTokensDetails] = None
+     reasoning_tokens: Optional[int] = 0
+ 
++    @model_serializer(mode="wrap")
++    def _serialize(self, handler):
++        data = handler(self)
++        if self.cached_tokens is None:
++            data.pop("cached_tokens", None)
++        return data
++
+ 
+ class StreamOptions(BaseModel):
+     include_usage: Optional[bool] = False
+@@ -808,6 +818,13 @@ ReasoningEffortType = Optional[
+ ]
+ 
+ 
++class ChatCompletionThinking(BaseModel):
++    """Vendor-compatible switch for Chat Completions reasoning."""
++
++    type: Literal["enabled", "disabled"]
++    model_config = ConfigDict(extra="forbid")
++
++
+ def _has_message_level_tools(messages: Any) -> bool:
+     if not isinstance(messages, list):
+         return False
+@@ -879,6 +896,10 @@ class ChatCompletionRequest(BaseModel):
+         "models that expose a maximum-effort tier above 'high'; models that don't "
+         "support it treat it the same as 'high'.",
+     )
++    thinking: Optional[ChatCompletionThinking] = Field(
++        default=None,
++        description="Vendor-compatible reasoning switch.",
++    )
+     task: Optional[
+         Literal["action", "query", "authority", "domain", "title", "read_url"]
+     ] = Field(
+@@ -1026,6 +1047,23 @@ class ChatCompletionRequest(BaseModel):
+         if effort is not None:
+             thinking = effort != "none"
+ 
++        vendor_thinking = values.get("thinking")
++        if vendor_thinking is not None:
++            vendor_type = (
++                vendor_thinking.get("type")
++                if isinstance(vendor_thinking, dict)
++                else getattr(vendor_thinking, "type", None)
++            )
++            if vendor_type in ("enabled", "disabled"):
++                vendor_enabled = vendor_type == "enabled"
++                if thinking is not None and thinking != vendor_enabled:
++                    raise ValueError(
++                        "thinking.type conflicts with reasoning/reasoning_effort"
++                    )
++                thinking = vendor_enabled
++                if not vendor_enabled:
++                    values["reasoning_effort"] = "none"
++
+         if thinking is not None:
+             ctk = values.get("chat_template_kwargs")
+             if not isinstance(ctk, dict):
+@@ -1033,8 +1071,12 @@ class ChatCompletionRequest(BaseModel):
+             # different models check different keys:
+             # - "thinking" for deepseek-v3, kimi_k2
+             # - "enable_thinking" for qwen3, glm45, nemotron_3, interns1
+-            ctk.setdefault("thinking", thinking)
+-            ctk.setdefault("enable_thinking", thinking)
++            for key in ("thinking", "enable_thinking"):
++                if vendor_thinking is not None and key in ctk and ctk[key] != thinking:
++                    raise ValueError(
++                        f"thinking.type conflicts with chat_template_kwargs.{key}"
++                    )
++                ctk.setdefault(key, thinking)
+             values["chat_template_kwargs"] = ctk
+ 
+         return values
+diff --git a/python/sglang/srt/entrypoints/openai/serving_chat.py b/python/sglang/srt/entrypoints/openai/serving_chat.py
+index 17ecfa782d..5a0d16001d 100644
+--- a/python/sglang/srt/entrypoints/openai/serving_chat.py
++++ b/python/sglang/srt/entrypoints/openai/serving_chat.py
+@@ -867,6 +867,18 @@ class OpenAIServingChat(OpenAIServingBase):
+         if not request.messages:
+             return "Messages cannot be empty."
+ 
++        if request.thinking is not None:
++            enabled = request.thinking.type == "enabled"
++            config = self.template_manager.reasoning_config
++            if enabled and not self.reasoning_parser:
++                return "thinking.enabled requires a reasoning parser."
++            if not enabled and (
++                self.template_manager.force_reasoning
++                or (config is not None and config.always_on)
++                or (config is None and self._reasoning_default_mode() == "always")
++            ):
++                return "This model's reasoning mode cannot be disabled."
++
+         if request.return_sampling_mask and not request.return_meta_info:
+             return "return_sampling_mask requires return_meta_info=true."
+ 
+@@ -1391,6 +1403,7 @@ class OpenAIServingChat(OpenAIServingBase):
+                     return_dict=False,
+                     **extra_template_kwargs,
+                 )
++                rendered_prompt = self._adapt_glm53_generation_prefix(rendered_prompt, request)
+                 prompt_ids = self.tokenizer_manager.tokenizer.encode(
+                     rendered_prompt, **encode_kwargs
+                 )
+@@ -1413,6 +1426,7 @@ class OpenAIServingChat(OpenAIServingBase):
+                             **extra_template_kwargs,
+                         )
+                     )
++                    rendered_prompt = self._adapt_glm53_generation_prefix(rendered_prompt, request)
+                     prompt_ids = self.tokenizer_manager.tokenizer.encode(
+                         rendered_prompt, **encode_kwargs
+                     )
+@@ -2427,6 +2441,26 @@ class OpenAIServingChat(OpenAIServingBase):
+         chat_template_kwargs[toggle_param] = enabled
+         request.chat_template_kwargs = chat_template_kwargs
+ 
++    def _adapt_glm53_generation_prefix(
++        self, prompt: str, request: ChatCompletionRequest
++    ) -> str:
++        """Close GLM-5.3's reasoning prefix before generation when disabled.
++
++        This changes model input, never hides generated reasoning. The template
++        signature and exact suffix guard prevent rewriting unrelated templates
++        or markers inside conversation history.
++        """
++        config = self.template_manager.reasoning_config
++        if (
++            config is None
++            or config.special_case != "glm53_generation_prefix"
++            or self._get_reasoning_from_request(request)
++        ):
++            return prompt
++        if not isinstance(prompt, str) or not prompt.endswith("<think>"):
++            raise ValueError("GLM-5.3 thinking.disabled requires an opening generation prefix")
++        return prompt[:-len("<think>")] + "</think>"
++
+     def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
+         """Determine whether reasoning mode should be enabled for this request.
+ 
+diff --git a/python/sglang/srt/entrypoints/openai/usage_processor.py b/python/sglang/srt/entrypoints/openai/usage_processor.py
+index 1c9ed62f3e..f1946c528a 100644
+--- a/python/sglang/srt/entrypoints/openai/usage_processor.py
++++ b/python/sglang/srt/entrypoints/openai/usage_processor.py
+@@ -11,8 +11,8 @@ class UsageProcessor:
+ 
+     @staticmethod
+     def _details_if_cached(count: int) -> Optional[PromptTokensDetails]:
+-        """Return PromptTokensDetails only when count > 0 (keeps JSON slim)."""
+-        return PromptTokensDetails(cached_tokens=count) if count > 0 else None
++        """Preserve zero counts when cache reporting is enabled."""
++        return PromptTokensDetails(cached_tokens=count)
+ 
+     @staticmethod
+     def calculate_response_usage(
+@@ -121,6 +121,7 @@ class UsageProcessor:
+             prompt_tokens=prompt_tokens,
+             completion_tokens=completion_tokens,
+             total_tokens=prompt_tokens + completion_tokens,
++            cached_tokens=(cached_tokens.cached_tokens if cached_tokens else None),
+             prompt_tokens_details=details,
+             reasoning_tokens=reasoning_tokens,
+         )
+diff --git a/python/sglang/srt/parser/template_detection.py b/python/sglang/srt/parser/template_detection.py
+index 766243bfd0..ba21ba57b7 100644
+--- a/python/sglang/srt/parser/template_detection.py
++++ b/python/sglang/srt/parser/template_detection.py
+@@ -145,6 +145,14 @@ def _has_toggle_default_assignment(
+ # ---------------------------------------------------------------------------
+ 
+ REASONING_MODE_RULES = (
++    DetectionRule(
++        name="glm53_generation_prefix",
++        value=ReasoningToggleConfig(
++            toggle_param="enable_thinking", default_enabled=True,
++            special_case="glm53_generation_prefix",
++        ),
++        predicate=lambda ctx: _is_glm53(ctx),
++    ),
+     DetectionRule(
+         name="gpt_oss_channel_markers",
+         value=ReasoningToggleConfig(special_case="always"),
+@@ -298,8 +306,20 @@ def _is_glm45(ctx):
+     )
+ 
+ 
++def _is_glm53(ctx):
++    # Structural signature from upstream GLM-5.3 template detection.
++    return (
++        ctx.has_text("[gMASK]<sop>")
++        and ctx.has_text("Reasoning Effort:")
++        and not ctx.has_text("enable_thinking")
++        and ctx.has_text("<tool_call>")
++        and ctx.has_text("<arg_key>")
++        and ctx.has_text("<arg_value>")
++    )
++
++
+ def _is_glm47(ctx):
+-    return _is_glm45(ctx) and ctx.has_pattern(
++    return (_is_glm45(ctx) or _is_glm53(ctx)) and ctx.has_pattern(
+         r"\{\{[-\s]*['\"]<tool_call>['\"]\s*\+\s*tc\.name"
+     )
+ 
+@@ -439,6 +459,7 @@ REASONING_PARSER_RULES = (
+     DetectionRule(name="gpt_oss", value="gpt-oss", predicate=_is_gpt_oss),
+     DetectionRule(name="kimi_k2", value="kimi_k2", predicate=_is_kimi_k2),
+     DetectionRule(name="nemotron_3", value="nemotron_3", predicate=_is_nemotron_3),
++    DetectionRule(name="glm53", value="glm45", predicate=_is_glm53),
+     DetectionRule(name="glm45", value="glm45", predicate=_is_glm45),
+     DetectionRule(name="hunyuan", value="hunyuan", predicate=_is_hunyuan),
+     DetectionRule(name="poolside_v1", value="poolside_v1", predicate=_is_poolside_v1),
+@@ -478,6 +499,7 @@ TOOL_CALL_PARSER_RULES = (
+     DetectionRule(name="deepseek_v31", value="deepseekv31", predicate=_is_deepseek_v31),
+     DetectionRule(name="lfm2", value="lfm2", predicate=_is_lfm2),
+     DetectionRule(name="glm47", value="glm47", predicate=_is_glm47),
++    DetectionRule(name="glm53", value="glm45", predicate=_is_glm53),
+     DetectionRule(name="glm45", value="glm45", predicate=_is_glm45),
+     DetectionRule(name="minicpm5", value="minicpm5", predicate=_is_minicpm5),
+     DetectionRule(name="hunyuan", value="hunyuan", predicate=_is_hunyuan),
+diff --git a/test/registered/unit/entrypoints/openai/test_protocol.py b/test/registered/unit/entrypoints/openai/test_protocol.py
+index dda22cd444..70f04c44ae 100644
+--- a/test/registered/unit/entrypoints/openai/test_protocol.py
++++ b/test/registered/unit/entrypoints/openai/test_protocol.py
+@@ -38,6 +38,52 @@ from sglang.test.ci.ci_register import register_cpu_ci
+ register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+ 
+ 
++class TestVendorThinking(unittest.TestCase):
++    def request(self, **kwargs):
++        return ChatCompletionRequest(model="x", messages=[{"role": "user", "content": "hi"}], **kwargs)
++
++    def test_switch_and_sampling_preserved(self):
++        for mode, enabled in (("enabled", True), ("disabled", False)):
++            request = self.request(thinking={"type": mode}, temperature=0.7, top_p=0.9, max_tokens=37)
++            self.assertEqual(request.chat_template_kwargs["enable_thinking"], enabled)
++            self.assertEqual((request.temperature, request.top_p, request.max_tokens), (0.7, 0.9, 37))
++
++    def test_invalid_and_conflicting_fields(self):
++        for fields in (
++            {"thinking": {"type": "auto"}},
++            {"thinking": {"type": "enabled", "unknown": 1}},
++            {"thinking": {"type": "enabled"}, "reasoning_effort": "none"},
++            {"thinking": {"type": "disabled"}, "reasoning_effort": "high"},
++            {"thinking": {"type": "disabled"}, "chat_template_kwargs": {"enable_thinking": True}},
++        ):
++            with self.subTest(fields=fields), self.assertRaises(ValidationError):
++                self.request(**fields)
++
++    def test_existing_template_override_precedence_unchanged(self):
++        request = self.request(reasoning_effort="high", chat_template_kwargs={"enable_thinking": False})
++        self.assertFalse(request.chat_template_kwargs["enable_thinking"])
++
++    def test_cache_counts_streaming_and_nonstreaming(self):
++        from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
++        for enabled in (False, True):
++            for count in (0, 8):
++                response = UsageProcessor.calculate_response_usage(
++                    [{"meta_info": {"prompt_tokens": 10, "completion_tokens": 2, "cached_tokens": count}}],
++                    enable_cache_report=enabled,
++                )
++                stream = UsageProcessor.calculate_streaming_usage(
++                    {0: 10}, {0: 0}, {0: 2}, {0: count}, 1, enable_cache_report=enabled,
++                )
++                for usage in (response, stream):
++                    data = usage.model_dump()
++                    if enabled:
++                        self.assertEqual(data["cached_tokens"], count)
++                        self.assertEqual(data["prompt_tokens_details"]["cached_tokens"], count)
++                    else:
++                        self.assertNotIn("cached_tokens", data)
++                    self.assertEqual(data["total_tokens"], 12)
++
++
+ class TestModelCard(unittest.TestCase):
+     """Test ModelCard protocol model"""
+ 
+diff --git a/test/registered/unit/entrypoints/openai/test_serving_chat.py b/test/registered/unit/entrypoints/openai/test_serving_chat.py
+index 2500f0c9c4..63d7b34f17 100644
+--- a/test/registered/unit/entrypoints/openai/test_serving_chat.py
++++ b/test/registered/unit/entrypoints/openai/test_serving_chat.py
+@@ -192,6 +192,41 @@ class ServingChatTestCase(unittest.TestCase):
+         self.fastapi_request = Mock(spec=Request)
+         self.fastapi_request.headers = {}
+ 
++    def test_glm53_thinking_changes_encoded_prompt_and_parser(self):
++        self.template_manager.chat_template_name = None
++        self.template_manager.reasoning_config = ReasoningToggleConfig(
++            toggle_param="enable_thinking", default_enabled=True,
++            special_case="glm53_generation_prefix",
++        )
++        self.tm._config_overrides["reasoning_parser"] = "glm45"
++        prefix = "history <think>old</think><|assistant|>\n<think>"
++        self.tm.tokenizer.apply_chat_template.return_value = prefix
++        for enabled in (False, True):
++            with self.subTest(enabled=enabled):
++                request = ChatCompletionRequest(
++                    model="x", messages=[{"role": "user", "content": "1+1?"}],
++                    thinking={"type": "enabled" if enabled else "disabled"},
++                )
++                self.chat._process_messages(request, is_multimodal=False)
++                expected = prefix if enabled else prefix[:-7] + "</think>"
++                self.assertEqual(self.tm.tokenizer.encode.call_args.args[0], expected)
++                self.assertEqual(self.chat._get_reasoning_from_request(request), enabled)
++
++    def test_glm53_disabled_rejects_unexpected_generation_suffix(self):
++        self.template_manager.reasoning_config = ReasoningToggleConfig(
++            toggle_param="enable_thinking", default_enabled=True,
++            special_case="glm53_generation_prefix",
++        )
++        self.tm._config_overrides["reasoning_parser"] = "glm45"
++        request = ChatCompletionRequest(
++            model="x", messages=[{"role": "user", "content": "hi"}],
++            thinking={"type": "disabled"},
++        )
++        with self.assertRaisesRegex(ValueError, "generation prefix"):
++            self.chat._adapt_glm53_generation_prefix("unexpected", request)
++        self.template_manager.reasoning_config = ReasoningToggleConfig(special_case="always")
++        self.assertIn("cannot be disabled", self.chat._validate_request(request))
++
+     def test_parsers_follow_the_control_plane_overlay(self):
+         """Template detection records the parsers through `override`, so they
+         answer from the bags; `ServerArgs` keeps the launcher's seed."""
+diff --git a/test/registered/unit/parser/test_template_manager.py b/test/registered/unit/parser/test_template_manager.py
+index 497077137d..baec872f95 100644
+--- a/test/registered/unit/parser/test_template_manager.py
++++ b/test/registered/unit/parser/test_template_manager.py
+@@ -45,6 +45,16 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
+         )
+         return force, config, parser
+ 
++    def test_glm53_generation_prefix_config(self):
++        template = "[gMASK]<sop> Reasoning Effort: <tool_call><arg_key><arg_value> <think>"
++        force, config, parser = self._detect(template, ["<tool_call>", "<|user|>"])
++        self.assertFalse(force)
++        self.assertEqual(config.special_case, "glm53_generation_prefix")
++        self.assertTrue(config.default_enabled)
++        self.assertEqual(parser, "glm45")
++        force, config = detect_reasoning_pattern(template.replace("Reasoning Effort:", ""))
++        self.assertIsNone(config)
++
+     def test_qwen3_template_not_misclassified_as_glm45(self):
+         template = """
+         {% set enable_thinking = enable_thinking if enable_thinking is defined else true %}

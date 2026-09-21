@@ -1,0 +1,40 @@
+{
+  "model": "glm-5.3",
+  "messages": [
+    {
+      "role": "user",
+      "content": "分别查询北京和上海当前天气。"
+    }
+  ],
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  },
+  "max_tokens": 512,
+  "thinking": {
+    "type": "disabled"
+  },
+  "parallel_tool_calls": true,
+  "tool_choice": "required",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "查询指定城市的当前天气",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "city"
+          ],
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}
