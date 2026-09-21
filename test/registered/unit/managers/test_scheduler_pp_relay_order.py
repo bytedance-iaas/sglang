@@ -1,3 +1,4 @@
+import inspect
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -87,20 +88,45 @@ class TestSchedulerPPRelayOrder(unittest.TestCase):
         )
         self.assertEqual(send_work, [])
 
-    def test_proxy_exchange_is_committed_before_next_ring(self):
+    def _assert_disagg_proxy_order(self, event_loop, control_marker):
+        source = inspect.getsource(event_loop)
+        launch_pos = source.index("result, self.launch_event = self._pp_launch_batch")
+        output_pos = source.index("relay_output_immediately=True", launch_pos)
+        control_pos = source.index(control_marker, output_pos)
+        send_pos = source.index(
+            "self._pp_queue_proxy_send",
+            control_pos,
+        )
+
+        self.assertLess(launch_pos, output_pos)
+        self.assertLess(output_pos, control_pos)
+        self.assertLess(control_pos, send_pos)
+
+    def test_prefill_proxy_send_stays_after_control_ring_and_async(self):
+        self._assert_disagg_proxy_order(
+            SchedulerPPMixin.event_loop_pp_disagg_prefill,
+            "self._pp_pd_send_consensus_bootstrapped_ids",
+        )
+
+    def test_decode_proxy_send_stays_after_control_ring_and_async(self):
+        self._assert_disagg_proxy_order(
+            SchedulerPPMixin.event_loop_pp_disagg_decode,
+            "self._pp_pd_send_consensus_bootstrapped_ids",
+        )
+
+    def test_proxy_send_is_queued_without_wait(self):
         scheduler = self._make_scheduler(is_last_rank=False)
         events = []
         scheduler._pp_send_dict_to_next_stage = lambda *args, **kwargs: (
-            events.append(("send", kwargs["msg_type"])) or ["proxy-work"]
+            events.append(("send", kwargs["async_send"], kwargs["msg_type"]))
+            or ["proxy-work"]
         )
         scheduler._pp_commit_comm_work = lambda work: events.append(("commit", work))
 
-        scheduler._pp_send_and_commit_proxy({"hidden_states": object()})
+        scheduler._pp_queue_proxy_send({"hidden_states": object()})
 
-        self.assertEqual(
-            events,
-            [("send", "proxy"), ("commit", ["proxy-work"])],
-        )
+        self.assertEqual(events, [("send", True, "proxy")])
+        self.assertEqual(scheduler.send_proxy_work, ["proxy-work"])
 
 
 if __name__ == "__main__":
