@@ -117,7 +117,9 @@ class TestHummingFp8Linear(CustomTestCase):
                 self.assertEqual(layer.weight.shape, (n, k))
                 self.assertEqual(layer.weight_scale_inv.shape, (n // 32, k // 32))
                 self.assertFalse(any("humming" in name for name in layer.state_dict()))
-                for m in (1, 6, 64):
+                # Include the old boundary, draft-expanded verify batches,
+                # and the new inclusive upper bound.
+                for m in (1, 6, 64, 65, 96, 256, 512, 1024):
                     x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
                     with mock.patch.object(
                         fp8, "humming_fp8_linear", wraps=humming_fp8.humming_fp8_linear
@@ -129,22 +131,32 @@ class TestHummingFp8Linear(CustomTestCase):
     def test_bias_leading_dims_noncontiguous_and_cuda_graph(self):
         with torch.no_grad():
             layer = self._make_layer()
-            x = torch.randn((2, 3, 2560), device="cuda", dtype=torch.bfloat16)[..., ::2]
-            bias = torch.randn(576, device="cuda", dtype=torch.bfloat16)
+            for m in (6, 96, 1024):
+                with self.subTest(m=m):
+                    x = torch.randn(
+                        (2, m // 2, 2560), device="cuda", dtype=torch.bfloat16
+                    )[..., ::2]
+                    bias = torch.randn(576, device="cuda", dtype=torch.bfloat16)
 
-            def fn():
-                return layer.quant_method.apply(layer, x, bias)
+                    def fn():
+                        return layer.quant_method.apply(layer, x, bias)
 
-            self._assert_close(fn(), self._reference(layer, x) + bias.float())
-            for _ in range(3):
-                fn()
-            torch.cuda.synchronize()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                out = fn()
-            graph.replay()
-            torch.cuda.synchronize()
-            self._assert_close(out, self._reference(layer, x) + bias.float())
+                    self._assert_close(fn(), self._reference(layer, x) + bias.float())
+                    for _ in range(3):
+                        fn()
+                    torch.cuda.synchronize()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        out = fn()
+                    for _ in range(3):
+                        # Reuse captured storage with new activations and bias.
+                        x.normal_()
+                        bias.normal_()
+                        graph.replay()
+                        torch.cuda.synchronize()
+                        self._assert_close(
+                            out, self._reference(layer, x) + bias.float()
+                        )
 
     def test_short_k_and_direct_reader_fallback(self):
         for k, skip in ((288, False), (512, False), (1280, True)):
@@ -152,7 +164,7 @@ class TestHummingFp8Linear(CustomTestCase):
                 layer = self._make_layer(k=k, skip=skip)
                 self.assertFalse(layer.humming_fp8_ready)
                 self.assertFalse(hasattr(layer, "_humming_fp8_weight"))
-                x = torch.randn((6, k), device="cuda", dtype=torch.bfloat16)
+                x = torch.randn((96, k), device="cuda", dtype=torch.bfloat16)
                 with mock.patch.object(
                     fp8, "humming_fp8_linear", side_effect=AssertionError
                 ):
@@ -169,10 +181,14 @@ class TestHummingFp8Linear(CustomTestCase):
     def test_large_m_prequantized_and_deterministic_fallback(self):
         with torch.no_grad():
             layer = self._make_layer()
-            x = torch.randn((6, 1280), device="cuda", dtype=torch.bfloat16)
+            x = torch.randn((96, 1280), device="cuda", dtype=torch.bfloat16)
             qx, sx = fp8_utils.sglang_per_token_group_quant_fp8(x, 32, scale_ue8m0=True)
-            large = torch.randn((65, 1280), device="cuda", dtype=torch.bfloat16)
-            for value in (large, (qx, sx)):
+            large = torch.randn((1025, 1280), device="cuda", dtype=torch.bfloat16)
+            # The limit counts all leading dimensions, not just x.shape[0].
+            large_rank3 = torch.randn(
+                (2, 513, 1280), device="cuda", dtype=torch.bfloat16
+            )
+            for value in (large, large_rank3, (qx, sx)):
                 with mock.patch.object(
                     fp8, "humming_fp8_linear", side_effect=AssertionError
                 ):
@@ -227,7 +243,7 @@ class TestHummingFp8Linear(CustomTestCase):
                 "_humming_fp8_locks",
             )
             pointers = [getattr(layer, name).data_ptr() for name in names]
-            x = torch.randn((6, 1280), device="cuda", dtype=torch.bfloat16)
+            x = torch.randn((96, 1280), device="cuda", dtype=torch.bfloat16)
             layer(x)  # warm up before capture
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):

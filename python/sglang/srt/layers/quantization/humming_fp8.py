@@ -93,8 +93,10 @@ def can_use_humming_fp8_linear(layer: torch.nn.Module, x) -> bool:
     if x.shape[-1] != layer.weight.shape[1]:
         return False
     m = x.numel() // x.shape[-1]
-    # Limit the first integration to the measured decode/verify envelope.
-    return 0 < m <= 64 and not _requires_deterministic_gemm()
+    # SM90 measurements cover up to 1024 flattened input tokens, including
+    # multi-request verify batches expanded by speculative draft tokens.
+    # Keep larger, unvalidated batches on the existing Triton path.
+    return 0 < m <= 1024 and not _requires_deterministic_gemm()
 
 
 def humming_fp8_linear(
