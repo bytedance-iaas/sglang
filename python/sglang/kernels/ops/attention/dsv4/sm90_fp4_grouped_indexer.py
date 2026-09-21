@@ -1,4 +1,4 @@
-"""SM90 FP8 Tensor Core indexer with request-grouped K reuse."""
+"""SM90 FP4 indexer with fused mapping and 64-head request-grouped K reuse."""
 
 from __future__ import annotations
 
@@ -104,11 +104,12 @@ def fp4_index_logits_grouped_sm90(
     width: int,
     group_size: int,
 ) -> torch.Tensor:
-    """Score request-major groups with short-path dispatch and K-tile reuse.
+    """Score request-major groups without materializing dense pool slots.
 
     Q must already satisfy the fake-FP4 contract. Each consecutive group_size
     rows belongs to one request; the final group may be partial. Cache mappings
     must be valid only for visible positions. Dynamic lens stay on the GPU.
+    32-head queries use mapped Triton; native grouped K reuse requires 64 heads.
     """
     tensors = (q, weights, req_to_token, req, lens, table)
     if not q.is_cuda or any(t.device != q.device for t in tensors):
@@ -117,7 +118,7 @@ def fp4_index_logits_grouped_sm90(
         raise ValueError("sm90_fp4_grouped_indexer requires an SM90 GPU")
     if width < 0 or page_size <= 0:
         raise ValueError("width must be nonnegative and page_size must be positive")
-    assert q.dtype == torch.bfloat16 and q.shape[1:] == (64, 128)
+    assert q.dtype == torch.bfloat16 and q.shape[1:] in ((32, 128), (64, 128))
     assert weights.dtype == torch.bfloat16 and weights.shape == q.shape[:2]
     assert req_to_token.dtype == torch.int32 and req_to_token.dim() == 2
     assert req.dtype == torch.int64 and req.shape == (q.shape[0],)
@@ -135,7 +136,9 @@ def fp4_index_logits_grouped_sm90(
 
     # H20 total-latency crossover; later tuning may refine this surface.
     # Mapping is fused, so this choice does not allocate a dense slots tensor.
-    if _prefer_triton(q.shape[0], width):
+    # Native WGMMA layouts and head reduction are specialized for 64 heads.
+    # Keep Flash's 32-head queries on mapped Triton at every capacity.
+    if q.shape[1] == 32 or _prefer_triton(q.shape[0], width):
         from sglang.kernels.ops.attention.dsv4.sm90_fp4_indexer import (
             fp4_index_logits_mapped_sm90,
         )
