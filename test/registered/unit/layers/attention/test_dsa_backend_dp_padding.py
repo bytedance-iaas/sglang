@@ -6,8 +6,8 @@ import torch
 
 from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
-    _restore_trtllm_decode_dp_padding,
-    _trim_trtllm_decode_dp_padding,
+    _restore_dsa_decode_dp_padding,
+    _trim_dsa_decode_dp_padding,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -19,7 +19,7 @@ class TestDSABackendDPPadding(unittest.TestCase):
         q_all = torch.arange(4 * 2 * 3).view(4, 2, 3)
         topk_indices = torch.arange(4 * 8, dtype=torch.int32).view(4, 8)
 
-        real_q, real_topk, num_padding_rows = _trim_trtllm_decode_dp_padding(
+        real_q, real_topk, num_padding_rows = _trim_dsa_decode_dp_padding(
             q_all,
             topk_indices,
             real_batch_size=2,
@@ -30,7 +30,7 @@ class TestDSABackendDPPadding(unittest.TestCase):
         self.assertEqual(num_padding_rows, 2)
 
         real_output = torch.ones((2, 1, 2, 5), dtype=torch.bfloat16)
-        output = _restore_trtllm_decode_dp_padding(real_output, num_padding_rows)
+        output = _restore_dsa_decode_dp_padding(real_output, num_padding_rows)
         self.assertEqual(output.shape, (4, 1, 2, 5))
         self.assertTrue(torch.equal(output[:2], real_output))
         self.assertTrue(torch.all(output[2:] == 0))
@@ -39,7 +39,7 @@ class TestDSABackendDPPadding(unittest.TestCase):
         q_all = torch.empty((2, 2, 3))
         topk_indices = torch.empty((2, 8), dtype=torch.int32)
 
-        real_q, real_topk, num_padding_rows = _trim_trtllm_decode_dp_padding(
+        real_q, real_topk, num_padding_rows = _trim_dsa_decode_dp_padding(
             q_all,
             topk_indices,
             real_batch_size=2,
@@ -49,7 +49,7 @@ class TestDSABackendDPPadding(unittest.TestCase):
         self.assertIs(real_topk, topk_indices)
         self.assertEqual(num_padding_rows, 0)
         self.assertIs(
-            _restore_trtllm_decode_dp_padding(real_q, num_padding_rows),
+            _restore_dsa_decode_dp_padding(real_q, num_padding_rows),
             real_q,
         )
 
@@ -57,7 +57,7 @@ class TestDSABackendDPPadding(unittest.TestCase):
         with self.assertRaisesRegex(
             AssertionError, "metadata batch size \\(3\\) exceeds q batch size \\(2\\)"
         ):
-            _trim_trtllm_decode_dp_padding(
+            _trim_dsa_decode_dp_padding(
                 torch.empty((2, 2, 3)),
                 torch.empty((2, 8), dtype=torch.int32),
                 real_batch_size=3,
