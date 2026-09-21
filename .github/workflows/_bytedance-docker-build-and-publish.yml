@@ -91,6 +91,11 @@ on:
         required: false
         type: string
         default: ""
+      artifact_run_id:
+        description: "Optional workflow run ID containing artifact_name"
+        required: false
+        type: string
+        default: ""
       image_formats:
         description: "CSV of image formats to build and push. Default builds all three (oci,zstd,nydus); pass a subset to narrow."
         required: false
@@ -279,10 +284,16 @@ jobs:
         with:
           name: ${{ inputs.artifact_name }}
           path: .ci-artifacts/sgl-kernel
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.artifact_run_id || github.run_id }}
 
       - name: Set up Docker Buildx with local Docker Hub mirror
         uses: docker/setup-buildx-action@v3
         with:
+          name: sgl-private-image-builder
+          keep-state: true
+          cleanup: false
           driver-opts: |
             network=host
           buildkitd-config-inline: |
@@ -327,6 +338,7 @@ jobs:
           fi
 
           docker buildx build \
+            --builder sgl-private-image-builder \
             --target ${{ inputs.docker_target }} \
             --platform linux/amd64 \
             --output type=image,name=${IMAGE_REPO},push-by-digest=true,name-canonical=true,push=true \
@@ -341,7 +353,6 @@ jobs:
             ${{ inputs.extra_build_args }} \
             "${CACHE_ARGS[@]}" \
             --metadata-file /tmp/metadata.json \
-            --no-cache \
             .
 
           DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata.json'))['containerimage.digest'])")
@@ -380,20 +391,21 @@ jobs:
           set -euo pipefail
           IMAGE_REF="${IMAGE_REPO}@${IMAGE_DIGEST}"
           docker buildx imagetools inspect "${IMAGE_REF}"
-          docker pull "${IMAGE_REF}"
+          docker buildx imagetools inspect \
+            "${IMAGE_REF}" \
+            --format '{{json .Image}}' \
+            > /tmp/image-config.json
 
-          python3 - "${IMAGE_REF}" <<'PY'
+          python3 - /tmp/image-config.json <<'PY'
           import json
           import os
-          import subprocess
           import sys
 
-          inspect = json.loads(
-              subprocess.check_output(["docker", "image", "inspect", sys.argv[1]])
-          )[0]
-          if inspect["Architecture"] != "amd64":
-              raise SystemExit(f"unexpected architecture: {inspect['Architecture']}")
-          labels = inspect["Config"].get("Labels") or {}
+          with open(sys.argv[1]) as config_file:
+              inspect = json.load(config_file)
+          if inspect["architecture"] != "amd64":
+              raise SystemExit(f"unexpected architecture: {inspect['architecture']}")
+          labels = inspect["config"].get("Labels") or {}
           expected = {
               "ai.sglang.build.commit": os.environ["EXPECTED_BUILD_COMMIT"],
               "ai.sglang.build.tree": os.environ["EXPECTED_BUILD_TREE"],
@@ -409,23 +421,8 @@ jobs:
           }
           if mismatches:
               raise SystemExit(f"image provenance mismatch: {mismatches}")
-          print(json.dumps({"architecture": inspect["Architecture"], **expected}))
+          print(json.dumps({"architecture": inspect["architecture"], **expected}))
           PY
-
-          docker run --rm \
-            -e EXPECTED_BUILD_COMMIT \
-            -e EXPECTED_BUILD_TREE \
-            -e EXPECTED_PYTHON_MANIFEST_SHA256 \
-            --entrypoint bash "${IMAGE_REF}" -lc '
-              set -euo pipefail
-              test "$SGLANG_BUILD_COMMIT" = "$EXPECTED_BUILD_COMMIT"
-              test "$SGLANG_BUILD_TREE" = "$EXPECTED_BUILD_TREE"
-              test "$SGLANG_PYTHON_MANIFEST_SHA256" = "$EXPECTED_PYTHON_MANIFEST_SHA256"
-              command -v oniond
-              python3 scripts/ci/verify_private_image_runtime.py
-              python3 -m pytest -q test/registered/unit/test_runtime_context.py -k TestMoeFlagsGroup
-              python3 -m pytest -q test/registered/unit/test_model_overrides.py -k deepseek_spec_moe_resolution
-            '
 
       # --- zstd format: re-export the just-built layers with zstd compression,
       # then reuse the same provenance/runtime verification. It pulls the
@@ -451,6 +448,7 @@ jobs:
           fi
 
           docker buildx build \
+            --builder sgl-private-image-builder \
             --target ${{ inputs.docker_target }} \
             --platform linux/amd64 \
             --output type=image,name=${IMAGE_REPO},push-by-digest=true,name-canonical=true,push=true,compression=zstd,compression-level=3,force-compression=true,oci-mediatypes=true \

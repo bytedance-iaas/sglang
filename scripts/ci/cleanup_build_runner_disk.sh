@@ -63,36 +63,39 @@ remove_builder_if_present() {
 echo "Disk state before cleanup"
 show_disk_state
 
-if [[ "${deep_clean}" == "true" ]]; then
+current_available_gb="$(available_gb)"
+if [[ "${deep_clean}" == "true" ]] || ((current_available_gb < required_gb)); then
+  echo "Reclaiming build caches: ${current_available_gb}GB available; ${required_gb}GB required"
   remove_builder_if_present "sgl-kernel-builder"
   while IFS= read -r builder; do
     [[ -n "${builder}" ]] || continue
     case "${builder}" in
-      builder-* | sgl-kernel-*)
+      builder-* | sgl-kernel-* | sgl-private-image-builder)
         remove_builder_if_present "${builder}"
         ;;
     esac
   done < <(docker buildx ls --format '{{.Name}}' 2>/dev/null | sed 's/\*$//' | sort -u)
+  # Do not prune volumes: they can contain state owned by another workload.
+  docker container prune -f
+  docker image prune -af
+  docker builder prune -af
+
+  cache_dir="$(realpath -m "${HOME:?HOME must be set}/.cache/sgl-kernel")"
+  case "${cache_dir}" in
+    "${HOME}/.cache/sgl-kernel")
+      if [[ -d "${cache_dir}" ]]; then
+        echo "Removing disposable SGLang kernel cache: ${cache_dir}"
+        sudo rm -rf -- "${cache_dir}"
+      fi
+      ;;
+    *)
+      echo "Refusing to remove unexpected cache path: ${cache_dir}" >&2
+      exit 1
+      ;;
+  esac
+else
+  echo "Keeping bounded build caches: ${current_available_gb}GB available; ${required_gb}GB required"
 fi
-
-# Do not prune volumes: they can contain state owned by another workload.
-docker container prune -f
-docker image prune -af
-docker builder prune -af
-
-cache_dir="$(realpath -m "${HOME:?HOME must be set}/.cache/sgl-kernel")"
-case "${cache_dir}" in
-  "${HOME}/.cache/sgl-kernel")
-    if [[ -d "${cache_dir}" ]]; then
-      echo "Removing disposable SGLang kernel cache: ${cache_dir}"
-      sudo rm -rf -- "${cache_dir}"
-    fi
-    ;;
-  *)
-    echo "Refusing to remove unexpected cache path: ${cache_dir}" >&2
-    exit 1
-    ;;
-esac
 
 echo "Disk state after cleanup"
 show_disk_state
