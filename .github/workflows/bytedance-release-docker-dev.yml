@@ -327,6 +327,7 @@ jobs:
     uses: ./.github/workflows/_bytedance-docker-build-and-publish.yml
     with:
       docker_target: framework_final
+      install_iaas_kernels: true
       checkout_ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
       cuda_key: ${{ matrix.cuda_key }}
       cuda_version: ${{ matrix.cuda_version }}
@@ -358,6 +359,7 @@ jobs:
     uses: ./.github/workflows/_bytedance-docker-build-and-publish.yml
     with:
       docker_target: ${{ inputs.private_debug_docker_target || 'framework_final' }}
+      install_iaas_kernels: ${{ inputs.private_debug_docker_target != 'private_dependency_smoke' }}
       checkout_ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
       cuda_key: cu130
       cuda_version: 13.0.3
