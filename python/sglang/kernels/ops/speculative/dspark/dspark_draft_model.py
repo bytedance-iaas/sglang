@@ -9,6 +9,10 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+from sglang.srt.layers.quantization.humming_fp8 import (
+    HummingFp8Weight,
+    pack_humming_fp8_weight,
+)
 
 _BLOCK_V = 1024
 _IDX_SENTINEL = tl.constexpr(2147483647)
@@ -447,7 +451,11 @@ def commit_kv_proj_fused(
         quant_method = wkv_linears[0].quant_method
         kv_all = quant_method.w8a8_block_fp8_linear(
             input=main_x,
-            weight=stacked.weight,
+            weight=(
+                stacked.humming_weight
+                if stacked.humming_weight is not None and main_x.dtype == torch.bfloat16
+                else stacked.weight
+            ),
             block_size=quant_method.quant_config.weight_block_size,
             weight_scale=stacked.fp8_scale,
             input_scale=None,
@@ -465,6 +473,7 @@ class _StackedWkvWeight(msgspec.Struct):
     weight: torch.Tensor
     fp8_scale: Optional[torch.Tensor]
     mxfp8_scale: Optional[torch.Tensor] = None
+    humming_weight: Optional[HummingFp8Weight] = None
 
 
 def _stacked_wkv_weight(*, wkv_linears: list[torch.nn.Module]) -> _StackedWkvWeight:
@@ -553,7 +562,14 @@ def _build_stacked_wkv_weight(
         scale = torch.cat([linear.weight_scale_inv for linear in wkv_linears], dim=0)
         if scale.dim() >= 2 and scale.stride(-2) != 1:
             scale = scale.transpose(-2, -1).contiguous().transpose(-2, -1)
-        return _StackedWkvWeight(weight=weight, fp8_scale=scale)
+        humming_weight = None
+        if getattr(wkv_linears[0].quant_method, "use_humming", False):
+            # Build alongside the existing stacked cache, never per forward.
+            # Original stage/stacked weights remain intact in this opt-in PR.
+            humming_weight = pack_humming_fp8_weight(weight, scale)
+        return _StackedWkvWeight(
+            weight=weight, fp8_scale=scale, humming_weight=humming_weight
+        )
     weight = torch.cat(
         [_dequant_linear_weight(linear) for linear in wkv_linears], dim=0
     )
