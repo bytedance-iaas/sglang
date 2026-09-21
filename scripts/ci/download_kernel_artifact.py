@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 import zipfile
 
 
@@ -22,6 +23,12 @@ def github_api(endpoint, **kwargs):
             "--silent",
             "--show-error",
             "--location",
+            "--connect-timeout",
+            "20",
+            "--speed-limit",
+            "1024",
+            "--speed-time",
+            "30",
             "--proto",
             "=https",
             "--proto-redir",
@@ -108,23 +115,31 @@ def main():
         raise ValueError("Refusing to reuse existing kernel wheels")
     artifact = find_artifact(args.repository, args.run_id, args.name)
     for attempt in range(1, 4):
+        started = time.monotonic()
+        received = 0
         try:
             with tempfile.TemporaryDirectory(dir=args.output) as staging:
                 archive = Path(staging) / "artifact.zip"
-                with archive.open("wb") as stream:
-                    github_api(
-                        f"repos/{args.repository}/actions/artifacts/{artifact['id']}/zip",
-                        stdout=stream,
-                        stderr=subprocess.PIPE,
-                        check=True,
-                        timeout=300,
-                    )
+                try:
+                    with archive.open("wb") as stream:
+                        github_api(
+                            f"repos/{args.repository}/actions/artifacts/{artifact['id']}/zip",
+                            stdout=stream,
+                            stderr=subprocess.PIPE,
+                            check=True,
+                            timeout=300,
+                        )
+                finally:
+                    received = archive.stat().st_size
                 verify_and_extract(archive, artifact, args.output)
             return
         except (subprocess.SubprocessError, ValueError, zipfile.BadZipFile) as exc:
             # Do not emit signed URLs or response bodies from download errors.
             print(
-                f"Kernel artifact attempt {attempt}/3 failed: {type(exc).__name__}",
+                f"Kernel artifact attempt {attempt}/3 failed: {type(exc).__name__}; "
+                f"curl_exit={getattr(exc, 'returncode', None)}; "
+                f"bytes={received}/{artifact['size_in_bytes']}; "
+                f"elapsed={time.monotonic() - started:.1f}s",
                 flush=True,
             )
             if attempt == 3:
