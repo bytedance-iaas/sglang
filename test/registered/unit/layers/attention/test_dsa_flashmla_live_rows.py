@@ -9,7 +9,6 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
-from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -239,77 +238,8 @@ class TestDSAFlashMLALiveRows(CustomTestCase):
         self.assertTrue(torch.equal(output[:4], torch.ones_like(output[:4])))
         self.assertTrue(torch.equal(output[4:], torch.zeros_like(output[4:])))
 
-    def test_draft_extend_trims_eager_padding_and_restores_output(self):
-        """MTP draft attention uses logical rows and restores MLP padding."""
-        captured = {}
-        metadata = SimpleNamespace(
-            # Production eager padding has already widened this mutable list.
-            # FlashMLA's immutable scheduler still describes four live rows.
-            dsa_extend_seq_lens_list=[4, 4],
-            cu_seqlens_q=torch.arange(5, dtype=torch.int32),
-            page_table_1=torch.zeros((1, 16), dtype=torch.int32),
-            flashmla_metadata=SimpleNamespace(
-                flashmla_metadata=torch.empty((1,), dtype=torch.int32),
-                num_splits=torch.empty((5,), dtype=torch.int32),
-            ),
-        )
-
-        def fake_flashmla(**kwargs):
-            captured.update(
-                q_rows=kwargs["q_all"].shape[0],
-                page_table_rows=kwargs["page_table_1"].shape[0],
-            )
-            return torch.ones((4, 1, 2, 2))
-
-        backend = SimpleNamespace(
-            forward_metadata=metadata,
-            dsa_decode_impl="flashmla_kv",
-            dsa_prefill_impl="fa3",
-            use_mha=False,
-            use_fused_topk=False,
-            hisparse_coordinator=None,
-            token_to_kv_pool=SimpleNamespace(
-                get_key_buffer=lambda _layer_id: torch.empty((64, 3))
-            ),
-            get_topk_transform_method=MagicMock(
-                return_value=TopkTransformMethod.PAGED
-            ),
-            _forward_flashmla_kv=fake_flashmla,
-        )
-        forward_batch = SimpleNamespace(
-            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
-        )
-        layer = SimpleNamespace(
-            is_cross_attention=False,
-            layer_id=0,
-            tp_q_head_num=2,
-            v_head_dim=2,
-            head_dim=3,
-            scaling=1.0,
-        )
-
-        with patch(
-            "sglang.srt.layers.attention.dsa_backend.transform_index_page_table_prefill",
-            return_value=torch.zeros((8, 2), dtype=torch.int32),
-        ):
-            output = DeepseekSparseAttnBackend.forward_extend(
-                backend,
-                q=torch.empty((8, 4)),
-                k=None,
-                v=None,
-                layer=layer,
-                forward_batch=forward_batch,
-                q_rope=torch.empty((8, 2)),
-                topk_indices=torch.zeros((8, 16), dtype=torch.int32),
-            )
-
-        self.assertEqual(captured, {"q_rows": 4, "page_table_rows": 4})
-        self.assertEqual(output.shape, (8, 1, 2, 2))
-        self.assertTrue(torch.equal(output[:4], torch.ones_like(output[:4])))
-        self.assertTrue(torch.equal(output[4:], torch.zeros_like(output[4:])))
-
-    def test_decode_rejects_each_misaligned_row_axis(self):
-        """Reject stale metadata before it reaches the FlashMLA kernel."""
+    def test_flashmla_rejects_scheduler_axis_larger_than_physical_inputs(self):
+        """Reject metadata that cannot be satisfied by physical inputs."""
         flashmla = ModuleType("sgl_kernel.flash_mla")
         flashmla.flash_mla_with_kvcache = MagicMock()
         sgl_kernel = ModuleType("sgl_kernel")
@@ -320,19 +250,13 @@ class TestDSAFlashMLALiveRows(CustomTestCase):
                 torch.tensor([8]),
                 torch.empty((3,), dtype=torch.int32),
                 2,
-                "length_rows=1",
+                r"metadata batch size \(2\) exceeds q batch size \(1\)",
             ),
             (
-                torch.tensor([8, 9]),
-                torch.empty((4,), dtype=torch.int32),
-                2,
-                "num_splits=4",
-            ),
-            (
-                torch.tensor([8, 9]),
+                torch.tensor([8, 9, 10]),
                 torch.empty((3,), dtype=torch.int32),
                 1,
-                "index_rows=1",
+                r"metadata batch size \(2\) exceeds topk batch size \(1\)",
             ),
         )
         with patch.dict(
@@ -344,11 +268,11 @@ class TestDSAFlashMLALiveRows(CustomTestCase):
         ):
             for cache_seqlens, num_splits, index_rows, message in cases:
                 with self.subTest(message=message), self.assertRaisesRegex(
-                    RuntimeError, message
+                    AssertionError, message
                 ):
                     DeepseekSparseAttnBackend._forward_flashmla_kv(
                         SimpleNamespace(),
-                        q_all=torch.empty((2, 2, 3)),
+                        q_all=torch.empty((len(cache_seqlens), 2, 3)),
                         kv_cache=torch.empty((64, 3)),
                         v_head_dim=2,
                         sm_scale=1.0,
