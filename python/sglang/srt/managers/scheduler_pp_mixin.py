@@ -1303,18 +1303,13 @@ class SchedulerPPMixin:
         batch_result = None
         send_output_work = []
 
-        # On CUDA, isend is async: it enqueues to the stream and returns,
-        # so every rank can send first safely. On some backends isend is
-        # effectively blocking and does not return until the peer posts a
-        # matching recv; if every PP rank sends first, all ranks block
-        # waiting for a receiver and the ring deadlocks. Order send/recv
-        # by pp_rank parity (even: send->recv, odd: recv->send) so each
-        # adjacent pair has one sender and one receiver posted at the
-        # same time.
-
-        # CUDA: send first
-        # XPU: even ranks send first, odd ranks recv first.
-        send_first = (not is_xpu()) or ((self.ps.pp_rank % 2) == 0)
+        # Speculative output carries several GPU tensors. Even CUDA isend
+        # stays ordered on the device stream: sending the whole payload on
+        # every rank before posting receives can deadlock the output ring.
+        # Pair adjacent ranks, as for XPU's blocking sends. Keep ordinary
+        # CUDA PP's existing ordering and leave send work pending across slots.
+        needs_pairing = is_xpu() or not self.spec_algorithm.is_none()
+        send_first = (not needs_pairing) or ((self.ps.pp_rank % 2) == 0)
 
         def _do_send():
             return self._pp_send_output_to_next_stage(
