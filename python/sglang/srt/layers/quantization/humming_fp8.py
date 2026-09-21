@@ -7,12 +7,15 @@ Only a derived, non-persistent Humming layout is cached at weight-load time.
 """
 
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec
 
 _HUMMING_FP8_MAX_M = envs.SGLANG_HUMMING_FP8_MAX_M.get()
+_HUMMING_FP8_PADDED_K = {(5120, 576): 1024}
+_HUMMING_FP8_PADDED_MIN_M = 1024
 
 
 def _requires_deterministic_gemm() -> bool:
@@ -35,10 +38,8 @@ def prepare_humming_fp8_linear(layer: torch.nn.Module) -> None:
         return
 
     n, k = layer.weight.shape
-    if n % 32 or k < 1024 or k % 128:
-        # In particular, TP8 shared-down has K=288. Padding both activation
-        # and weight is necessary for group-32 Humming and can cost more than
-        # the small GEMM; padding scales alone silently produces wrong values.
+    packed_k = _HUMMING_FP8_PADDED_K.get((n, k), k)
+    if n % 32 or k % 32 or packed_k < 1024 or packed_k % 128:
         return
 
     try:
@@ -49,10 +50,18 @@ def prepare_humming_fp8_linear(layer: torch.nn.Module) -> None:
             "install the version pinned in python/pyproject.toml"
         ) from exc
 
+    weight = layer.weight
+    weight_scale = layer.weight_scale_inv.float()
+    if packed_k != k:
+        # Humming requires its logical K to match the padded activation. Keep
+        # the checkpoint tensors unchanged and pad only this derived cache.
+        weight = F.pad(weight, (0, packed_k - k))
+        weight_scale = F.pad(weight_scale, (0, packed_k // 32 - k // 32), value=1.0)
+
     with torch.device(layer.weight.device):
         packed = HummingLayer(
             shape_n=n,
-            shape_k=k,
+            shape_k=packed_k,
             weight_config={"quant_method": "fp8", "weight_block_size": [32, 32]},
             input_config={
                 "dtype": "float8e4m3",
@@ -63,9 +72,7 @@ def prepare_humming_fp8_linear(layer: torch.nn.Module) -> None:
             pad_k_to_multiple=128,
             torch_dtype=torch.bfloat16,
         )
-    packed.load_from_tensors(
-        {"weight": layer.weight, "weight_scale_inv": layer.weight_scale_inv.float()}
-    )
+    packed.load_from_tensors({"weight": weight, "weight_scale_inv": weight_scale})
     packed.transform()
 
     for name in ("weight", "weight_scale", "locks"):
@@ -84,6 +91,7 @@ def prepare_humming_fp8_linear(layer: torch.nn.Module) -> None:
         else:
             layer.register_buffer(cache_name, tensor, persistent=False)
     layer._humming_fp8_config = packed.humming_config
+    layer._humming_fp8_input_padding = packed_k - k
     layer.humming_fp8_ready = True
 
 
@@ -96,7 +104,12 @@ def can_use_humming_fp8_linear(layer: torch.nn.Module, x) -> bool:
     if x.shape[-1] != layer.weight.shape[1]:
         return False
     m = x.numel() // x.shape[-1]
-    return 0 < m <= _HUMMING_FP8_MAX_M and not _requires_deterministic_gemm()
+    min_m = (
+        _HUMMING_FP8_PADDED_MIN_M
+        if getattr(layer, "_humming_fp8_input_padding", 0)
+        else 1
+    )
+    return min_m <= m <= _HUMMING_FP8_MAX_M and not _requires_deterministic_gemm()
 
 
 def humming_fp8_linear(
@@ -109,6 +122,9 @@ def humming_fp8_linear(
     )
 
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+    input_padding = getattr(layer, "_humming_fp8_input_padding", 0)
+    if input_padding:
+        x_2d = F.pad(x_2d, (0, input_padding))
     # Do not use Humming's default per-token quantizer: preserve the existing
     # group-32 power-of-two scales and FP8 activation rounding.
     q_input, input_scale = sglang_per_token_group_quant_fp8(x_2d, 32, scale_ue8m0=True)

@@ -126,6 +126,41 @@ class TestHummingFp8Linear(CustomTestCase):
                     self.assertEqual(run.call_count, 1)
                     self._assert_close(out, self._reference(layer, x))
 
+    def test_k576_padding_uses_humming_only_for_large_m(self):
+        with (
+            torch.no_grad(),
+            mock.patch.object(humming_fp8, "_HUMMING_FP8_MAX_M", 8192),
+        ):
+            layer = self._make_layer(n=5120, k=576)
+            self.assertTrue(layer.humming_fp8_ready)
+            self.assertEqual(layer.weight.shape, (5120, 576))
+            self.assertEqual(layer.weight_scale_inv.shape, (160, 18))
+            self.assertEqual(layer._humming_fp8_config.shape_k, 1024)
+            self.assertEqual(layer._humming_fp8_input_padding, 448)
+            self.assertFalse(any("humming" in name for name in layer.state_dict()))
+
+            small = torch.randn((256, 576), device="cuda", dtype=torch.bfloat16)
+            with mock.patch.object(
+                fp8, "humming_fp8_linear", side_effect=AssertionError
+            ):
+                small_out, _ = layer(small)
+            expected = fp8_utils.triton_w8a8_block_fp8_linear(
+                small,
+                layer.weight,
+                [32, 32],
+                layer.weight_scale_inv,
+                act_scale_ue8m0=True,
+            )
+            torch.testing.assert_close(small_out, expected, rtol=0, atol=0)
+
+            large = torch.randn((1024, 576), device="cuda", dtype=torch.bfloat16)
+            with mock.patch.object(
+                fp8, "humming_fp8_linear", wraps=humming_fp8.humming_fp8_linear
+            ) as run:
+                large_out, _ = layer(large)
+            self.assertEqual(run.call_count, 1)
+            self._assert_close(large_out, self._reference(layer, large))
+
     def test_bias_leading_dims_noncontiguous_and_cuda_graph(self):
         with torch.no_grad():
             layer = self._make_layer()
