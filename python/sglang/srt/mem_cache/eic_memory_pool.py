@@ -4,6 +4,7 @@ import os
 import queue
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from enum import IntEnum
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
@@ -12,6 +13,7 @@ import torch
 import yaml
 
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.mem_cache.eic_stats import stats
 from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     MHATokenToKVPool,
@@ -88,6 +90,14 @@ def get_eic_config_file_path():
     return config_file
 
 
+def _status_name(status_code) -> str:
+    if status_code == eic.StatusCode.SUCCESS:
+        return "SUCCESS"
+    if status_code == eic.StatusCode.PARTIAL_FAILED:
+        return "PARTIAL_FAILED"
+    return "FAILED"
+
+
 class MemoryStateInt(IntEnum):
     IDLE = 0
     RESERVED = 1
@@ -118,6 +128,7 @@ class FlexibleKVCacheMemoryPool:
 
         self.free_data_addr = set()
         self.data_ptr_to_index = dict()
+        self._pool_lock = threading.Lock()
 
         if self.device.startswith("cpu"):
             self.kvcache_mempool = torch.zeros(
@@ -161,21 +172,25 @@ class FlexibleKVCacheMemoryPool:
             )
             return None, None
 
-        ret = []
-        indices = []
-        for _ in range(count):
-            free_index = self.free_data_addr.pop()
-            ret.append(self.kvcache_mempool[free_index])
-            indices.append(free_index)
+        with self._pool_lock:
+            if len(self.free_data_addr) < count:
+                return None, None
+            ret = []
+            indices = []
+            for _ in range(count):
+                free_index = self.free_data_addr.pop()
+                ret.append(self.kvcache_mempool[free_index])
+                indices.append(free_index)
         return ret, indices
 
     def free_to_mempool(self, data_ptr):
-        if data_ptr not in self.data_ptr_to_index:
-            logger.error(
-                f"free_to_mempool failed, data_ptr {data_ptr} not in allocated_data_addr"
-            )
-            return
-        self.free_data_addr.add(self.data_ptr_to_index[data_ptr])
+        with self._pool_lock:
+            if data_ptr not in self.data_ptr_to_index:
+                logger.error(
+                    f"free_to_mempool failed, data_ptr {data_ptr} not in allocated_data_addr"
+                )
+                return
+            self.free_data_addr.add(self.data_ptr_to_index[data_ptr])
 
     def check_data_ptr_allocated(self, data_ptr):
         return data_ptr in self.data_ptr_to_index
@@ -268,6 +283,7 @@ class EICKVClient:
         eic_namespace = config.get("eic_namespace", "")
         logger.info(f"eic namespace: {eic_namespace}")
         self.eic_namespace = eic_namespace
+        stats.start_periodic_dump()
 
         self.gdr_bounce_buffer_size = config.get(
             "gdr_bounce_buffer_size", G_GDRBounceBufferSize
@@ -340,6 +356,34 @@ class EICKVClient:
             self.device if G_EnableKVGetGPUDirect else "cpu",
         )
 
+        # Parallel DSv4 load-back. Fetcher threads run only the network mget into
+        # disjoint bounce chunks; the caller repacks on its single GPU stream in
+        # fetch order, so TP collectives/acks above stay identical to serial.
+        # fanout=1 is the original path.
+        self.load_fanout = max(1, int(config.get("eic_load_fanout", 1)))
+        self.load_page_batch_cfg = int(config.get("eic_load_page_batch", 0))
+        credit_cap = G_GDRBounceTensorCount * (
+            5 if (not G_EnableKVGetGPUDirect and G_EnableGPUNicAffinity) else 1
+        )
+        # Multi-permit reservation so concurrent fetchers reserve a whole batch
+        # atomically or wait: bounds total in-flight GDR chunks to the
+        # registered pool size (no unregistered fallback under contention).
+        self._read_cap = credit_cap
+        self._read_free = credit_cap
+        self._read_cond = threading.Condition()
+        self._load_fetch_pool = (
+            ThreadPoolExecutor(
+                max_workers=self.load_fanout,
+                thread_name_prefix="eic-load-fetch",
+            )
+            if self.load_fanout > 1
+            else None
+        )
+        logger.info(
+            f"eic load fanout={self.load_fanout} page_batch_cfg={self.load_page_batch_cfg} "
+            f"bounce_chunks={credit_cap}"
+        )
+
         if G_EnableAsyncKVSet:
             logger.info("enable async kv set")
             self.kv_cache_write_mem_pool = FlexibleKVCacheMemoryPool(
@@ -367,6 +411,17 @@ class EICKVClient:
             thread.start()
 
         self._warm_up()
+
+    def _acquire_chunks(self, n):
+        with self._read_cond:
+            while self._read_free < n:
+                self._read_cond.wait()
+            self._read_free -= n
+
+    def _release_chunks(self, n):
+        with self._read_cond:
+            self._read_free += n
+            self._read_cond.notify_all()
 
     def _warm_up(self):
         logger.info("begin warm up eic client")
@@ -488,15 +543,22 @@ class EICKVClient:
         exist_option = eic.ExistOption()
         exist_option.ns = self.eic_namespace
 
+        _t0 = time.perf_counter()
         status_code, exist_outcome = self.connection.mexist(keys_vec, exist_option)
         if status_code == eic.StatusCode.SUCCESS:
+            stats.record_rpc("mexist", time.perf_counter() - _t0, "SUCCESS", len(keys))
             return [c == eic.StatusCode.SUCCESS for c in exist_outcome.status_codes]
         if status_code != eic.StatusCode.PARTIAL_FAILED:
             logger.error(f"eic exists {len(keys)} failed, status_code {status_code}")
+            stats.record_rpc(
+                "mexist", time.perf_counter() - _t0, "FAILED", len(keys), len(keys)
+            )
             return [False] * len(keys)
 
         codes = list(exist_outcome.status_codes)
+        codes += [None] * (len(keys) - len(codes))
         failed = [i for i, c in enumerate(codes) if c != eic.StatusCode.SUCCESS]
+        stats.incr("mexist.reprobe")
         retry_keys = eic.StringVector()
         for i in failed:
             retry_keys.append(keys[i])
@@ -504,11 +566,21 @@ class EICKVClient:
             retry_keys, exist_option
         )
         retry_codes = list(retry_outcome.status_codes)
+        still_failed = 0
         for j, i in enumerate(failed):
             if retry_status == eic.StatusCode.SUCCESS or (
                 j < len(retry_codes) and retry_codes[j] == eic.StatusCode.SUCCESS
             ):
                 codes[i] = eic.StatusCode.SUCCESS
+            else:
+                still_failed += 1
+        stats.record_rpc(
+            "mexist",
+            time.perf_counter() - _t0,
+            "SUCCESS" if still_failed == 0 else "PARTIAL_FAILED",
+            len(keys),
+            still_failed,
+        )
         return [c == eic.StatusCode.SUCCESS for c in codes]
 
     def allocate_eic_read_buffer(self, count):
@@ -551,10 +623,122 @@ class EICKVClient:
             ):
                 codes[i] = eic.StatusCode.SUCCESS
         recovered = sum(codes[i] == eic.StatusCode.SUCCESS for i in failed)
+        stats.incr("mget.refetch")
+        stats.incr("mget.recovered", recovered)
         logger.info(f"eic mget refetched {len(failed)} failed keys, {recovered} recovered")
         ok = all(c == eic.StatusCode.SUCCESS for c in codes)
         status = eic.StatusCode.SUCCESS if ok else eic.StatusCode.PARTIAL_FAILED
         return status, SimpleNamespace(status_codes=codes)
+
+    def _fetch_batch(self, keys: List[str]):
+        """Network-only half of a get batch; runs on a fetcher thread.
+
+        Reserves bounce-chunk credits and pulls into disjoint bounce chunks. No
+        GPU repack here, so concurrent fetchers have no CUDA-stream dependency.
+        """
+        count = len(keys)
+        self._acquire_chunks(count)
+        handle = {"count": count, "permits": count}
+        try:
+            objs, host_pool, host_indices, registered = (
+                self.allocate_eic_read_buffer(count)
+            )
+            handle.update(
+                objs=objs,
+                host_memory_pool=host_pool,
+                host_indices=host_indices,
+                registered=registered,
+            )
+            data_keys = eic.StringVector()
+            data_vals = eic.IOBuffers()
+            for i, key in enumerate(keys):
+                data_keys.append(key)
+                data_vals.append(
+                    objs[i].data_ptr(),
+                    objs[i].element_size() * objs[i].numel(),
+                    registered,
+                )
+            get_option = eic.GetOption()
+            get_option.ns = self.eic_namespace
+            t0 = time.perf_counter()
+            status_code, _, get_outcome = self.connection.mget(
+                data_keys, get_option, data_vals
+            )
+            first_s = time.perf_counter() - t0
+            stats.observe_lat("mget.first", first_s)
+            stats.observe_slow("mget", first_s, 1.0)
+            if status_code == eic.StatusCode.PARTIAL_FAILED:
+                rf0 = time.perf_counter()
+                status_code, get_outcome = self._refetch_failed(
+                    keys, objs, registered, get_option, get_outcome
+                )
+                stats.observe_lat("mget.refetch_s", time.perf_counter() - rf0)
+
+            success_mask = [True] * count
+            fail_count = 0
+            if status_code == eic.StatusCode.PARTIAL_FAILED:
+                for i, err_code in enumerate(get_outcome.status_codes):
+                    if err_code != eic.StatusCode.SUCCESS:
+                        success_mask[i] = False
+                        fail_count += 1
+            elif status_code != eic.StatusCode.SUCCESS:
+                logger.error(
+                    f"eic mget {count} keys failed, status_code {status_code}"
+                )
+                success_mask = [False] * count
+                fail_count = count
+            if fail_count:
+                logger.warning(
+                    f"eic mget {count} keys failed, fail {fail_count}, "
+                    f"success {count - fail_count}"
+                )
+            stats.record_rpc(
+                "mget",
+                time.perf_counter() - t0,
+                _status_name(status_code),
+                count,
+                fail_count,
+            )
+            handle["success_mask"] = success_mask
+        except Exception:
+            self._release_chunks(count)
+            raise
+        return handle
+
+    def _finalize_batch(self, handle, device_indices, copy_func):
+        """GPU-repack half; caller runs this serially on one stream in fetch
+        order, then returns the bounce chunks to the pool."""
+        success_mask = handle["success_mask"]
+        objs = handle["objs"]
+        registered = handle["registered"]
+        try:
+            suc_count = 0
+            for mask in success_mask:
+                if mask:
+                    suc_count += 1
+                else:
+                    break
+            if suc_count > 0:
+                # device_writeback ends with a stream synchronize, so on return
+                # the chunks are safe for the NIC to reuse.
+                copy_func(
+                    device_indices,
+                    handle["host_memory_pool"],
+                    handle["host_indices"][:suc_count],
+                )
+        finally:
+            if registered:
+                for item in objs:
+                    self.kv_cache_read_mem_pool.free_to_mempool(item.data_ptr())
+            self._release_chunks(handle["permits"])
+        return success_mask
+
+    def _release_fetch(self, handle):
+        """Release a fetched batch without repacking (mirrors serial break)."""
+        if handle["registered"]:
+            for item in handle["objs"]:
+                self.kv_cache_read_mem_pool.free_to_mempool(item.data_ptr())
+        self._release_chunks(handle["permits"])
 
     def batch_get(
         self, keys: List[str], device_indices: torch.Tensor = None, copy_func=None
@@ -582,13 +766,19 @@ class EICKVClient:
         # Get data: recv data buffer tensor
         get_option = eic.GetOption()
         get_option.ns = self.eic_namespace
+        _mget_t0 = time.perf_counter()
         status_code, data_vals, get_outcome = self.connection.mget(
             data_keys, get_option, data_vals
         )
+        _first_s = time.perf_counter() - _mget_t0
+        stats.observe_lat("mget.first", _first_s)
+        stats.observe_slow("mget", _first_s, 1.0)
         if status_code == eic.StatusCode.PARTIAL_FAILED:
+            _rf_t0 = time.perf_counter()
             status_code, get_outcome = self._refetch_failed(
                 keys, objs, registered, get_option, get_outcome
             )
+            stats.observe_lat("mget.refetch_s", time.perf_counter() - _rf_t0)
 
         result = []
         device_copy = False
@@ -628,6 +818,13 @@ class EICKVClient:
             logger.warning(
                 f"eic mget {len(keys)} keys failed, fail count {fail_count}, success count {count - fail_count}"
             )
+        stats.record_rpc(
+            "mget",
+            time.perf_counter() - _mget_t0,
+            _status_name(status_code),
+            count,
+            fail_count,
+        )
         if device_copy:
             suc_count = 0
             for mask in success_mask:
@@ -729,13 +926,19 @@ class EICKVClient:
         set_option = eic.SetOption()
         set_option.ns = self.eic_namespace
         set_option.ttl_second = self.kv_set_ttl_option
+        t0 = time.perf_counter()
         status_code, set_outcome = self.connection.mset(keys_vec, vals_vec, set_option)
 
         if status_code != eic.StatusCode.SUCCESS:
             # kv set is idempotent: retry once on per-key RPC timeout.
+            stats.incr("mset.retry")
             status_code, set_outcome = self.connection.mset(
                 keys_vec, vals_vec, set_option
             )
+        failed_keys = 0 if status_code == eic.StatusCode.SUCCESS else count
+        stats.record_rpc(
+            "mset", time.perf_counter() - t0, _status_name(status_code), count, failed_keys
+        )
 
         # Write slots outlive the retry DMA; release them after.
         if registered:
@@ -758,6 +961,7 @@ class EICKVClient:
                 len(failed),
                 failed[0],
             )
+            stats.incr("mset.keys_failed", len(failed))
             return False
 
         logger.debug(f"set data key {len(keys)} success")
@@ -786,19 +990,30 @@ class EICKVClient:
         set_option = eic.SetOption()
         set_option.ns = self.eic_namespace
         set_option.ttl_second = self.kv_set_ttl_option
+        _t0 = time.perf_counter()
         status_code, set_outcome = self.connection.mset(keys_vec, vals_vec, set_option)
+        count = len(keys)
 
         if status_code != eic.StatusCode.SUCCESS:
-            logger.error(f"eic mset {len(keys)} failed, status_code {status_code}")
+            logger.error(f"eic mset {count} failed, status_code {status_code}")
+            stats.record_rpc(
+                "mset", time.perf_counter() - _t0, _status_name(status_code), count, count
+            )
             return False
-        else:
-            logger.debug(f"eic mset {len(keys)} success")
+        logger.debug(f"eic mset {count} success")
 
         failed = [
             (i, err_code)
             for i, err_code in enumerate(set_outcome.status_codes)
             if err_code != eic.StatusCode.SUCCESS
         ]
+        stats.record_rpc(
+            "mset",
+            time.perf_counter() - _t0,
+            _status_name(status_code) if not failed else "PARTIAL_FAILED",
+            count,
+            len(failed),
+        )
         if failed:
             logger.error(
                 "async set data key batch failed, total=%s failed=%s first_failed=%s",
@@ -1921,6 +2136,7 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
                     )
 
     def device_writeback(self, device_indices, src_tensor, src_indices):
+        _wb_t0 = time.perf_counter()
         chunk_count = len(src_indices)
         page_count = chunk_count // self.page_chunk_count
         if page_count == 0:
@@ -1948,7 +2164,9 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
                 swa_host_indices[token_offset].item(),
                 page_data,
             )
+        _t_cat = time.perf_counter()
         torch.cuda.current_stream().synchronize()
+        _t_sync1 = time.perf_counter()
 
         for layer_id in range(self.transfer_layer_num):
             self.host_pool_group.load_to_device_per_layer(
@@ -1960,6 +2178,13 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
                 pool_transfers=transfers,
             )
         torch.cuda.current_stream().synchronize()
+        _t_end = time.perf_counter()
+        stats.observe_lat("load.unpack.cat", _t_cat - _wb_t0)
+        stats.observe_lat("load.unpack.sync", _t_sync1 - _t_cat)
+        stats.observe_lat("load.unpack.h2d", _t_end - _t_sync1)
+        _unpack_s = _t_end - _wb_t0
+        stats.observe_lat("load.unpack", _unpack_s)
+        stats.observe_slow("unpack", _unpack_s, 1.0)
 
     def assign_page_data(self, content_hashes, flat_data, device_indices=None):
         logger.debug(f"assign_deepseek_v4_page_data hashes {content_hashes}")
@@ -1995,27 +2220,69 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
         if device_indices is None:
             logger.error("DeepSeek V4 EIC get_page_data requires device_indices")
             return [False] * len(content_hashs)
-        page_batch_size = max(1, G_GDRBounceTensorCount // self.page_chunk_count)
-        success_mask = []
-        for i in range(0, len(content_hashs), page_batch_size):
-            page_hashes = content_hashs[i : i + page_batch_size]
-            key = self._encode_page_chunk_keys(page_hashes)
-            indices = device_indices[
-                i * self.page_size : (i + len(page_hashes)) * self.page_size
-            ]
-            _, chunk_mask = self.eic_client.batch_get(
-                key, indices, copy_func=self.device_writeback
-            )
+        client = self.eic_client
+        base_page_batch = max(1, G_GDRBounceTensorCount // self.page_chunk_count)
+        if client.load_page_batch_cfg > 0:
+            page_batch_size = client.load_page_batch_cfg
+        elif client.load_fanout > 1:
+            page_batch_size = max(1, base_page_batch // client.load_fanout)
+        else:
+            page_batch_size = base_page_batch
+
+        def _pages_from_chunks(page_hashes, chunk_mask):
             page_mask = []
             for page_id in range(len(page_hashes)):
                 start = page_id * self.page_chunk_count
-                end = start + self.page_chunk_count
-                chunk = chunk_mask[start:end]
+                chunk = chunk_mask[start : start + self.page_chunk_count]
                 # all([]) is True: a truncated reply would read as a full hit.
-                page_mask.append(len(chunk) == self.page_chunk_count and all(chunk))
-            success_mask.extend(page_mask)
-            if not all(page_mask):
-                break
+                page_mask.append(
+                    len(chunk) == self.page_chunk_count and all(chunk)
+                )
+            return page_mask
+
+        if client.load_fanout <= 1:
+            success_mask = []
+            for i in range(0, len(content_hashs), page_batch_size):
+                page_hashes = content_hashs[i : i + page_batch_size]
+                key = self._encode_page_chunk_keys(page_hashes)
+                indices = device_indices[
+                    i * self.page_size : (i + len(page_hashes)) * self.page_size
+                ]
+                _, chunk_mask = client.batch_get(
+                    key, indices, copy_func=self.device_writeback
+                )
+                success_mask.extend(_pages_from_chunks(page_hashes, chunk_mask))
+                if not all(success_mask[-len(page_hashes):]):
+                    break
+            return success_mask
+
+        # Parallel within this one op: network fetches run on a bounded pool and
+        # the chunk credits keep total in-flight GDR <= the registered pool.
+        # Repack stays on this single load stream, strictly in fetch order, so
+        # TP collectives and acks above match the serial path exactly.
+        batches = [
+            (i, content_hashs[i : i + page_batch_size])
+            for i in range(0, len(content_hashs), page_batch_size)
+        ]
+        futures = [
+            client._load_fetch_pool.submit(
+                client._fetch_batch, self._encode_page_chunk_keys(ph)
+            )
+            for _, ph in batches
+        ]
+        success_mask = []
+        for (i, page_hashes), fut in zip(batches, futures):
+            handle = fut.result()
+            if all(success_mask):
+                indices = device_indices[
+                    i * self.page_size : (i + len(page_hashes)) * self.page_size
+                ]
+                chunk_mask = client._finalize_batch(
+                    handle, indices, self.device_writeback
+                )
+                success_mask.extend(_pages_from_chunks(page_hashes, chunk_mask))
+            else:
+                client._release_fetch(handle)
         return success_mask
 
 
