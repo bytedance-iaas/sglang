@@ -67,31 +67,29 @@ class TestSchedulerPPRelayOrder(unittest.TestCase):
                 mb_metadata=[None, None],
                 last_rank_comm_queue=[],
                 pp_outputs=None,
-                relay_output_immediately=True,
             )
 
         return events, send_work
 
-    def test_last_rank_injects_output_before_commit(self):
+    def test_last_rank_leaves_output_send_pending_for_next_slot(self):
         events, send_work = self._run_relay(is_last_rank=True)
 
-        self.assertEqual(
-            events[:4], ["send", "recv", "prep", ("commit", ["output-work"])]
-        )
-        self.assertEqual(send_work, [])
+        self.assertEqual(events, ["send", "recv", "prep"])
+        self.assertEqual(send_work, ["output-work"])
 
-    def test_non_last_rank_forwards_received_output_before_commit(self):
+    def test_non_last_rank_leaves_prior_output_send_pending(self):
         events, send_work = self._run_relay(is_last_rank=False)
 
-        self.assertEqual(
-            events[:4], ["recv", "prep", "relay", ("commit", ["relay-work"])]
-        )
-        self.assertEqual(send_work, [])
+        self.assertEqual(events, ["send", "recv", "prep"])
+        self.assertEqual(send_work, ["output-work"])
 
     def _assert_disagg_proxy_order(self, event_loop, control_marker):
         source = inspect.getsource(event_loop)
         launch_pos = source.index("result, self.launch_event = self._pp_launch_batch")
-        output_pos = source.index("relay_output_immediately=True", launch_pos)
+        output_pos = source.index(
+            "self._pp_commit_send_output_work_and_preprocess_output_tensors",
+            launch_pos,
+        )
         control_pos = source.index(control_marker, output_pos)
         send_pos = source.index(
             "self._pp_queue_proxy_send",
