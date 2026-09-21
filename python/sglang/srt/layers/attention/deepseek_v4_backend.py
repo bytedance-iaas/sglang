@@ -58,6 +58,7 @@ from sglang.srt.layers.attention.base_attn_backend import (
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.attention.dsv4.candidate_indexer import (
+    CandidateBlocks,
     CandidateMasks,
     CandidateMetadata,
     IndexerInputs,
@@ -3594,7 +3595,6 @@ class DeepseekV4AttnBackend(
         )
         if bs == 0:
             return
-        lens = (pos + 1) // ratio
         metadata = (
             self.forward_metadata.c1_indexer_metadata
             if ratio == 1
@@ -3617,7 +3617,7 @@ class DeepseekV4AttnBackend(
             and torch.version.cuda is not None
             and torch.cuda.get_device_capability(q.device)[0] == 9
             and q.dtype == weights.dtype == torch.bfloat16
-            and q.shape[1:] == (64, 128)
+            and q.shape[1:] in ((32, 128), (64, 128))
             and q.is_contiguous()
             and weights.is_contiguous()
             and self.req_to_token.dtype == torch.int32
@@ -3626,6 +3626,103 @@ class DeepseekV4AttnBackend(
             and table.dim() == 2
             and table.stride(1) == 1
         )
+        use_length_aware = (
+            use_grouped
+            and envs.SGLANG_OPT_DSV41_SM90_LENGTH_AWARE_INDEXER.get()
+            and q.shape[1] == 32
+            and 0 < indexer.index_topk <= 2048
+            and (
+                not indexer.is_candidate_source
+                or (
+                    0 < indexer.candidate_topk_blocks <= 2048
+                    and indexer.candidate_block_size in (1, 2, 4, 8, 16, 32, 64, 128)
+                )
+            )
+        )
+        if use_length_aware:
+            from sglang.kernels.ops.attention.dsv4.sm90_length_aware_indexer import (
+                candidate_blocks,
+                candidate_mask,
+                prefix_logits,
+                prepare_candidate_lengths,
+                publish_topk,
+                select_prefix_topk,
+            )
+
+            request = req.to(torch.int64).contiguous()
+            consumer = indexer.uses_candidates and not indexer.is_candidate_source
+            compact = envs.SGLANG_OPT_DSV41_SM90_COMPACT_CANDIDATES.get() and (
+                indexer.is_candidate_source or consumer
+            )
+            candidates = self.forward_metadata.candidate_metadata if consumer else None
+            candidates = (
+                candidates
+                if compact and isinstance(candidates, CandidateBlocks)
+                else None
+            )
+            if compact:
+                visible, score_lens = prepare_candidate_lengths(
+                    pos, ratio, lmax, candidates
+                )
+            else:
+                visible = (
+                    ((pos + 1) // ratio).clamp(0, lmax).to(torch.int32).contiguous()
+                )
+                score_lens = visible
+            consume = None
+            if consumer and candidates is None:
+                consume = published_masks(self.forward_metadata.candidate_metadata).mask
+                assert consume is not None and consume.shape[0] == bs
+                assert consume.shape[1] >= lmax and consume.stride(1) == 1
+            score_width = lmax
+            if candidates is not None:
+                assert candidates.blocks.shape[0] == bs and candidates.width >= lmax
+                score_width = min(
+                    lmax, candidates.blocks.shape[1] * candidates.block_size
+                )
+            s = prefix_logits(
+                q,
+                weights,
+                self.req_to_token,
+                request,
+                score_lens,
+                table,
+                table.shape[1] // 68,
+                ratio,
+                score_width,
+                consume,
+                candidates=candidates,
+                visible=visible,
+            )
+            if indexer.is_candidate_source:
+                publish = candidate_blocks if compact else candidate_mask
+                published = publish(
+                    s,
+                    visible,
+                    lmax,
+                    indexer.candidate_topk_blocks,
+                    indexer.candidate_block_size,
+                )
+                self.forward_metadata.candidate_metadata = (
+                    published if compact else CandidateMasks(mask=published)
+                )
+            idx = select_prefix_topk(
+                s, score_lens, min(indexer.index_topk, score_width)
+            )
+            publish_topk(
+                idx,
+                s,
+                score_lens,
+                request,
+                self.req_to_token,
+                page_indices,
+                raw_indices,
+                ratio,
+                consumer,
+                candidates=candidates,
+            )
+            return
+        lens = (pos + 1) // ratio
         slots = None
         if use_grouped:
             from sglang.kernels.ops.attention.dsv4.sm90_fp4_grouped_indexer import (
