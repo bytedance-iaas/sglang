@@ -151,6 +151,8 @@ jobs:
           ref: ${{ inputs.checkout_ref || github.ref }}
           fetch-depth: 0
           fetch-tags: true
+          # BRANCH_TYPE=local copies Git metadata into the image for versioning.
+          persist-credentials: false
 
       - name: Configure iaas-kernels NVLink image
         env:
