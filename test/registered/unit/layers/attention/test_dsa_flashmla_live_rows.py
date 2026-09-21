@@ -189,7 +189,9 @@ class TestDSAFlashMLALiveRows(CustomTestCase):
         """MTP draft attention uses logical rows and restores MLP padding."""
         captured = {}
         metadata = SimpleNamespace(
-            dsa_extend_seq_lens_list=[4],
+            # Production eager padding has already widened this mutable list.
+            # FlashMLA's immutable scheduler still describes four live rows.
+            dsa_extend_seq_lens_list=[4, 4],
             cu_seqlens_q=torch.arange(5, dtype=torch.int32),
             page_table_1=torch.zeros((1, 16), dtype=torch.int32),
             flashmla_metadata=SimpleNamespace(
@@ -234,7 +236,7 @@ class TestDSAFlashMLALiveRows(CustomTestCase):
 
         with patch(
             "sglang.srt.layers.attention.dsa_backend.transform_index_page_table_prefill",
-            return_value=torch.zeros((4, 2), dtype=torch.int32),
+            return_value=torch.zeros((8, 2), dtype=torch.int32),
         ):
             output = DeepseekSparseAttnBackend.forward_extend(
                 backend,

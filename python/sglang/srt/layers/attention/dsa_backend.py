@@ -192,7 +192,7 @@ def _idle_spec_rows_per_seq(forward_batch: ForwardBatch) -> int:
     return max(1, spec_info.num_tokens_per_req)
 
 
-def _trim_dsa_decode_dp_padding(
+def _trim_dsa_dp_padding(
     q_all: torch.Tensor,
     topk_indices: Optional[torch.Tensor],
     real_batch_size: int,
@@ -200,9 +200,11 @@ def _trim_dsa_decode_dp_padding(
     """Keep pre-planned DSA metadata aligned with its real query rows.
 
     Eager DP-attention pads model activations to the largest token count across
-    ranks, but an MTP draft batch can carry DSA metadata planned before that
-    padding. Attention has no DP collective, so it should run only on the real
-    prefix; its output is padded back before the following MLP collectives.
+    ranks, but an MTP draft batch can carry DSA metadata that was deliberately
+    planned before that padding.  The metadata page table therefore has
+    ``real_batch_size`` rows while q/top-k have the larger physical row count.
+    Attention has no DP collective, so it should run only on the real prefix;
+    the output is padded back before the following MLP collectives.
     """
     physical_batch_size = q_all.shape[0]
     assert real_batch_size <= physical_batch_size, (
@@ -227,7 +229,7 @@ def _trim_dsa_decode_dp_padding(
     )
 
 
-def _restore_dsa_decode_dp_padding(
+def _restore_dsa_dp_padding(
     output: torch.Tensor, num_padding_rows: int
 ) -> torch.Tensor:
     if num_padding_rows == 0:
@@ -2030,31 +2032,6 @@ class DeepseekSparseAttnBackend(
                     k_rope,
                 )
 
-        # DRAFT_EXTEND_V2 plans FlashMLA metadata on the logical draft-token
-        # axis before eager MLP-sync padding widens the live activations. Keep
-        # the KV write above on the physical layout, but feed FlashMLA exactly
-        # the rows covered by its immutable scheduler metadata. Restore zero
-        # padding on the output for the following MLP collective.
-        num_extend_padding_rows = 0
-        if (
-            dsa_impl == "flashmla_kv"
-            and forward_batch.forward_mode.is_draft_extend_v2()
-        ):
-            assert metadata.flashmla_metadata is not None
-            assert metadata.dsa_extend_seq_lens_list is not None
-            real_num_tokens = sum(metadata.dsa_extend_seq_lens_list)
-            q, topk_indices, num_extend_padding_rows = _trim_dsa_decode_dp_padding(
-                q, topk_indices, real_num_tokens
-            )
-            q_rope, _, q_rope_padding_rows = _trim_dsa_decode_dp_padding(
-                q_rope, None, real_num_tokens
-            )
-            if q_rope_padding_rows != num_extend_padding_rows:
-                raise RuntimeError(
-                    "DSA q/q_rope padding rows disagree: "
-                    f"q={num_extend_padding_rows}, q_rope={q_rope_padding_rows}"
-                )
-
         # Use MHA kernel if in MHA_ONE_SHOT mode
         if self.use_mha:
             assert k is not None and v is not None
@@ -2284,6 +2261,17 @@ class DeepseekSparseAttnBackend(
         elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            num_extend_padding_rows = 0
+            if forward_batch.forward_mode.is_draft_extend_v2():
+                assert metadata.flashmla_metadata is not None
+                scheduled_num_tokens = (
+                    metadata.flashmla_metadata.num_splits.shape[0] - 1
+                )
+                q_all, page_table_1, num_extend_padding_rows = (
+                    _trim_dsa_dp_padding(
+                        q_all, page_table_1, scheduled_num_tokens
+                    )
+                )
             output = self._forward_flashmla_kv(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -2294,7 +2282,7 @@ class DeepseekSparseAttnBackend(
                 metadata=metadata,
                 page_table_1=page_table_1,
             )
-            return _restore_dsa_decode_dp_padding(
+            return _restore_dsa_dp_padding(
                 output, num_extend_padding_rows
             )
         elif dsa_impl == "fa3":
@@ -3363,7 +3351,7 @@ class DeepseekSparseAttnBackend(
         num_decode_padding_rows = 0
         if not is_prefill:
             q_all, topk_indices, num_decode_padding_rows = (
-                _trim_dsa_decode_dp_padding(
+                _trim_dsa_dp_padding(
                     q_all,
                     topk_indices,
                     metadata.cache_seqlens_int32.shape[0],
@@ -3443,7 +3431,7 @@ class DeepseekSparseAttnBackend(
             multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
         )
 
-        return _restore_dsa_decode_dp_padding(out, num_decode_padding_rows)
+        return _restore_dsa_dp_padding(out, num_decode_padding_rows)
 
     def _pad_topk_indices(
         self, topk_indices: torch.Tensor, num_tokens: int
