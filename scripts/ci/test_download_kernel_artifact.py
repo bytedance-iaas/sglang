@@ -34,6 +34,9 @@ def make_wheel():
 
 class KernelArtifactTests(unittest.TestCase):
     def setUp(self):
+        token = patch.dict(download.os.environ, {"GH_TOKEN": "test-token"})
+        token.start()
+        self.addCleanup(token.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -106,6 +109,8 @@ class KernelArtifactTests(unittest.TestCase):
         downloads = []
 
         def gh(command, **kwargs):
+            self.assertEqual(command[0], "curl")
+            self.assertNotIn("test-token", " ".join(command))
             if "stdout" not in kwargs:
                 return SimpleNamespace(stdout=json.dumps({"artifacts": [metadata]}))
             downloads.append(command)

@@ -11,16 +11,38 @@ import tempfile
 import zipfile
 
 
+def github_api(endpoint, **kwargs):
+    # Supply credentials on stdin, never in process arguments or logs. curl
+    # strips Authorization on cross-host redirects (do not use location-trusted).
+    header = f"Authorization: Bearer {os.environ['GH_TOKEN']}\n"
+    return subprocess.run(
+        [
+            "curl",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--header",
+            "Accept: application/vnd.github+json",
+            "--header",
+            "@-",
+            f"{os.environ.get('GITHUB_API_URL', 'https://api.github.com')}/{endpoint}",
+        ],
+        input=header if kwargs.get("text") else header.encode(),
+        **kwargs,
+    )
+
+
 def find_artifact(repository, run_id, name):
     matches = []
     page = 1
     while True:
-        response = subprocess.run(
-            [
-                "gh",
-                "api",
-                f"repos/{repository}/actions/runs/{run_id}/artifacts?per_page=100&page={page}",
-            ],
+        response = github_api(
+            f"repos/{repository}/actions/runs/{run_id}/artifacts?per_page=100&page={page}",
             check=True,
             capture_output=True,
             text=True,
@@ -90,12 +112,8 @@ def main():
             with tempfile.TemporaryDirectory(dir=args.output) as staging:
                 archive = Path(staging) / "artifact.zip"
                 with archive.open("wb") as stream:
-                    subprocess.run(
-                        [
-                            "gh",
-                            "api",
-                            f"repos/{args.repository}/actions/artifacts/{artifact['id']}/zip",
-                        ],
+                    github_api(
+                        f"repos/{args.repository}/actions/artifacts/{artifact['id']}/zip",
                         stdout=stream,
                         stderr=subprocess.PIPE,
                         check=True,
