@@ -153,6 +153,65 @@ class Mxfp4FlashinferCutlassMoEMethod:
 
         self.runner = MoeRunner(MoeRunnerBackend.FLASHINFER_MXFP4, moe_runner_config)
 
+    def prefill_autotune_key(self, layer: Module):
+        if not self._use_sm90_humming:
+            return None
+        config = self.moe_runner_config
+        return (
+            type(self).__name__,
+            layer.w13_weight.shape,
+            layer.w13_weight.stride(),
+            layer.w2_weight.shape,
+            layer.w2_weight.stride(),
+            config.num_experts,
+            config.top_k,
+            layer.moe_tp_size,
+            layer.moe_ep_size,
+        )
+
+    def autotune_prefill(
+        self,
+        layer: Module,
+        *,
+        num_tokens: int,
+        dtype: torch.dtype,
+        routing_module: Module,
+    ) -> bool:
+        """Tune Humming MoE tactics without running model or PP state."""
+        if not self._use_sm90_humming:
+            return False
+
+        from sglang.srt.layers.moe.token_dispatcher.standard import (
+            StandardDispatchOutput,
+        )
+
+        config = self.moe_runner_config
+        top_k = config.top_k
+        num_experts = config.num_experts
+        hidden_size = config.hidden_size
+        assert top_k is not None and num_experts is not None and hidden_size is not None
+
+        device = layer.w13_weight.device
+        generator = torch.Generator(device=device)
+        generator.manual_seed(0)
+        hidden_states = torch.randn(
+            (num_tokens, hidden_size),
+            dtype=dtype,
+            device=device,
+            generator=generator,
+        )
+        router_logits = routing_module.gate(hidden_states, None)
+        topk_output = routing_module.topk(hidden_states, router_logits)
+        self.apply(
+            layer,
+            StandardDispatchOutput(
+                hidden_states=hidden_states,
+                hidden_states_scale=None,
+                topk_output=topk_output,
+            ),
+        )
+        return True
+
     def process_weights_after_loading(self, layer: Module) -> None:
         # Preserve the base FP4 post-load handling.
         self._fp8.process_weights_after_loading(layer)

@@ -5224,14 +5224,38 @@ class DeepseekV4ForCausalLM(nn.Module):
         return getattr(self.config, "model_type", None) == "deepseek_v41"
 
     def autotune_prefill_kernels(self, num_tokens: int, *, dtype: torch.dtype) -> int:
-        """Tune resident MXFP8 linears for every M bucket up to ``num_tokens``.
-        The quant method is called directly, so no TP collectives run and no
-        request/KV/draft state is touched; the runner owns the autotune context."""
+        """Tune state-free dense and MoE kernels at the prefill token ceiling.
+
+        Methods are called directly, so no attention, PP transport, request/KV,
+        or draft state is required. The runner owns the autotune context.
+        """
         if getattr(self.config, "model_type", None) != "deepseek_v41":
             return 0
+
         seen = set()
         # The backbone excludes vision and lm_head, whose prefill shapes differ.
         for layer in self.model.modules():
+            experts = getattr(layer, "experts", None)
+            method = getattr(experts, "quant_method", None)
+            moe_key = getattr(method, "prefill_autotune_key", None)
+            moe_autotune = getattr(method, "autotune_prefill", None)
+            if (
+                callable(moe_key)
+                and callable(moe_autotune)
+                and not getattr(layer, "is_hash", False)
+            ):
+                key = moe_key(experts)
+                if key in seen:
+                    continue
+                if key is not None and moe_autotune(
+                    experts,
+                    num_tokens=num_tokens,
+                    dtype=dtype,
+                    routing_module=layer,
+                ):
+                    seen.add(key)
+                    continue
+
             method = getattr(layer, "quant_method", None)
             if not isinstance(method, Fp8LinearMethod):
                 continue
@@ -5270,7 +5294,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             del x
         if seen:
             logger.info(
-                "FlashInfer prefill autotune: %d MXFP8 weight layouts at M=%d.",
+                "FlashInfer prefill autotune: %d state-free layouts at M=%d.",
                 len(seen),
                 num_tokens,
             )

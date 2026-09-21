@@ -14,6 +14,8 @@ Run on H100/H200:
 from __future__ import annotations
 
 from contextlib import nullcontext
+from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -205,6 +207,86 @@ def _build_flashinfer_mxfp4_runner(num_experts, hidden, inter):
         is_gated=True,
     )
     return MoeRunner(MoeRunnerBackend.FLASHINFER_MXFP4, cfg)
+
+
+def test_dsv41_prefill_autotune_deduplicates_humming_moe_layouts():
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
+    from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
+        Mxfp4FlashinferCutlassMoEMethod,
+    )
+    from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+
+    num_experts, hidden, inter, top_k = 8, 256, 256, 2
+    wrappers = []
+    methods = []
+    for _ in range(2):
+        experts = _MockLayer()
+        experts.w13_weight = torch.empty(
+            num_experts,
+            2 * inter,
+            hidden // 2,
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        experts.w2_weight = torch.empty(
+            num_experts,
+            hidden,
+            inter // 2,
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        experts.moe_tp_size = experts.moe_ep_size = 1
+        method = Mxfp4FlashinferCutlassMoEMethod.__new__(
+            Mxfp4FlashinferCutlassMoEMethod
+        )
+        method._use_sm90_humming = True
+        method.moe_runner_config = MoeRunnerConfig(
+            num_experts=num_experts,
+            hidden_size=hidden,
+            intermediate_size_per_partition=inter,
+            top_k=top_k,
+        )
+        method.apply = mock.Mock()
+        experts.quant_method = method
+        routed = StandardTopKOutput(
+            topk_weights=torch.full(
+                (128, top_k), 1.0 / top_k, dtype=torch.float32, device="cuda"
+            ),
+            topk_ids=torch.arange(128 * top_k, device="cuda")
+            .reshape(128, top_k)
+            .remainder(num_experts)
+            .to(torch.int32),
+            router_logits=torch.empty(0, dtype=torch.float32, device="cuda"),
+        )
+        wrapper = SimpleNamespace(
+            experts=experts,
+            gate=mock.Mock(
+                return_value=torch.empty(
+                    (128, num_experts), dtype=torch.float32, device="cuda"
+                )
+            ),
+            topk=mock.Mock(return_value=routed),
+            is_hash=False,
+        )
+        wrappers.append(wrapper)
+        methods.append(method)
+
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="deepseek_v41"),
+        model=SimpleNamespace(modules=lambda: iter(wrappers)),
+    )
+    count = DeepseekV4ForCausalLM.autotune_prefill_kernels(
+        model, 128, dtype=torch.bfloat16
+    )
+
+    assert count == 1
+    methods[0].apply.assert_called_once()
+    methods[1].apply.assert_not_called()
+    wrappers[0].gate.assert_called_once()
+    wrappers[0].topk.assert_called_once()
+    dispatch = methods[0].apply.call_args.args[1]
+    assert dispatch.hidden_states.shape == (128, hidden)
+    assert dispatch.topk_output is wrappers[0].topk.return_value
 
 
 def _expected_w13_processed(w13_un, w13_s_un, w13_b_un, N_pad, K_pad, group_size):
