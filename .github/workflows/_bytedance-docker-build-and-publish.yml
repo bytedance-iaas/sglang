@@ -280,13 +280,18 @@ jobs:
 
       - name: Download local sgl-kernel wheel
         if: ${{ inputs.artifact_name != '' }}
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ inputs.artifact_name }}
-          path: .ci-artifacts/sgl-kernel
-          github-token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          run-id: ${{ inputs.artifact_run_id || github.run_id }}
+        timeout-minutes: 20
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KERNEL_ARTIFACT_NAME: ${{ inputs.artifact_name }}
+          KERNEL_ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id || github.run_id }}
+        run: |
+          python3 -m unittest discover -s scripts/ci -p test_download_kernel_artifact.py
+          python3 scripts/ci/download_kernel_artifact.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$KERNEL_ARTIFACT_RUN_ID" \
+            --name "$KERNEL_ARTIFACT_NAME" \
+            --output .ci-artifacts/sgl-kernel
 
       - name: Set up Docker Buildx with local Docker Hub mirror
         uses: docker/setup-buildx-action@v3
