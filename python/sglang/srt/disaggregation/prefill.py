@@ -718,7 +718,13 @@ class SchedulerDisaggregationPrefillMixin:
             result.indexer_topk_output = None
 
         logprob_pt = 0
-        assert batch.spec_info is result.next_draft_input
+        if result.skipped_output_comm:
+            # Pure middle chunks carry placeholder tokens and no draft output.
+            # The last PP stage can still hold its local draft in spec_info;
+            # preserve it, but never consume it as this placeholder's result.
+            self.batch_result_processor._validate_pp_skip_output_comm(batch, result)
+        else:
+            assert batch.spec_info is result.next_draft_input
         draft_input = result.next_draft_input
         draft_hidden_states_cpu = None
         draft_dsa_topk_indices_cpu = None
