@@ -29,7 +29,76 @@ class _Layer:
         return kwargs["hidden_states"] + 1, kwargs["prev_pre"] + 1
 
 
+class _ReqToTokenTable:
+    def __init__(self, values):
+        self.values = values
+        self.device = values.device
+        self.indices = []
+
+    def __getitem__(self, index):
+        self.indices.append(index)
+        return self.values[index]
+
+
 class TestDeepSeekV41PP(unittest.TestCase):
+    def test_pp_full_page_ids_uses_batched_request_indices(self):
+        req_to_token = _ReqToTokenTable(torch.zeros((4, 12), dtype=torch.int32))
+        req_to_token.values[1] = torch.arange(40, 52)
+        req_to_token.values[3] = torch.arange(100, 112)
+        forward_batch = SimpleNamespace(
+            seq_lens_cpu=[5, 0, 9],
+            req_pool_indices=torch.tensor([1, 0, 3], dtype=torch.int32),
+        )
+
+        with (
+            patch.object(
+                deepseek_v4,
+                "get_token_to_kv_pool",
+                return_value=SimpleNamespace(page_size=4),
+            ),
+            patch.object(
+                deepseek_v4,
+                "get_req_to_token_pool",
+                return_value=SimpleNamespace(req_to_token=req_to_token),
+            ),
+        ):
+            page_ids = DeepseekV4Model._pp_full_page_ids(None, forward_batch)
+
+        torch.testing.assert_close(
+            page_ids, torch.tensor([10, 11, 25, 26, 27], dtype=torch.int32)
+        )
+        self.assertEqual(len(req_to_token.indices), 2)
+        for request_indices, logical_page_starts in req_to_token.indices:
+            self.assertEqual(request_indices.dtype, torch.int64)
+            self.assertEqual(request_indices.shape, (1,))
+            self.assertEqual(logical_page_starts.ndim, 2)
+            self.assertEqual(logical_page_starts.shape[0], 1)
+
+    def test_pp_full_page_ids_handles_all_empty_requests(self):
+        req_to_token = _ReqToTokenTable(torch.zeros((2, 4), dtype=torch.int32))
+        forward_batch = SimpleNamespace(
+            seq_lens_cpu=[0, 0],
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
+        )
+
+        with (
+            patch.object(
+                deepseek_v4,
+                "get_token_to_kv_pool",
+                return_value=SimpleNamespace(page_size=4),
+            ),
+            patch.object(
+                deepseek_v4,
+                "get_req_to_token_pool",
+                return_value=SimpleNamespace(req_to_token=req_to_token),
+            ),
+        ):
+            page_ids = DeepseekV4Model._pp_full_page_ids(None, forward_batch)
+
+        self.assertEqual(page_ids.dtype, torch.int64)
+        self.assertEqual(page_ids.numel(), 0)
+        self.assertEqual(req_to_token.indices, [])
+
     def test_decode_candidate_mask_survives_pipeline_boundary(self):
         from sglang.srt.layers.attention.dsv4.candidate_indexer import CandidateMasks
 

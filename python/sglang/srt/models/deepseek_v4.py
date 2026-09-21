@@ -4687,9 +4687,9 @@ class DeepseekV4Model(nn.Module):
             )
             page_ids.append(
                 req_to_token[
-                    forward_batch.req_pool_indices[index],
-                    logical_page_starts,
-                ]
+                    forward_batch.req_pool_indices[index : index + 1].to(torch.int64),
+                    logical_page_starts.unsqueeze(0),
+                ].squeeze(0)
                 // page_size
             )
         if not page_ids:
