@@ -357,21 +357,30 @@ def _fp8_index_logits_prefill_kernel(
     offs_h = tl.arange(0, H)
     offs_d = tl.arange(0, D)
     visible = tl.load(lens_ptr + row)
-    valid = offs_l < tl.minimum(visible, width)
-    q = tl.load(q_ptr + row * stride_qb + offs_h[:, None] * stride_qh + offs_d[None, :])
-    k = tl.load(
-        k_ptr + offs_l[:, None] * stride_kl + offs_d[None, :],
-        mask=valid[:, None],
-        other=0.0,
-    )
-    score = tl.dot(q, tl.trans(k), out_dtype=tl.float32)
-    score = score.to(tl.bfloat16).to(tl.float32)
-    score = tl.maximum(score, 0.0)
-    weights = tl.load(w_ptr + row * stride_wb + offs_h).to(tl.float32)
-    score = (score * weights[:, None]).to(tl.bfloat16).to(tl.float32)
-    logits = tl.sum(score, axis=0).to(tl.bfloat16).to(tl.float32)
-    logits = tl.where(valid, logits, float("-inf"))
-    tl.store(out_ptr + row * out_width + offs_l, logits, mask=offs_l < out_width)
+    if block * BLOCK_L >= visible:
+        tl.store(
+            out_ptr + row * out_width + offs_l,
+            float("-inf"),
+            mask=offs_l < out_width,
+        )
+    else:
+        valid = offs_l < tl.minimum(visible, width)
+        q = tl.load(
+            q_ptr + row * stride_qb + offs_h[:, None] * stride_qh + offs_d[None, :]
+        )
+        k = tl.load(
+            k_ptr + offs_l[:, None] * stride_kl + offs_d[None, :],
+            mask=valid[:, None],
+            other=0.0,
+        )
+        score = tl.dot(q, tl.trans(k), out_dtype=tl.float32)
+        score = score.to(tl.bfloat16).to(tl.float32)
+        score = tl.maximum(score, 0.0)
+        weights = tl.load(w_ptr + row * stride_wb + offs_h).to(tl.float32)
+        score = (score * weights[:, None]).to(tl.bfloat16).to(tl.float32)
+        logits = tl.sum(score, axis=0).to(tl.bfloat16).to(tl.float32)
+        logits = tl.where(valid, logits, float("-inf"))
+        tl.store(out_ptr + row * out_width + offs_l, logits, mask=offs_l < out_width)
 
 
 def fp8_index_logits_prefill(

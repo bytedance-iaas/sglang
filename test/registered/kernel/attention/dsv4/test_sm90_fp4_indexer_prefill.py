@@ -103,6 +103,34 @@ class TestSm90Fp4IndexerPrefill(CustomTestCase):
                 )
             )
 
+    def test_invisible_tiles_ignore_nonfinite_queries(self):
+        from sglang.kernels.ops.attention.dsv4.sm90_fp4_indexer import (
+            fp8_index_logits_prefill,
+            quantize_bf16_index_queries_fp8,
+        )
+
+        rows, heads, width = 3, 64, 129
+        queries = torch.randn(rows, heads, 128, dtype=torch.bfloat16, device="cuda")
+        weights = torch.randn(rows, heads, dtype=torch.bfloat16, device="cuda")
+        keys = torch.randn(width, 128, dtype=torch.bfloat16, device="cuda").to(
+            torch.float8_e4m3fn
+        )
+        queries[0].fill_(float("nan"))
+        weights[0].fill_(float("nan"))
+        lens = torch.tensor([0, 1, 65], dtype=torch.int64, device="cuda")
+
+        actual = fp8_index_logits_prefill(
+            quantize_bf16_index_queries_fp8(queries),
+            weights,
+            keys,
+            lens,
+        )
+        columns = torch.arange(actual.shape[1], device="cuda")
+        invisible = columns[None, :] >= lens[:, None]
+        self.assertTrue(torch.isneginf(actual[invisible]).all().item())
+        self.assertTrue(torch.isfinite(actual[1, :1]).all().item())
+        self.assertTrue(torch.isfinite(actual[2, :65]).all().item())
+
 
 if __name__ == "__main__":
     unittest.main()
