@@ -25,6 +25,7 @@ jobs:
     outputs:
       community-version: ${{ steps.release.outputs.community-version }}
       internal-version: ${{ steps.release.outputs.internal-version }}
+      checkout-ref: ${{ steps.release.outputs.checkout-ref }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -69,6 +70,7 @@ jobs:
 
           echo "community-version=${COMMUNITY_VERSION}" >> "$GITHUB_OUTPUT"
           echo "internal-version=${INTERNAL_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "checkout-ref=${RAW_TAG}" >> "$GITHUB_OUTPUT"
 
   build-and-publish-volcengine:
     if: github.repository == 'bytedance-iaas/sglang'
@@ -85,6 +87,8 @@ jobs:
     uses: ./.github/workflows/_bytedance-docker-build-and-publish.yml
     with:
       docker_target: framework_final
+      install_iaas_kernels: true
+      checkout_ref: ${{ needs.resolve-volcengine-release.outputs.checkout-ref }}
       cuda_key: ${{ matrix.cuda_key }}
       cuda_version: ${{ matrix.cuda_version }}
       cuda_suffix: ${{ matrix.cuda_suffix }}
