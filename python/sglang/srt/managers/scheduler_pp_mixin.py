@@ -293,18 +293,6 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
-                    # The next PP stage receives this proxy before it can
-                    # enter the disaggregation control rings below.  Forward
-                    # and complete it immediately after launch; deferring it
-                    # until after the control rings lets PP1 wait for PP0
-                    # while PP0 waits in the same untagged control channel.
-                    if not self.pp_group.is_last_rank:
-                        self.device_module.current_stream().wait_event(
-                            self.launch_event
-                        )
-                        self._pp_send_and_commit_proxy(
-                            result.pp_hidden_states_proxy_tensors.tensors
-                        )
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -359,6 +347,18 @@ class SchedulerPPMixin:
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
+                    if cur_batch:
+                        # The peer posts this recv at the start of its next
+                        # scheduler slot. Queue the send after the current PD
+                        # control ring and commit it at the start of our next
+                        # slot; waiting here deadlocks against the peer's
+                        # control receive.
+                        self.device_module.current_stream().wait_event(
+                            self.launch_event
+                        )
+                        self._pp_queue_proxy_send(
+                            result.pp_hidden_states_proxy_tensors.tensors
+                        )
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
@@ -457,16 +457,6 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
-                    if (
-                        not self.pp_group.is_last_rank
-                        and not cur_batch.forward_mode.is_prebuilt()
-                    ):
-                        self.device_module.current_stream().wait_event(
-                            self.launch_event
-                        )
-                        self._pp_send_and_commit_proxy(
-                            result.pp_hidden_states_proxy_tensors.tensors
-                        )
 
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -550,6 +540,16 @@ class SchedulerPPMixin:
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
+                    if cur_batch and not cur_batch.forward_mode.is_prebuilt():
+                        # Match the prefill schedule: the next slot owns the
+                        # completion because the peer has not posted its proxy
+                        # receive while it is still in this slot's PD ring.
+                        self.device_module.current_stream().wait_event(
+                            self.launch_event
+                        )
+                        self._pp_queue_proxy_send(
+                            result.pp_hidden_states_proxy_tensors.tensors
+                        )
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
@@ -1078,16 +1078,15 @@ class SchedulerPPMixin:
         )
         return p2p_work
 
-    def _pp_send_and_commit_proxy(
+    def _pp_queue_proxy_send(
         self: Scheduler, tensor_dict: Dict[str, torch.Tensor]
     ) -> None:
-        """Complete a proxy exchange before reusing the PP output/control ring."""
+        """Queue a proxy for the peer's next scheduler slot without waiting."""
         self.send_proxy_work = self._pp_send_dict_to_next_stage(
             tensor_dict,
             async_send=True,
             msg_type="proxy",
         )
-        self._pp_commit_comm_work(self.send_proxy_work)
 
     def _pp_recv_typed_dict(
         self: Scheduler,
