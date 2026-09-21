@@ -46,6 +46,14 @@ on:
         required: false
         type: string
         default: ""
+      kernel_registry_layer:
+        description: "Optional immutable Volcengine layer containing the same verified kernel wheel (repository@sha256:...)"
+        required: false
+        default: ""
+      kernel_wheel_sha256:
+        description: "Independently verified wheel SHA-256, required with kernel_registry_layer"
+        required: false
+        default: ""
       image_formats:
         description: "Volcengine fork only: CSV of image formats to build (oci, zstd, nydus)."
         required: false
@@ -298,7 +306,7 @@ jobs:
             --push .
 
   build-dev-kernel-wheel:
-    if: ${{ github.repository == 'bytedance-iaas/sglang' && !inputs.private_debug_base_only && inputs.private_debug_verify_image == '' && inputs.kernel_artifact_run_id == '' && (github.event_name == 'schedule' || inputs.compile_kernel) }}
+    if: ${{ github.repository == 'bytedance-iaas/sglang' && !inputs.private_debug_base_only && inputs.private_debug_verify_image == '' && inputs.kernel_artifact_run_id == '' && inputs.kernel_registry_layer == '' && (github.event_name == 'schedule' || inputs.compile_kernel) }}
     strategy:
       fail-fast: false
       matrix:
@@ -336,13 +344,15 @@ jobs:
       tag_mode: ${{ github.event_name == 'schedule' && 'nightly' || 'manual' }}
       tag_value: ${{ inputs.tag }}
       use_environment: prod
-      artifact_name: ${{ (inputs.kernel_artifact_run_id != '' || github.event_name == 'schedule' || inputs.compile_kernel) && matrix.artifact_name || '' }}
+      artifact_name: ${{ (inputs.kernel_artifact_run_id != '' || inputs.kernel_registry_layer != '' || github.event_name == 'schedule' || inputs.compile_kernel) && matrix.artifact_name || '' }}
       artifact_run_id: ${{ inputs.kernel_artifact_run_id }}
+      kernel_registry_layer: ${{ inputs.kernel_registry_layer }}
+      kernel_wheel_sha256: ${{ inputs.kernel_wheel_sha256 }}
       image_formats: ${{ github.event_name == 'schedule' && 'oci,zstd,nydus' || inputs.image_formats }}
       extra_build_args: >-
         --build-arg BRANCH_TYPE=local
         --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
-        --build-arg INSTALL_LOCAL_SGL_KERNEL_WHEEL=${{ (inputs.kernel_artifact_run_id != '' || github.event_name == 'schedule' || inputs.compile_kernel) && '1' || '0' }}
+        --build-arg INSTALL_LOCAL_SGL_KERNEL_WHEEL=${{ (inputs.kernel_artifact_run_id != '' || inputs.kernel_registry_layer != '' || github.event_name == 'schedule' || inputs.compile_kernel) && '1' || '0' }}
         --build-arg HTTP_PROXY=http://100.68.162.211:3128
         --build-arg HTTPS_PROXY=http://100.68.162.211:3128
         --build-arg ALL_PROXY=http://100.68.162.211:3128

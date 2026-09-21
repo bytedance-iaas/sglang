@@ -5,10 +5,14 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import time
+import urllib.parse
+import urllib.request
 import zipfile
 
 
@@ -103,16 +107,123 @@ def verify_and_extract(archive, artifact, output):
     return destination
 
 
+def recover_registry_wheel(layer_ref, expected_wheel_sha256, output):
+    """Recover the exact wheel from a pinned, anonymously readable Harbor layer.
+
+    The expected wheel hash must come from independent artifact verification.
+    This is an alternate transport for the wheel, not an image build base.
+    """
+    match = re.fullmatch(
+        r"([a-z0-9.-]+\.cr\.volces\.com)/([a-z0-9._/-]+)@sha256:([0-9a-f]{64})",
+        layer_ref,
+    )
+    if match is None or not re.fullmatch(r"[0-9a-f]{64}", expected_wheel_sha256):
+        raise ValueError("Require a pinned Volcengine layer and verified wheel SHA-256")
+    host, repository, layer_sha256 = match.groups()
+    query = urllib.parse.urlencode(
+        {"service": "harbor-registry", "scope": f"repository:{repository}:pull"}
+    )
+    # Anonymous, pull-only token. No host credentials or new permissions needed.
+    with urllib.request.urlopen(
+        f"https://{host}/service/token?{query}", timeout=30
+    ) as response:
+        token = json.load(response)["token"]
+    with tempfile.TemporaryDirectory(dir=output) as staging:
+        archive = Path(staging) / "layer.tar.gz"
+        with archive.open("wb") as stream:
+            result = subprocess.run(
+                [
+                    "curl",
+                    "--fail",
+                    "--silent",
+                    "--show-error",
+                    "--location",
+                    "--proto",
+                    "=https",
+                    "--proto-redir",
+                    "=https",
+                    "--connect-timeout",
+                    "20",
+                    "--max-time",
+                    "900",
+                    "--header",
+                    "@-",
+                    f"https://{host}/v2/{repository}/blobs/sha256:{layer_sha256}",
+                ],
+                input=f"Authorization: Bearer {token}\n".encode(),
+                stdout=stream,
+                stderr=subprocess.PIPE,
+                timeout=910,
+            )
+        if result.returncode:
+            raise RuntimeError(
+                f"Registry layer download failed: curl_exit={result.returncode}; "
+                f"bytes={archive.stat().st_size}"
+            )
+        return verify_registry_layer(
+            archive, layer_sha256, expected_wheel_sha256, output
+        )
+
+
+def verify_registry_layer(
+    archive, expected_layer_sha256, expected_wheel_sha256, output
+):
+    digest = hashlib.sha256()
+    with archive.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != expected_layer_sha256:
+        raise ValueError("Registry layer SHA-256 mismatch")
+    with tarfile.open(archive, "r:gz") as bundle:
+        wheels = [m for m in bundle.getmembers() if m.name.endswith(".whl")]
+        if (
+            len(wheels) != 1
+            or not wheels[0].isfile()
+            or not Path(wheels[0].name).name.startswith("sglang_kernel-")
+        ):
+            raise ValueError("Expected exactly one regular sglang_kernel wheel")
+        with tempfile.TemporaryDirectory(dir=output) as staging:
+            wheel = Path(staging) / Path(wheels[0].name).name
+            digest = hashlib.sha256()
+            with bundle.extractfile(wheels[0]) as src, wheel.open("wb") as dst:
+                for chunk in iter(lambda: src.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                    dst.write(chunk)
+            if digest.hexdigest() != expected_wheel_sha256:
+                raise ValueError("Kernel wheel SHA-256 mismatch")
+            with zipfile.ZipFile(wheel) as package:
+                if package.testzip() is not None:
+                    raise ValueError("Kernel wheel ZIP CRC mismatch")
+                for suffix in (".dist-info/WHEEL", ".dist-info/METADATA"):
+                    if not any(n.endswith(suffix) for n in package.namelist()):
+                        raise ValueError(f"Kernel wheel missing {suffix}")
+            destination = output / wheel.name
+            os.replace(wheel, destination)
+    print(
+        f"Verified registry layer sha256:{expected_layer_sha256}; "
+        f"kernel wheel sha256:{expected_wheel_sha256}",
+        flush=True,
+    )
+    return destination
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repository", required=True)
     parser.add_argument("--run-id", required=True, type=int)
     parser.add_argument("--name", required=True)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--registry-layer", default="")
+    parser.add_argument("--wheel-sha256", default="")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     if list(args.output.glob("*.whl")):
         raise ValueError("Refusing to reuse existing kernel wheels")
+    if args.registry_layer:
+        recover_registry_wheel(args.registry_layer, args.wheel_sha256, args.output)
+        return
+    if args.wheel_sha256:
+        raise ValueError("--wheel-sha256 requires --registry-layer")
     artifact = find_artifact(args.repository, args.run_id, args.name)
     for attempt in range(1, 4):
         started = time.monotonic()

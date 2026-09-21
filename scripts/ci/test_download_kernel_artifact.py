@@ -4,6 +4,7 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import tarfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -57,6 +58,55 @@ class KernelArtifactTests(unittest.TestCase):
             "digest": "sha256:" + hashlib.sha256(data).hexdigest(),
         }
         return archive, metadata
+
+    def registry_bundle(self, entries):
+        archive = self.root / "layer.tar.gz"
+        with tarfile.open(archive, "w:gz") as bundle:
+            for name, data in entries:
+                member = tarfile.TarInfo(name)
+                member.size = len(data)
+                bundle.addfile(member, io.BytesIO(data))
+        return archive, hashlib.sha256(archive.read_bytes()).hexdigest()
+
+    def test_registry_wheel_requires_both_hashes_and_is_published_safely(self):
+        data = make_wheel()
+        archive, layer_hash = self.registry_bundle([("../../" + WHEEL, data)])
+        wheel_hash = hashlib.sha256(data).hexdigest()
+        for actual_layer, actual_wheel, error in (
+            ("0" * 64, wheel_hash, "layer SHA-256"),
+            (layer_hash, "0" * 64, "wheel SHA-256"),
+        ):
+            with self.assertRaisesRegex(ValueError, error):
+                download.verify_registry_layer(
+                    archive, actual_layer, actual_wheel, self.output
+                )
+            self.assertEqual(list(self.output.iterdir()), [])
+        result = download.verify_registry_layer(
+            archive, layer_hash, wheel_hash, self.output
+        )
+        self.assertEqual(result, self.output / WHEEL)
+        self.assertEqual(result.read_bytes(), data)
+
+    def test_registry_ambiguous_wheels_are_rejected(self):
+        data = make_wheel()
+        archive, layer_hash = self.registry_bundle(
+            [(WHEEL, data), ("other/" + WHEEL, data)]
+        )
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            download.verify_registry_layer(
+                archive, layer_hash, hashlib.sha256(data).hexdigest(), self.output
+            )
+        self.assertEqual(list(self.output.iterdir()), [])
+
+    def test_registry_tag_or_missing_hash_is_rejected_without_network(self):
+        for ref, digest in (
+            ("example.cr.volces.com/repo:tag", "a" * 64),
+            ("example.cr.volces.com/repo@sha256:" + "a" * 64, ""),
+        ):
+            with patch.object(download.urllib.request, "urlopen") as request:
+                with self.assertRaisesRegex(ValueError, "pinned"):
+                    download.recover_registry_wheel(ref, digest, self.output)
+                request.assert_not_called()
 
     def test_verified_wheel_is_published_without_extracting_member_paths(self):
         wheel = make_wheel()

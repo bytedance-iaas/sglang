@@ -7,6 +7,16 @@ name: Bytedance Build and Publish Volcengine Docker Image
 on:
   workflow_call:
     inputs:
+      kernel_registry_layer:
+        description: "Optional pinned Volcengine layer containing a previously verified kernel wheel"
+        required: false
+        type: string
+        default: ""
+      kernel_wheel_sha256:
+        description: "Independent wheel SHA-256 required for registry transport"
+        required: false
+        type: string
+        default: ""
       docker_target:
         description: "Dockerfile target stage"
         required: true
@@ -279,19 +289,23 @@ jobs:
           scripts/ci/cleanup_build_runner_disk.sh --required-gb 150
 
       - name: Download local sgl-kernel wheel
-        if: ${{ inputs.artifact_name != '' }}
+        if: ${{ inputs.artifact_name != '' || inputs.kernel_registry_layer != '' || inputs.kernel_wheel_sha256 != '' }}
         timeout-minutes: 20
         env:
           GH_TOKEN: ${{ github.token }}
           KERNEL_ARTIFACT_NAME: ${{ inputs.artifact_name }}
           KERNEL_ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id || github.run_id }}
+          KERNEL_REGISTRY_LAYER: ${{ inputs.kernel_registry_layer }}
+          KERNEL_WHEEL_SHA256: ${{ inputs.kernel_wheel_sha256 }}
         run: |
           python3 -m unittest discover -s scripts/ci -p test_download_kernel_artifact.py
           python3 scripts/ci/download_kernel_artifact.py \
             --repository "$GITHUB_REPOSITORY" \
             --run-id "$KERNEL_ARTIFACT_RUN_ID" \
             --name "$KERNEL_ARTIFACT_NAME" \
-            --output .ci-artifacts/sgl-kernel
+            --output .ci-artifacts/sgl-kernel \
+            --registry-layer "$KERNEL_REGISTRY_LAYER" \
+            --wheel-sha256 "$KERNEL_WHEEL_SHA256"
 
       - name: Set up Docker Buildx with local Docker Hub mirror
         uses: docker/setup-buildx-action@v3
