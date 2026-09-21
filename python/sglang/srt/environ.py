@@ -1520,6 +1520,9 @@ class Envs:
     # head_dim=128, ratio=1/2). Short shapes use mapped Triton. Unsupported
     # layouts, ordinary decode and compact/ragged verify retain the default path.
     SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER = EnvBool(False)
+    # Opt-in SM90 prefill indexer that converts packed FP4 keys once per request
+    # and fuses FP8 scoring across heads. Supports eager regular and CP prefill.
+    SGLANG_OPT_DSV41_SM90_PREFILL_INDEXER = EnvBool(False)
     # Overlap layers 1/14's shared-host embedding lookups with earlier layers. The
     # WKV projection stays on the main stream so this path works on Hopper and
     # with DP attention without introducing a side-stream collective or GEMM.

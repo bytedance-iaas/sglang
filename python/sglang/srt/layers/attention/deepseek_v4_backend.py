@@ -39,6 +39,11 @@ from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
 )
 from sglang.kernels.ops.attention.dsv4.online_c128_mtp import OnlineC128MTPController
+from sglang.kernels.ops.attention.dsv4.sm90_fp4_indexer import (
+    fp8_index_logits_prefill,
+    quantize_bf16_index_queries_fp8,
+    unpack_fp4_index_keys_to_fp8,
+)
 from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     BuildPageTablePositions,
@@ -149,6 +154,11 @@ PAGE_INDEX_ALIGNED_SIZE = 64
 def _is_sm100_or_newer() -> bool:
     # DeepGEMM's fp8_fp4 mqa-logits kernels need SM100+; Hopper takes the torch indexer.
     return torch.cuda.get_device_capability()[0] >= 10
+
+
+@functools.lru_cache(maxsize=None)
+def _is_sm90() -> bool:
+    return torch.cuda.get_device_capability()[0] == 9
 
 
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -2919,6 +2929,16 @@ class DeepseekV4AttnBackend(
                     torch.tensor(q_lens_cpu, dtype=torch.int32, device=x.device),
                     q_lens_cpu,
                 )
+            elif self._use_sm90_fp8_prefill_indexer(forward_batch):
+                self._low_ratio_index_topk_sm90_prefill(
+                    layer,
+                    local_x,
+                    local_q_lora,
+                    local_pos,
+                    forward_batch,
+                    request_ids=forward_batch.req_pool_indices,
+                    q_lens_cpu=q_lens_cpu,
+                )
             else:
                 local_req = torch.repeat_interleave(
                     forward_batch.req_pool_indices.to(torch.int64),
@@ -3259,6 +3279,10 @@ class DeepseekV4AttnBackend(
             self._use_dense_fp4_prefill_indexer(forward_batch) and _is_sm100_or_newer()
         ):
             self._low_ratio_index_topk_extend(layer, x, q_lora, pos, forward_batch)
+        elif self._use_sm90_fp8_prefill_indexer(forward_batch):
+            self._low_ratio_index_topk_sm90_prefill(
+                layer, x, q_lora, pos, forward_batch
+            )
         else:
             self._low_ratio_index_topk_torch(layer, x, q_lora, req, pos)
 
@@ -3271,6 +3295,144 @@ class DeepseekV4AttnBackend(
             and forward_batch.seq_lens_cpu is not None
             and forward_batch.extend_seq_lens_cpu is not None
         )
+
+    @staticmethod
+    def _use_sm90_fp8_prefill_indexer(forward_batch) -> bool:
+        return (
+            envs.SGLANG_OPT_DSV41_SM90_PREFILL_INDEXER.get()
+            and not envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get()
+            and _is_sm90()
+            and forward_batch.forward_mode.is_extend()
+            and forward_batch.seq_lens_cpu is not None
+            and forward_batch.extend_seq_lens_cpu is not None
+        )
+
+    def _low_ratio_index_topk_sm90_prefill(
+        self,
+        layer,
+        x,
+        q_lora,
+        pos,
+        forward_batch,
+        *,
+        request_ids=None,
+        q_lens_cpu=None,
+    ) -> None:
+        """Score request-major eager prefill rows with an SM90 FP8 kernel."""
+        pool = self.token_to_kv_pool
+        core = self.forward_metadata.core_metadata
+        ratio = layer.compress_ratio
+        indexer = layer.indexer
+        page_indices = core.sparse_page_indices(ratio)
+        raw_indices = core.sparse_raw_indices(ratio)
+        page_indices.fill_(-1)
+        if raw_indices is not None:
+            raw_indices.fill_(-1)
+
+        if q_lens_cpu is None:
+            tail = self.forward_metadata.late_layer_tail
+            q_lens_cpu = (
+                tail.extend_seq_lens_cpu
+                if tail is not None
+                else _as_int_list(forward_batch.extend_seq_lens_cpu)
+            )
+        if request_ids is None:
+            request_ids = forward_batch.req_pool_indices
+        seq_lens_cpu = _as_int_list(forward_batch.seq_lens_cpu)
+        assert q_lens_cpu is not None and seq_lens_cpu is not None
+        assert len(q_lens_cpu) == len(seq_lens_cpu) == request_ids.shape[0]
+
+        q = indexer.queries(q_lora, layer.freqs_cis[pos])
+        weights = indexer.head_weights(x)
+        compress_lens = ((pos + 1) // ratio).to(torch.int32)
+        topk_offsets = torch.zeros_like(compress_lens)
+        table = pool.get_index_k_with_scale_buffer(layer.layer_id)
+        page_size = table.shape[1] // 68
+        topk = indexer.index_topk
+        publish = [] if indexer.is_candidate_source else None
+        consume = (
+            published_masks(self.forward_metadata.candidate_metadata).request_masks
+            if indexer.uses_candidates
+            else None
+        )
+        empty_mask = torch.zeros(0, 0, dtype=torch.bool, device=pos.device)
+
+        row_base = 0
+        for b, (q_len, seq_len) in enumerate(zip(q_lens_cpu, seq_lens_cpu)):
+            lc = seq_len // ratio
+            if lc == 0 or q_len == 0:
+                if publish is not None:
+                    publish.append(empty_mask)
+                row_base += q_len
+                continue
+            compressed_positions = torch.arange(lc, device=pos.device) * ratio
+            slots = (
+                self.req_to_token[
+                    request_ids[b : b + 1].to(torch.int64),
+                    compressed_positions.unsqueeze(0),
+                ]
+                .squeeze(0)
+                .to(torch.int64)
+                // ratio
+            )
+            index_k = unpack_fp4_index_keys_to_fp8(slots, table, page_size)
+            k = min(topk, lc)
+            rows_per_chunk = max(1, _TORCH_INDEXER_SCORE_BUDGET_BYTES // (lc * 4))
+            masks = [] if publish is not None else None
+            for start in range(0, q_len, rows_per_chunk):
+                stop = min(q_len, start + rows_per_chunk)
+                token_rows = slice(row_base + start, row_base + stop)
+                local_rows = slice(start, stop)
+                lens = compress_lens[token_rows]
+                scores = fp8_index_logits_prefill(
+                    quantize_bf16_index_queries_fp8(q[token_rows]),
+                    weights[token_rows],
+                    index_k,
+                    lens,
+                )
+                if masks is not None:
+                    masks.append(
+                        select_candidate_blocks(
+                            scores,
+                            lens[:, None],
+                            topk_blocks=indexer.candidate_topk_blocks,
+                            block_size=indexer.candidate_block_size,
+                        )
+                    )
+                elif consume is not None:
+                    scores.masked_fill_(~consume[b][local_rows], -torch.inf)
+                selected = torch.empty(
+                    (scores.shape[0], k), dtype=torch.int32, device=scores.device
+                )
+                topk_transform_ragged_v2(
+                    scores,
+                    lens,
+                    out_offsets=topk_offsets[token_rows],
+                    out_indices=selected,
+                )
+                if consume is not None and masks is None:
+                    selected = mask_topk_scores(scores, selected)
+                unselected = torch.iinfo(torch.int32).max
+                selected = (
+                    selected.masked_fill(selected < 0, unselected).sort(dim=-1).values
+                )
+                reach = (selected != unselected) & (selected < lens[:, None])
+                page_indices[token_rows, :k] = torch.where(
+                    reach, slots[selected.clamp_max(lc - 1)], -1
+                ).to(torch.int32)
+                if raw_indices is not None:
+                    raw_indices[token_rows, :k] = torch.where(reach, selected, -1).to(
+                        torch.int32
+                    )
+            if masks is not None:
+                publish.append(torch.cat(masks) if len(masks) > 1 else masks[0])
+            row_base += q_len
+
+        assert row_base == q.shape[0]
+        if publish is not None:
+            self.forward_metadata.candidate_metadata = CandidateMasks(
+                request_masks=publish
+            )
 
     def _low_ratio_index_topk_extend(
         self, layer, x, q_lora, pos, forward_batch

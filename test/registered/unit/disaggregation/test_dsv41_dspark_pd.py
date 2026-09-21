@@ -426,7 +426,9 @@ class TestDSV41DSparkPD(CustomTestCase):
         backend = object.__new__(DeepseekV4AttnBackend)
         backend.forward_metadata = SimpleNamespace(late_layer_tail=None)
         backend._use_dense_fp4_prefill_indexer = Mock(return_value=True)
+        backend._use_sm90_fp8_prefill_indexer = Mock(return_value=False)
         backend._low_ratio_index_topk_dense = Mock()
+        backend._low_ratio_index_topk_sm90_prefill = Mock()
         backend._low_ratio_index_topk_torch = Mock()
         layer = SimpleNamespace(compressor=None, indexer=object())
         forward_batch = SimpleNamespace(
@@ -463,6 +465,7 @@ class TestDSV41DSparkPD(CustomTestCase):
             )
 
         backend._low_ratio_index_topk_dense.assert_not_called()
+        backend._low_ratio_index_topk_sm90_prefill.assert_not_called()
         args = backend._low_ratio_index_topk_torch.call_args.args
         self.assertIs(args[0], layer)
         torch.testing.assert_close(args[1], x)
@@ -476,6 +479,97 @@ class TestDSV41DSparkPD(CustomTestCase):
         self.assertEqual(
             backend._low_ratio_index_topk_torch.call_args.kwargs["q_lens_cpu"], [4]
         )
+
+    def test_prefill_cp_uses_sm90_fp8_indexer_when_enabled(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.forward_metadata = SimpleNamespace(late_layer_tail=None)
+        backend._use_dense_fp4_prefill_indexer = Mock(return_value=True)
+        backend._use_sm90_fp8_prefill_indexer = Mock(return_value=True)
+        backend._low_ratio_index_topk_dense = Mock()
+        backend._low_ratio_index_topk_sm90_prefill = Mock()
+        backend._low_ratio_index_topk_torch = Mock()
+        layer = SimpleNamespace(compressor=None, indexer=object())
+        forward_batch = SimpleNamespace(
+            attn_cp_metadata=SimpleNamespace(total_seq_lens=8),
+            extend_seq_lens_cpu=[8],
+            extend_seq_lens=torch.tensor([8], dtype=torch.int32),
+            req_pool_indices=torch.tensor([7], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([8], dtype=torch.int32),
+            positions=torch.arange(8),
+            forward_mode=ForwardMode.EXTEND,
+        )
+        x = torch.zeros(4, 8)
+        q_lora = torch.zeros(4, 4)
+        positions = torch.arange(4)
+
+        with (
+            patch(
+                "sglang.srt.layers.attention.deepseek_v4_backend.get_parallel",
+                return_value=SimpleNamespace(attn_cp_rank=0, attn_cp_size=2),
+            ),
+            patch(
+                "sglang.srt.layers.attention.deepseek_v4_backend._is_sm100_or_newer",
+                return_value=False,
+            ),
+        ):
+            backend._forward_low_ratio_sources_cp(
+                layer=layer,
+                x=x,
+                q_lora=q_lora,
+                positions=positions,
+                forward_batch=forward_batch,
+                run_compressor=False,
+                run_indexer=True,
+            )
+
+        backend._low_ratio_index_topk_dense.assert_not_called()
+        backend._low_ratio_index_topk_torch.assert_not_called()
+        call = backend._low_ratio_index_topk_sm90_prefill.call_args
+        self.assertIs(call.args[0], layer)
+        torch.testing.assert_close(call.args[1], x)
+        torch.testing.assert_close(call.args[2], q_lora)
+        torch.testing.assert_close(call.args[3], positions.to(torch.int64))
+        self.assertIs(call.args[4], forward_batch)
+        self.assertIs(call.kwargs["request_ids"], forward_batch.req_pool_indices)
+        self.assertEqual(call.kwargs["q_lens_cpu"], [4])
+
+    def test_sm90_fp8_prefill_indexer_dispatch_guards(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            seq_lens_cpu=[8],
+            extend_seq_lens_cpu=[8],
+        )
+        with (
+            envs.SGLANG_OPT_DSV41_SM90_PREFILL_INDEXER.override(True),
+            envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.override(False),
+            patch(
+                "sglang.srt.layers.attention.deepseek_v4_backend._is_sm90",
+                return_value=True,
+            ),
+        ):
+            self.assertTrue(
+                DeepseekV4AttnBackend._use_sm90_fp8_prefill_indexer(forward_batch)
+            )
+            forward_batch.forward_mode = ForwardMode.DECODE
+            self.assertFalse(
+                DeepseekV4AttnBackend._use_sm90_fp8_prefill_indexer(forward_batch)
+            )
+            forward_batch.forward_mode = ForwardMode.EXTEND
+            with envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.override(True):
+                self.assertFalse(
+                    DeepseekV4AttnBackend._use_sm90_fp8_prefill_indexer(forward_batch)
+                )
 
     def test_prefill_cp_torch_indexer_keeps_empty_request_placeholders(self):
         from sglang.srt.layers.attention.deepseek_v4_backend import (
