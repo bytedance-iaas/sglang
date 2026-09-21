@@ -232,5 +232,6 @@ def humming_w8a8_block_fp8_linear(
         compute_config={"use_batch_invariant": _requires_deterministic_gemm()},
     )
     if bias is not None:
-        output = output + bias
+        # Match the block-linear contract even if bias is stored in FP32.
+        output.add_(bias)
     return output.reshape(output_shape)

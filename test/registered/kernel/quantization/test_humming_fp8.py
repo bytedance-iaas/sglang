@@ -207,6 +207,16 @@ class TestHummingFp8Linear(CustomTestCase):
                     input=x, weight=packed, block_size=[32, 32], weight_scale=None
                 )
             self._assert_close(out, ref)
+            bias = torch.randn(576, device="cuda", dtype=torch.float32)
+            with self._forbid_fallback():
+                out = runner(
+                    input=x,
+                    weight=packed,
+                    block_size=[32, 32],
+                    weight_scale=None,
+                    bias=bias,
+                )
+            self._assert_close(out, ref + bias)
             with self.assertRaisesRegex(ValueError, "dtype or K"):
                 runner(
                     input=x.half(),
