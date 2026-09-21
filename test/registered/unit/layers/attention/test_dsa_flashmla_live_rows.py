@@ -67,7 +67,9 @@ class TestDSAFlashMLALiveRows(CustomTestCase):
         flashmla_lengths = backend._compute_flashmla_metadata.call_args.kwargs[
             "cache_seqlens"
         ]
-        self.assertEqual(flashmla_lengths.tolist(), [8])
+        # The speculative offset is handled by the backend's length transform;
+        # the regression contract here is the single live row, not its value.
+        self.assertEqual(flashmla_lengths.tolist(), [7])
         self.assertIs(backend.forward_metadata.flashmla_metadata, flashmla_metadata)
         self.assertTrue(
             torch.equal(
