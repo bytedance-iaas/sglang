@@ -1612,12 +1612,18 @@ class DeepseekV4AttnBackend(
         extend_lens_cpu = forward_batch.extend_seq_lens_cpu
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert extend_lens_cpu is not None and seq_lens_cpu is not None
-        device = forward_batch.out_cache_loc.device
-        token_indices, tail_lens_cpu, swa_replay_start = late_layer_tail_layout(
-            extend_lens_cpu=extend_lens_cpu,
-            seq_lens_cpu=seq_lens_cpu.tolist(),
-            tail_len=SWA_WINDOW,
-            device=device,
+        assert (
+            forward_batch.extend_seq_lens is not None
+            and forward_batch.seq_lens is not None
+        )
+        token_indices, tail_lens_cpu, tail_lens, swa_replay_start = (
+            late_layer_tail_layout(
+                extend_lens=forward_batch.extend_seq_lens,
+                extend_lens_cpu=extend_lens_cpu,
+                seq_lens=forward_batch.seq_lens,
+                seq_lens_cpu=seq_lens_cpu.tolist(),
+                tail_len=SWA_WINDOW,
+            )
         )
         contiguous_start = (
             extend_lens_cpu[0] - tail_lens_cpu[0] if len(extend_lens_cpu) == 1 else None
@@ -1627,9 +1633,13 @@ class DeepseekV4AttnBackend(
             token_indices=token_indices,
             contiguous_start=contiguous_start,
         )
-        tail_lens = torch.tensor(tail_lens_cpu, dtype=torch.int32, device=device)
         cp_tail = (
-            self._late_layer_tail_cp_layout(forward_batch, token_indices, tail_lens)
+            self._late_layer_tail_cp_layout(
+                forward_batch,
+                token_indices,
+                extend_lens_cpu,
+                tail_lens_cpu,
+            )
             if is_cp_active(forward_batch)
             else None
         )
@@ -1657,7 +1667,9 @@ class DeepseekV4AttnBackend(
         )
         metadata.core_attn_metadata.swa_out_cache_loc = swa_out_cache_loc
         metadata.low_ratio_req_indices = torch.repeat_interleave(
-            forward_batch.req_pool_indices.to(torch.int64), tail_lens.to(torch.int64)
+            forward_batch.req_pool_indices.to(torch.int64),
+            tail_lens.to(torch.int64),
+            output_size=sum(tail_lens_cpu),
         )
         positions = _tail_rows(
             forward_batch.positions,
@@ -1696,28 +1708,39 @@ class DeepseekV4AttnBackend(
         self,
         forward_batch: ForwardBatch,
         token_indices: torch.Tensor,
-        tail_lens: torch.Tensor,
+        extend_lens_cpu: List[int],
+        tail_lens_cpu: List[int],
     ) -> dict:
         cp_rank = get_parallel().attn_cp_rank
         cp_size = get_parallel().attn_cp_size
         device = token_indices.device
         total = token_indices.shape[0]
         owner_rank = token_indices % cp_size
-        counts = torch.bincount(owner_rank, minlength=cp_size).tolist()
+        counts = [0] * cp_size
+        local_lens_cpu = []
+        extend_end = 0
+        for extend_len, tail_len in zip(extend_lens_cpu, tail_lens_cpu, strict=True):
+            extend_end += extend_len
+            request_counts = [tail_len // cp_size] * cp_size
+            tail_start = extend_end - tail_len
+            for offset in range(tail_len % cp_size):
+                request_counts[(tail_start + offset) % cp_size] += 1
+            local_lens_cpu.append(request_counts[cp_rank])
+            counts = [a + b for a, b in zip(counts, request_counts, strict=True)]
         max_local = max(counts)
         order = torch.argsort(owner_rank, stable=True)
-        rank_starts = torch.tensor(
-            [sum(counts[:r]) for r in range(cp_size)],
-            dtype=torch.int64,
-            device=device,
-        )
-        slot = torch.empty_like(owner_rank)
-        slot[order] = (
-            torch.arange(total, device=device) - rank_starts[owner_rank[order]]
-        )
-        gather_index = owner_rank * max_local + slot
-
-        local_tail_rows = (owner_rank == cp_rank).nonzero().squeeze(1)
+        gather_index = torch.empty_like(owner_rank)
+        rank_start = 0
+        local_tail_rows = None
+        for rank, count in enumerate(counts):
+            rank_rows = order[rank_start : rank_start + count]
+            gather_index[rank_rows] = rank * max_local + torch.arange(
+                count, device=device
+            )
+            if rank == cp_rank:
+                local_tail_rows = rank_rows
+            rank_start += count
+        assert local_tail_rows is not None
         pad_rows = max_local - counts[cp_rank]
         # Give each rank distinct padding rows in the compact tail metadata.
         pad_start = total + sum(max_local - c for c in counts[:cp_rank])
@@ -1726,11 +1749,6 @@ class DeepseekV4AttnBackend(
                 local_tail_rows,
                 torch.arange(pad_start, pad_start + pad_rows, device=device),
             ]
-        )
-        tail_request_ids = torch.repeat_interleave(
-            torch.arange(forward_batch.batch_size, device=device),
-            tail_lens.to(torch.int64),
-            output_size=total,
         )
         local_positions = torch.cat(
             [
@@ -1751,9 +1769,7 @@ class DeepseekV4AttnBackend(
             cp_metadata=cp_metadata,
             local_token_indices=(token_indices[local_tail_rows] - cp_rank) // cp_size,
             local_positions=local_positions,
-            local_lens_cpu=torch.bincount(
-                tail_request_ids[local_tail_rows], minlength=forward_batch.batch_size
-            ).tolist(),
+            local_lens_cpu=local_lens_cpu,
             pad_rows=pad_rows,
         )
 

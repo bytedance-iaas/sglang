@@ -437,33 +437,39 @@ class BuildCausalSwaPageIndices:
 
 def late_layer_tail_layout(
     *,
+    extend_lens: torch.Tensor,
     extend_lens_cpu: list[int],
+    seq_lens: torch.Tensor,
     seq_lens_cpu: list[int],
     tail_len: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, list[int], torch.Tensor]:
+) -> tuple[torch.Tensor, list[int], torch.Tensor, torch.Tensor]:
     """Tail rows of each prefill extend: its last min(tail_len, extend_len) tokens.
-    Returns (token indices into the extend, per-request tail lengths, per-row
-    absolute window floor)."""
+    Returns (token indices into the extend, host and device per-request tail
+    lengths, per-row absolute window floor)."""
+    device = extend_lens.device
+    assert seq_lens.device == device
     tail_lens_cpu = [min(tail_len, n) for n in extend_lens_cpu]
+    tail_lens = extend_lens.to(torch.int32).clamp_max(tail_len)
     if len(extend_lens_cpu) == 1:
         n, t, s = extend_lens_cpu[0], tail_lens_cpu[0], seq_lens_cpu[0]
         floor = torch.full((t,), s - t, dtype=torch.int32, device=device)
-        return torch.arange(n - t, n, device=device), tail_lens_cpu, floor
-    # One H2D copy for the three length vectors; launch count does not grow with bs.
-    lens = torch.tensor([extend_lens_cpu, tail_lens_cpu, seq_lens_cpu], device=device)
-    extend_lens, tail_lens, seq_lens = lens[0], lens[1], lens[2]
+        return (
+            torch.arange(n - t, n, device=device),
+            tail_lens_cpu,
+            tail_lens,
+            floor,
+        )
     total = sum(tail_lens_cpu)
     req = torch.repeat_interleave(
         torch.arange(len(tail_lens_cpu), device=device), tail_lens, output_size=total
     )
-    offs = (
-        torch.arange(total, device=device)
-        - (torch.cumsum(tail_lens, 0) - tail_lens)[req]
-    )
-    token_indices = (torch.cumsum(extend_lens, 0) - tail_lens)[req] + offs
+    tail_starts = torch.cumsum(tail_lens, 0, dtype=torch.int64) - tail_lens
+    offs = torch.arange(total, device=device) - tail_starts[req]
+    token_indices = (torch.cumsum(extend_lens, 0, dtype=torch.int64) - tail_lens)[
+        req
+    ] + offs
     floor = (seq_lens - tail_lens)[req].to(torch.int32)
-    return token_indices, tail_lens_cpu, floor
+    return token_indices, tail_lens_cpu, tail_lens, floor
 
 
 def build_causal_swa_page_indices(
