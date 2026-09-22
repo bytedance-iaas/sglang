@@ -199,10 +199,15 @@ class TestPrepareServerArgs(CustomTestCase):
         check_pipeline_parallel_compat(self._pp_spec_cfg())
 
     def test_target_eagle_mtp_prefill_is_allowed(self):
-        check_pipeline_parallel_compat(
-            self._pp_spec_cfg(speculative_algorithm="EAGLE"),
-            model_architecture=self._PP_EAGLE_SUPPORTED_ARCH,
-        )
+        for architecture in (
+            self._PP_EAGLE_SUPPORTED_ARCH,
+            "Qwen4ExpForConditionalGeneration",
+        ):
+            with self.subTest(architecture=architecture):
+                check_pipeline_parallel_compat(
+                    self._pp_spec_cfg(speculative_algorithm="EAGLE"),
+                    model_architecture=architecture,
+                )
 
     def test_overlap_schedule_is_rejected(self):
         with self.assertRaisesRegex(AssertionError, "overlap schedule"):
