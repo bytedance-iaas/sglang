@@ -151,6 +151,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
+    get_req_to_token_pool,
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner import (
@@ -4125,8 +4126,6 @@ class DeepseekV4Model(nn.Module):
             unavailable = []
             if not _is_cuda:
                 unavailable.append("CUDA is required")
-            if self.pp_group.world_size != 1:
-                unavailable.append("PP must be 1")
             # Vision-capable checkpoints can prefetch rows too: WKV and gate
             # stay on the main stream, followed by the common image-token mask
             # in _forward_layers_hc_pre_from_prev.
@@ -4261,9 +4260,10 @@ class DeepseekV4Model(nn.Module):
         input_ids_global: torch.Tensor,
         capture_dspark: bool,
         dspark_aux_hidden_states: List[torch.Tensor],
+        prev_pre: Optional[torch.Tensor] = None,
+        pp_tail_active: bool = False,
         token_parallel: Optional[DSV41TokenParallel] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
-        assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
         hash_ids = None
         cp_extend = (
             is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
@@ -4353,15 +4353,36 @@ class DeepseekV4Model(nn.Module):
                 )
 
         saved_full = None
-        prev_pre = None
+        if pp_tail_active:
+            if tail is None:
+                raise RuntimeError("PP tail continuation has no replay metadata")
+            if self.start_layer <= self.late_layer_start:
+                raise RuntimeError("PP tail continuation precedes the replay boundary")
+            saved_full = attn_backend.enter_late_layer_tail(
+                forward_batch,
+                inherit_full_state=False,
+            )
+            local_input_ids = tail.rows(local_input_ids)
+            if tail.cp_metadata is not None:
+                tail_input_ids = forward_batch.input_ids[tail.output_token_indices]
+                input_ids = cp_interleave_input_ids(tail_input_ids, forward_batch)
+                input_ids_global = input_ids
+            else:
+                input_ids = tail.rows(input_ids)
+                input_ids_global = tail.rows(input_ids_global)
+                local_input_ids = input_ids
+            positions = tail.positions
+            if hash_ids is not None:
+                hash_ids = tail.rows(hash_ids)
         precomputed_attn = None
         late_dp_layout = None
         if token_parallel is not None:
             assert tail is None and not cp_extend and not capture_dspark
             hidden_states = token_parallel.local(hidden_states)
         for i in range(self.start_layer, self.end_layer):
-            if tail is not None and i == self.late_layer_start:
-                # Decode reaches back at most SWA_WINDOW positions.
+            if tail is not None and not pp_tail_active and i == self.late_layer_start:
+                # Past the last kv_source layer a layer only owes its window KV,
+                # and decode reaches back at most SWA_WINDOW positions.
                 saved_full = attn_backend.enter_late_layer_tail(forward_batch)
                 hidden_states = tail.rows(hidden_states)
                 prev_pre = tail.rows(prev_pre)
@@ -4649,6 +4670,214 @@ class DeepseekV4Model(nn.Module):
         )
         return hidden_states
 
+    def _pp_full_page_ids(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        page_size = get_token_to_kv_pool().page_size
+        req_to_token = get_req_to_token_pool().req_to_token
+        page_ids = []
+        for index, seq_len_value in enumerate(forward_batch.seq_lens_cpu):
+            seq_len = int(seq_len_value)
+            if seq_len == 0:
+                continue
+            logical_page_starts = torch.arange(
+                0,
+                seq_len,
+                page_size,
+                dtype=torch.int64,
+                device=req_to_token.device,
+            )
+            page_ids.append(
+                req_to_token[
+                    forward_batch.req_pool_indices[index : index + 1].to(torch.int64),
+                    logical_page_starts.unsqueeze(0),
+                ].squeeze(0)
+                // page_size
+            )
+        if not page_ids:
+            return torch.empty(0, dtype=torch.int64, device=req_to_token.device)
+        return torch.cat(page_ids)
+
+    def _pp_attention_metadata(self, tail_active: bool):
+        attn_backend = get_attn_backend()
+        metadata = (
+            attn_backend.tail_forward_metadata
+            if tail_active
+            else attn_backend.forward_metadata
+        )
+        if metadata is None:
+            raise RuntimeError(
+                "PP activation references unavailable attention metadata"
+            )
+        return metadata
+
+    def _install_pp_state(
+        self,
+        pp_proxy_tensors: PPProxyTensors,
+        forward_batch: ForwardBatch,
+        tail_active: bool,
+    ) -> None:
+        tensors = pp_proxy_tensors.tensors
+        source_layer_id = tensors.get("pp_source_layer_id")
+        if source_layer_id is not None:
+            prefix = "pp_source_"
+            get_token_to_kv_pool().install_source_pages(
+                int(source_layer_id),
+                self._pp_full_page_ids(forward_batch),
+                {
+                    key.removeprefix(prefix): value
+                    for key, value in tensors.items()
+                    if key.startswith(prefix) and key != "pp_source_layer_id"
+                },
+            )
+
+        metadata = self._pp_attention_metadata(tail_active)
+        core = metadata.core_metadata
+        from sglang.srt.layers.attention.dsv4.pp import remap_sparse_slots
+
+        for ratio in (1, 2):
+            for suffix in (
+                "sparse_topk_lengths",
+                "sparse_page_indices",
+                "sparse_raw_indices",
+            ):
+                name = f"c{ratio}_{suffix}"
+                target = getattr(core, name, None)
+                value = tensors.get(f"pp_index_{name}")
+                if value is not None and target is not None:
+                    if suffix == "sparse_page_indices":
+                        value = remap_sparse_slots(
+                            value,
+                            tensors["pp_index_page_table"],
+                            core.page_table,
+                            core.page_size // ratio,
+                            tensors["pp_index_num_pages"],
+                        )
+                    target.copy_(value)
+
+        candidate_count = int(tensors.get("pp_candidate_count", 0))
+        if candidate_count or "pp_candidate_mask" in tensors:
+            from sglang.srt.layers.attention.dsv4.candidate_indexer import (
+                CandidateMasks,
+            )
+
+            metadata.candidate_metadata = CandidateMasks(
+                mask=tensors.get("pp_candidate_mask"),
+                request_masks=[
+                    tensors[f"pp_candidate_{index}"] for index in range(candidate_count)
+                ]
+                if candidate_count
+                else None,
+            )
+        candidate_ratio = tensors.get("pp_candidate_ratio")
+        index_metadata = (
+            getattr(metadata, f"c{candidate_ratio}_indexer_metadata", None)
+            if candidate_ratio is not None
+            else None
+        )
+        if "pp_candidate_blocks" in tensors and index_metadata is not None:
+            from sglang.srt.layers.attention.dsv4.candidate_indexer_deep_gemm import (
+                SparseBlockTable,
+                build_sparse_indexer_schedule,
+                sort_candidate_blocks,
+            )
+
+            blocks = tensors["pp_candidate_blocks"]
+            lens = index_metadata.compressed_seq_lens.reshape(-1)
+            phys_blocks = sort_candidate_blocks(
+                blocks,
+                lens,
+                index_metadata.page_table,
+                index_metadata.compressed_page_size,
+            )
+            request_ids = get_attn_backend().candidate_indexer._request_ids(
+                None, blocks.shape[0], blocks.device
+            )
+            schedule = build_sparse_indexer_schedule(
+                blocks,
+                lens,
+                index_metadata.page_table,
+                index_metadata.compressed_page_size,
+                torch.int8,
+                request_ids,
+            )
+            ready = torch.cuda.Event()
+            ready.record()
+            metadata.candidate_metadata = SparseBlockTable(
+                blocks,
+                schedule,
+                phys_blocks,
+                tensors["pp_candidate_valid_lens"],
+                ready,
+            )
+
+    def _export_pp_state(
+        self,
+        tensors: dict,
+        forward_batch: ForwardBatch,
+        tail_active: bool,
+    ) -> None:
+        next_layer_id = self.end_layer
+        ratio = self.config.compress_ratios[next_layer_id]
+        if ratio in (1, 2):
+            sources = [
+                source
+                for source in self.config.kv_source_layer_ids
+                if source <= next_layer_id
+                and self.config.compress_ratios[source] == ratio
+            ]
+            source_layer_id = max(sources)
+            if source_layer_id < next_layer_id:
+                source_tensors = get_token_to_kv_pool().export_source_pages(
+                    source_layer_id,
+                    self._pp_full_page_ids(forward_batch),
+                )
+                tensors["pp_source_layer_id"] = source_layer_id
+                tensors.update(
+                    {f"pp_source_{key}": value for key, value in source_tensors.items()}
+                )
+
+        metadata = self._pp_attention_metadata(tail_active)
+        core = metadata.core_metadata
+        tensors["pp_index_page_table"] = core.page_table
+        tensors["pp_index_num_pages"] = (
+            core.seq_lens_casual + core.page_size - 1
+        ) // core.page_size
+        for ratio in (1, 2):
+            for suffix in (
+                "sparse_topk_lengths",
+                "sparse_page_indices",
+                "sparse_raw_indices",
+            ):
+                name = f"c{ratio}_{suffix}"
+                value = getattr(core, name, None)
+                if value is not None:
+                    tensors[f"pp_index_{name}"] = value
+
+        from sglang.srt.layers.attention.dsv4.candidate_indexer import CandidateMasks
+
+        candidate = metadata.candidate_metadata
+        if isinstance(candidate, CandidateMasks) and candidate.mask is not None:
+            tensors["pp_candidate_mask"] = candidate.mask
+        if (
+            isinstance(candidate, CandidateMasks)
+            and candidate.request_masks is not None
+        ):
+            tensors["pp_candidate_count"] = len(candidate.request_masks)
+            for index, mask in enumerate(candidate.request_masks):
+                tensors[f"pp_candidate_{index}"] = mask
+        if candidate is not None and not isinstance(candidate, CandidateMasks):
+            from sglang.srt.layers.attention.dsv4.candidate_indexer_deep_gemm import (
+                SparseBlockTable,
+            )
+
+            if isinstance(candidate, SparseBlockTable):
+                torch.cuda.current_stream().wait_event(candidate.ready)
+                source_layer = self.config.candidate_source_layer_id
+                tensors["pp_candidate_ratio"] = self.config.compress_ratios[
+                    source_layer
+                ]
+                tensors["pp_candidate_blocks"] = candidate.blocks
+                tensors["pp_candidate_valid_lens"] = candidate.valid_lens
+
     @torch.no_grad()
     def forward(
         self,
@@ -4672,6 +4901,20 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = hidden_states.view(
                     hidden_states.shape[0], self.hc_mult, self.hidden_size
                 )
+        prev_pre = (
+            None
+            if pp_proxy_tensors is None
+            else pp_proxy_tensors.tensors.get("prev_pre")
+        )
+        pp_tail_active = pp_proxy_tensors is not None and bool(
+            pp_proxy_tensors.tensors.get("pp_late_layer_tail", False)
+        )
+        if pp_proxy_tensors is not None:
+            self._install_pp_state(
+                pp_proxy_tensors,
+                forward_batch,
+                pp_tail_active,
+            )
 
         if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
@@ -4765,6 +5008,8 @@ class DeepseekV4Model(nn.Module):
                 input_ids_global,
                 capture_dspark,
                 dspark_aux_hidden_states,
+                prev_pre,
+                pp_tail_active,
                 token_parallel=token_parallel,
             )
         elif run_tbo:
@@ -4813,7 +5058,27 @@ class DeepseekV4Model(nn.Module):
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
-            return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
+            tensors = {"hidden_states": hidden_states.flatten(1)}
+            if last_pre is not None:
+                tensors["prev_pre"] = last_pre
+            tail_active = tail is not None
+            if tail_active:
+                tensors["pp_late_layer_tail"] = True
+            self._export_pp_state(tensors, forward_batch, tail_active)
+            if capture_dspark:
+                if dspark_aux_hidden_states:
+                    tensors["dspark_aux_hidden_states"] = torch.cat(
+                        dspark_aux_hidden_states, dim=-1
+                    )
+                else:
+                    tensors["dspark_aux_hidden_states"] = hidden_states.new_empty(
+                        hidden_states.shape[0], 0
+                    )
+            tensors = {
+                key: value.contiguous() if isinstance(value, torch.Tensor) else value
+                for key, value in tensors.items()
+            }
+            return PPProxyTensors(tensors)
 
         pre_hc_head = hidden_states.flatten(1)
 
@@ -4850,6 +5115,19 @@ class DeepseekV4Model(nn.Module):
         return hidden_states, pre_hc_head
 
 
+def _dsv41_multimodal_enabled(config: DeepSeekV4Config) -> bool:
+    return (
+        config.model_type == "deepseek_v41"
+        and config.vision_n_layers > 0
+        and not getattr(config, "language_only", False)
+        and not getattr(config, "language_model_only", False)
+    )
+
+
+def _should_build_dsv41_vision(config: DeepSeekV4Config, pp_group) -> bool:
+    return _dsv41_multimodal_enabled(config) and pp_group.is_first_rank
+
+
 class DeepseekV4ForCausalLM(nn.Module):
     supports_cuda_vmm_feature_transport = True
 
@@ -4874,8 +5152,10 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.quant_config = quant_config
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
         self.determine_num_fused_shared_experts()
+        self.pp_group = get_pp_group()
+        self.dsv41_multimodal_enabled = _dsv41_multimodal_enabled(config)
         self.vision = None
-        if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
+        if _should_build_dsv41_vision(config, self.pp_group):
             moe_a2a_backend = get_moe_a2a_backend()
             sm90_mega_moe = (
                 _is_cuda
@@ -4884,12 +5164,12 @@ class DeepseekV4ForCausalLM(nn.Module):
                 and get_parallel().moe_ep_size == self.tp_size
                 and self.tp_size <= 8
             )
-            if get_pp_group().world_size != 1 or not (
-                moe_a2a_backend.is_none() or sm90_mega_moe
+            if not moe_a2a_backend.is_none() and not (
+                self.pp_group.world_size == 1 and sm90_mega_moe
             ):
                 raise ValueError(
-                    "V4.1 vision requires PP=1 and MoE A2A=none, or SM90 "
-                    "MegaMoE with TP=EP<=8 and attention CP=DP=1"
+                    "V4.1 vision with PP supports MoE A2A=none; PP=1 also "
+                    "supports SM90 MegaMoE with TP=EP<=8 and attention CP=DP=1"
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
@@ -4901,7 +5181,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.model = DeepseekV4Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
-        self.pp_group = get_pp_group()
         if self.pp_group.is_last_rank:
             if self.pp_group.world_size == 1 and config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
@@ -4943,14 +5222,38 @@ class DeepseekV4ForCausalLM(nn.Module):
         return getattr(self.config, "model_type", None) == "deepseek_v41"
 
     def autotune_prefill_kernels(self, num_tokens: int, *, dtype: torch.dtype) -> int:
-        """Tune resident MXFP8 linears for every M bucket up to ``num_tokens``.
-        The quant method is called directly, so no TP collectives run and no
-        request/KV/draft state is touched; the runner owns the autotune context."""
+        """Tune state-free dense and MoE kernels at the prefill token ceiling.
+
+        Methods are called directly, so no attention, PP transport, request/KV,
+        or draft state is required. The runner owns the autotune context.
+        """
         if getattr(self.config, "model_type", None) != "deepseek_v41":
             return 0
+
         seen = set()
         # The backbone excludes vision and lm_head, whose prefill shapes differ.
         for layer in self.model.modules():
+            experts = getattr(layer, "experts", None)
+            method = getattr(experts, "quant_method", None)
+            moe_key = getattr(method, "prefill_autotune_key", None)
+            moe_autotune = getattr(method, "autotune_prefill", None)
+            if (
+                callable(moe_key)
+                and callable(moe_autotune)
+                and not getattr(layer, "is_hash", False)
+            ):
+                key = moe_key(experts)
+                if key in seen:
+                    continue
+                if key is not None and moe_autotune(
+                    experts,
+                    num_tokens=num_tokens,
+                    dtype=dtype,
+                    routing_module=layer,
+                ):
+                    seen.add(key)
+                    continue
+
             method = getattr(layer, "quant_method", None)
             if not isinstance(method, Fp8LinearMethod):
                 continue
@@ -4989,7 +5292,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             del x
         if seen:
             logger.info(
-                "FlashInfer prefill autotune: %d MXFP8 weight layouts at M=%d.",
+                "FlashInfer prefill autotune: %d state-free layouts at M=%d.",
                 len(seen),
                 num_tokens,
             )
@@ -5052,14 +5355,17 @@ class DeepseekV4ForCausalLM(nn.Module):
         return self.model.get_input_embeddings()
 
     def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
-        if not self.pp_group.is_last_rank:
-            return
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."
             )
-        self.capture_aux_hidden_states = True
-        self.model.dspark_layers_to_capture = list(layer_ids)
+        local_layer_ids = [
+            int(layer_id)
+            for layer_id in layer_ids
+            if self.model.start_layer <= int(layer_id) < self.model.end_layer
+        ]
+        self.capture_aux_hidden_states = bool(local_layer_ids)
+        self.model.dspark_layers_to_capture = local_layer_ids or None
 
     @classmethod
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
@@ -5119,7 +5425,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             if input_embeds is not None:
                 raise ValueError("Cannot combine input_embeds and image inputs")
             input_embeds = self._prepare_mm_embeddings(input_ids, forward_batch)
-        if self.vision is not None and not (
+        if self.dsv41_multimodal_enabled and not (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
         ):

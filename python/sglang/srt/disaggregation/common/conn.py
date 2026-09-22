@@ -941,24 +941,14 @@ class CommonKVManager(BaseKVManager):
                 raise RuntimeError(
                     "DeepSeek-V4.1 DSpark PD layout mismatch "
                     f"({', '.join(mismatched_fields)}): both servers must "
-                    "enable DSpark with the same block size and target/draft KV "
-                    "layout. Upgrade both servers together."
+                    "use the same transfer protocol, draft block size, and "
+                    "compression ratios. Upgrade both servers together."
                 )
             if self.attn_cp_size != 1:
                 raise RuntimeError("DeepSeek-V4.1 DSpark PD requires Decode CP=1")
-            prefill_attention_width = info.attn_tp_size * info.attn_cp_size
-            if (
-                info.attn_cp_size > 1
-                and prefill_attention_width != self.attn_tp_size
-            ):
-                raise RuntimeError(
-                    "DeepSeek-V4.1 DSpark PD requires the Prefill attention "
-                    "parallel width to match Decode attention TP: "
-                    f"prefill={info.attn_tp_size}x{info.attn_cp_size}, "
-                    f"decode={self.attn_tp_size}"
-                )
-            # Non-CP V4.1 peers may use different attention TP sizes. The
-            # existing rank mapping selects the corresponding transfer peers.
+            # Prefill CP partitions token pages, independently of the TP head
+            # slicing below. Each CP sender scatters its pages across the decode
+            # TP ranks, so the total Prefill attention width need not match.
 
         if self.dcp_size > 1:
             if not (self.is_mla_backend or self.is_hybrid_mla_backend):
@@ -979,6 +969,15 @@ class CommonKVManager(BaseKVManager):
     def _resolve_rank_mapping(self, info: PrefillServerInfo) -> None:
         """Compute TP/CP/PP rank mapping and store on the PrefillServerInfo object.
         Deterministic for a given (bootstrap_addr, decode engine) pair."""
+        larger_tp_size = max(self.attn_tp_size, info.attn_tp_size)
+        smaller_tp_size = min(self.attn_tp_size, info.attn_tp_size)
+        if larger_tp_size % smaller_tp_size != 0:
+            raise RuntimeError(
+                "Prefill and Decode attention TP sizes must divide evenly for "
+                f"KV transfer: prefill={info.attn_tp_size}, "
+                f"decode={self.attn_tp_size}."
+            )
+
         # TP rank mapping
         if self.attn_tp_size == info.attn_tp_size:
             target_tp_rank = self.kv_args.engine_rank % self.attn_tp_size

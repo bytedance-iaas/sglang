@@ -30,6 +30,9 @@ from sglang.srt.model_executor.runner.flashinfer_autotune import (
     _autotune_cache_digest,
     _autotune_tactic_sync_group,
     _drop_diverged_autotune_cache,
+    run_flashinfer_prefill_only_autotune,
+    should_run_flashinfer_autotune,
+    should_run_flashinfer_prefill_only_autotune,
 )
 from sglang.test.test_utils import CustomTestCase, find_available_port
 
@@ -58,6 +61,44 @@ def _gate_worker(rank, world_size, master_port, cache_path, writer):
 
 
 class TestAutotuneTacticSyncGroup(CustomTestCase):
+    def test_dsv41_pp_skips_state_free_dummy_forward(self):
+        model_runner = SimpleNamespace(
+            ps=SimpleNamespace(pp_size=4),
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(model_type="deepseek_v41")
+            ),
+        )
+        self.assertFalse(should_run_flashinfer_autotune(model_runner))
+
+    def test_dsv41_pp_allows_model_owned_prefill_only_autotune(self):
+        model_runner = SimpleNamespace(
+            ps=SimpleNamespace(pp_size=2),
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(model_type="deepseek_v41")
+            ),
+            model=SimpleNamespace(
+                autotune_prefill_kernels=Mock(),
+                wants_prefill_autotune=lambda: True,
+            ),
+            is_draft_worker=False,
+            device="cuda",
+        )
+        runtime = SimpleNamespace(
+            kernel=SimpleNamespace(disable_flashinfer_autotune=False),
+            deterministic=SimpleNamespace(enable_deterministic_inference=False),
+            moe=SimpleNamespace(moe_runner_backend="flashinfer_mxfp4"),
+        )
+        with (
+            patch.object(autotune, "get_exec", return_value=runtime),
+            patch.object(
+                autotune.envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND,
+                "get",
+                return_value=True,
+            ),
+            patch.object(torch.cuda, "get_device_capability", return_value=(9, 0)),
+        ):
+            self.assertTrue(should_run_flashinfer_prefill_only_autotune(model_runner))
+
     def test_single_rank_has_nobody_to_agree_with(self):
         # A 1-rank group would add a collective per tactic for no agreement.
         tp_group = SimpleNamespace(world_size=1, cpu_group=object())
@@ -200,6 +241,13 @@ class TestModelPrefillAutotune(CustomTestCase):
         autotune.maybe_flashinfer_autotune_extend(self.runner, decode_num_tokens=384)
         self.hook.assert_not_called()
         self.flashinfer_autotune_context.assert_not_called()
+
+    def test_prefill_only_path_calls_model_hook_without_dummy_buffers(self):
+        run_flashinfer_prefill_only_autotune(self.runner)
+        self.hook.assert_called_once_with(65536, dtype=torch.bfloat16)
+        self.flashinfer_autotune_context.assert_called_once_with(
+            self.mr, run_lm_head=False
+        )
 
     def test_extend_pass_is_opt_in(self):
         # A draft worker keeps its own warmup; a model without the hook opts out.

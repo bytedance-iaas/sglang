@@ -52,11 +52,23 @@ def get_flashinfer_autotune_skip_ops(model_runner: ModelRunner) -> set[str]:
     return skip_ops
 
 
+def _is_dsv41_pp(model_runner: ModelRunner) -> bool:
+    return (
+        model_runner.ps.pp_size > 1
+        and getattr(model_runner.model_config.hf_config, "model_type", None)
+        == "deepseek_v41"
+    )
+
+
 def should_run_flashinfer_autotune(
     model_runner: ModelRunner, *, for_speculative_draft: bool = False
 ) -> bool:
     """Check if flashinfer autotune should be run."""
     mr = model_runner
+    if _is_dsv41_pp(mr):
+        # DSV4.1 PP transports sparse index and candidate state produced by the
+        # preceding stage. A standalone dummy forward cannot synthesize it.
+        return False
     if mr.device != "cuda":
         return False
     if get_exec().kernel.disable_flashinfer_autotune:
@@ -131,6 +143,29 @@ def should_run_flashinfer_autotune(
         return mr.is_draft_worker if for_speculative_draft else not mr.is_draft_worker
 
     return True
+
+
+def should_run_flashinfer_prefill_only_autotune(model_runner: ModelRunner) -> bool:
+    """Allow a model-owned, state-free prefill tuner when PP blocks dummy forward."""
+    mr = model_runner
+    if (
+        not _is_dsv41_pp(mr)
+        or mr.is_draft_worker
+        or not envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.get()
+    ):
+        return False
+    if (
+        mr.device != "cuda"
+        or get_exec().kernel.disable_flashinfer_autotune
+        or get_exec().deterministic.enable_deterministic_inference
+        or torch.cuda.get_device_capability()[0] < 9
+    ):
+        return False
+    if get_exec().moe.moe_runner_backend != "flashinfer_mxfp4":
+        return False
+    hook = getattr(mr.model, "autotune_prefill_kernels", None)
+    wants = getattr(mr.model, "wants_prefill_autotune", None)
+    return callable(hook) and (wants is None or wants())
 
 
 def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
@@ -305,6 +340,19 @@ def run_flashinfer_autotune_forward(
     """Run flashinfer autotune forward."""
     with flashinfer_autotune_context(model_runner, run_lm_head=run_lm_head):
         forward_fn()
+
+
+def run_flashinfer_prefill_only_autotune(runner: BaseRunner) -> None:
+    """Tune model-owned prefill kernels without constructing a PP forward batch."""
+    mr = runner.model_runner
+    num_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
+    with flashinfer_autotune_context(mr, run_lm_head=False):
+        tuned = mr.model.autotune_prefill_kernels(num_tokens, dtype=mr.dtype)
+    log_info_on_rank0(
+        logger,
+        "FlashInfer PP prefill-only autotune completed: "
+        f"{tuned} unique layouts at M={num_tokens}.",
+    )
 
 
 def maybe_flashinfer_autotune_speculative_draft(

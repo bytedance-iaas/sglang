@@ -50,6 +50,8 @@ class TestDeepseekV4EngramPrefetch(CustomTestCase):
         shared=True,
         pinned=True,
         layer_options=None,
+        pp_world_size=1,
+        layer_range=None,
     ):
         config = SimpleNamespace(
             model_type="deepseek_v41",
@@ -85,8 +87,12 @@ class TestDeepseekV4EngramPrefetch(CustomTestCase):
                 :, :, None
             ]
         )
+        start_layer, end_layer = layer_range or (0, len(layers))
         pp_group = SimpleNamespace(
-            world_size=1, rank_in_group=0, is_first_rank=True, is_last_rank=True
+            world_size=pp_world_size,
+            rank_in_group=0,
+            is_first_rank=start_layer == 0,
+            is_last_rank=end_layer == len(layers),
         )
         stream = Mock()
         with ExitStack() as stack:
@@ -108,7 +114,7 @@ class TestDeepseekV4EngramPrefetch(CustomTestCase):
                     ),
                     VocabParallelEmbedding=Mock(return_value=nn.Identity()),
                     RMSNorm=Mock(return_value=nn.Identity()),
-                    make_layers=Mock(return_value=(layers, 0, len(layers))),
+                    make_layers=Mock(return_value=(layers, start_layer, end_layer)),
                     is_cross_layer_mhc_fusion_enabled=Mock(return_value=False),
                     _is_fused_mhc_post_pre_enabled_xpu=Mock(return_value=False),
                     get_exec=Mock(
@@ -253,6 +259,23 @@ class TestDeepseekV4EngramPrefetch(CustomTestCase):
                         [14 if layer_id == 1 else 1],
                     )
                     self.assertIsNotNone(model.engram_embed_prefetch_stream)
+
+    def test_pipeline_stages_prefetch_only_local_engram_layers(self):
+        for layer_range, expected in (
+            ((0, 14), [1]),
+            ((14, 15), [14]),
+            ((2, 14), []),
+        ):
+            with self.subTest(layer_range=layer_range):
+                model = self._make_model(
+                    pp_world_size=2,
+                    layer_range=layer_range,
+                )
+                self.assertEqual(list(model.engram_embed_prefetch_events), expected)
+                self.assertEqual(
+                    model.engram_embed_prefetch_stream is not None,
+                    bool(expected),
+                )
 
     def test_decode_matches_sync_and_preserves_image_token_mask(self):
         for token_ids in ([1], [1, 7, 2]):

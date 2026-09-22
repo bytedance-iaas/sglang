@@ -12,6 +12,9 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
+    late_layer_tail_layout,
+)
 from sglang.srt.layers import dp_attention as dp
 from sglang.srt.layers.attention.dsv4.late_layer import (
     LateLayerDPLayout,
@@ -38,6 +41,99 @@ def _batch(dp_size, rank, mode, non_padded=512):
 
 
 class TestLateLayerRows(CustomTestCase):
+    def test_tail_layout_reuses_device_length_tensors(self):
+        extend_lens = torch.tensor([200, 0, 50], dtype=torch.int32)
+        seq_lens = torch.tensor([300, 10, 80], dtype=torch.int32)
+
+        with patch.object(
+            torch,
+            "tensor",
+            side_effect=AssertionError("unexpected host-to-device tensor creation"),
+        ):
+            token_indices, tail_lens_cpu, tail_lens, replay_start = (
+                late_layer_tail_layout(
+                    extend_lens=extend_lens,
+                    extend_lens_cpu=[200, 0, 50],
+                    seq_lens=seq_lens,
+                    seq_lens_cpu=[300, 10, 80],
+                    tail_len=128,
+                )
+            )
+
+        torch.testing.assert_close(
+            token_indices,
+            torch.cat((torch.arange(72, 200), torch.arange(200, 250))),
+        )
+        self.assertEqual(tail_lens_cpu, [128, 0, 50])
+        torch.testing.assert_close(
+            tail_lens, torch.tensor([128, 0, 50], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            replay_start,
+            torch.cat(
+                (
+                    torch.full((128,), 172, dtype=torch.int32),
+                    torch.full((50,), 30, dtype=torch.int32),
+                )
+            ),
+        )
+
+    def test_cp_tail_layout_computes_host_counts_without_device_readback(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+
+        extend_lens_cpu = [7, 2, 5]
+        tail_lens_cpu = [4, 2, 4]
+        token_indices = torch.tensor([3, 4, 5, 6, 7, 8, 10, 11, 12, 13])
+        forward_batch = SimpleNamespace(batch_size=3, positions=torch.arange(14))
+        expected_counts = [3, 2, 2, 3]
+        expected_local_lens = (
+            [1, 1, 1],
+            [1, 0, 1],
+            [1, 0, 1],
+            [1, 1, 1],
+        )
+
+        for cp_rank in range(4):
+            with (
+                self.subTest(cp_rank=cp_rank),
+                patch(
+                    "sglang.srt.layers.attention.deepseek_v4_backend.get_parallel",
+                    return_value=SimpleNamespace(attn_cp_rank=cp_rank, attn_cp_size=4),
+                ),
+                patch.object(
+                    torch,
+                    "tensor",
+                    side_effect=AssertionError(
+                        "unexpected host-to-device tensor creation"
+                    ),
+                ),
+            ):
+                layout = DeepseekV4AttnBackend._late_layer_tail_cp_layout(
+                    None,
+                    forward_batch,
+                    token_indices,
+                    extend_lens_cpu,
+                    tail_lens_cpu,
+                )
+
+            self.assertEqual(
+                layout["cp_metadata"].per_rank_logical_token, expected_counts
+            )
+            torch.testing.assert_close(
+                layout["cp_metadata"].gather_index,
+                torch.tensor([9, 0, 3, 6, 10, 1, 7, 11, 2, 4]),
+            )
+            self.assertEqual(layout["local_lens_cpu"], expected_local_lens[cp_rank])
+            local_rows = token_indices[token_indices % 4 == cp_rank]
+            torch.testing.assert_close(
+                layout["local_token_indices"], (local_rows - cp_rank) // 4
+            )
+            self.assertEqual(
+                layout["pad_rows"], max(expected_counts) - expected_counts[cp_rank]
+            )
+
     def test_model_forward_pads_only_moe_and_restores_residual_rows(self):
         from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
 

@@ -18,7 +18,10 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVManager,
     CommonKVSender,
 )
-from sglang.srt.disaggregation.utils import get_dsv41_spec_layout
+from sglang.srt.disaggregation.utils import (
+    _dsv4_c128_component_layer_ids,
+    get_dsv41_spec_layout,
+)
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     request_scoped_state_transfer_indices,
 )
@@ -45,6 +48,14 @@ def make_layout():
 
 
 class TestDSV41DSparkPD(CustomTestCase):
+    def test_request_state_layer_ids_include_all_request_scoped_ratios(self):
+        pool = SimpleNamespace(
+            compression_ratios=[2, 4, 128],
+            get_request_state_layer_ids=Mock(return_value=[0, 2]),
+        )
+
+        self.assertEqual(_dsv4_c128_component_layer_ids(pool), [0, 2])
+
     def test_dp_attention_allowed_with_static_mooncake_pd(self):
         from sglang.srt.arg_groups import deepseek_v4_hook as hook
         from sglang.srt.model_executor.cuda_graph_config import Backend
@@ -333,36 +344,54 @@ class TestDSV41DSparkPD(CustomTestCase):
         self.assertEqual(info.required_dst_info_num, 8)
         self.assertEqual(info.required_prefill_response_num, 8)
 
-    def test_bootstrap_rejects_mismatched_total_attention_width(self):
+    def test_bootstrap_accepts_cp4_pp2_to_decode_tp8(self):
         manager = object.__new__(CommonKVManager)
         manager.prefill_info_table = {}
-        manager.kv_args = SimpleNamespace(page_size=256)
+        manager.kv_args = SimpleNamespace(page_size=256, engine_rank=3)
         manager.kv_cache_dtype_str = "fp8_e4m3"
         manager.dsv41_spec_layout = make_layout()
         manager.attn_tp_size = 8
         manager.attn_cp_size = 1
+        manager.attn_cp_rank = 0
         manager.dcp_size = 1
-        manager._resolve_rank_mapping = Mock()
+        manager.pp_size = 1
+        manager.pp_rank = 0
+        manager.is_mla_backend = True
+        manager.is_hybrid_mla_backend = False
+        manager.enable_all_cp_ranks_for_transfer = True
         response = Mock(status_code=200)
         response.json.return_value = dict(
             attn_tp_size=1,
             attn_cp_size=4,
             dp_size=1,
-            pp_size=1,
+            pp_size=2,
             page_size=256,
             kv_cache_dtype="fp8_e4m3",
             follow_bootstrap_room=True,
             dsv41_spec_layout=manager.dsv41_spec_layout,
         )
-        with (
-            patch(
-                "sglang.srt.disaggregation.common.conn.requests.get",
-                return_value=response,
-            ),
-            self.assertRaisesRegex(RuntimeError, "attention parallel width"),
+        with patch(
+            "sglang.srt.disaggregation.common.conn.requests.get",
+            return_value=response,
         ):
-            manager.try_ensure_parallel_info("prefill:8998")
-        manager._resolve_rank_mapping.assert_not_called()
+            self.assertTrue(manager.try_ensure_parallel_info("prefill:8998"))
+
+        info = manager.prefill_info_table["prefill:8998"]
+        self.assertEqual(info.target_tp_rank, 0)
+        self.assertEqual(info.target_tp_ranks, [0])
+        self.assertEqual(info.target_cp_ranks, list(range(4)))
+        self.assertEqual(info.target_pp_ranks, [0, 1])
+        self.assertEqual(info.required_dst_info_num, 8)
+        self.assertEqual(info.required_prefill_response_num, 8)
+
+    def test_bootstrap_rejects_non_divisible_attention_tp(self):
+        manager = object.__new__(CommonKVManager)
+        manager.kv_args = SimpleNamespace(engine_rank=0)
+        manager.attn_tp_size = 6
+        info = SimpleNamespace(attn_tp_size=4)
+
+        with self.assertRaisesRegex(RuntimeError, "must divide evenly"):
+            manager._resolve_rank_mapping(info)
 
     def test_prefill_cp_partitions_every_kv_page_once(self):
         pages = np.arange(11, dtype=np.int32)
@@ -397,7 +426,9 @@ class TestDSV41DSparkPD(CustomTestCase):
         backend = object.__new__(DeepseekV4AttnBackend)
         backend.forward_metadata = SimpleNamespace(late_layer_tail=None)
         backend._use_dense_fp4_prefill_indexer = Mock(return_value=True)
+        backend._use_sm90_fp8_prefill_indexer = Mock(return_value=False)
         backend._low_ratio_index_topk_dense = Mock()
+        backend._low_ratio_index_topk_sm90_prefill = Mock()
         backend._low_ratio_index_topk_torch = Mock()
         layer = SimpleNamespace(compressor=None, indexer=object())
         forward_batch = SimpleNamespace(
@@ -434,6 +465,7 @@ class TestDSV41DSparkPD(CustomTestCase):
             )
 
         backend._low_ratio_index_topk_dense.assert_not_called()
+        backend._low_ratio_index_topk_sm90_prefill.assert_not_called()
         args = backend._low_ratio_index_topk_torch.call_args.args
         self.assertIs(args[0], layer)
         torch.testing.assert_close(args[1], x)
@@ -447,6 +479,97 @@ class TestDSV41DSparkPD(CustomTestCase):
         self.assertEqual(
             backend._low_ratio_index_topk_torch.call_args.kwargs["q_lens_cpu"], [4]
         )
+
+    def test_prefill_cp_uses_sm90_fp8_indexer_when_enabled(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.forward_metadata = SimpleNamespace(late_layer_tail=None)
+        backend._use_dense_fp4_prefill_indexer = Mock(return_value=True)
+        backend._use_sm90_fp8_prefill_indexer = Mock(return_value=True)
+        backend._low_ratio_index_topk_dense = Mock()
+        backend._low_ratio_index_topk_sm90_prefill = Mock()
+        backend._low_ratio_index_topk_torch = Mock()
+        layer = SimpleNamespace(compressor=None, indexer=object())
+        forward_batch = SimpleNamespace(
+            attn_cp_metadata=SimpleNamespace(total_seq_lens=8),
+            extend_seq_lens_cpu=[8],
+            extend_seq_lens=torch.tensor([8], dtype=torch.int32),
+            req_pool_indices=torch.tensor([7], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([8], dtype=torch.int32),
+            positions=torch.arange(8),
+            forward_mode=ForwardMode.EXTEND,
+        )
+        x = torch.zeros(4, 8)
+        q_lora = torch.zeros(4, 4)
+        positions = torch.arange(4)
+
+        with (
+            patch(
+                "sglang.srt.layers.attention.deepseek_v4_backend.get_parallel",
+                return_value=SimpleNamespace(attn_cp_rank=0, attn_cp_size=2),
+            ),
+            patch(
+                "sglang.srt.layers.attention.deepseek_v4_backend._is_sm100_or_newer",
+                return_value=False,
+            ),
+        ):
+            backend._forward_low_ratio_sources_cp(
+                layer=layer,
+                x=x,
+                q_lora=q_lora,
+                positions=positions,
+                forward_batch=forward_batch,
+                run_compressor=False,
+                run_indexer=True,
+            )
+
+        backend._low_ratio_index_topk_dense.assert_not_called()
+        backend._low_ratio_index_topk_torch.assert_not_called()
+        call = backend._low_ratio_index_topk_sm90_prefill.call_args
+        self.assertIs(call.args[0], layer)
+        torch.testing.assert_close(call.args[1], x)
+        torch.testing.assert_close(call.args[2], q_lora)
+        torch.testing.assert_close(call.args[3], positions.to(torch.int64))
+        self.assertIs(call.args[4], forward_batch)
+        self.assertIs(call.kwargs["request_ids"], forward_batch.req_pool_indices)
+        self.assertEqual(call.kwargs["q_lens_cpu"], [4])
+
+    def test_sm90_fp8_prefill_indexer_dispatch_guards(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            seq_lens_cpu=[8],
+            extend_seq_lens_cpu=[8],
+        )
+        with (
+            envs.SGLANG_OPT_DSV41_SM90_PREFILL_INDEXER.override(True),
+            envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.override(False),
+            patch(
+                "sglang.srt.layers.attention.deepseek_v4_backend._is_sm90",
+                return_value=True,
+            ),
+        ):
+            self.assertTrue(
+                DeepseekV4AttnBackend._use_sm90_fp8_prefill_indexer(forward_batch)
+            )
+            forward_batch.forward_mode = ForwardMode.DECODE
+            self.assertFalse(
+                DeepseekV4AttnBackend._use_sm90_fp8_prefill_indexer(forward_batch)
+            )
+            forward_batch.forward_mode = ForwardMode.EXTEND
+            with envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.override(True):
+                self.assertFalse(
+                    DeepseekV4AttnBackend._use_sm90_fp8_prefill_indexer(forward_batch)
+                )
 
     def test_prefill_cp_torch_indexer_keeps_empty_request_placeholders(self):
         from sglang.srt.layers.attention.deepseek_v4_backend import (
@@ -557,6 +680,7 @@ class TestDSV41DSparkPD(CustomTestCase):
         torch.nn.Module.__init__(model)
         model.vision = torch.nn.Identity()
         model.config = SimpleNamespace(image_token_id=-1)
+        model.dsv41_multimodal_enabled = True
         model.dsa_enable_prefill_cp = False
         model.pp_group = SimpleNamespace(is_last_rank=False)
         model.model = Mock()

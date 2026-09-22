@@ -17,6 +17,7 @@ import triton.language as tl
 INDEX_HEAD_DIM = 128
 PAYLOAD_BYTES = tl.constexpr(64)
 SCALE_BYTES = tl.constexpr(4)
+FP8_E4M3_MAX = 448.0
 
 
 @triton.jit
@@ -226,6 +227,210 @@ def fp4_index_logits_mapped_sm90(
         req_stride=req_to_token.stride(0),
         ratio=ratio,
         MAPPED=True,
+        num_warps=4,
+    )
+    return out
+
+
+@triton.jit
+def _unpack_fp4_index_keys_to_fp8_kernel(
+    slots_ptr,
+    table_ptr,
+    out_ptr,
+    page_size,
+    row_stride,
+    HALF_D: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offs_i = tl.arange(0, HALF_D)
+    slot = tl.load(slots_ptr + row).to(tl.int64)
+    page = slot // page_size
+    off = slot % page_size
+    row_base = page * row_stride
+    pay = tl.load(table_ptr + row_base + off * PAYLOAD_BYTES + offs_i)
+    scale_block = offs_i // 16
+    exps = tl.load(
+        table_ptr
+        + row_base
+        + page_size * PAYLOAD_BYTES
+        + off * SCALE_BYTES
+        + scale_block
+    )
+    scale = tl.exp2(exps.to(tl.float32) - 127.0)
+    low = tl.clamp(_e2m1_decode(pay & 0x0F) * scale, -FP8_MAX, FP8_MAX).to(
+        out_ptr.dtype.element_ty
+    )
+    high = tl.clamp(
+        _e2m1_decode((pay >> 4) & 0x0F) * scale,
+        -FP8_MAX,
+        FP8_MAX,
+    ).to(out_ptr.dtype.element_ty)
+    out = out_ptr + row * (HALF_D * 2)
+    tl.store(out + 2 * offs_i, low)
+    tl.store(out + 2 * offs_i + 1, high)
+
+
+def unpack_fp4_index_keys_to_fp8(
+    slots: torch.Tensor,
+    table: torch.Tensor,
+    page_size: int,
+) -> torch.Tensor:
+    """Gather packed FP4 index keys and decode them directly into E4M3."""
+    assert slots.dim() == 1
+    assert table.dtype == torch.uint8 and table.dim() == 2
+    slots = slots.to(torch.int64).contiguous()
+    values = torch.empty(
+        (slots.shape[0], INDEX_HEAD_DIM),
+        dtype=torch.float8_e4m3fn,
+        device=slots.device,
+    )
+    if slots.numel() > 0:
+        _unpack_fp4_index_keys_to_fp8_kernel[(slots.shape[0],)](
+            slots,
+            table,
+            values,
+            page_size,
+            table.stride(0),
+            HALF_D=INDEX_HEAD_DIM // 2,
+            FP8_MAX=FP8_E4M3_MAX,
+            num_warps=4,
+        )
+    return values
+
+
+@triton.jit
+def _quantize_bf16_index_queries_fp8_kernel(
+    q_ptr,
+    out_ptr,
+    stride_qb,
+    stride_qh,
+    stride_ob,
+    stride_oh,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offs_h = tl.arange(0, H)
+    offs_d = tl.arange(0, D)
+    q = tl.load(
+        q_ptr + row * stride_qb + offs_h[:, None] * stride_qh + offs_d[None, :]
+    ).to(tl.float32)
+    q_fp8 = tl.clamp(q, -FP8_MAX, FP8_MAX).to(out_ptr.dtype.element_ty)
+    tl.store(
+        out_ptr + row * stride_ob + offs_h[:, None] * stride_oh + offs_d[None, :],
+        q_fp8,
+    )
+
+
+def quantize_bf16_index_queries_fp8(q: torch.Tensor) -> torch.Tensor:
+    """Cast BF16 query heads to E4M3 for the K=128 tensor-core dot."""
+    assert q.dtype == torch.bfloat16 and q.shape[-1] == INDEX_HEAD_DIM
+    q = q.contiguous()
+    rows, heads, _ = q.shape
+    values = torch.empty_like(q, dtype=torch.float8_e4m3fn)
+    if rows > 0:
+        _quantize_bf16_index_queries_fp8_kernel[(rows,)](
+            q,
+            values,
+            q.stride(0),
+            q.stride(1),
+            values.stride(0),
+            values.stride(1),
+            H=heads,
+            D=INDEX_HEAD_DIM,
+            FP8_MAX=FP8_E4M3_MAX,
+            num_warps=8,
+        )
+    return values
+
+
+@triton.jit
+def _fp8_index_logits_prefill_kernel(
+    q_ptr,
+    w_ptr,
+    k_ptr,
+    lens_ptr,
+    out_ptr,
+    width,
+    out_width,
+    stride_qb,
+    stride_qh,
+    stride_kl,
+    stride_wb,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_L: tl.constexpr,
+):
+    row = tl.program_id(0)
+    block = tl.program_id(1)
+    offs_l = block * BLOCK_L + tl.arange(0, BLOCK_L)
+    offs_h = tl.arange(0, H)
+    offs_d = tl.arange(0, D)
+    visible = tl.load(lens_ptr + row)
+    if block * BLOCK_L >= visible:
+        tl.store(
+            out_ptr + row * out_width + offs_l,
+            float("-inf"),
+            mask=offs_l < out_width,
+        )
+    else:
+        valid = offs_l < tl.minimum(visible, width)
+        q = tl.load(
+            q_ptr + row * stride_qb + offs_h[:, None] * stride_qh + offs_d[None, :]
+        )
+        k = tl.load(
+            k_ptr + offs_l[:, None] * stride_kl + offs_d[None, :],
+            mask=valid[:, None],
+            other=0.0,
+        )
+        score = tl.dot(q, tl.trans(k), out_dtype=tl.float32)
+        score = score.to(tl.bfloat16).to(tl.float32)
+        score = tl.maximum(score, 0.0)
+        weights = tl.load(w_ptr + row * stride_wb + offs_h).to(tl.float32)
+        score = (score * weights[:, None]).to(tl.bfloat16).to(tl.float32)
+        logits = tl.sum(score, axis=0).to(tl.bfloat16).to(tl.float32)
+        logits = tl.where(valid, logits, float("-inf"))
+        tl.store(out_ptr + row * out_width + offs_l, logits, mask=offs_l < out_width)
+
+
+def fp8_index_logits_prefill(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    keys: torch.Tensor,
+    lens: torch.Tensor,
+) -> torch.Tensor:
+    """Fuse E4M3 indexer scoring and head reduction for ragged prefill rows."""
+    assert q.dtype == torch.float8_e4m3fn and q.shape[-1] == INDEX_HEAD_DIM
+    rows, heads, _ = q.shape
+    width = keys.shape[0]
+    assert keys.dtype == torch.float8_e4m3fn and keys.shape[1:] == (INDEX_HEAD_DIM,)
+    assert weights.shape == (rows, heads)
+    assert lens.shape == (rows,)
+    q = q.contiguous()
+    weights = weights.to(torch.bfloat16).contiguous()
+    keys = keys.contiguous()
+    out_width = (width + 3) // 4 * 4
+    out = torch.empty((rows, out_width), dtype=torch.float32, device=q.device)
+    if rows == 0 or width == 0:
+        return out
+    block_l = 64
+    _fp8_index_logits_prefill_kernel[(rows, triton.cdiv(out_width, block_l))](
+        q,
+        weights,
+        keys,
+        lens.to(torch.int64).contiguous(),
+        out,
+        width,
+        out_width,
+        q.stride(0),
+        q.stride(1),
+        keys.stride(0),
+        weights.stride(0),
+        H=heads,
+        D=INDEX_HEAD_DIM,
+        BLOCK_L=block_l,
         num_warps=4,
     )
     return out
