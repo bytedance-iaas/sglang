@@ -67,6 +67,7 @@ from sglang.srt.arg_groups.serving_hook import (
 )
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.arg_groups.validation_hook import (
+    check_pipeline_parallel_compat,
     check_server_args,
     check_two_batch_overlap,
 )
@@ -110,14 +111,8 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
-    def test_pipeline_parallelism_allows_speculative_decoding_when_overlap_disabled(
-        self,
-    ):
-        """PP and speculative decoding are compatible when overlap is off.
-
-        GLM-5.3 Prefill uses PP2 with EAGLE MTP. The PP guard must reject the
-        overlapping scheduler, not speculative decoding itself.
-        """
+    def test_pipeline_parallelism_allows_target_prefill_eagle(self):
+        """GLM-5.3 Prefill uses PP2 with non-multi-layer EAGLE MTP."""
         cfg = SimpleNamespace(
             ep_join_mode="normal",
             tp_size=8,
@@ -135,9 +130,10 @@ class TestPrepareServerArgs(CustomTestCase):
             moe_dense_tp_size=None,
             served_model_name="dummy",
             speculative_algorithm="EAGLE",
+            enable_multi_layer_eagle=False,
             enable_mixed_chunk=False,
             chunked_prefill_size=-1,
-            disaggregation_mode="null",
+            disaggregation_mode="prefill",
             page_size=1,
             enable_pdmux=False,
             tokenizer_worker_num=1,
@@ -175,6 +171,73 @@ class TestPrepareServerArgs(CustomTestCase):
             patch.object(validation_hook, "check_load_publish_args"),
         ):
             check_server_args(object())
+
+    @staticmethod
+    def _pp_spec_cfg(**overrides):
+        cfg = dict(
+            disable_overlap_schedule=True,
+            speculative_algorithm=None,
+            enable_multi_layer_eagle=False,
+            disaggregation_mode="prefill",
+            min_free_slots_delay=None,
+        )
+        cfg.update(overrides)
+        return SimpleNamespace(**cfg)
+
+    def test_no_speculative_decoding_is_allowed(self):
+        check_pipeline_parallel_compat(self._pp_spec_cfg())
+
+    def test_target_eagle_mtp_prefill_is_allowed(self):
+        check_pipeline_parallel_compat(self._pp_spec_cfg(speculative_algorithm="EAGLE"))
+
+    def test_overlap_schedule_is_rejected(self):
+        with self.assertRaisesRegex(AssertionError, "overlap schedule"):
+            check_pipeline_parallel_compat(
+                self._pp_spec_cfg(disable_overlap_schedule=False)
+            )
+
+    def test_non_eagle_relay_contracts_are_rejected(self):
+        for algorithm in (
+            "NGRAM",
+            "STANDALONE",
+            "EAGLE3",
+            "FROZEN_KV_MTP",
+            "CUSTOM_SPEC",
+        ):
+            with self.subTest(algorithm=algorithm):
+                with self.assertRaisesRegex(AssertionError, "only supports EAGLE"):
+                    check_pipeline_parallel_compat(
+                        self._pp_spec_cfg(speculative_algorithm=algorithm)
+                    )
+
+    def test_standalone_pd_is_rejected(self):
+        with self.assertRaisesRegex(AssertionError, "only supports EAGLE"):
+            check_pipeline_parallel_compat(
+                self._pp_spec_cfg(
+                    speculative_algorithm="STANDALONE",
+                    disaggregation_mode="prefill",
+                )
+            )
+
+    def test_eagle_is_rejected_outside_pd_prefill(self):
+        for mode in ("null", "decode"):
+            with self.subTest(disaggregation_mode=mode):
+                with self.assertRaisesRegex(AssertionError, "prefill nodes"):
+                    check_pipeline_parallel_compat(
+                        self._pp_spec_cfg(
+                            speculative_algorithm="EAGLE",
+                            disaggregation_mode=mode,
+                        )
+                    )
+
+    def test_multi_layer_eagle_is_rejected(self):
+        with self.assertRaisesRegex(AssertionError, "non-multi-layer"):
+            check_pipeline_parallel_compat(
+                self._pp_spec_cfg(
+                    speculative_algorithm="EAGLE",
+                    enable_multi_layer_eagle=True,
+                )
+            )
 
     def test_weight_cache_daemon_allows_static_eplb(self):
         args = ServerArgs(
