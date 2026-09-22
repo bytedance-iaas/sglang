@@ -6,6 +6,9 @@ import pytest
 import torch
 
 from sglang.kernels.ops.communication import nvlink_comm
+from sglang.kernels.ops.communication.moe_finalize_reduce_scatter import (
+    moe_finalize_reduce_scatter,
+)
 from sglang.srt.distributed import parallel_state as ps
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
@@ -57,6 +60,69 @@ def test_reduce_scatter_pre_reduce(group):
         routed,
         actual,
         pre_reduce=shared,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=4e-2)
+
+
+def test_moe_finalize_reduce_scatter(group):
+    if group.ca_comm is None or group.ca_comm.disabled:
+        pytest.skip("CustomAllReduceV2 is unavailable")
+
+    rows, hidden, top_k = group.world_size * 8, 5120, 8
+    generator = torch.Generator(device="cuda").manual_seed(20 + group.rank_in_group)
+    gemm2 = torch.randn(
+        rows * top_k,
+        hidden,
+        generator=generator,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    weights = torch.rand(
+        rows,
+        top_k,
+        generator=generator,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    weights /= weights.sum(dim=1, keepdim=True)
+    indices = torch.randperm(
+        rows * top_k,
+        generator=generator,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    indices[::17] = -1
+    shared = torch.randn(
+        rows,
+        hidden,
+        generator=generator,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+
+    gathered = gemm2[indices.clamp_min(0).long()].view(rows, top_k, hidden).float()
+    mask = indices.view(rows, top_k) >= 0
+    routed = (
+        (gathered * weights[:, :, None] * mask[:, :, None])
+        .sum(dim=1)
+        .to(torch.bfloat16)
+    )
+    rank_local = (routed + shared).to(torch.bfloat16)
+    expected = torch.empty(
+        rows // group.world_size,
+        hidden,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    group._reduce_scatter_tensor(expected, rank_local)
+
+    actual = moe_finalize_reduce_scatter(
+        group.ca_comm.obj,
+        gemm2,
+        indices,
+        weights,
+        shared,
     )
     torch.cuda.synchronize()
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=4e-2)

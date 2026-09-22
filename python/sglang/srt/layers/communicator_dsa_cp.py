@@ -75,12 +75,54 @@ def dsa_cp_gather_hidden_states(hidden_states: torch.Tensor):
 def dsa_cp_reduce_scatter_hidden_states(
     hidden_states: torch.Tensor,
     pre_reduce: Optional[torch.Tensor] = None,
+    deferred_moe=None,
 ):
     attn_dp_size = get_parallel().attn_dp_size
     attn_tp_size = get_parallel().attn_tp_size
     assert attn_dp_size == 1 and attn_tp_size == 1
     cp_size = get_parallel().attn_cp_size
     cp_rank = get_parallel().attn_cp_rank
+    if deferred_moe is not None:
+        assert pre_reduce is not None
+        group = get_parallel().attn_cp_group
+        ca_comm = group.ca_comm
+        local_tokens = deferred_moe.expert_weights.shape[0] // cp_size + int(
+            cp_rank < deferred_moe.expert_weights.shape[0] % cp_size
+        )
+        can_use_fused = (
+            ca_comm is not None
+            and not ca_comm.disabled
+            and ca_comm.obj.push is not None
+            and deferred_moe.gemm2_out.is_contiguous()
+            and deferred_moe.expanded_idx_to_permuted_idx.is_contiguous()
+            and deferred_moe.expert_weights.is_contiguous()
+            and pre_reduce.is_contiguous()
+            and local_tokens * pre_reduce.shape[1] * pre_reduce.element_size()
+            <= ca_comm.max_push_size
+        )
+        if can_use_fused:
+            from sglang.kernels.ops.communication.moe_finalize_reduce_scatter import (
+                moe_finalize_reduce_scatter,
+            )
+
+            return moe_finalize_reduce_scatter(
+                ca_comm.obj,
+                deferred_moe.gemm2_out,
+                deferred_moe.expanded_idx_to_permuted_idx,
+                deferred_moe.expert_weights,
+                pre_reduce,
+            )
+
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            finalize_flashinfer_trtllm_deferred_output,
+        )
+
+        hidden_states = finalize_flashinfer_trtllm_deferred_output(
+            deferred_moe,
+            pre_reduce,
+        )
+        pre_reduce = None
+
     input_hidden_states = hidden_states
     hidden_states = hidden_states.tensor_split(cp_size)[cp_rank]
     if pre_reduce is not None:

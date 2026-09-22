@@ -3578,7 +3578,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
         _use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         _fuse_cp_moe_reduce_scatter = (
-            envs.SGLANG_DSV41_CP_MOE_FUSED_REDUCE_SCATTER.get()
+            (
+                envs.SGLANG_DSV41_CP_MOE_FUSED_REDUCE_SCATTER.get()
+                or envs.SGLANG_DSV41_MOE_FINALIZE_REDUCE_SCATTER.get()
+            )
             and _use_cp
             and get_moe_a2a_backend().is_none()
             and get_platform().is_sm90
@@ -3694,6 +3697,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     mlp_reduce_scatter=mlp_reduce_scatter,
                     defer_cp_moe_shared_add=_fuse_cp_moe_reduce_scatter,
                     cp_moe_shared_output=None,
+                    cp_moe_deferred_output=None,
                 ),
                 gathered_rows,
             ):
@@ -3705,12 +3709,14 @@ class DeepseekV4DecoderLayer(nn.Module):
                     skip_shared_experts=_do_shared_local,
                 )
                 cp_moe_shared_output = get_forward().cp_moe_shared_output
+                cp_moe_deferred_output = get_forward().cp_moe_deferred_output
         finally:
             forward_batch.num_token_non_padded = saved_num_token_non_padded
         if _use_cp and get_moe_a2a_backend().is_none():
             hidden_states = dsa_cp_reduce_scatter_hidden_states(
                 hidden_states,
                 pre_reduce=cp_moe_shared_output,
+                deferred_moe=cp_moe_deferred_output,
             )
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
