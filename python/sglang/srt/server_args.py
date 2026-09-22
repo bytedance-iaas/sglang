@@ -3005,7 +3005,7 @@ class ServerArgs:
     ] = None
     disaggregation_decode_enable_radix_cache: A[
         bool,
-        "Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Incompatible with --enable-hisparse, speculative decoding, and --disaggregation-transfer-backend fake.",
+        "Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Incompatible with --enable-hisparse and --disaggregation-transfer-backend fake. Speculative decoding is supported only for the validated GLM DSA in-checkpoint EAGLE/NEXTN MTP 5/1/6 path.",
         NS("disagg"),
     ] = False
     disaggregation_decode_admission_policy: A[

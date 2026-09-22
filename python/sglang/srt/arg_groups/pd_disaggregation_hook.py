@@ -13,6 +13,66 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _validate_decode_radix_speculative(server_args: ServerArgs) -> None:
+    """Keep the initial decode-radix/speculative contract deliberately narrow.
+
+    The lifecycle and transferred DSA seed implemented by this prototype are
+    validated for GLM DSA's linear in-checkpoint MTP chain only.  Do not turn a
+    model-specific prototype into a blanket EAGLE compatibility claim.
+    """
+    algorithm = (server_args.speculative_algorithm or "").upper()
+    if not algorithm:
+        return
+    if algorithm not in ("EAGLE", "NEXTN"):
+        raise ValueError(
+            "--disaggregation-decode-enable-radix-cache supports speculative "
+            "decoding only for the validated GLM DSA EAGLE/NEXTN path, but got "
+            f"--speculative-algorithm {server_args.speculative_algorithm}"
+        )
+    # This prototype shares the target checkpoint's in-tree MTP state.  An
+    # explicitly supplied draft path is a different lifecycle contract and can
+    # also cause NEXTN/EAGLE to be promoted to FROZEN_KV_MTP later in
+    # handle_speculative_decoding, after this early PD validation runs.
+    if server_args.speculative_draft_model_path is not None:
+        raise ValueError(
+            "Decode radix cache with GLM DSA speculative decoding requires the "
+            "in-checkpoint MTP draft; --speculative-draft-model-path is not "
+            "supported."
+        )
+    if server_args.speculative_adaptive:
+        raise ValueError(
+            "Decode radix cache with GLM DSA speculative decoding requires the "
+            "fixed MTP 5/1/6 chain; --speculative-adaptive is not supported."
+        )
+    if server_args.speculative_eagle_topk != 1:
+        raise ValueError(
+            "Decode radix cache with GLM DSA speculative decoding requires "
+            "--speculative-eagle-topk 1."
+        )
+    if (
+        server_args.speculative_num_steps != 5
+        or server_args.speculative_num_draft_tokens != 6
+    ):
+        raise ValueError(
+            "Decode radix cache with GLM DSA speculative decoding is validated "
+            "only for MTP 5/1/6: --speculative-num-steps 5, "
+            "--speculative-eagle-topk 1, and "
+            "--speculative-num-draft-tokens 6."
+        )
+
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    hf_config = server_args.get_model_config().hf_config
+    architectures = getattr(hf_config, "architectures", None) or []
+    if architectures != ["GlmMoeDsaForCausalLM"] or not is_deepseek_dsa(
+        hf_config
+    ):
+        raise ValueError(
+            "Decode radix cache with speculative decoding is currently "
+            "validated only for the DSA-capable GlmMoeDsaForCausalLM target."
+        )
+
+
 def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
     if server_args.disaggregation_decode_admission_max_bypasses < 0:
@@ -77,12 +137,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with --disaggregation-transfer-backend fake"
                 )
-            if server_args.speculative_algorithm is not None:
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
-                    "with speculative decoding "
-                    f"(--speculative-algorithm {server_args.speculative_algorithm})"
-                )
+            _validate_decode_radix_speculative(server_args)
             from sglang.srt.arg_groups.overrides import resolved_view
 
             if resolved_view(server_args).enable_dp_attention:

@@ -16,6 +16,7 @@ from sglang.srt.disaggregation.common.utils import (
 )
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
+    filter_kv_indices_for_cp_rank,
     get_dsv4_c128_state_indices,
     poll_and_all_reduce_attn_cp_tp_group,
     setup_state_kv_args,
@@ -166,6 +167,56 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
     def test_mismatched_nonempty_lengths_raise(self):
         with self.assertRaises(ValueError):
             group_concurrent_contiguous(self._arr([1, 2, 3]), self._arr([1, 2]))
+
+
+class TestCPRequestRelativePartition(unittest.TestCase):
+    def test_prefix_hit_keeps_cp8_partition_request_relative(self):
+        suffix_pages = np.arange(100, 108, dtype=np.int32)
+        expected = {
+            0: ([], slice(0, 0)),
+            1: ([], slice(0, 0)),
+            2: ([100, 101], slice(0, 2)),
+            3: ([102, 103], slice(2, 4)),
+            4: ([104], slice(4, 5)),
+            5: ([105], slice(5, 6)),
+            6: ([106], slice(6, 7)),
+            7: ([107], slice(7, 8)),
+        }
+
+        for cp_rank, (pages, destination_slice) in expected.items():
+            with self.subTest(cp_rank=cp_rank):
+                manager = SimpleNamespace(attn_cp_rank=cp_rank, attn_cp_size=8)
+                actual_pages, actual_slice = filter_kv_indices_for_cp_rank(
+                    manager,
+                    suffix_pages,
+                    slice(0, 8),
+                    total_pages=12,
+                    page_offset=4,
+                )
+                self.assertEqual(actual_pages.tolist(), pages)
+                self.assertEqual(actual_slice, destination_slice)
+
+    def test_chunk_destination_slices_remain_suffix_relative(self):
+        manager = SimpleNamespace(attn_cp_rank=3, attn_cp_size=8)
+        first, first_slice = filter_kv_indices_for_cp_rank(
+            manager,
+            np.arange(100, 103, dtype=np.int32),
+            slice(0, 3),
+            total_pages=12,
+            page_offset=4,
+        )
+        second, second_slice = filter_kv_indices_for_cp_rank(
+            manager,
+            np.arange(103, 108, dtype=np.int32),
+            slice(3, 8),
+            total_pages=12,
+            page_offset=4,
+        )
+
+        self.assertEqual(first.tolist(), [102])
+        self.assertEqual(first_slice, slice(2, 3))
+        self.assertEqual(second.tolist(), [103])
+        self.assertEqual(second_slice, slice(3, 4))
 
 
 class TestEagleDsaSeedTransfer(unittest.TestCase):
