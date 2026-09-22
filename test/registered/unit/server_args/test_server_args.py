@@ -370,6 +370,100 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertFalse(server_args.disable_radix_cache)
         self.assertEqual(server_args.disaggregation_transfer_backend, "mooncake")
 
+    def test_pd_decode_radix_cache_allows_fixed_glm_dsa_mtp(self):
+        for algorithm in ("EAGLE", "NEXTN"):
+            with self.subTest(algorithm=algorithm):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    disaggregation_mode="decode",
+                    disaggregation_decode_enable_radix_cache=True,
+                    disaggregation_transfer_backend="nixl",
+                    speculative_algorithm=algorithm,
+                    speculative_num_steps=5,
+                    speculative_eagle_topk=1,
+                    speculative_num_draft_tokens=6,
+                )
+                server_args.get_model_config = Mock(
+                    return_value=SimpleNamespace(
+                        hf_config=SimpleNamespace(
+                            architectures=["GlmMoeDsaForCausalLM"],
+                            index_topk=2048,
+                        )
+                    )
+                )
+
+                server_args._handle_pd_disaggregation()
+
+                self.assertFalse(server_args.disable_radix_cache)
+
+    def test_pd_decode_radix_cache_rejects_unvalidated_speculative_shapes(self):
+        cases = [
+            ("DSPARK", 5, 1, 6, False, "GLM DSA EAGLE/NEXTN"),
+            ("EAGLE3", 5, 1, 6, False, "GLM DSA EAGLE/NEXTN"),
+            ("EAGLE", 5, 2, 6, False, "topk 1"),
+            ("EAGLE", 3, 1, 4, False, "MTP 5/1/6"),
+            ("EAGLE", 5, 1, 6, True, "speculative-adaptive"),
+        ]
+        for algorithm, steps, topk, draft_tokens, adaptive, message in cases:
+            with self.subTest(algorithm=algorithm, steps=steps, topk=topk):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    disaggregation_mode="decode",
+                    disaggregation_decode_enable_radix_cache=True,
+                    disaggregation_transfer_backend="nixl",
+                    speculative_algorithm=algorithm,
+                    speculative_num_steps=steps,
+                    speculative_eagle_topk=topk,
+                    speculative_num_draft_tokens=draft_tokens,
+                    speculative_adaptive=adaptive,
+                )
+                with self.assertRaisesRegex(ValueError, message):
+                    server_args._handle_pd_disaggregation()
+
+    def test_pd_decode_radix_cache_rejects_non_glm_or_non_dsa_target(self):
+        for architectures, index_topk in (
+            (["DeepseekV3ForCausalLM"], 2048),
+            (["GlmMoeDsaForCausalLM"], None),
+            (["GlmMoeDsaForCausalLM", "OtherForCausalLM"], 2048),
+        ):
+            with self.subTest(architectures=architectures, index_topk=index_topk):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    disaggregation_mode="decode",
+                    disaggregation_decode_enable_radix_cache=True,
+                    disaggregation_transfer_backend="nixl",
+                    speculative_algorithm="EAGLE",
+                    speculative_num_steps=5,
+                    speculative_eagle_topk=1,
+                    speculative_num_draft_tokens=6,
+                )
+                server_args.get_model_config = Mock(
+                    return_value=SimpleNamespace(
+                        hf_config=SimpleNamespace(
+                            architectures=architectures,
+                            index_topk=index_topk,
+                        )
+                    )
+                )
+                with self.assertRaisesRegex(ValueError, "DSA-capable"):
+                    server_args._handle_pd_disaggregation()
+
+    def test_pd_decode_radix_cache_rejects_external_speculative_draft(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="nixl",
+            speculative_algorithm="NEXTN",
+            speculative_draft_model_path="gemma-assistant-or-other-external-draft",
+            speculative_num_steps=5,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=6,
+        )
+
+        with self.assertRaisesRegex(ValueError, "in-checkpoint MTP draft"):
+            server_args._handle_pd_disaggregation()
+
     def test_pd_decode_rejects_negative_admission_bypass_limit(self):
         server_args = ServerArgs(
             model_path="dummy",

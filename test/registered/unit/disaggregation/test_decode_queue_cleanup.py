@@ -2,13 +2,15 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
+import torch
+
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
     HiCacheRestoreResult,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import DisaggregationMode, MetadataBuffers
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
@@ -30,6 +32,103 @@ class FakeReceiver:
 
 
 class TestDecodeQueueCleanup(CustomTestCase):
+    @patch("sglang.srt.disaggregation.utils.dist.all_reduce")
+    def test_metadata_gate_blocks_transfer_until_aux_payload_is_ready(self, _reduce):
+        receiver = MagicMock()
+        receiver.poll.return_value = KVPoll.Success
+        req = SimpleNamespace(
+            rid="metadata-gate",
+            bootstrap_host="10.0.0.1",
+            bootstrap_room=23,
+        )
+        decode_req = SimpleNamespace(
+            req=req,
+            kv_receiver=receiver,
+            metadata_buffer_index=0,
+        )
+        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        queue.queue = [decode_req]
+        queue.gloo_group = object()
+        queue.metadata_buffers = SimpleNamespace(
+            bootstrap_room=torch.zeros((1, 8), dtype=torch.uint64)
+        )
+        queue.scheduler = SimpleNamespace(
+            enable_decode_hicache=False,
+            server_args=SimpleNamespace(disaggregation_transfer_backend="nixl"),
+        )
+
+        self.assertEqual(queue._poll_with_metadata_gate(), [KVPoll.Transferring])
+        queue.metadata_buffers.bootstrap_room[0, 0] = req.bootstrap_room
+        self.assertEqual(queue._poll_with_metadata_gate(), [KVPoll.Success])
+
+    def test_speculative_metadata_commit_preserves_full_hit_seed(self):
+        metadata = MetadataBuffers(
+            size=1,
+            hidden_size=3,
+            hidden_states_dtype=torch.float32,
+            output_dsa_topk_indices_dim=4,
+        )
+        prefill_req = SimpleNamespace(
+            metadata_buffer_index=0,
+            output_ids=[321],
+            cached_tokens=65_472,
+            cached_tokens_device=65_472,
+            cached_tokens_host=0,
+            cached_tokens_storage=0,
+            multimodal_inputs=None,
+            return_logprob=False,
+            return_sampling_mask=False,
+            output_topk_p=torch.tensor([0.75]),
+            output_topk_index=torch.tensor([17]),
+            hidden_states_tensor=torch.tensor([1.0, 2.0, 3.0]),
+            output_dsa_topk_indices=torch.tensor([4, 5, 6, 7], dtype=torch.int32),
+            bootstrap_room=29,
+        )
+        metadata.set_buf(prefill_req)
+
+        receiver = FakeReceiver()
+        req = SimpleNamespace(
+            rid="full-hit-seed",
+            bootstrap_host="10.0.0.1",
+            bootstrap_room=29,
+            output_ids=[],
+            cached_tokens=0,
+            return_logprob=False,
+            return_sampling_mask=False,
+            pd_rebootstrap_forced_output_id=None,
+            time_stats=SimpleNamespace(set_wait_queue_entry_time=lambda: None),
+        )
+        decode_req = SimpleNamespace(
+            req=req,
+            kv_receiver=receiver,
+            metadata_buffer_index=0,
+            is_rebootstrap=False,
+        )
+        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        queue.metadata_buffers = metadata
+        queue.spec_algorithm = SimpleNamespace(is_none=lambda: False)
+        queue.scheduler = SimpleNamespace(
+            server_args=SimpleNamespace(disaggregation_transfer_backend="nixl")
+        )
+        queue._commit_hicache_local_restore_to_req = MagicMock()
+
+        queue._commit_transfer_to_req(decode_req)
+
+        self.assertEqual(req.output_ids, [321])
+        self.assertEqual(req.cached_tokens, 65_472)
+        self.assertEqual(req.already_computed, 65_472)
+        torch.testing.assert_close(req.output_topk_p[:1], torch.tensor([0.75]))
+        torch.testing.assert_close(req.output_topk_index[:1], torch.tensor([17]))
+        torch.testing.assert_close(
+            req.hidden_states_tensor, torch.tensor([1.0, 2.0, 3.0])
+        )
+        torch.testing.assert_close(
+            req.output_dsa_topk_indices,
+            torch.tensor([4, 5, 6, 7], dtype=torch.int32),
+        )
+        self.assertTrue(receiver.clear_called)
+        self.assertIsNone(decode_req.kv_receiver)
+
     def test_prealloc_abort_clears_receiver_before_removing_request(self):
         receiver = FakeReceiver()
         req = SimpleNamespace(

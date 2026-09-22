@@ -362,11 +362,22 @@ class PrefillBootstrapQueue:
         num_kv_indices = len(req.origin_input_ids)
         req.start_send_idx = decode_prefix_len
         num_kv_indices_to_send = num_kv_indices - decode_prefix_len
-        num_pages = kv_to_page_num(
-            num_kv_indices_to_send,
-            self.scheduler.token_to_kv_pool_allocator.page_size,
+        page_size = self.scheduler.token_to_kv_pool_allocator.page_size
+        assert 0 <= decode_prefix_len <= num_kv_indices, (
+            f"decode_prefix_len ({decode_prefix_len}) must be within request "
+            f"length ({num_kv_indices}), rid={req.rid}"
         )
-        req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
+        assert decode_prefix_len % page_size == 0, (
+            f"decode_prefix_len ({decode_prefix_len}) must be page aligned, "
+            f"page_size={page_size}, rid={req.rid}"
+        )
+        num_pages = kv_to_page_num(num_kv_indices_to_send, page_size)
+        req.disagg_kv_sender.init(
+            num_pages,
+            req.metadata_buffer_index,
+            num_request_pages=kv_to_page_num(num_kv_indices, page_size),
+            send_page_offset=decode_prefix_len // page_size,
+        )
         req.pending_bootstrap = False
         return True
 
