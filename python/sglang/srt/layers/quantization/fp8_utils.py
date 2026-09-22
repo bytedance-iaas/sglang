@@ -593,10 +593,13 @@ def dispatch_w8a8_block_fp8_linear(
     if backend.is_humming():
         if not get_platform().is_sm90:
             raise RuntimeError("--fp8-gemm-backend=humming requires SM90 GPUs")
-        # Humming needs load-time repacked weights. Fp8LinearMethod owns that
-        # cache and the small-M dispatch; direct weight consumers and all
-        # ineligible layers retain the original Triton layout and quantization.
-        return partial(triton_w8a8_block_fp8_linear, act_scale_ue8m0=act_scale_ue8m0)
+        from sglang.srt.layers.quantization.humming_fp8 import (
+            humming_w8a8_block_fp8_linear,
+        )
+
+        # Owners prepare packed weights once. Raw, non-packed contracts keep
+        # compatibility inside the runner; packed calls never need Triton.
+        return partial(humming_w8a8_block_fp8_linear, act_scale_ue8m0=act_scale_ue8m0)
 
     # Only Triton reads the block size at launch; DeepGEMM, the FlashInfer
     # groupwise kernels and CUTLASS take 128-wide K blocks only.

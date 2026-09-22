@@ -77,7 +77,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.srt.layers.quantization.humming_fp8 import (
     can_use_humming_fp8_linear,
-    humming_fp8_linear,
+    get_humming_fp8_weight,
     prepare_humming_fp8_linear,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
@@ -1149,7 +1149,14 @@ class Fp8LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.use_humming and can_use_humming_fp8_linear(layer, x):
-            return humming_fp8_linear(layer, x, bias)
+            return self.w8a8_block_fp8_linear(
+                input=x[0] if isinstance(x, tuple) else x,
+                weight=get_humming_fp8_weight(layer),
+                block_size=self.weight_block_size,
+                weight_scale=None,
+                input_scale=x[1] if isinstance(x, tuple) else None,
+                bias=bias,
+            )
 
         if self.use_marlin:
             return torch.ops.sglang.apply_fp8_marlin_linear(
