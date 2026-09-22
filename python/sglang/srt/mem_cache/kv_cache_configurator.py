@@ -1009,16 +1009,17 @@ class KVCacheConfigurator:
         return req_to_token_pool
 
     def _get_mamba_layer_ids_for_req_pool(self) -> list:
-        mamba_layer_ids = [
+        # The target request pool owns state only for recurrent layers executed
+        # by the target model.  Speculative draft blocks share its req-to-token
+        # mapping, but any recurrent draft block gets a separate one-layer pool
+        # through ``clone_with_new_mamba``.  In particular, GLM's NextN block is
+        # MLA rather than KDA, so adding ``nextn_layer_ids`` here would allocate
+        # an unreachable state/ring row and make every ReplaySSM fold process it.
+        return [
             i
             for i in self.mambaish_config.mamba2_cache_params.layers
             if self.layer_info.start_layer <= i < self.layer_info.end_layer
         ]
-        if max_speculative_num_draft_tokens():
-            for layer_id in getattr(self.mambaish_config, "nextn_layer_ids", []):
-                if layer_id not in mamba_layer_ids:
-                    mamba_layer_ids.append(layer_id)
-        return mamba_layer_ids
 
     def _build_hybrid_mamba_decode_req_pool(
         self,

@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.kv_cache_configurator import (
     KVCacheConfigurator,
     _pp_local_per_request_bytes,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -107,6 +108,20 @@ class TestReplaySSMRingAccounting(CustomTestCase):
         model_config = SimpleNamespace(hf_config=config, is_draft_model=True)
 
         self.assertIsNone(hybrid_kda_config(model_config))
+
+    def test_glm_mla_nextn_is_not_a_target_state_pool_row(self):
+        config = Glm5NextConfig(text_config={"num_hidden_layers": 45})
+        configurator = object.__new__(KVCacheConfigurator)
+        configurator.mambaish_config = config.text_config
+        configurator.layer_info = SimpleNamespace(start_layer=0, end_layer=45)
+
+        with get_parallel().override(attn_tp_size=1):
+            target_layer_ids = configurator._get_mamba_layer_ids_for_req_pool()
+
+        self.assertEqual(target_layer_ids, config.text_config.linear_layer_ids)
+        self.assertEqual(len(target_layer_ids), 34)
+        self.assertEqual(config.text_config.nextn_layer_ids, [45])
+        self.assertNotIn(45, target_layer_ids)
 
     def test_gdn_fold(self):
         # d 512 + normalized k 512 + scalar g 128 + d/k low parts 1024 = 2176
