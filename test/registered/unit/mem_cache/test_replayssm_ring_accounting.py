@@ -9,9 +9,14 @@ under spec, see MambaPool). If the MambaPool allocation changes shape, update
 both the allocation and this expectation together.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from sglang.srt.configs.glm5_next import Glm5NextConfig
+from sglang.srt.configs.hybrid_arch import hybrid_kda_config, mambaish_config
+from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.configs.mamba_utils import (
     KimiLinearCacheParams,
     KimiLinearStateShape,
@@ -19,7 +24,10 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2StateDType,
     Mamba2StateShape,
 )
-from sglang.srt.mem_cache.kv_cache_configurator import _pp_local_per_request_bytes
+from sglang.srt.mem_cache.kv_cache_configurator import (
+    KVCacheConfigurator,
+    _pp_local_per_request_bytes,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -62,6 +70,44 @@ def _gdn_params(temporal_dtype=torch.float32):
 
 
 class TestReplaySSMRingAccounting(CustomTestCase):
+    def test_glm_kda_uses_shared_replay_capability(self):
+        config = Glm5NextConfig(text_config={"num_hidden_layers": 4})
+        model_config = SimpleNamespace(
+            hf_config=config,
+            is_draft_model=False,
+            linear_attn_registry_result=None,
+        )
+
+        self.assertIs(hybrid_kda_config(model_config), config.text_config)
+        self.assertIs(mambaish_config(model_config), config.text_config)
+
+        configurator = object.__new__(KVCacheConfigurator)
+        configurator.model_config = model_config
+        configurator.is_draft_worker = False
+        configurator.draft_model_idx = None
+        configurator.is_hybrid_swa = False
+        KVCacheConfigurator.__post_init__(configurator)
+        self.assertIs(configurator.hybrid_kda_config, config.text_config)
+
+    def test_kimi_remains_a_shared_kda_capability(self):
+        config = KimiLinearConfig(
+            num_hidden_layers=2,
+            linear_attn_config={"kda_layers": [1], "full_attn_layers": [2]},
+        )
+        model_config = SimpleNamespace(
+            hf_config=config,
+            is_draft_model=False,
+            linear_attn_registry_result=None,
+        )
+
+        self.assertIs(hybrid_kda_config(model_config), config)
+
+    def test_glm_mtp_draft_does_not_claim_target_kda_capability(self):
+        config = Glm5NextConfig(text_config={"num_hidden_layers": 4})
+        model_config = SimpleNamespace(hf_config=config, is_draft_model=True)
+
+        self.assertIsNone(hybrid_kda_config(model_config))
+
     def test_gdn_fold(self):
         # d 512 + normalized k 512 + scalar g 128 + d/k low parts 1024 = 2176
         self.assertEqual(
