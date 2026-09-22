@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from sglang.srt.arg_groups.overrides import (
     _hisparse_validation,
+    model_config_of,
     resolved_view,
     resolving_view,
     run_post_process_pass,
@@ -23,8 +24,19 @@ from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
 
+_PP_EAGLE_SUPPORTED_ARCHITECTURES = frozenset(
+    {
+        "DeepseekV2ForCausalLM",
+        "DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM",
+        "GlmMoeDsaForCausalLM",
+    }
+)
 
-def check_pipeline_parallel_compat(cfg: Any) -> None:
+
+def check_pipeline_parallel_compat(
+    cfg: Any, *, model_architecture: Optional[str] = None
+) -> None:
     """Validate the speculative-decoding contract of the PP relay.
 
     The relay in ``scheduler_pp_mixin`` reconstructs an ``EagleDraftInput``
@@ -46,6 +58,11 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
         assert cfg.disaggregation_mode == "prefill", (
             "PP + speculative decoding (MTP) is only supported on prefill "
             "nodes (disaggregation-mode=prefill)"
+        )
+        assert model_architecture in _PP_EAGLE_SUPPORTED_ARCHITECTURES, (
+            "PP + speculative decoding is only supported for DeepSeek/GLM "
+            "models whose last pipeline stage supplies the EAGLE draft "
+            f"embedding; got architecture={model_architecture}"
         )
     assert cfg.min_free_slots_delay is None, (
         "--min-free-slots-delay is not supported with pipeline "
@@ -79,7 +96,10 @@ def check_server_args(server_args: Any):
     )
 
     if cfg.pp_size > 1:
-        check_pipeline_parallel_compat(cfg)
+        model_architecture = None
+        if cfg.speculative_algorithm is not None:
+            model_architecture = model_config_of(server_args).hf_config.architectures[0]
+        check_pipeline_parallel_compat(cfg, model_architecture=model_architecture)
 
     assert not (
         cfg.dp_size > 1 and cfg.nnodes != 1 and not cfg.enable_dp_attention

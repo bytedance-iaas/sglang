@@ -111,6 +111,8 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    _PP_EAGLE_SUPPORTED_ARCH = "GlmMoeDsaForCausalLM"
+
     def test_pipeline_parallelism_allows_target_prefill_eagle(self):
         """GLM-5.3 Prefill uses PP2 with non-multi-layer EAGLE MTP."""
         cfg = SimpleNamespace(
@@ -165,6 +167,15 @@ class TestPrepareServerArgs(CustomTestCase):
         )
         with (
             patch.object(validation_hook, "resolving_view", return_value=cfg),
+            patch.object(
+                validation_hook,
+                "model_config_of",
+                return_value=SimpleNamespace(
+                    hf_config=SimpleNamespace(
+                        architectures=[self._PP_EAGLE_SUPPORTED_ARCH]
+                    )
+                ),
+            ),
             patch("sglang.srt.arg_groups.lora_hook.check_lora_server_args"),
             patch.object(validation_hook, "run_post_process_pass"),
             patch.object(validation_hook, "check_two_batch_overlap"),
@@ -188,7 +199,10 @@ class TestPrepareServerArgs(CustomTestCase):
         check_pipeline_parallel_compat(self._pp_spec_cfg())
 
     def test_target_eagle_mtp_prefill_is_allowed(self):
-        check_pipeline_parallel_compat(self._pp_spec_cfg(speculative_algorithm="EAGLE"))
+        check_pipeline_parallel_compat(
+            self._pp_spec_cfg(speculative_algorithm="EAGLE"),
+            model_architecture=self._PP_EAGLE_SUPPORTED_ARCH,
+        )
 
     def test_overlap_schedule_is_rejected(self):
         with self.assertRaisesRegex(AssertionError, "overlap schedule"):
@@ -207,7 +221,8 @@ class TestPrepareServerArgs(CustomTestCase):
             with self.subTest(algorithm=algorithm):
                 with self.assertRaisesRegex(AssertionError, "only supports EAGLE"):
                     check_pipeline_parallel_compat(
-                        self._pp_spec_cfg(speculative_algorithm=algorithm)
+                        self._pp_spec_cfg(speculative_algorithm=algorithm),
+                        model_architecture=self._PP_EAGLE_SUPPORTED_ARCH,
                     )
 
     def test_standalone_pd_is_rejected(self):
@@ -216,7 +231,8 @@ class TestPrepareServerArgs(CustomTestCase):
                 self._pp_spec_cfg(
                     speculative_algorithm="STANDALONE",
                     disaggregation_mode="prefill",
-                )
+                ),
+                model_architecture=self._PP_EAGLE_SUPPORTED_ARCH,
             )
 
     def test_eagle_is_rejected_outside_pd_prefill(self):
@@ -227,7 +243,8 @@ class TestPrepareServerArgs(CustomTestCase):
                         self._pp_spec_cfg(
                             speculative_algorithm="EAGLE",
                             disaggregation_mode=mode,
-                        )
+                        ),
+                        model_architecture=self._PP_EAGLE_SUPPORTED_ARCH,
                     )
 
     def test_multi_layer_eagle_is_rejected(self):
@@ -236,7 +253,15 @@ class TestPrepareServerArgs(CustomTestCase):
                 self._pp_spec_cfg(
                     speculative_algorithm="EAGLE",
                     enable_multi_layer_eagle=True,
-                )
+                ),
+                model_architecture=self._PP_EAGLE_SUPPORTED_ARCH,
+            )
+
+    def test_eagle_is_rejected_for_an_unproven_model_architecture(self):
+        with self.assertRaisesRegex(AssertionError, "DeepSeek/GLM"):
+            check_pipeline_parallel_compat(
+                self._pp_spec_cfg(speculative_algorithm="EAGLE"),
+                model_architecture="LlamaForCausalLM",
             )
 
     def test_weight_cache_daemon_allows_static_eplb(self):
