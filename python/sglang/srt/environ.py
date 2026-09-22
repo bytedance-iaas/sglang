@@ -1133,6 +1133,9 @@ class Envs:
     # Blackwell MegaMoE uses a whole-grid software barrier. Keep a small
     # residency margin so every cluster can launch beside other streams.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
+    # MegaMoE owns EP dispatch. Falling through to the local MoE runner would
+    # skip its all-to-all and is therefore not a correct serving fallback.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_FAIL_CLOSED = EnvBool(True)
 
     # ===================================================================
     # Top-k kernels

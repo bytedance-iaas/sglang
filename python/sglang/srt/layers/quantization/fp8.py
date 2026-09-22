@@ -1744,6 +1744,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 build_sm90_mega_moe_experts_weights(layer)
                 return
 
+            if (
+                get_moe_a2a_backend().is_megamoe()
+                and get_platform().is_sm100
+                and not self.is_fp4_expert
+            ):
+                if self.quant_config.weight_block_size != [128, 128]:
+                    raise ValueError(
+                        "SM100 native FP8 MegaMoE requires serialized "
+                        "weight_block_size=[128, 128]"
+                    )
+                from sglang.srt.layers.moe.mega_moe import (
+                    build_native_fp8_mega_moe_experts_weights,
+                )
+
+                build_native_fp8_mega_moe_experts_weights(layer)
+                return
+
             if not self.is_fp4_expert:
                 weight_block_size = self.quant_config.weight_block_size
                 for weight, weight_scale in (

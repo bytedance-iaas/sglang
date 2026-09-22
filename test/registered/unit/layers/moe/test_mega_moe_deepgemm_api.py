@@ -65,6 +65,70 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 with patch.object(mega_moe, "get_exec", return_value=config):
                     self.assertEqual(mega_moe._mega_moe_mma_type(), expected)
 
+    def test_native_fp8_experts_select_fp8xfp8(self):
+        experts = SimpleNamespace(_mega_moe_native_fp8=True)
+        self.assertEqual(mega_moe._mega_moe_mma_type(experts), "fp8xfp8")
+
+    def test_fail_closed_rejects_missing_weights_and_token_overflow(self):
+        backend = SimpleNamespace(is_megamoe=lambda: True)
+        moe = SimpleNamespace(experts=SimpleNamespace(_mega_moe_weights_built=False))
+        with (
+            patch.object(mega_moe, "get_moe_a2a_backend", return_value=backend),
+            patch.object(
+                mega_moe.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_FAIL_CLOSED,
+                "get",
+                return_value=True,
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "weights were not built"):
+                mega_moe.should_use_mega_moe(moe, torch.zeros((1, 4)))
+
+        moe.experts._mega_moe_weights_built = True
+        with (
+            patch.object(mega_moe, "get_moe_a2a_backend", return_value=backend),
+            patch.object(mega_moe, "_device_sm", 100),
+            patch.object(mega_moe, "get_is_capture_mode", return_value=False),
+            patch.object(mega_moe, "get_dp_global_num_tokens", return_value=[17]),
+            patch.object(mega_moe, "is_dsa_enable_prefill_cp", return_value=False),
+            patch.object(
+                mega_moe.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK,
+                "get",
+                return_value=16,
+            ),
+            patch.object(
+                mega_moe.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_FAIL_CLOSED,
+                "get",
+                return_value=True,
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "token requirement 17 exceeds"):
+                mega_moe.should_use_mega_moe(moe, torch.zeros((1, 4)))
+
+    def test_native_fp8_builder_requantizes_and_keeps_fallback_layout(self):
+        layer = SimpleNamespace(
+            w13_weight=torch.nn.Parameter(torch.zeros((1, 16, 8))),
+            w13_weight_scale_inv=torch.nn.Parameter(torch.zeros((1, 2, 2))),
+            w2_weight=torch.nn.Parameter(torch.zeros((1, 8, 8))),
+            w2_weight_scale_inv=torch.nn.Parameter(torch.zeros((1, 1, 2))),
+        )
+
+        def fake_requant(_weight, scale, _block):
+            scale.data = torch.zeros((1, 128, 1), dtype=torch.int32)
+
+        with patch(
+            "sglang.srt.layers.quantization.fp8_utils.requant_weight_ue8m0_inplace",
+            side_effect=fake_requant,
+        ) as requant:
+            mega_moe.build_native_fp8_mega_moe_experts_weights(layer)
+
+        self.assertEqual(requant.call_count, 2)
+        self.assertTrue(layer._mega_moe_native_fp8)
+        self.assertTrue(layer._mega_moe_weights_built)
+        self.assertIs(layer.mega_l1_weights[0], layer.w13_weight.data)
+        self.assertIs(layer.mega_l2_weights[0], layer.w2_weight.data)
+        self.assertEqual(layer.w13_weight_scale_inv.shape, (1, 128, 1))
+        self.assertEqual(layer.mega_l1_weights[1].shape, (1, 128, 1))
+
     def test_buffer_cache_separates_mma_types(self):
         deep_gemm = ModuleType("deep_gemm")
         expected_buffers = (object(), object())
@@ -100,6 +164,74 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             ],
             ["fp8xfp4", "mxf4xmxf4"],
         )
+
+    def test_native_fp8_buffer_and_kernel_use_matching_mma_type(self):
+        deep_gemm = ModuleType("deep_gemm")
+        buffer = SimpleNamespace(
+            x=object(), x_sf=object(), topk_idx=object(), topk_weights=object()
+        )
+        deep_gemm.get_symm_buffer_for_mega_moe = MagicMock(return_value=buffer)
+        deep_gemm.fp8_fp4_mega_moe = MagicMock()
+        experts = SimpleNamespace(
+            num_experts=8,
+            _mega_moe_native_fp8=True,
+            mega_l1_weights=object(),
+            mega_l2_weights=object(),
+            should_fuse_routed_scaling_factor_in_topk=True,
+        )
+        topk_output = SimpleNamespace(
+            topk_ids=torch.tensor([[0, 1]]),
+            topk_weights=torch.tensor([[0.6, 0.4]]),
+        )
+        moe = SimpleNamespace(
+            config=SimpleNamespace(
+                hidden_size=4,
+                num_experts_per_tok=2,
+                moe_intermediate_size=8,
+                swiglu_limit=None,
+            ),
+            experts=experts,
+            gate=MagicMock(return_value=torch.empty((1, 8))),
+            topk=MagicMock(return_value=topk_output),
+            is_hash=False,
+            num_fused_shared_experts=0,
+            layer_id=0,
+            routed_scaling_factor=1.0,
+        )
+
+        with (
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch.object(mega_moe, "_device_sm", 100),
+            patch.object(mega_moe, "mega_moe_pre_dispatch") as pre_dispatch,
+            patch.object(
+                mega_moe,
+                "_configure_mega_moe_deep_gemm_num_sms",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                mega_moe.ExpertLocationDispatchInfo,
+                "init_new",
+                return_value=object(),
+            ),
+            patch(
+                "sglang.srt.distributed.parallel_state.get_moe_ep_group",
+                return_value=SimpleNamespace(device_group=object()),
+            ),
+        ):
+            mega_moe._run_mega_routed(
+                moe,
+                torch.zeros((1, 4)),
+                forward_batch=None,
+                input_ids_global=None,
+                num_tokens=1,
+            )
+
+        self.assertEqual(
+            deep_gemm.get_symm_buffer_for_mega_moe.call_args.kwargs["mma_type"],
+            "fp8xfp8",
+        )
+        self.assertTrue(pre_dispatch.called)
+        self.assertTrue(deep_gemm.fp8_fp4_mega_moe.called)
 
     def test_mxf4_weight_transform_uses_matching_mma_type(self):
         from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod

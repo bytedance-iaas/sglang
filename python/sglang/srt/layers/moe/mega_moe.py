@@ -45,7 +45,9 @@ if TYPE_CHECKING:
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 
 
-def _mega_moe_mma_type() -> str:
+def _mega_moe_mma_type(experts=None) -> str:
+    if experts is not None and getattr(experts, "_mega_moe_native_fp8", False):
+        return "fp8xfp8"
     return "mxf4xmxf4" if get_exec().moe.enable_w4a4_mxfp4_megamoe else "fp8xfp4"
 
 
@@ -93,10 +95,12 @@ def _get_mega_moe_symm_buffer(
     num_topk: int,
     hidden: int,
     intermediate_hidden: int,
+    mma_type: Optional[str] = None,
 ) -> SymmBuffer:
     import deep_gemm
 
-    mma_type = _mega_moe_mma_type()
+    if mma_type is None:
+        mma_type = _mega_moe_mma_type()
     key = (
         id(group),
         num_max_tokens_per_rank,
@@ -122,16 +126,16 @@ def _get_mega_moe_symm_buffer(
     return buf
 
 
-def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool:
-    if not get_moe_a2a_backend().is_megamoe():
-        return False
+def _mega_moe_unavailable_reason(
+    moe: DeepseekV2MoE, hidden_states: torch.Tensor
+) -> Optional[str]:
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
-        return False
+        return "MegaMoE weights were not built"
     if _device_sm == 90:
         if not is_sm90_fp8_mega_moe_available(moe.experts):
-            return False
+            return "the installed DeepGEMM does not provide the required SM90 ABI"
     if get_is_capture_mode():
-        return True
+        return None
 
     global_num_tokens = get_dp_global_num_tokens()
     if global_num_tokens and not is_dsa_enable_prefill_cp():
@@ -139,7 +143,24 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     else:
         max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
-    return max_tokens_per_rank <= cap
+    if max_tokens_per_rank > cap:
+        return (
+            f"token requirement {max_tokens_per_rank} exceeds "
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
+            f"{cap}"
+        )
+    return None
+
+
+def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool:
+    if not get_moe_a2a_backend().is_megamoe():
+        return False
+    reason = _mega_moe_unavailable_reason(moe, hidden_states)
+    if reason is None:
+        return True
+    if envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_FAIL_CLOSED.get():
+        raise RuntimeError(f"MegaMoE fail-closed: {reason}")
+    return False
 
 
 def forward_mega_moe(
@@ -228,6 +249,7 @@ def _run_mega_routed(
         f"cuda_graph_max_bs / chunked_prefill_size accordingly"
     )
 
+    mma_type = _mega_moe_mma_type(moe.experts)
     buf = _get_mega_moe_symm_buffer(
         ep_group,
         num_experts=num_experts,
@@ -235,6 +257,7 @@ def _run_mega_routed(
         num_topk=top_k,
         hidden=hidden_size,
         intermediate_hidden=intermediate_size,
+        mma_type=mma_type,
     )
 
     if num_tokens > 0:
@@ -254,7 +277,6 @@ def _run_mega_routed(
             num_tokens,
         )
 
-    mma_type = _mega_moe_mma_type()
     if mma_type == "mxf4xmxf4":
         # FP4 path goes through DeepGEMM's mega_moe_pre_dispatch which
         # handles the E2M1 packing variant. The jit implementation
@@ -405,4 +427,42 @@ def build_mega_moe_experts_weights(experts) -> None:
     experts.mega_l1_weights = (experts.w13_weight.data, w13_sf_utccp)
     experts.mega_l2_weights = (experts.w2_weight.data, w2_sf_utccp)
 
+    experts._mega_moe_weights_built = True
+
+
+def build_native_fp8_mega_moe_experts_weights(experts) -> None:
+    """Build SM100 ``fp8xfp8`` weights from serialized block-128 FP8."""
+    if getattr(experts, "_mega_moe_weights_built", False):
+        return
+
+    from sglang.srt.layers.quantization.fp8_utils import requant_weight_ue8m0_inplace
+
+    for weight, scale in (
+        (experts.w13_weight, experts.w13_weight_scale_inv),
+        (experts.w2_weight, experts.w2_weight_scale_inv),
+    ):
+        if not getattr(scale, "format_ue8m0", False):
+            # Arbitrary block-128 scales cannot just be expanded to K32: the
+            # native kernel requires UE8M0 scales and correspondingly requanted
+            # FP8 values. Reuse the ordinary DeepGEMM conversion.
+            requant_weight_ue8m0_inplace(weight, scale, [128, 128])
+            scale.format_ue8m0 = True
+
+    w13_interleaved, w13_sf_interleaved = _interleave_mega_moe_l1_weights(
+        (experts.w13_weight.data, experts.w13_weight_scale_inv.data), "fp8xfp8"
+    )
+    w13_sf_utccp = _transpose_mega_moe_sf_for_utccp(w13_sf_interleaved)
+    w2_sf_utccp = _transpose_mega_moe_sf_for_utccp(
+        experts.w2_weight_scale_inv.data
+    )
+
+    # Keep the normal DeepGEMM fallback views live. Only MegaMoE needs the
+    # additional UTCCP scale layout.
+    experts.w13_weight.data = w13_interleaved
+    experts.w13_weight_scale_inv.data = w13_sf_interleaved
+    experts.w13_weight_scale_inv.format_ue8m0 = True
+    experts.w2_weight_scale_inv.format_ue8m0 = True
+    experts.mega_l1_weights = (experts.w13_weight.data, w13_sf_utccp)
+    experts.mega_l2_weights = (experts.w2_weight.data, w2_sf_utccp)
+    experts._mega_moe_native_fp8 = True
     experts._mega_moe_weights_built = True
