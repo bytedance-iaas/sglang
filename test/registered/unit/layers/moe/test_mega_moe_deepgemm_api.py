@@ -104,30 +104,78 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, "token requirement 17 exceeds"):
                 mega_moe.should_use_mega_moe(moe, torch.zeros((1, 4)))
 
+    def test_fail_closed_rejects_capture_shape_overflow(self):
+        backend = SimpleNamespace(is_megamoe=lambda: True)
+        moe = SimpleNamespace(experts=SimpleNamespace(_mega_moe_weights_built=True))
+        with (
+            patch.object(mega_moe, "get_moe_a2a_backend", return_value=backend),
+            patch.object(mega_moe, "_device_sm", 100),
+            patch.object(mega_moe, "get_is_capture_mode", return_value=True),
+            patch.object(
+                mega_moe.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK,
+                "get",
+                return_value=16,
+            ),
+            patch.object(
+                mega_moe.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_FAIL_CLOSED,
+                "get",
+                return_value=True,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "local token requirement 17 exceeds"
+            ):
+                mega_moe.should_use_mega_moe(moe, torch.zeros((17, 4)))
+            self.assertTrue(mega_moe.should_use_mega_moe(moe, torch.zeros((16, 4))))
+
     def test_native_fp8_builder_requantizes_and_keeps_fallback_layout(self):
         layer = SimpleNamespace(
-            w13_weight=torch.nn.Parameter(torch.zeros((1, 16, 8))),
-            w13_weight_scale_inv=torch.nn.Parameter(torch.zeros((1, 2, 2))),
-            w2_weight=torch.nn.Parameter(torch.zeros((1, 8, 8))),
-            w2_weight_scale_inv=torch.nn.Parameter(torch.zeros((1, 1, 2))),
+            w13_weight=torch.nn.Parameter(
+                torch.zeros((1, 256, 32)), requires_grad=False
+            ),
+            w13_weight_scale_inv=torch.nn.Parameter(
+                torch.zeros((1, 2, 1)), requires_grad=False
+            ),
+            w2_weight=torch.nn.Parameter(
+                torch.zeros((1, 128, 32)), requires_grad=False
+            ),
+            w2_weight_scale_inv=torch.nn.Parameter(
+                torch.zeros((1, 1, 1)), requires_grad=False
+            ),
         )
 
-        def fake_requant(_weight, scale, _block):
-            scale.data = torch.zeros((1, 128, 1), dtype=torch.int32)
-
-        with patch(
-            "sglang.srt.layers.quantization.fp8_utils.requant_weight_ue8m0_inplace",
-            side_effect=fake_requant,
-        ) as requant:
+        fake_deep_gemm = ModuleType("deep_gemm")
+        fake_deep_gemm.transform_sf_into_required_layout = MagicMock(
+            side_effect=lambda scale, **_kwargs: torch.zeros(
+                (*scale.shape[:-1], 1), dtype=torch.int32
+            )
+        )
+        with (
+            patch.dict(sys.modules, {"deep_gemm": fake_deep_gemm}),
+            patch(
+                "sglang.srt.layers.quantization.fp8_utils.block_quant_dequant",
+                side_effect=lambda weight, *_args: weight.to(torch.bfloat16),
+            ),
+            patch(
+                "sglang.srt.layers.quantization.fp8_utils.ceil_to_ue8m0",
+                side_effect=lambda scale: torch.ones_like(scale),
+            ),
+        ):
             mega_moe.build_native_fp8_mega_moe_experts_weights(layer)
 
-        self.assertEqual(requant.call_count, 2)
+        self.assertEqual(
+            fake_deep_gemm.transform_sf_into_required_layout.call_count, 2
+        )
         self.assertTrue(layer._mega_moe_native_fp8)
         self.assertTrue(layer._mega_moe_weights_built)
-        self.assertIs(layer.mega_l1_weights[0], layer.w13_weight.data)
-        self.assertIs(layer.mega_l2_weights[0], layer.w2_weight.data)
-        self.assertEqual(layer.w13_weight_scale_inv.shape, (1, 128, 1))
-        self.assertEqual(layer.mega_l1_weights[1].shape, (1, 128, 1))
+        self.assertEqual(
+            layer.mega_l1_weights[0].data_ptr(), layer.w13_weight.data_ptr()
+        )
+        self.assertEqual(
+            layer.mega_l2_weights[0].data_ptr(), layer.w2_weight.data_ptr()
+        )
+        self.assertEqual(layer.w13_weight_scale_inv.shape, (1, 256, 1))
+        self.assertEqual(layer.mega_l1_weights[1].shape, (1, 256, 1))
 
     def test_buffer_cache_separates_mma_types(self):
         deep_gemm = ModuleType("deep_gemm")

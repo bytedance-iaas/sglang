@@ -134,6 +134,16 @@ def _mega_moe_unavailable_reason(
     if _device_sm == 90:
         if not is_sm90_fp8_mega_moe_available(moe.experts):
             return "the installed DeepGEMM does not provide the required SM90 ABI"
+    cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+    # CUDA Graph uses a fixed, padded local shape. It is both available and
+    # sufficient during capture, whereas DP metadata may not be. Reject an
+    # oversized graph before _run_mega_routed reaches its assertion.
+    if hidden_states.shape[0] > cap:
+        return (
+            f"local token requirement {hidden_states.shape[0]} exceeds "
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
+            f"{cap}"
+        )
     if get_is_capture_mode():
         return None
 
@@ -142,7 +152,6 @@ def _mega_moe_unavailable_reason(
         max_tokens_per_rank = max(global_num_tokens)
     else:
         max_tokens_per_rank = hidden_states.shape[0]
-    cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
     if max_tokens_per_rank > cap:
         return (
             f"token requirement {max_tokens_per_rank} exceeds "
@@ -435,7 +444,12 @@ def build_native_fp8_mega_moe_experts_weights(experts) -> None:
     if getattr(experts, "_mega_moe_weights_built", False):
         return
 
-    from sglang.srt.layers.quantization.fp8_utils import requant_weight_ue8m0_inplace
+    import deep_gemm
+
+    from sglang.srt.layers.quantization.fp8_utils import (
+        block_quant_dequant,
+        ceil_to_ue8m0,
+    )
 
     for weight, scale in (
         (experts.w13_weight, experts.w13_weight_scale_inv),
@@ -444,8 +458,30 @@ def build_native_fp8_mega_moe_experts_weights(experts) -> None:
         if not getattr(scale, "format_ue8m0", False):
             # Arbitrary block-128 scales cannot just be expanded to K32: the
             # native kernel requires UE8M0 scales and correspondingly requanted
-            # FP8 values. Reuse the ordinary DeepGEMM conversion.
-            requant_weight_ue8m0_inplace(weight, scale, [128, 128])
+            # FP8 values. The ordinary DeepGEMM conversion keeps K128 scales,
+            # whereas fp8xfp8 MegaMoE requires one scale per row and K32.
+            dequant = block_quant_dequant(
+                weight.data,
+                scale.data,
+                [128, 128],
+                torch.bfloat16,
+            )
+            *batch_dims, n, k = dequant.shape
+            assert k % 32 == 0
+            blocks = dequant.view(*batch_dims, n, k // 32, 32)
+            scale_k32 = ceil_to_ue8m0(
+                blocks.abs().float().amax(dim=-1).clamp_min(1e-4) / 448.0
+            )
+            weight.data = (blocks / scale_k32.unsqueeze(-1)).to(
+                torch.float8_e4m3fn
+            ).reshape_as(dequant)
+            scale.data = deep_gemm.transform_sf_into_required_layout(
+                scale_k32,
+                mn=n,
+                k=k,
+                recipe=(1, 32),
+                num_groups=weight.shape[0],
+            )
             scale.format_ue8m0 = True
 
     w13_interleaved, w13_sf_interleaved = _interleave_mega_moe_l1_weights(
@@ -456,8 +492,9 @@ def build_native_fp8_mega_moe_experts_weights(experts) -> None:
         experts.w2_weight_scale_inv.data
     )
 
-    # Keep the normal DeepGEMM fallback views live. Only MegaMoE needs the
-    # additional UTCCP scale layout.
+    # MegaMoE is fail-closed for this backend, so these parameters may use its
+    # K32/interleaved representation. A non-MegaMoE server loads the checkpoint
+    # independently and retains the ordinary DeepGEMM representation.
     experts.w13_weight.data = w13_interleaved
     experts.w13_weight_scale_inv.data = w13_sf_interleaved
     experts.w13_weight_scale_inv.format_ue8m0 = True
