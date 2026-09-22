@@ -5,21 +5,23 @@ writes the page-table transform of the selected raw indices into the output. We
 validate against ``torch.topk`` with a small tolerance for boundary ties (the
 fp16 coarse histogram can swap elements of equal score).
 
-Coverage is organized around the kernel's dispatch so every template and its
-boundaries are exercised:
+Coverage is organized around the kernel's exact dispatch so every template and
+its boundaries are exercised.  The cluster templates remain covered by the
+legacy matrix when enabled, but production dispatch currently routes all long
+rows through Streaming until cluster-wide overflow refinement is available:
 
   template      per-row seq            reached when
   --------      ----------             ------------
   trivial       seq <= k
   Register2     k < seq <= 8192        max_seq <= 8192          (level 0)
   Register4     8192 < seq <= 16384    max_seq <= 16384         (level 1)
-  Streaming     16384 < seq <= floor   max_seq > 16384, non-cluster (level 2)
-  Cluster       seq > floor(=65536)    max_seq > floor and batch <= 128
+  Streaming     seq > 16384            max_seq > 16384 (level 2)
+  Cluster       currently disabled     requires cluster-wide exact refinement
 
-and two cluster dispatch shapes: the fused small-batch kernel (batch <= 30) and
-the persistent-pool + main kernel (30 < batch <= 128). Boundary seq lengths
-(8192/8193, 16384/16385, 65535/65536/65537) and batch sizes (30/31, 128/129) are
-included explicitly, across k in {512,1024,2048} and identity/perm page tables.
+Historical cluster dispatch boundaries (batch 30/31 and 128/129) remain in the
+matrix to prove they deterministically take the exact Streaming path. Boundary
+seq lengths (8192/8193, 16384/16385, 65535/65536/65537) are included explicitly,
+across k in {512,1024,2048} and identity/perm page tables.
 """
 
 from __future__ import annotations
@@ -76,7 +78,9 @@ FIXED_CONFIGS = [
 ]
 
 
-def _assert_topk_close(scores_cpu, ref_raw, our_raw, bs, seq_lens, k):
+def _assert_topk_close(
+    scores_cpu, ref_raw, our_raw, bs, seq_lens, k, max_permit_error=MAX_PERMIT_ERROR
+):
     """Set-compare our top-k raw indices vs torch's, tolerating equal-score ties."""
     bad = 0
     for i in range(bs):
@@ -94,7 +98,7 @@ def _assert_topk_close(scores_cpu, ref_raw, our_raw, bs, seq_lens, k):
         assert len(our) == min(
             k, L
         ), f"b={i} L={L} k={k}: {len(our)} valid != {min(k, L)}"
-    assert bad <= MAX_PERMIT_ERROR, f"{bad=} > {MAX_PERMIT_ERROR}"
+    assert bad <= max_permit_error, f"{bad=} > {max_permit_error}"
 
 
 def _make_page_table(batch, num_pages, mode, device, per_row=False):
@@ -163,6 +167,188 @@ def _run_raw(scores, seq_lens, page_table, k):
     torch.cuda.synchronize()
     raw_cpu = raw.cpu().tolist()
     return [[v for v in raw_cpu[i] if v != -1] for i in range(batch)]
+
+
+def _single_bin_scores(kind, batch, width, device):
+    """fp32 scores whose fp16-derived coarse bin cannot order the row."""
+    if kind == "distinct":
+        # One coarse bin with far more than 2048 distinct fp32 values.
+        # A 12-bit coarse bin spans 16 adjacent fp16 keys; this interval stays
+        # in the bin beginning at 1.0 while retaining thousands of fp32 keys.
+        return (
+            1.0 + torch.rand(batch, width, dtype=torch.float32, device=device) * 0.001
+        )
+    if kind == "tiny":
+        # Every value underflows when cast to fp16, while fp32 remains ordered.
+        return (
+            0.5 + torch.rand(batch, width, dtype=torch.float32, device=device)
+        ) * 1e-30
+    if kind == "ties":
+        hi = torch.tensor(1.0, dtype=torch.float32, device=device).nextafter(
+            torch.tensor(2.0, dtype=torch.float32, device=device)
+        )
+        return torch.where(
+            torch.rand(batch, width, device=device) < 0.5,
+            hi,
+            torch.ones((), dtype=torch.float32, device=device),
+        )
+    raise ValueError(kind)
+
+
+STRICT_OVERFLOW_CONFIGS = [
+    # Register/streaming boundaries required by the GLM-5.3 K1 contract.
+    (1, 8191),
+    (1, 8192),
+    (1, 8193),
+    (1, 16383),
+    (1, 16384),
+    (1, 16385),
+    (1, 65535),
+    (1, 65536),
+    (1, 65537),
+    (1, 67036),
+    # Actual verify/draft-expanded dispatch boundaries.  Cluster is deliberately
+    # excluded until it has a cluster-wide exact refinement.
+    (30, 67036),
+    (31, 67036),
+    (128, 67036),
+    (129, 67036),
+]
+
+
+@pytest.mark.parametrize("batch,seq", STRICT_OVERFLOW_CONFIGS)
+@torch.inference_mode()
+def test_topk_v2_overflow_is_exact(batch: int, seq: int) -> None:
+    """Overflowing coarse bins have zero non-tie selection errors.
+
+    A padded backing allocation makes the score view non-contiguous while
+    preserving the kernel's required 16-byte row stride.  Each row uses an
+    independently permuted physical page map and the raw output is compared to
+    an fp32 torch oracle with no historical five-error allowance.
+    """
+    torch.manual_seed(batch * 100003 + seq)
+    device, k = "cuda", 2048
+    width = (seq + 3) & ~3
+    backing = _single_bin_scores("distinct", batch, width + 4, device)
+    scores = backing[:, :width]
+    # PyTorch treats the stride of a size-one leading dimension as irrelevant
+    # to contiguity.  The padded row stride is still present and exercised; for
+    # multi-row cases the view is also observably non-contiguous.
+    assert scores.stride() == (width + 4, 1)
+    assert scores.stride(0) % 4 == 0
+    assert batch == 1 or not scores.is_contiguous()
+    seq_lens = torch.full((batch,), seq, dtype=torch.int32, device=device)
+    num_pages = (width + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table, _ = _make_page_table(batch, num_pages, "perm", device, per_row=True)
+
+    our_raw = _run_raw(scores, seq_lens, page_table, k)
+    ref_raw = _reference(scores, seq_lens, k)
+    _assert_topk_close(
+        scores.cpu(),
+        ref_raw,
+        our_raw,
+        batch,
+        seq_lens.cpu(),
+        k,
+        max_permit_error=0,
+    )
+
+
+@pytest.mark.parametrize("kind", ["tiny", "ties"])
+@torch.inference_mode()
+def test_topk_v2_overflow_ties_and_masked_rows(kind: str) -> None:
+    """Strict overflow with repeated values, zero-length padding and tails."""
+    torch.manual_seed(20326350 + (kind == "ties"))
+    device, batch, width, k = "cuda", 6, 67036, 2048
+    scores = _single_bin_scores(kind, batch, width + 4, device)[:, :width]
+    seq_lens = torch.tensor(
+        [0, 1, 2048, 2049, 65535, width], dtype=torch.int32, device=device
+    )
+    num_pages = (width + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table, _ = _make_page_table(batch, num_pages, "perm", device, per_row=True)
+
+    our_raw = _run_raw(scores, seq_lens, page_table, k)
+    ref_raw = _reference(scores, seq_lens, k)
+    _assert_topk_close(
+        scores.cpu(),
+        ref_raw,
+        our_raw,
+        batch,
+        seq_lens.cpu(),
+        k,
+        max_permit_error=0,
+    )
+
+
+@pytest.mark.parametrize("batch", [30, 31, 128, 129])
+@torch.inference_mode()
+def test_topk_v2_overflow_cuda_graph_capture_replay(batch: int) -> None:
+    """Captured exact dispatch re-reads all fixed-shape replay buffers.
+
+    The production attention backend refreshes ``seq_lens`` and its prebuilt
+    plan in-place before replay.  Exercise that contract together with dynamic
+    scores and independently permuted physical-page mappings at the historical
+    cluster batch boundaries used by target/draft-expanded rows.
+    """
+    torch.manual_seed(20326350 + batch)
+    device, width, k = "cuda", 67036, 2048
+    scores = _single_bin_scores("distinct", batch, width, device)
+    seq_lens = torch.full((batch,), width, dtype=torch.int32, device=device)
+    num_pages = (width + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table, inv = _make_page_table(batch, num_pages, "perm", device, per_row=True)
+    out = torch.full((batch, k), -1, dtype=torch.int32, device=device)
+    raw = torch.full_like(out, -1)
+    metadata = plan_topk_v2(seq_lens)
+
+    # Compile and allocate all JIT state before capture.
+    topk_transform_512_v2(scores, seq_lens, page_table, out, PAGE_SIZE, metadata, raw)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        topk_transform_512_v2(
+            scores, seq_lens, page_table, out, PAGE_SIZE, metadata, raw
+        )
+
+    for replay in range(2):
+        torch.manual_seed(20326350 + batch * 10 + replay)
+        next_scores = _single_bin_scores("distinct", batch, width, device)
+        next_lens = torch.full(
+            (batch,), width - replay * 4, dtype=torch.int32, device=device
+        )
+        # Include tail and empty DP-companion rows without changing shapes.
+        next_lens[-1] = 0
+        if batch > 1:
+            next_lens[-2] = 65535
+        next_table, next_inv = _make_page_table(
+            batch, num_pages, "perm", device, per_row=True
+        )
+        next_plan = plan_topk_v2(next_lens)
+        scores.copy_(next_scores)
+        seq_lens.copy_(next_lens)
+        page_table.copy_(next_table)
+        metadata.copy_(next_plan)
+        out.fill_(-1)
+        raw.fill_(-1)
+
+        graph.replay()
+        torch.cuda.synchronize()
+
+        raw_cpu = raw.cpu().tolist()
+        our_raw = [[v for v in row if v != -1] for row in raw_cpu]
+        ref_raw = _reference(next_scores, next_lens, k)
+        _assert_topk_close(
+            next_scores.cpu(),
+            ref_raw,
+            our_raw,
+            batch,
+            next_lens.cpu(),
+            k,
+            max_permit_error=0,
+        )
+        out_cpu = out.cpu().tolist()
+        mapped_raw = [_invert(out_cpu[i], next_inv[i]) for i in range(batch)]
+        assert mapped_raw == our_raw
 
 
 @pytest.mark.parametrize("page_mode", ["identity", "perm"])
