@@ -5161,8 +5161,6 @@ class DeepseekV4ForCausalLM(nn.Module):
                 _is_cuda
                 and moe_a2a_backend.is_megamoe()
                 and get_platform().is_sm90
-                and get_parallel().attn_cp_size == 1
-                and get_parallel().attn_dp_size == 1
                 and get_parallel().moe_ep_size == self.tp_size
                 and self.tp_size <= 8
             )
