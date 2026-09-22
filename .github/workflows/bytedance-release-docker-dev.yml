@@ -49,7 +49,7 @@ jobs:
               except urllib.error.HTTPError as error:
                   response = error
               except Exception as error:
-                  row.update(error_type=type(error).__name__)
+                  row.update(error_type=type(error).__name__, reason=str(getattr(error, "reason", error))[:300])
                   return row, b""
               with response:
                   row.update(http_status=response.status,
@@ -86,5 +86,20 @@ jobs:
                           row["valid_wheel"] = False
               else:
                   RESULTS.append({"check": "packaging_wheel_download", "error_type": "PinnedWheelNotListed"})
+
+          # Compare the HTTP proxy already configured in the internal image workflow.
+          # curl -q disables user config; no credentials, cookies, netrc, or TLS overrides.
+          import subprocess
+          for package in ["packaging", "iaas-kernels"]:
+              url = INDEX + package + "/"
+              command = ["curl", "-q", "--proxy", "http://100.68.162.211:3128",
+                         "--noproxy", "", "--connect-timeout", "5", "--max-time", "15",
+                         "--silent", "--show-error", "--output", "/dev/null",
+                         "--write-out", "%{http_code}", url]
+              result = subprocess.run(command, text=True, capture_output=True, timeout=20)
+              RESULTS.append({"check": package + "_via_existing_build_proxy",
+                              "explicit_credentials": False, "curl_exit": result.returncode,
+                              "http_status": result.stdout.strip(), "error": result.stderr[:300]})
+
           print(json.dumps({"audit": "bytedpypi_read_access", "checks": RESULTS}, sort_keys=True))
           PYCODE
