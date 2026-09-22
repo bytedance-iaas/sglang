@@ -1539,6 +1539,10 @@ class Envs:
     # Keep mHC residuals token-sharded between Attention ReduceScatter and the
     # next Attention input AllGather. Opt-in: DSV4.1 SM90 TP8/EP8 MegaMoE decode.
     SGLANG_DSV41_MEGAMOE_REDUCE_SCATTER = EnvBool(False)
+    # Fuse the rank-partial shared-expert output into the DSV4.1 prefill-CP
+    # ReduceScatter push. Falls back to add + NCCL when the custom communicator
+    # or its push workspace cannot cover the local output shard.
+    SGLANG_DSV41_CP_MOE_FUSED_REDUCE_SCATTER = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 

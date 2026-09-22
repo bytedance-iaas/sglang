@@ -1321,12 +1321,19 @@ class DeepseekV2MoE(nn.Module):
                 pre_quant_input=pre_quant_input,
             )
 
+        defer_cp_shared_add = (
+            get_forward().defer_cp_moe_shared_add
+            and shared_output is not None
+            and not self._shared_expert_tp1
+        )
         final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
             self.experts,
             final_hidden_states,
-            None if self._shared_expert_tp1 else shared_output,
+            (None if self._shared_expert_tp1 or defer_cp_shared_add else shared_output),
             self.routed_scaling_factor,
         )
+        if defer_cp_shared_add:
+            get_forward().set("cp_moe_shared_output", shared_output)
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,

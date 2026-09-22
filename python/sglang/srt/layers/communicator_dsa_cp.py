@@ -72,7 +72,10 @@ def dsa_cp_gather_hidden_states(hidden_states: torch.Tensor):
     return hidden_states
 
 
-def dsa_cp_reduce_scatter_hidden_states(hidden_states: torch.Tensor):
+def dsa_cp_reduce_scatter_hidden_states(
+    hidden_states: torch.Tensor,
+    pre_reduce: Optional[torch.Tensor] = None,
+):
     attn_dp_size = get_parallel().attn_dp_size
     attn_tp_size = get_parallel().attn_tp_size
     assert attn_dp_size == 1 and attn_tp_size == 1
@@ -80,6 +83,30 @@ def dsa_cp_reduce_scatter_hidden_states(hidden_states: torch.Tensor):
     cp_rank = get_parallel().attn_cp_rank
     input_hidden_states = hidden_states
     hidden_states = hidden_states.tensor_split(cp_size)[cp_rank]
+    if pre_reduce is not None:
+        group = get_parallel().attn_cp_group
+        ca_comm = group.ca_comm
+        can_use_custom = (
+            ca_comm is not None
+            and not ca_comm.disabled
+            and ca_comm.obj.push is not None
+            and input_hidden_states.is_contiguous()
+            and pre_reduce.is_contiguous()
+            and input_hidden_states.shape == pre_reduce.shape
+            and input_hidden_states.dtype == pre_reduce.dtype == torch.bfloat16
+            and hidden_states.nbytes <= ca_comm.max_push_size
+        )
+        if can_use_custom:
+            from sglang.kernels.ops.communication import nvlink_comm
+
+            nvlink_comm.reduce_scatter_push(
+                ca_comm.obj,
+                input_hidden_states,
+                hidden_states,
+                pre_reduce=pre_reduce,
+            )
+            return hidden_states
+        input_hidden_states.add_(pre_reduce)
     attn_cp_reduce_scatter_tensor(hidden_states, input_hidden_states)
     return hidden_states
 
@@ -108,7 +135,7 @@ class DSACPLayerCommunicator(LayerCommunicator):
         # SCATTERED in attn tp is different from SCATTERED in global tp when dp_size > 1
         if self.layer_scatter_modes.mlp_mode != ScatterMode.SCATTERED:
             assert self._context.attn_dp_size == 1, (
-                f"dp_size should be 1 when moe_runner_backend is none"
+                "dp_size should be 1 when moe_runner_backend is none"
             )
         self._communicate_simple_fn = DSACPCommunicateSimpleFn.get_fn(
             input_mode=ScatterMode.SCATTERED,

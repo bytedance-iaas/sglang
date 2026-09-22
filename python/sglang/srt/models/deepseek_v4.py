@@ -3577,6 +3577,14 @@ class DeepseekV4DecoderLayer(nn.Module):
                 input_ids_global=input_ids_global,
             )
         _use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
+        _fuse_cp_moe_reduce_scatter = (
+            envs.SGLANG_DSV41_CP_MOE_FUSED_REDUCE_SCATTER.get()
+            and _use_cp
+            and get_moe_a2a_backend().is_none()
+            and get_platform().is_sm90
+            and hidden_states.is_cuda
+            and not get_is_capture_mode()
+        )
         _use_tp_moe_gather = (
             not _use_cp
             and get_parallel().attn_dp_size > 1
@@ -3682,7 +3690,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             forward_batch.num_token_non_padded = None
         try:
             with (
-                get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter),
+                get_forward().scoped(
+                    mlp_reduce_scatter=mlp_reduce_scatter,
+                    defer_cp_moe_shared_add=_fuse_cp_moe_reduce_scatter,
+                    cp_moe_shared_output=None,
+                ),
                 gathered_rows,
             ):
                 hidden_states = self.mlp(
@@ -3692,10 +3704,14 @@ class DeepseekV4DecoderLayer(nn.Module):
                     input_ids_global=input_ids_global,
                     skip_shared_experts=_do_shared_local,
                 )
+                cp_moe_shared_output = get_forward().cp_moe_shared_output
         finally:
             forward_batch.num_token_non_padded = saved_num_token_non_padded
         if _use_cp and get_moe_a2a_backend().is_none():
-            hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
+            hidden_states = dsa_cp_reduce_scatter_hidden_states(
+                hidden_states,
+                pre_reduce=cp_moe_shared_output,
+            )
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_tp_group()),

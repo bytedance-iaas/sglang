@@ -50,6 +50,7 @@ struct fast_mod_div_u32_t {
 template <uint32_t kWorldSize>
 struct NVLinkCommPushParams {
   const void* __restrict__ input;
+  const void* __restrict__ pre_reduce;
   const void* __restrict__ residual;
   void* __restrict__ output;
   uint32_t dst_offset;  // AR = rank slot stride; AG = packed token prefix
@@ -113,7 +114,7 @@ SGL_DEVICE vec_t reduce_vec(vec_t x, vec_t y) {
  * `RS` use swizzle layout for push kernel \n
  * `AG` use normal linear layout for push kernel
  */
-template <typename T, bool kHasResidual, Primitive kPrim, uint32_t kWorldSize, bool kUsePDL>
+template <typename T, bool kHasResidual, bool kHasPreReduce, Primitive kPrim, uint32_t kWorldSize, bool kUsePDL>
 PUSH_KERNEL void nvlink_push_kernel(const __grid_constant__ NVLinkCommPushParams<kWorldSize> params) {
   using namespace device;
   enable_smem_spilling();
@@ -180,6 +181,11 @@ PUSH_KERNEL void nvlink_push_kernel(const __grid_constant__ NVLinkCommPushParams
       const auto src_token = rank_prefix + dst_token_id;
       vec_t vec;
       vec.load(params.input, src_token * vpt + offset);
+      if constexpr (kHasPreReduce) {
+        vec_t pre_reduce;
+        pre_reduce.load(params.pre_reduce, src_token * vpt + offset);
+        vec = reduce_vec(vec, pre_reduce);
+      }
       const auto dst_ptr = epoch.slot_ptr(dst_rank, params.rank);
       Lamport::clear_pos_zero(vec.data());
       ptx::st_relaxed_16B(vec, dst_ptr, dst_token_id * vpt + offset);
@@ -477,9 +483,15 @@ struct NVLinkComm {
       const PushPlaneObj& push,
       const TensorView in,
       const TensorView out,
-      const tvm::ffi::Optional<TensorView> residual) {
+      const tvm::ffi::Optional<TensorView> residual,
+      const tvm::ffi::Optional<TensorView> pre_reduce = {}) {
     CHECK_HOST(push.world_size == kWorldSize) << push.world_size << " != " << kWorldSize;
     const auto [hidden_size, device] = check_params(in, out, residual);
+    if (pre_reduce.has_value()) {
+      check_params(in, out, pre_reduce);
+      CHECK_HOST(kPrim == Primitive::RS) << "pre_reduce is only valid for reduce-scatter";
+      CHECK_HOST(pre_reduce.value().size(0) == in.size(0)) << "pre_reduce must match the full reduce-scatter input";
+    }
     const auto rank = push.rank;
     const auto num_vecs_per_token = static_cast<uint32_t>(hidden_size / kVecSize);
     const auto num_push_vecs = static_cast<uint32_t>(in.numel() / kVecSize);
@@ -521,6 +533,7 @@ struct NVLinkComm {
         routing.prefix_tokens * static_cast<uint32_t>(num_vecs_per_token * kVecBytes));
     const auto params = NVLinkCommPushParams<kWorldSize>{
         .input = in.data_ptr(),
+        .pre_reduce = pre_reduce.has_value() ? pre_reduce.value().data_ptr() : nullptr,
         .residual = residual_ptr,
         .output = out.data_ptr(),
         .dst_offset = dst_offset,
@@ -533,8 +546,12 @@ struct NVLinkComm {
         .vecs_per_token_div = fast_mod_div_u32_t{num_vecs_per_token},
         .ws = push.get_workspace<kWorldSize>(/*size=*/0),
     };
-    const auto kernel = residual.has_value() ? nvlink_push_kernel<T, true, kPrim, kWorldSize, kUsePDL>
-                                             : nvlink_push_kernel<T, false, kPrim, kWorldSize, kUsePDL>;
+    const auto kernel =
+        residual.has_value()
+            ? (pre_reduce.has_value() ? nvlink_push_kernel<T, true, true, kPrim, kWorldSize, kUsePDL>
+                                      : nvlink_push_kernel<T, true, false, kPrim, kWorldSize, kUsePDL>)
+            : (pre_reduce.has_value() ? nvlink_push_kernel<T, false, true, kPrim, kWorldSize, kUsePDL>
+                                      : nvlink_push_kernel<T, false, false, kPrim, kWorldSize, kUsePDL>);
     host::LaunchKernel(push.num_blocks, block_size, device).enable_pdl(kUsePDL)(kernel, params);
   }
 
@@ -616,9 +633,13 @@ struct NVLinkComm {
     return run_push<Primitive::AG, kWorldSize>(comm->get_push_obj(), in, out, residual);
   }
   template <uint32_t kWorldSize>
-  static void
-  reduce_scatter_push(CommunicatorRef comm, TensorView in, TensorView out, tvm::ffi::Optional<TensorView> residual) {
-    return run_push<Primitive::RS, kWorldSize>(comm->get_push_obj(), in, out, residual);
+  static void reduce_scatter_push(
+      CommunicatorRef comm,
+      TensorView in,
+      TensorView out,
+      tvm::ffi::Optional<TensorView> residual,
+      tvm::ffi::Optional<TensorView> pre_reduce = {}) {
+    return run_push<Primitive::RS, kWorldSize>(comm->get_push_obj(), in, out, residual, pre_reduce);
   }
 
   // only compile once for each world size
