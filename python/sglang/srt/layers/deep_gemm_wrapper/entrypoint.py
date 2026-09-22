@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper import compile_utils
+from sglang.srt.layers.deep_gemm_wrapper.api import get_masked_fp8_gemm
 from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     DEEPGEMM_BLACKWELL,
     DEEPGEMM_NEED_TMA_ALIGNED_SCALES,
@@ -79,7 +80,9 @@ def grouped_gemm_nt_f8f8bf16_masked(
             if recipe_b is not None:
                 fp4_kwargs["recipe_b"] = recipe_b
 
-            return deep_gemm.fp8_m_grouped_gemm_nt_masked(
+            return get_masked_fp8_gemm(
+                deep_gemm, require_overlap=overlap_args is not None
+            )(
                 lhs,
                 rhs,
                 out,

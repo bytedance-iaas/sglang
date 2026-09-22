@@ -16,6 +16,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     restore_symmetric_memory_context,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.deep_gemm_wrapper.api import get_masked_fp8_gemm
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import (
@@ -391,7 +392,7 @@ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
         )
 
     def execute(self, m):
-        deep_gemm.fp8_m_grouped_gemm_nt_masked(
+        get_masked_fp8_gemm(deep_gemm)(
             (self.lhs_q, self.lhs_s),
             (self.rhs_q, self.rhs_s),
             self.out,
