@@ -206,6 +206,17 @@ struct TopKConfig {
   // by downstream sparse attention.
   static constexpr uint32_t kMaxNumTie = 2048;
   static constexpr uint32_t kRadixSize = 1 << 8;
+  // Exact-key refinement for a coarse threshold bin that contains more
+  // candidates than the staging buffer.  Twelve bits gives 12/12/8-bit rounds
+  // over the order-preserving fp32 key, and the histogram fits exactly in the
+  // bytes occupied by kMaxNumTie TieValue entries.
+  static constexpr uint32_t kRefineBits = 12;
+  static constexpr uint32_t kRefineSize = 1 << kRefineBits;
+  static constexpr uint32_t kRefineItems = kRefineSize / kBlockSize;
+  static_assert(
+      kRefineSize * sizeof(uint32_t) <= kMaxNumTie * sizeof(TieValue),
+      "the refinement histogram must fit the tie staging buffer");
+  static_assert(kRefineSize % kBlockSize == 0);
   static constexpr uint32_t kTopKItems = (kMaxTopK + kBlockSize - 1) / kBlockSize;
   // tie candidates owned per thread in the strided handle_tie loops
   static constexpr uint32_t kTieItems = kMaxNumTie / kBlockSize;
@@ -313,6 +324,39 @@ struct TopKConfig {
       // the common path so it alone pays the multi-item register cost.
       radix_tie_select<kTieItems>(tie_buffer, problem, base, num_ties, topk, smem);
     }
+  }
+
+  SGL_DEVICE static void refine_find_threshold(  //
+      const uint32_t* hist,
+      const uint32_t total_active,
+      const uint32_t topk_remain,
+      TieHandleSmem* smem) {
+    const auto tx = threadIdx.x;
+    const auto lane_id = tx % kWarpSize;
+    const auto warp_id = tx / kWarpSize;
+
+    uint32_t counts[kRefineItems];
+    uint32_t local_sum = 0;
+#pragma unroll
+    for (uint32_t i = 0; i < kRefineItems; ++i) {
+      counts[i] = hist[tx * kRefineItems + i];
+      local_sum += counts[i];
+    }
+    const auto warp_inc = warp_inclusive_sum(lane_id, local_sum);
+    if (lane_id == kWarpSize - 1) smem->warp_sum[warp_id] = warp_inc;
+    __syncthreads();
+
+    uint32_t prefix = warp::reduce_sum(lane_id < warp_id ? smem->warp_sum[lane_id] : 0);
+    prefix += warp_inc - local_sum;
+#pragma unroll
+    for (uint32_t i = 0; i < kRefineItems; ++i) {
+      prefix += counts[i];
+      const auto above = total_active - prefix;
+      if (above < topk_remain && above + counts[i] >= topk_remain) {
+        smem->match = {tx * kRefineItems + i, above, counts[i]};
+      }
+    }
+    __syncthreads();
   }
 
   /// Exact radix select over the tie candidates: each thread owns kItems
@@ -442,7 +486,10 @@ struct TopKRadixBase : TopKConfig {
       kHistVec hist_vecs[kBlockSize];
       struct {
         TieHandleSmem handle;
-        TieValue values[kMaxNumTie];
+        union {
+          TieValue values[kMaxNumTie];
+          uint32_t refine_hist[kRefineSize];
+        };
       } tie;
     };
   };
@@ -510,6 +557,99 @@ struct TopKRadixBase : TopKConfig {
       }
     }
     __syncthreads();
+  }
+
+  // Re-read and radix-refine an overflowing coarse threshold bin before tie
+  // handling.  The original collect pass retained an arrival-order subset, so
+  // using it directly is inexact whenever the discarded values are distinct.
+  SGL_DEVICE static void refine_and_handle_tie(  //
+      const TopKProblem& problem,
+      Smem* smem,
+      const float v_lo,
+      const float v_hi,
+      const uint32_t count_eq) {
+    const auto tx = threadIdx.x;
+    const auto topk = problem.topk;
+    const auto handle = &smem->tie.handle;
+    const auto hist = smem->tie.refine_hist;
+    const auto clear_hist = [&] {
+#pragma unroll
+      for (uint32_t i = 0; i < kRefineItems; ++i)
+        hist[tx * kRefineItems + i] = 0;
+      __syncthreads();
+    };
+
+    if (smem->count_gt >= topk) [[unlikely]]
+      return;
+    uint32_t cand_count = count_eq;
+    uint32_t remain = topk - smem->count_gt;
+    uint32_t prefix = 0;
+    uint32_t mask = 0;
+    uint32_t width = kRefineBits;
+    uint32_t shift = 32 - kRefineBits;
+
+    clear_hist();
+    for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t) {
+      if (val >= v_lo && val < v_hi) atomicAdd(&hist[extract_exact_bin(val) >> shift], 1);
+    });
+    __syncthreads();
+
+    while (true) {
+      refine_find_threshold(hist, cand_count, remain, handle);
+      const auto match = handle->match;
+      const auto sel_prefix = prefix;
+      const auto sel_mask = mask;
+      const auto sel_shift = shift;
+      const auto sel_digit = (1u << width) - 1u;
+      prefix |= match.bin << sel_shift;
+      mask |= sel_digit << sel_shift;
+      remain -= match.above_count;
+      cand_count = match.equal_count;
+
+      if (cand_count <= kMaxNumTie || sel_shift == 0 || remain == 0) {
+        if (tx == 0) smem->count_eq = 0;
+        __syncthreads();
+        for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
+          if (val >= v_lo && val < v_hi) {
+            const auto key = extract_exact_bin(val);
+            if ((key & sel_mask) != sel_prefix) return;
+            const auto digit = (key >> sel_shift) & sel_digit;
+            if (digit > match.bin) {
+              const auto pos = atomicAdd(&smem->count_gt, 1);
+              if (pos < topk) problem.emit(pos, idx);
+            } else if (digit == match.bin) {
+              const auto slot = atomicAdd(&smem->count_eq, 1);
+              if (slot < kMaxNumTie) smem->tie.values[slot] = {val, idx};
+            }
+          }
+        });
+        __syncthreads();
+        break;
+      }
+
+      width = min(sel_shift, kRefineBits);
+      shift = sel_shift - width;
+      clear_hist();
+      for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
+        if (val >= v_lo && val < v_hi) {
+          const auto key = extract_exact_bin(val);
+          if ((key & sel_mask) != sel_prefix) return;
+          const auto digit = (key >> sel_shift) & sel_digit;
+          if (digit > match.bin) {
+            const auto pos = atomicAdd(&smem->count_gt, 1);
+            if (pos < topk) problem.emit(pos, idx);
+          } else if (digit == match.bin) {
+            atomicAdd(&hist[(key >> shift) & ((1u << width) - 1u)], 1);
+          }
+        }
+      });
+      __syncthreads();
+    }
+
+    const auto count_gt = smem->count_gt;
+    const auto tie_count = min(smem->count_eq, kMaxNumTie);
+    const auto remain_topk = count_gt < topk ? topk - count_gt : 0;
+    handle_tie(smem->tie.values, problem, count_gt, tie_count, remain_topk, handle);
   }
 };
 
@@ -612,6 +752,9 @@ struct TopKRegister : TopKRadixBase<12> {
     __syncthreads();
     const auto above_count = smem->count_gt;
     const auto equal_count = smem->count_eq;
+    if (equal_count > kMaxNumTie) [[unlikely]] {
+      return refine_and_handle_tie(problem, smem, v_lo, v_hi, equal_count);
+    }
     const auto remain_topk = above_count < topk ? topk - above_count : 0;
     const auto tie_count = min(equal_count, kMaxNumTie);
     handle_tie(smem->tie.values, problem, above_count, tie_count, remain_topk, &smem->tie.handle);
@@ -684,6 +827,9 @@ struct TopKStreaming : TopKRegister<2> {
     __syncthreads();
     const auto above_count = smem->count_gt;
     const auto equal_count = smem->count_eq;
+    if (equal_count > kMaxNumTie) [[unlikely]] {
+      return refine_and_handle_tie(problem, smem, v_lo, v_hi, equal_count);
+    }
     const auto remain_topk = above_count < topk ? topk - above_count : 0;
     const auto tie_count = min(equal_count, kMaxNumTie);
     handle_tie(smem->tie.values, problem, above_count, tie_count, remain_topk, &smem->tie.handle);
@@ -693,6 +839,9 @@ struct TopKStreaming : TopKRegister<2> {
 // ---------------------------------------------------------------------------
 // Cluster path: very long seq_len, small batch. `kClusterSize` blocks cooperate
 // on one batch element via distributed shared memory (one cluster per element).
+// This implementation still truncates an overflowing threshold bin.  Exact
+// service dispatch therefore routes all shapes through register/streaming until
+// a cluster-wide refinement (histogram plus emit counters) is implemented.
 // ---------------------------------------------------------------------------
 
 template <uint32_t kClusterSize_>

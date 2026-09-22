@@ -428,7 +428,11 @@ struct TopKKernel {
         .cluster_floor = (batch_size <= kSmallBatchLowFloor) ? kClusterFloorSmall : kClusterFloor,
     };
 
-    const bool use_cluster = (max_seq_len > params.cluster_floor) && (batch_size <= kClusterMaxBatch);
+    // TopKCluster's threshold candidates are distributed across blocks and its
+    // current gather truncates overflow at kMaxNumTie.  Prefer the exact
+    // single-block streaming path for every shape until cluster-wide exact-key
+    // refinement exists.  This is deterministic before CUDA Graph capture.
+    const bool use_cluster = false;
     constexpr bool kUsePDL = true;
     if (use_cluster) {
       if (batch_size <= kNumPersistentClusters) {
