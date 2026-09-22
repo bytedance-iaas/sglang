@@ -5,7 +5,7 @@ import socket
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import pd_disaggregation_hook
@@ -1734,20 +1734,37 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
         reloaded = self._reload_server_args_with_env(enabled=True)
         self.assertIn("token_oracle", reloaded.SAMPLING_BACKEND_CHOICES)
 
-        parsed = reloaded.prepare_server_args(
-            [
-                "--model-path",
-                DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
-                "--sampling-backend",
-                "token_oracle",
-                # Explicit device so ServerArgs.__post_init__ does not call
-                # get_device() (fails on CPU-only CI runners) and does not run
-                # _handle_cpu_backends (which would override sampling_backend
-                # to "pytorch", masking what we want to verify).
-                "--device",
-                "cuda",
-            ]
+        model_config = MagicMock()
+        model_config.hf_config = SimpleNamespace(
+            architectures=["Qwen2ForCausalLM"],
+            model_type="qwen2",
+            dual_chunk_attention_config=None,
         )
+        model_config.is_hybrid_swa = False
+        model_config.is_multimodal = False
+        model_config.is_multimodal_piecewise_cuda_graph_supported = False
+        model_config.is_multimodal_breakable_cuda_graph_supported = False
+        model_config.is_piecewise_cuda_graph_disabled_model = False
+        model_config.nvfp4_moe_meta = None
+        with patch.object(
+            reloaded.ServerArgs,
+            "get_model_config",
+            return_value=model_config,
+        ):
+            parsed = reloaded.prepare_server_args(
+                [
+                    "--model-path",
+                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                    "--sampling-backend",
+                    "token_oracle",
+                    # Explicit device so ServerArgs.__post_init__ does not call
+                    # get_device() (fails on CPU-only CI runners) and does not run
+                    # _handle_cpu_backends (which would override sampling_backend
+                    # to "pytorch", masking what we want to verify).
+                    "--device",
+                    "cuda",
+                ]
+            )
         self.assertEqual(parsed.sampling_backend, "token_oracle")
 
 
