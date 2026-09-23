@@ -74,7 +74,7 @@ concurrency:
   # Manual recovery and explicitly named builds must not wait behind a
   # scheduled build. Keep scheduled publishers serialized to avoid cancelling
   # between OCI/zstd/nydus tag updates and leaving mixed rolling aliases.
-  group: release-docker-dev-${{ github.event_name == 'schedule' && format('scheduled-{0}', github.ref) || inputs.private_debug_verify_image != '' && format('verify-{0}', github.run_id) || inputs.tag != '' && format('tag-{0}', inputs.tag) || inputs.pr_number != '' && format('pr-{0}', inputs.pr_number) || format('manual-{0}', github.run_id) }}
+  group: release-docker-dev-${{ github.event_name == 'schedule' && format('scheduled-{0}', github.ref) || inputs.private_debug_verify_image != '' && format('verify-{0}', github.run_id) || inputs.tag != '' && format('tag-{0}', inputs.tag) || inputs.pr_number != '' && format('pr-{0}', inputs.pr_number) || format('manual-{0}', github.ref) }}
   cancel-in-progress: false
 
 jobs:
