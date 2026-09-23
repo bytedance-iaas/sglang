@@ -112,6 +112,11 @@ on:
         required: false
         type: boolean
         default: false
+      concurrency_group:
+        description: "Concurrency group for builds that publish the same tag family"
+        required: false
+        type: string
+        default: "bytedance-x64-docker-build-node"
 
 jobs:
   build-and-publish:
@@ -119,7 +124,7 @@ jobs:
     environment: ${{ inputs.use_environment || null }}
     runs-on: x64-docker-build-node
     concurrency:
-      group: bytedance-x64-docker-build-node
+      group: ${{ inputs.concurrency_group }}
       cancel-in-progress: false
     env:
       CUDA_KEY: ${{ inputs.cuda_key }}

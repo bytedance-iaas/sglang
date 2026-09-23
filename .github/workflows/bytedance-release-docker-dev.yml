@@ -71,9 +71,10 @@ on:
     - cron: "0 0 * * *"
 
 concurrency:
-  group: release-docker-dev-${{ inputs.private_debug_verify_image != '' && format('verify-{0}', github.run_id) || inputs.tag || inputs.pr_number || 'nightly' }}
-  # Kernel/image cold builds can take over an hour. Queue duplicate triggers
-  # instead of discarding all completed download and compile work.
+  # Manual recovery and explicitly named builds must not wait behind a
+  # scheduled build. Keep scheduled publishers serialized to avoid cancelling
+  # between OCI/zstd/nydus tag updates and leaving mixed rolling aliases.
+  group: release-docker-dev-${{ github.event_name == 'schedule' && format('scheduled-{0}', github.ref) || inputs.private_debug_verify_image != '' && format('verify-{0}', github.run_id) || inputs.tag != '' && format('tag-{0}', inputs.tag) || inputs.pr_number != '' && format('pr-{0}', inputs.pr_number) || format('manual-{0}', github.run_id) }}
   cancel-in-progress: false
 
 jobs:
@@ -310,6 +311,9 @@ jobs:
       checkout_ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
       cuda_version: ${{ matrix.cuda_version }}
       artifact_name: sgl-kernel-${{ matrix.arch_tag }}
+      # Builders and workspaces are run-scoped, and the repository has several
+      # eligible runners. Do not serialize unrelated kernel builds globally.
+      concurrency_group: ${{ format('bytedance-kernel-build-{0}', github.run_id) }}
 
   build-dev:
     needs: [build-dev-kernel-wheel]
@@ -337,6 +341,9 @@ jobs:
       tag_mode: ${{ github.event_name == 'schedule' && 'nightly' || 'manual' }}
       tag_value: ${{ inputs.tag }}
       use_environment: prod
+      # Serialize only builds that can publish the same tag family. Distinct
+      # explicit tags/PRs can use different build runners concurrently.
+      concurrency_group: ${{ github.event_name == 'schedule' && 'bytedance-docker-publish-dev-nightly' || inputs.tag != '' && format('bytedance-docker-publish-tag-{0}', inputs.tag) || inputs.pr_number != '' && format('bytedance-docker-publish-pr-{0}', inputs.pr_number) || 'bytedance-docker-publish-dev-manual' }}
       artifact_name: ${{ (inputs.kernel_artifact_run_id != '' || github.event_name == 'schedule' || inputs.compile_kernel) && matrix.artifact_name || '' }}
       artifact_run_id: ${{ inputs.kernel_artifact_run_id }}
       image_formats: ${{ github.event_name == 'schedule' && 'oci,zstd,nydus' || inputs.image_formats }}
