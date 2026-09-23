@@ -2396,6 +2396,14 @@ class ServerArgs:
         ),
         NS("exec.moe"),
     ] = "none"
+    megamoe_transport: A[
+        Literal["auto", "nvlink", "rdma"],
+        Arg(
+            help="IAAS SM90 MegaMoE transport. Auto selects from the EP group topology at model initialization.",
+            choices=["auto", "nvlink", "rdma"],
+        ),
+        NS("exec.moe"),
+    ] = "auto"
     enable_w4a4_mxfp4_megamoe: A[
         bool,
         "Enable the W4A4 MXFP4 MegaMoE path with DeepGEMM's "

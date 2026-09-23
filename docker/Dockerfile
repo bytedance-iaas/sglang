@@ -18,6 +18,7 @@ ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
 ARG INSTALL_LOCAL_SGL_KERNEL_WHEEL=0
 ARG INSTALL_AI_DYNAMO=1
+ARG INSTALL_IAAS_KERNELS=0
 ARG FLASHINFER_VERSION=0.6.18
 ARG MOONCAKE_VERSION=0.3.13
 ARG MSCCLPP_VERSION=sglang-v0.9.1
@@ -361,6 +362,36 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     fi
 
 ########################################################
+# Optional internal SM90 wheel (needs torch_deps)
+########################################################
+FROM torch_deps AS iaas_kernels_builder
+
+ARG INSTALL_IAAS_KERNELS
+ARG TARGETARCH
+ARG CUDA_VERSION
+
+COPY docker/iaas-kernels.lock.json /build/iaas-kernels.lock.json
+COPY scripts/ci/build_iaas_kernels_wheel.py scripts/ci/check_iaas_kernels_image.py /build/
+# Build only the host extension here; SM90 kernels are JIT compiled at runtime.
+# The private repository token is a BuildKit secret, never a build argument.
+RUN --mount=type=secret,id=iaas_kernels_token \
+    --mount=type=cache,target=/root/.cache/pip \
+    mkdir -p /wheels && \
+    if [ "$INSTALL_IAAS_KERNELS" = "1" ]; then \
+        test "$TARGETARCH" = "amd64" && test "$CUDA_VERSION" = "13.0.3" && \
+        apt-get update && apt-get install -y --no-install-recommends libdw-dev libelf-dev ninja-build && \
+        rm -rf /var/lib/apt/lists/* && \
+        python3 -m pip install 'build==1.3.0' && \
+        python3 /build/build_iaas_kernels_wheel.py --lock /build/iaas-kernels.lock.json; \
+    else \
+        test "$INSTALL_IAAS_KERNELS" = "0"; \
+    fi
+
+# Optional export target for archiving the exact wheel and its provenance.
+FROM scratch AS iaas_kernels_wheel
+COPY --from=iaas_kernels_builder /wheels/ /
+
+########################################################
 # PARALLEL STAGE 3: FlashInfer Cache (needs torch_deps)
 ########################################################
 FROM torch_deps AS flashinfer_cache
@@ -499,6 +530,7 @@ ARG MSCCLPP_VERSION
 ARG EIC_SDK_VERSION
 ARG EIC_SDK_RELEASE_ROOT
 ARG INSTALL_AI_DYNAMO
+ARG INSTALL_IAAS_KERNELS
 # Renamed from NCCL_VERSION: the nvidia/cuda base image sets ENV NCCL_VERSION
 # (Debian apt format, e.g. 2.28.3-1), which shadows a same-named ARG inside RUN.
 ARG SGL_NCCL_VERSION
@@ -515,6 +547,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     if ls /tmp/wheels/hpc-ops/*.whl >/dev/null 2>&1; then \
         pip install --no-deps /tmp/wheels/hpc-ops/*.whl; \
     fi && rm -rf /tmp/wheels/hpc-ops
+
+COPY --from=iaas_kernels_builder /wheels /tmp/wheels/iaas-kernels
+RUN mkdir -p /opt/sglang/share/iaas-kernels && \
+    if [ "$INSTALL_IAAS_KERNELS" = "1" ]; then \
+        apt-get update && apt-get install -y --no-install-recommends libdw1t64 libelf1t64 && \
+        rm -rf /var/lib/apt/lists/* && \
+        python3 -m pip install --force-reinstall --no-deps /tmp/wheels/iaas-kernels/*.whl && \
+        cp /tmp/wheels/iaas-kernels/*.json /opt/sglang/share/iaas-kernels/; \
+    fi && rm -rf /tmp/wheels/iaas-kernels
 
 # Copy flashinfer cubin (always) and jit-cache (if installed) packages
 COPY --from=flashinfer_cache /flashinfer_jit_output/ /opt/sglang/lib/python3.12/site-packages/
@@ -787,6 +828,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
 
+# Check the actual installed package after all pip operations. Plugin load errors
+# are logged and swallowed by the loader, so explicitly assert registration.
+RUN if [ "$INSTALL_IAAS_KERNELS" = "1" ]; then \
+        test "$BRANCH_TYPE" = "local" && \
+        python3 scripts/ci/check_iaas_kernels_image.py; \
+    fi
+
 # Keep build provenance at the end so metadata changes do not invalidate build layers.
 ARG SGLANG_BUILD_COMMIT=unknown
 ARG SGLANG_BUILD_TREE=unknown
@@ -832,6 +880,7 @@ FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS runtime
 
 ARG CUDA_VERSION
 ARG TARGETARCH
+ARG INSTALL_IAAS_KERNELS=0
 ARG GDRCOPY_VERSION=2.5.1
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -895,6 +944,12 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
+# Native host-library dependencies for the optional SM90 wheel.
+RUN if [ "$INSTALL_IAAS_KERNELS" = "1" ]; then \
+        apt-get update && apt-get install -y --no-install-recommends libdw1t64 libelf1t64 && \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
+
 # Install Onion model/data tooling only for private-delivery builds.
 ARG INSTALL_ONION=0
 ARG BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=http://mirrors.ivolces.com/extra-tools/ubuntu
@@ -940,6 +995,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
 
 # Copy Python site-packages from framework (already cleaned of __pycache__/tests/pyc files)
 COPY --from=framework_final /opt/sglang/lib/python3.12/site-packages /opt/sglang/lib/python3.12/site-packages
+COPY --from=framework_final /opt/sglang/share/iaas-kernels /opt/sglang/share/iaas-kernels
 
 # Copy SGLang workspace
 COPY --from=framework_final /sgl-workspace /sgl-workspace
@@ -966,6 +1022,10 @@ COPY --from=framework_final /usr/src/gdrdrv-2.5.1 /usr/src/gdrdrv-2.5.1
 RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so
 
 WORKDIR /sgl-workspace/sglang
+
+RUN if [ "$INSTALL_IAAS_KERNELS" = "1" ]; then \
+        python3 scripts/ci/check_iaas_kernels_image.py; \
+    fi
 
 # Keep build provenance at the end so metadata changes do not invalidate build layers.
 ARG SGLANG_BUILD_COMMIT=unknown

@@ -107,6 +107,12 @@ on:
         type: boolean
         default: true
 
+      install_iaas_kernels:
+        description: "Preinstall the pinned SM90 NVLink wheel (amd64/cu130, local source only)"
+        required: false
+        type: boolean
+        default: false
+
 jobs:
   build-and-publish:
     if: github.repository == 'bytedance-iaas/sglang'
@@ -145,6 +151,31 @@ jobs:
           ref: ${{ inputs.checkout_ref || github.ref }}
           fetch-depth: 0
           fetch-tags: true
+          # BRANCH_TYPE=local copies Git metadata into the image for versioning.
+          persist-credentials: false
+
+      - name: Configure iaas-kernels NVLink image
+        env:
+          INSTALL_IAAS_KERNELS: ${{ inputs.install_iaas_kernels }}
+          IAAS_KERNELS_READ_TOKEN: ${{ secrets.IAAS_KERNELS_READ_TOKEN }}
+          CUDA_VERSION: ${{ inputs.cuda_version }}
+          DOCKER_TARGET: ${{ inputs.docker_target }}
+        run: |
+          set -euo pipefail
+          : > /tmp/iaas-kernels.args
+          if [ "$INSTALL_IAAS_KERNELS" = "true" ]; then
+            test "$CUDA_VERSION" = "13.0.3"
+            case "$DOCKER_TARGET" in framework_final|runtime) ;; *) exit 1 ;; esac
+            if [ -z "$IAAS_KERNELS_READ_TOKEN" ]; then
+              echo "::error::IAAS_KERNELS_READ_TOKEN needs read access to bytedance-iaas/iaas-kernels"
+              exit 1
+            fi
+            printf '%s\n' --build-arg INSTALL_IAAS_KERNELS=1 \
+              --build-arg BRANCH_TYPE=local \
+              --secret id=iaas_kernels_token,env=IAAS_KERNELS_READ_TOKEN \
+              > /tmp/iaas-kernels.args
+            python3 -m unittest discover -s scripts/ci -p test_iaas_kernels_image.py -v
+          fi
 
       - name: Resolve Volcengine publish target
         run: |
@@ -313,6 +344,7 @@ jobs:
       - name: Build and push AMD64 image
         id: build
         env:
+          IAAS_KERNELS_READ_TOKEN: ${{ secrets.IAAS_KERNELS_READ_TOKEN }}
           IMAGE_TAGS: ${{ steps.image-tag.outputs.image-tags }}
         run: |
           set -euo pipefail
@@ -321,6 +353,7 @@ jobs:
             VERSION_ARG="--build-arg SGL_VERSION=${SGL_VERSION}"
           fi
           mapfile -t METADATA_ARGS < /tmp/docker-metadata.args
+          mapfile -t IAAS_ARGS < /tmp/iaas-kernels.args
 
           # When a zstd re-export will follow, export a full (mode=max) registry
           # build cache so the zstd step can reuse these freshly built layers
@@ -351,6 +384,7 @@ jobs:
             "${METADATA_ARGS[@]}" \
             ${VERSION_ARG} \
             ${{ inputs.extra_build_args }} \
+            "${IAAS_ARGS[@]}" \
             "${CACHE_ARGS[@]}" \
             --metadata-file /tmp/metadata.json \
             .
@@ -358,6 +392,16 @@ jobs:
           DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata.json'))['containerimage.digest'])")
           echo "Pushed digest: ${DIGEST}"
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify iaas-kernels candidate
+        if: ${{ inputs.install_iaas_kernels }}
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint python3 "${IMAGE_REPO}@${IMAGE_DIGEST}" \
+            /sgl-workspace/sglang/scripts/ci/check_iaas_kernels_image.py \
+            | tee /tmp/iaas-kernels-smoke.json
 
       - name: Create Volcengine image tag
         env:
@@ -434,6 +478,8 @@ jobs:
       - name: Build and push AMD64 zstd image
         id: build-zstd
         if: ${{ contains(inputs.image_formats, 'zstd') }}
+        env:
+          IAAS_KERNELS_READ_TOKEN: ${{ secrets.IAAS_KERNELS_READ_TOKEN }}
         run: |
           set -euo pipefail
           VERSION_ARG=""
@@ -441,6 +487,7 @@ jobs:
             VERSION_ARG="--build-arg SGL_VERSION=${SGL_VERSION}"
           fi
           mapfile -t METADATA_ARGS < /tmp/docker-metadata.args
+          mapfile -t IAAS_ARGS < /tmp/iaas-kernels.args
 
           CACHE_FROM_ARGS=()
           if [ -n "${{ steps.build.outputs.cache-ref }}" ]; then
@@ -457,9 +504,11 @@ jobs:
             --build-arg BUILD_TYPE=all \
             --build-arg GRACE_BLACKWELL=0 \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            --build-arg INSTALL_ONION=1 \
             "${METADATA_ARGS[@]}" \
             ${VERSION_ARG} \
             ${{ inputs.extra_build_args }} \
+            "${IAAS_ARGS[@]}" \
             "${CACHE_FROM_ARGS[@]}" \
             --metadata-file /tmp/metadata-zstd.json \
             .
@@ -467,6 +516,16 @@ jobs:
           DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-zstd.json'))['containerimage.digest'])")
           echo "Pushed zstd digest: ${DIGEST}"
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify iaas-kernels candidate-zstd
+        if: ${{ inputs.install_iaas_kernels && contains(inputs.image_formats, 'zstd') }}
+        env:
+          IMAGE_DIGEST: ${{ steps.build-zstd.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint python3 "${IMAGE_REPO}@${IMAGE_DIGEST}" \
+            /sgl-workspace/sglang/scripts/ci/check_iaas_kernels_image.py \
+            | tee /tmp/iaas-kernels-smoke-zstd.json
 
       - name: Create Volcengine zstd image tag
         if: ${{ contains(inputs.image_formats, 'zstd') }}
@@ -665,3 +724,14 @@ jobs:
         run: |
           docker image prune -af || true
           df -h /
+
+      - name: Upload iaas-kernels provenance and smoke results
+        if: ${{ always() && inputs.install_iaas_kernels }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: iaas-kernels-${{ inputs.docker_target }}-${{ inputs.cuda_key }}-${{ inputs.variant_suffix || 'base' }}
+          path: |
+            /tmp/iaas-kernels-smoke*.json
+            /tmp/metadata.json
+            /tmp/metadata-zstd.json
+          if-no-files-found: warn
