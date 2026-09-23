@@ -34,12 +34,7 @@ from sglang.srt.speculative.ragged_verify import (
     build_ragged_target_verify_geometry,
     resolve_ragged_verify_layout,
 )
-from sglang.srt.utils import (
-    is_gfx95_supported,
-    is_hip,
-    is_npu,
-    is_sm90_supported,
-)
+from sglang.srt.utils import is_npu
 
 if is_npu():
     from sglang.kernels.ops.attention.minimax_sparse.common.index import (
@@ -1656,7 +1651,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 use_msa=self.use_msa,
                 use_sgl_native_q8kv8_step1=use_native_step1,
                 use_sgl_native_q8kv8_step3=use_native_step3,
-                page_size=(self.page_size if (use_native_step1 or use_native_step3) else None),
+                page_size=(
+                    self.page_size if (use_native_step1 or use_native_step3) else None
+                ),
                 seqlens_cpu=extend_seq_lens_cpu,
                 cu_seqblocks_q=cu_seqblocks_q,
                 max_seqblock_q=max_seqblock_q,
