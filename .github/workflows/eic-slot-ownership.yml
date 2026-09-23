@@ -8,6 +8,7 @@ on:
       - "python/sglang/srt/mem_cache/hiradix_cache.py"
       - "python/sglang/srt/mem_cache/radix_cache.py"
       - "test/registered/unit/mem_cache/test_eic_slot_ownership.py"
+      - "test/registered/unit/mem_cache/test_eic_pp_protocol.py"
       - ".github/workflows/eic-slot-ownership.yml"
   workflow_dispatch:
 
@@ -34,3 +35,8 @@ jobs:
         env:
           PYTHONPATH: python
         run: python test/registered/unit/mem_cache/test_eic_slot_ownership.py -v
+
+      - name: PP load-back protocol, all interleavings
+        env:
+          PYTHONPATH: python
+        run: python test/registered/unit/mem_cache/test_eic_pp_protocol.py -v
