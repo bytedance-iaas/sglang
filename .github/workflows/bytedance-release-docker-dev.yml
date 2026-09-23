@@ -13,7 +13,7 @@ jobs:
     runs-on: x64-docker-build-node
     timeout-minutes: 240
     env:
-      SOURCE_COMMIT: 99fee4258c36139ac599c736c1c7200c1e319d3f
+      SOURCE_COMMIT: 7595f52c35a04efcc2d3ed84117cb82d0cdad718
       SOURCE_DIR: validation-source-${{ github.run_id }}-${{ github.run_attempt }}
       RESULT_DIR: /tmp/iaas-image-${{ github.run_id }}-${{ github.run_attempt }}
       IMAGE_BASE: iaas-image-validation:${{ github.run_id }}-${{ github.run_attempt }}
