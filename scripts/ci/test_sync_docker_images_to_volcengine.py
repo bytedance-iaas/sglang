@@ -6,8 +6,8 @@ import io
 import sys
 import unittest
 from pathlib import Path
-from urllib.error import HTTPError
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -88,13 +88,10 @@ class SyncDockerImagesToVolcengineTest(unittest.TestCase):
 
         mock_fetch_page.side_effect = page
 
-        tags = sync_module.fetch_docker_hub_tags(
-            "docker.io/lmsysorg/sglang", pages=10
-        )
+        tags = sync_module.fetch_docker_hub_tags("docker.io/lmsysorg/sglang", pages=10)
 
         self.assertEqual(len(tags), 10)
         self.assertEqual(mock_fetch_page.call_count, 10)
-
 
     def test_builds_default_sglang_and_vllm_latest_plan(self) -> None:
         plan = build_sync_plan(
