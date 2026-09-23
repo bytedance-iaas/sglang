@@ -1,9 +1,0 @@
-name = "eic_spec"
-defaultTargets = ["EicSpec", "eic_replay"]
-
-[[lean_lib]]
-name = "EicSpec"
-
-[[lean_exe]]
-name = "eic_replay"
-root = "Main"

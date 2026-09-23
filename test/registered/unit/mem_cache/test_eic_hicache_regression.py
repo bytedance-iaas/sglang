@@ -688,7 +688,7 @@ class TestEICHiCacheRegression(unittest.TestCase):
         self.assertEqual(len(free_ids) + c.evictable_size_ + c.protected_size_, total)
 
     def test_finished_insert_through_inflight_load_keeps_pool_invariant(self):
-        # Found by test_eic_lean_spec. Req A (holding head H) finished while B's
+        # Found by test_eic_slot_ownership. Req A (holding head H) finished while B's
         # load of the tail T was in flight, hanging A's KV under T. T's load
         # failed, leaving that KV under an evicted gap; C's insert revived T but
         # prefix_len skipped it, so kv[protected:prefix_len] freed T's new slots.
@@ -714,7 +714,7 @@ class TestEICHiCacheRegression(unittest.TestCase):
         self._assert_pool_invariant(c, free_ids, total)
 
     def test_match_ends_at_resident_node_above_failed_load_tail(self):
-        # Found by test_eic_lean_spec. A failed load leaves its tail evicted with
+        # Found by test_eic_slot_ownership. A failed load leaves its tail evicted with
         # no host KV; an insert revives the node above it without a backup. The
         # host-hit walk climbed past that resident node, so last_device_node was
         # shallower than device_indices and the req's lock left slots evictable.

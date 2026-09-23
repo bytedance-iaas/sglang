@@ -1,20 +1,15 @@
-"""Differential test: EICPagedHiRadixCache against the Lean spec in lean/eic.
+"""Slot-ownership property test for EICPagedHiRadixCache.
 
 Random admit / finish / backup / evict / load / settle sequences drive the real
-cache over a mocked device allocator. Each step records the per-slot ownership
-before and after, the spec transitions the step claims to perform, and the
-cache's avail/evictable/protected counters; `eic_replay` (lean/eic/Main.lean)
-checks every step against EicSpec.lean. Needs `lake` on PATH or EIC_REPLAY
-pointing at a built `eic_replay`; skipped otherwise.
+cache over a mocked device allocator. Every device slot is free ("f"), loading
+("l", load-back DMA not yet acked) or cached with a lock count (int). Each step
+declares the per-slot transitions it performs; the check applies them to the
+slots before the step and requires the cache to land on exactly the result, with
+its avail / evictable / protected counters equal to the slot counts.
 """
 
-import os
 import random
-import shutil
-import subprocess
-import tempfile
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -27,19 +22,57 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=30, suite="stage-a-test-cpu")
 
-LEAN_DIR = Path(__file__).resolve().parents[4] / "lean" / "eic"
 TOTAL, PAGE = 64, 4
 # Two families sharing an 8-token head, so requests hit, split and diverge.
 BASES = [list(range(32)), list(range(8)) + list(range(100, 124))]
 
+# Legal per-slot moves; None is a move the cache must never make. The comments
+# name the PR whose bug the refusal rules out.
+TRANSITIONS = {
+    # adopt a slot: never one still loading (#768)
+    "lock": lambda s: s + 1 if type(s) is int else None,
+    # release a hold: never on a slot nobody holds (#748)
+    "unlock": lambda s: s - 1 if type(s) is int and s > 0 else None,
+    "startLoad": lambda s: "l" if s == "f" else None,
+    "ackOk": lambda s: 0 if s == "l" else None,
+    # a failed load frees only its own loading slots (#768)
+    "ackFail": lambda s: "f" if s == "l" else None,
+    "insert": lambda s: 0 if s == "f" else None,
+    # eviction never takes a held or loading slot
+    "evict": lambda s: "f" if s == 0 else None,
+}
 
-def replay_binary():
-    if os.environ.get("EIC_REPLAY"):
-        return os.environ["EIC_REPLAY"]
-    if shutil.which("lake") is None:
-        return None
-    subprocess.run(["lake", "build"], cwd=LEAN_DIR, check=True, capture_output=True)
-    return str(LEAN_DIR / ".lake" / "build" / "bin" / "eic_replay")
+
+class Violation(AssertionError):
+    pass
+
+
+def check_step(label, prims, pre, post, counters):
+    if "x" in pre or "x" in post:
+        side = "before" if "x" in pre else "after"
+        slots = [i for i, s in enumerate(pre if side == "before" else post) if s == "x"]
+        raise Violation(f"{label}: slots {slots} lost or double-owned {side} the step")
+    cur = list(pre)
+    for name, slots in prims:
+        for i in slots:
+            nxt = TRANSITIONS[name](cur[i])
+            if nxt is None:
+                raise Violation(
+                    f"{label}: illegal {name} on slot {i} in state {cur[i]}"
+                )
+            cur[i] = nxt
+    if cur != post:
+        diff = {i: (a, b) for i, (a, b) in enumerate(zip(cur, post)) if a != b}
+        raise Violation(f"{label}: slot (expected, actual) {diff}")
+    expect = (
+        sum(s == "f" for s in post),
+        sum(s == 0 for s in post),
+        sum(s == "l" or (type(s) is int and s > 0) for s in post),
+    )
+    if counters != expect:
+        raise Violation(
+            f"{label}: avail/evictable/protected {counters}, slots {expect}"
+        )
 
 
 class Driver:
@@ -48,7 +81,7 @@ class Driver:
         self.adopt_inflight = adopt_inflight  # re-opens the #768 window
         self.free_ids = set(range(TOTAL))
         self.reqs = []
-        self.lines = []
+        self.steps = 0
         self.c = self._make_cache()
 
     def _alloc(self, n):
@@ -113,15 +146,14 @@ class Driver:
         loading = self._loading()
         for n in self._nodes():
             if n.value is not None:
-                s = "l" if n.id in loading else f"c{n.lock_ref}"
+                s = "l" if n.id in loading else n.lock_ref
                 for i in n.value.tolist():
                     owner[i].append(s)
-        # A lost or double-owned slot has no spec state: "x" fails the replay.
-        return " ".join(o[0] if len(o) == 1 else "x" for o in owner)
+        return [o[0] if len(o) == 1 else "x" for o in owner]
 
     def counters(self):
         c = self.c
-        return f"{len(self.free_ids)} {c.evictable_size_} {c.protected_size_}"
+        return (len(self.free_ids), c.evictable_size_, c.protected_size_)
 
     def _path_slots(self, node):
         out = []
@@ -140,8 +172,10 @@ class Driver:
         return [i for n in reversed(nodes) for i in n.value.tolist()]
 
     def record(self, label, prims, pre):
-        p = ";".join(f"{k}:{','.join(map(str, v))}" for k, v in prims if v) or "-"
-        self.lines.append(f"{label}\t{p}\t{pre}\t{self.snapshot()}\t{self.counters()}")
+        self.steps += 1
+        check_step(
+            f"step {self.steps} [{label}]", prims, pre, self.snapshot(), self.counters()
+        )
 
     # ---- operations -------------------------------------------------------
 
@@ -258,38 +292,23 @@ class Driver:
         ops = [self.admit, self.finish, self.backup, self.evict, self.load, self.settle]
         for _ in range(steps):
             self.rng.choice(ops)()
-        return self.lines
 
 
-class TestEICLeanSpec(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.replay = replay_binary()
-        if cls.replay is None:
-            raise unittest.SkipTest("lake not on PATH and EIC_REPLAY unset")
-
-    def _replay(self, lines):
-        with tempfile.NamedTemporaryFile("w", suffix=".trace", delete=False) as f:
-            f.write("\n".join(lines) + "\n")
-        try:
-            return subprocess.run([self.replay, f.name], capture_output=True, text=True)
-        finally:
-            os.unlink(f.name)
-
-    def test_random_traces_match_spec(self):
-        lines = []
+class TestEICSlotOwnership(unittest.TestCase):
+    def test_random_sequences_keep_slot_ownership(self):
         for seed in range(200):
-            lines += Driver(seed).run(300)
-        r = self._replay(lines)
-        self.assertEqual(r.returncode, 0, r.stderr)
+            with self.subTest(seed=seed):
+                Driver(seed).run(300)
 
     def test_adopting_inflight_load_is_caught(self):
         # Without the prefix_loading defer (#768) some seed adopts a loading slot.
-        caught = [
-            s
-            for s in range(200)
-            if self._replay(Driver(s, adopt_inflight=True).run(300)).returncode
-        ]
+        caught = 0
+        for seed in range(200):
+            try:
+                Driver(seed, adopt_inflight=True).run(300)
+            except Violation as e:
+                self.assertIn("illegal lock", str(e))
+                caught += 1
         self.assertTrue(caught)
 
     def test_unlocking_unheld_node_is_caught(self):
@@ -299,9 +318,8 @@ class TestEICLeanSpec(unittest.TestCase):
         node = next(iter(d.c.root_node.children.values()))
         pre = d.snapshot()
         d.c.dec_lock_ref(node)
-        d.record("bad-unlock", [("unlock", node.value.tolist())], pre)
-        r = self._replay(d.lines)
-        self.assertEqual(r.returncode, 1)
+        with self.assertRaises(Violation):
+            d.record("bad-unlock", [("unlock", node.value.tolist())], pre)
 
 
 if __name__ == "__main__":

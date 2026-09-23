@@ -1,32 +1,21 @@
-name: EIC Lean spec
+name: EIC slot ownership
 
 on:
   pull_request:
     branches: [ep_main]
     paths:
-      - "lean/eic/**"
       - "python/sglang/srt/mem_cache/eic_*.py"
       - "python/sglang/srt/mem_cache/hiradix_cache.py"
       - "python/sglang/srt/mem_cache/radix_cache.py"
-      - "test/registered/unit/mem_cache/test_eic_lean_spec.py"
-      - ".github/workflows/eic-lean.yml"
+      - "test/registered/unit/mem_cache/test_eic_slot_ownership.py"
+      - ".github/workflows/eic-slot-ownership.yml"
   workflow_dispatch:
 
 jobs:
-  eic-lean:
+  eic-slot-ownership:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install elan
-        run: |
-          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
-            | sh -s -- -y --default-toolchain none
-          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
-
-      - name: Check proofs and build the replayer
-        working-directory: lean/eic
-        run: lake build
 
       - uses: actions/setup-python@v5
         with:
@@ -41,8 +30,7 @@ jobs:
             starlette IPython pydantic aiohttp msgspec pyzmq dill einops \
             compressed_tensors gguf openai partial_json_parser xgrammar sentencepiece
 
-      - name: Differential test against the spec
+      - name: Slot-ownership property test
         env:
           PYTHONPATH: python
-          EIC_REPLAY: lean/eic/.lake/build/bin/eic_replay
-        run: python test/registered/unit/mem_cache/test_eic_lean_spec.py -v
+        run: python test/registered/unit/mem_cache/test_eic_slot_ownership.py -v

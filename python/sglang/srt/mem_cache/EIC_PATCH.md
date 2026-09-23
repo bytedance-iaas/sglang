@@ -41,9 +41,8 @@ Serving benchmark snapshots: `benchmark/hicache/eic_snapshots/`.
 | `mem_cache/eic_chunk_cache.py` | `EICChunkCache` / `EICSWAChunkCache` for `--disable-radix-cache` |
 | `mem_cache/eic_pp_reconcile.py` | Cross-PP load-length reconciler |
 | `mem_cache/eic_stats.py` | Dependency-free per-rank `EIC_STATS` line (#778): write ack/mset/mget/mexist errors, eic_hit%, miss reason counts, RPC p50/p95/p99/max; interval `EIC_STATS_INTERVAL_S` (60s) |
-| `lean/eic/` | Lean 4 spec of device-slot ownership (`EicSpec.lean`, theorems for #741/#748/#768/#799) and the trace replayer `eic_replay` |
-| `test/registered/unit/mem_cache/test_eic_lean_spec.py` | differential test: random cache op sequences replayed against the spec; skipped without `lake` |
-| `.github/workflows/eic-lean.yml` | runs `lake build` and the differential test on PRs touching EIC cache code |
+| `test/registered/unit/mem_cache/test_eic_slot_ownership.py` | property test: random cache op sequences, each step checked against the legal per-slot transitions and the three pool counters |
+| `.github/workflows/eic-slot-ownership.yml` | runs that test on PRs touching EIC cache code (the fork's CPU suite does not run) |
 
 Upstream APIs these subclass or call, the usual source of silent breakage after
 a refresh: `HiCacheController.__init__`, `HiRadixCache`,
