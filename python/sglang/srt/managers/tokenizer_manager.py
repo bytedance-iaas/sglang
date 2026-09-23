@@ -2492,6 +2492,36 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # This is the single write point for first_token_time.
             if state.time_stats.first_token_time == 0.0:
                 state.time_stats.set_first_token_time()
+                if get_observability().enable_request_time_stats_logging:
+                    scheduler_time_stats = (
+                        recv_obj.time_stats[i]
+                        if recv_obj.time_stats is not None
+                        else None
+                    )
+                    event = {
+                        "event": "request_first_token_timeline",
+                        "rid": rid,
+                        "api_receive_ts": convert_time_to_realtime(
+                            state.time_stats.created_time
+                        ),
+                        "tokenize_finish_ts": convert_time_to_realtime(
+                            state.time_stats.tokenize_finish_time
+                        ),
+                        "api_dispatch_start_ts": convert_time_to_realtime(
+                            state.time_stats.api_server_dispatch_time
+                        ),
+                        "api_dispatch_finish_ts": convert_time_to_realtime(
+                            state.time_stats.api_server_dispatch_finish_time
+                        ),
+                        "tokenizer_first_chunk_ts": convert_time_to_realtime(
+                            state.time_stats.first_token_time
+                        ),
+                    }
+                    if scheduler_time_stats is not None:
+                        event.update(
+                            scheduler_time_stats.convert_to_diagnostic_timestamps()
+                        )
+                    logger.info("REQUEST_TIMELINE %s", json.dumps(event, sort_keys=True))
 
             if state.finished:
                 if state.time_stats.trace_ctx.tracing_enable:

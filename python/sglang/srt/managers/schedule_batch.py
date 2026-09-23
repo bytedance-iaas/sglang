@@ -5,6 +5,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
+    get_observability,
     get_parallel,
     get_schedule,
     get_serving,
@@ -1262,6 +1263,10 @@ class Req(ReqDllmMixin):
         else:
             self.time_stats = SchedulerReqTimeStats(disagg_mode=disagg_mode)
         self.time_stats.set_metrics_collector(metrics_collector)
+        self.time_stats.has_timing_data = (
+            self.time_stats.has_timing_data
+            or get_observability().enable_request_time_stats_logging
+        )
         self.time_stats.set_scheduler_recv_time()
         self.has_log_time_stats: bool = False
 

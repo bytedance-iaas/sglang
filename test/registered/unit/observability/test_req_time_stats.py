@@ -39,6 +39,35 @@ class TestSetstatePreservesUnsetTimeSentinels(CustomTestCase):
         self.assertEqual(hop2.prefill_finished_time, 0.0)
         self.assertAlmostEqual(hop2.wait_queue_entry_time, 123.456 - 9.0)
 
+    def test_diagnostic_timestamps_round_trip_only_when_enabled(self):
+        src = rts.SchedulerReqTimeStats()
+        src.scheduler_recv_time = 101.0
+        src.decode_prealloc_queue_entry_time = 102.0
+        src.bootstrap_done_time = 103.0
+        src.decode_transfer_queue_entry_time = 104.0
+        src.wait_queue_entry_time = 105.0
+        src.forward_entry_time = 106.0
+        src.decode_prebuilt_finish_time = 107.0
+        src.last_decode_finish_time = 108.0
+
+        with mock.patch.object(rts, "global_diff_realtime_monotonic", 1_000.0):
+            disabled_state = src.__getstate__()
+            self.assertEqual(disabled_state, {})
+
+            src.has_timing_data = True
+            blob = pickle.dumps(src)
+
+        with mock.patch.object(rts, "global_diff_realtime_monotonic", 1_005.0):
+            restored = pickle.loads(blob)
+
+        self.assertAlmostEqual(restored.scheduler_recv_time, 96.0)
+        self.assertAlmostEqual(restored.decode_prebuilt_finish_time, 102.0)
+        self.assertAlmostEqual(restored.last_decode_finish_time, 103.0)
+        with mock.patch.object(rts, "global_diff_realtime_monotonic", 1_005.0):
+            timestamps = restored.convert_to_diagnostic_timestamps()
+        self.assertEqual(timestamps["scheduler_recv_ts"], 1101.0)
+        self.assertEqual(timestamps["last_decode_finish_ts"], 1108.0)
+
 
 if __name__ == "__main__":
     unittest.main()

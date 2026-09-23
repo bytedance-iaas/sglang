@@ -654,6 +654,17 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             "prefill_finished_time": self.prefill_finished_time,
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
+        if self.has_timing_data:
+            state.update(
+                {
+                    "scheduler_recv_time": self.scheduler_recv_time,
+                    "decode_prealloc_queue_entry_time": self.decode_prealloc_queue_entry_time,
+                    "bootstrap_done_time": self.bootstrap_done_time,
+                    "decode_transfer_queue_entry_time": self.decode_transfer_queue_entry_time,
+                    "decode_prebuilt_finish_time": self.decode_prebuilt_finish_time,
+                    "last_decode_finish_time": self.last_decode_finish_time,
+                }
+            )
         return state
 
     def set_scheduler_recv_time(self, ts=None):
@@ -1184,6 +1195,32 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             }
         )
         return meta_data
+
+    def convert_to_diagnostic_timestamps(self) -> Dict[str, float]:
+        """Return stamped scheduler boundaries in one wall-clock domain.
+
+        This is used only by request-time diagnostic logging. Unset timestamps
+        stay absent so a missing lifecycle boundary cannot be mistaken for a
+        near-zero duration after cross-process clock rebasing.
+        """
+
+        fields = (
+            "scheduler_recv_time",
+            "decode_prealloc_queue_entry_time",
+            "bootstrap_done_time",
+            "decode_transfer_queue_entry_time",
+            "wait_queue_entry_time",
+            "forward_entry_time",
+            "decode_prebuilt_finish_time",
+            "last_decode_finish_time",
+        )
+        return {
+            f"{field.removesuffix('_time')}_ts": convert_time_to_realtime(
+                getattr(self, field)
+            )
+            for field in fields
+            if getattr(self, field) > 0.0
+        }
 
     def format_duration(self, duration: float) -> str:
         return f"{duration * 1e3:.2f}ms"
