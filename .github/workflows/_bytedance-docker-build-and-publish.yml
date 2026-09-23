@@ -316,11 +316,15 @@ jobs:
 
       - name: Download local sgl-kernel wheel
         if: ${{ inputs.artifact_name != '' }}
-        timeout-minutes: 20
+        # The Actions blob route has sustained less than 0.1 MiB/s from the
+        # image runners. Keep the transfer bounded, but allow resumed chunks
+        # enough wall time to finish a verified ~372 MiB wheel artifact.
+        timeout-minutes: 100
         env:
           GH_TOKEN: ${{ github.token }}
           KERNEL_ARTIFACT_NAME: ${{ inputs.artifact_name }}
           KERNEL_ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id || github.run_id }}
+          KERNEL_ARTIFACT_HTTPS_PROXY: http://100.68.162.211:3128
         run: |
           python3 -m unittest discover -s scripts/ci -p test_download_kernel_artifact.py
           python3 scripts/ci/download_kernel_artifact.py \
