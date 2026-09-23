@@ -155,6 +155,10 @@ def check_image(manifest_path):
         "deep_gemm is missing or shadowed",
     )
     check_plugin()
+    # Match load_native(): importing tvm_ffi loads its host runtime library.
+    # A bare CDLL otherwise cannot resolve libtvm_ffi.so in site-packages.
+    import tvm_ffi  # noqa: F401
+
     # Resolve host dependencies/symbols, including libdw/libelf, without calling
     # the native init function (which would query the GPU).
     ctypes.CDLL(str(library))
