@@ -2,12 +2,12 @@ import hashlib
 import importlib.util
 import io
 import json
-from pathlib import Path
 import tempfile
-from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
 import zipfile
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location(
     "download_kernel_artifact", Path(__file__).with_name("download_kernel_artifact.py")
