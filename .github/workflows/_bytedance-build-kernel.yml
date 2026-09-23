@@ -2,6 +2,16 @@ name: Bytedance Build SGLang Kernel Artifact
 
 on:
   workflow_call:
+    outputs:
+      kernel_tos_uri:
+        description: "Immutable TOS object containing the built kernel wheel"
+        value: ${{ jobs.build-wheel.outputs.kernel_tos_uri }}
+      kernel_wheel_sha256:
+        description: "SHA-256 of the wheel uploaded to TOS"
+        value: ${{ jobs.build-wheel.outputs.kernel_wheel_sha256 }}
+    secrets:
+      TOSUTIL_CONFIG_B64:
+        required: true
     inputs:
       checkout_ref:
         description: "Git ref to build from"
@@ -50,6 +60,26 @@ on:
         required: false
         type: string
         default: "bytedance-x64-kernel-build-node"
+      tos_bucket:
+        description: "TOS bucket for run-scoped kernel wheel transport"
+        required: false
+        type: string
+        default: "ai-infra"
+      tos_endpoint:
+        description: "TOS endpoint used by build runners"
+        required: false
+        type: string
+        default: "tos-cn-beijing.volces.com"
+      tos_region:
+        description: "TOS region used by build runners"
+        required: false
+        type: string
+        default: "cn-beijing"
+      tos_prefix:
+        description: "TOS object prefix for run-scoped kernel wheels"
+        required: false
+        type: string
+        default: "sglang-ci/kernel-wheels"
 
 concurrency:
   group: ${{ inputs.concurrency_group }}
@@ -57,7 +87,11 @@ concurrency:
 
 jobs:
   build-wheel:
+    environment: prod
     runs-on: ${{ inputs.runner }}
+    outputs:
+      kernel_tos_uri: ${{ steps.tos-upload.outputs.kernel_tos_uri }}
+      kernel_wheel_sha256: ${{ steps.tos-upload.outputs.kernel_wheel_sha256 }}
     env:
       SGL_KERNEL_BUILDER_NAME: sgl-kernel-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.artifact_name }}
       BUILDKITD_CONFIG: /tmp/sgl-kernel-buildkitd.toml
@@ -113,6 +147,42 @@ jobs:
           name: ${{ inputs.artifact_name }}
           path: python/sglang/kernels/aot/dist/*
           if-no-files-found: error
+
+      - name: Upload wheel to TOS transport
+        id: tos-upload
+        env:
+          ARTIFACT_NAME: ${{ inputs.artifact_name }}
+          TOS_BUCKET: ${{ inputs.tos_bucket }}
+          TOS_ENDPOINT: ${{ inputs.tos_endpoint }}
+          TOS_PREFIX: ${{ inputs.tos_prefix }}
+          TOS_REGION: ${{ inputs.tos_region }}
+          TOSUTIL_CONFIG_B64: ${{ secrets.TOSUTIL_CONFIG_B64 }}
+        run: |
+          set -euo pipefail
+          scripts/ci/install_tosutil.sh
+          test -n "$TOSUTIL_CONFIG_B64"
+          tos_config="$(mktemp /tmp/tosutil-config.XXXXXX)"
+          trap 'rm -f "$tos_config"' EXIT
+          printf '%s' "$TOSUTIL_CONFIG_B64" | base64 --decode > "$tos_config"
+          chmod 0600 "$tos_config"
+          mapfile -t wheels < <(find python/sglang/kernels/aot/dist -maxdepth 1 -type f -name 'sglang_kernel-*.whl' -print)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one built sglang_kernel wheel"
+            exit 1
+          fi
+          wheel="${wheels[0]}"
+          wheel_sha256="$(sha256sum "$wheel" | awk '{print $1}')"
+          object_key="${TOS_PREFIX}/${GITHUB_REPOSITORY_ID}/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/${ARTIFACT_NAME}/$(basename "$wheel")"
+          tos_uri="tos://${TOS_BUCKET}/${object_key}"
+          timeout 20m tosutil cp "$wheel" "$tos_uri" \
+            -e="$TOS_ENDPOINT" -re="$TOS_REGION" \
+            -p=8 -threshold=52428800 -ps=16777216 -vchecksum \
+            -conf="$tos_config"
+          {
+            echo "kernel_tos_uri=${tos_uri}"
+            echo "kernel_wheel_sha256=${wheel_sha256}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Uploaded verified kernel wheel transport for run ${GITHUB_RUN_ID}"
 
       - name: Remove run-scoped BuildKit state
         if: always()
