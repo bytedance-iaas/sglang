@@ -504,6 +504,7 @@ jobs:
             --build-arg BUILD_TYPE=all \
             --build-arg GRACE_BLACKWELL=0 \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            --build-arg INSTALL_ONION=1 \
             "${METADATA_ARGS[@]}" \
             ${VERSION_ARG} \
             ${{ inputs.extra_build_args }} \
