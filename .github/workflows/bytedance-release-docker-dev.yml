@@ -2,6 +2,12 @@ name: iaas-kernels image build validation
 run-name: iaas-kernels image build validation
 on:
   workflow_dispatch:
+    inputs:
+      operation:
+        description: Build images or publish the already validated local images
+        type: choice
+        options: [build, publish]
+        default: build
 permissions:
   contents: read
 concurrency:
@@ -9,7 +15,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   build:
-    if: github.repository == 'bytedance-iaas/sglang'
+    if: github.repository == 'bytedance-iaas/sglang' && inputs.operation != 'publish'
     runs-on: x64-docker-build-node
     timeout-minutes: 240
     env:
@@ -213,3 +219,96 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf -- "$RESULT_DIR/private-wheel"
+  publish:
+    if: github.repository == 'bytedance-iaas/sglang' && inputs.operation == 'publish'
+    environment: prod
+    runs-on: x64-docker-build-node
+    timeout-minutes: 90
+    env:
+      SOURCE_COMMIT: 7595f52c35a04efcc2d3ed84117cb82d0cdad718
+      RESULT_DIR: /tmp/iaas-image-publish-${{ github.run_id }}-${{ github.run_attempt }}
+      REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
+      IMAGE_REPO: ${{ vars.VOLCENGINE_CR_REGISTRY }}/${{ vars.VOLCENGINE_CR_NAMESPACE }}/${{ vars.VOLCENGINE_CR_REPOSITORY }}
+      TAG_PREFIX: debug-iaas-cu130-7595f52c-35811697811
+      DOCKER_CONFIG: /tmp/iaas-publish-auth-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Require the exact validated images on this runner
+        run: |
+          set -euo pipefail
+          mkdir -p "$RESULT_DIR" "$DOCKER_CONFIG"
+          chmod 700 "$DOCKER_CONFIG"
+          printf '%s\n' "$RUNNER_NAME" > "$RESULT_DIR/runner.txt"
+          test "$REGISTRY" = iaas-gpu-cn-beijing.cr.volces.com
+          test "$IMAGE_REPO" = iaas-gpu-cn-beijing.cr.volces.com/serving/sglang
+          for variant in runtime framework_final; do
+            image="iaas-image-validation:35811697811-1-${variant}"
+            case "$variant" in
+              runtime) expected=sha256:a0304040fc40130b5791c34a84ef214e196bd1d91cb6977da5df39cf6470eaf8 ;;
+              framework_final) expected=sha256:442bc10f8679caef63db317c78a547d3a6012d695dbac40a8da284e2b5061860 ;;
+            esac
+            test "$(docker image inspect "$image" --format '{{.Id}}')" = "$expected"
+            test "$(docker image inspect "$image" --format '{{index .Config.Labels "ai.sglang.build.commit"}}')" = "$SOURCE_COMMIT"
+            test "$(docker image inspect "$image" --format '{{.Architecture}}')" = amd64
+            docker image inspect "$image" --format '{{.Id}}' > "$RESULT_DIR/${variant}-image-id.txt"
+            docker run --rm --entrypoint python3 "$image" \
+              /sgl-workspace/sglang/scripts/ci/check_iaas_kernels_image.py \
+              | tee "$RESULT_DIR/${variant}-smoke.json"
+          done
+      - name: Login to the private registry
+        env:
+          REGISTRY_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$REGISTRY_PASSWORD" | docker login "$REGISTRY" \
+            --username "$REGISTRY_USERNAME" --password-stdin
+      - name: Prepare the promotion command
+        run: |
+          set -euo pipefail
+          cat > "$RESULT_DIR/publish.sh" <<'BASH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          variant="$1"
+          local_image="iaas-image-validation:35811697811-1-${variant}"
+          remote_image="${IMAGE_REPO}:${TAG_PREFIX}-${variant}"
+          docker tag "$local_image" "$remote_image"
+          docker push "$remote_image" 2>&1 | tee "$RESULT_DIR/${variant}-push.log"
+          docker image inspect "$remote_image" --format '{{json .RepoDigests}}' > "$RESULT_DIR/${variant}-repo-digests.json"
+          ref=$(python3 - "$RESULT_DIR/${variant}-repo-digests.json" "$IMAGE_REPO" <<'PYCODE'
+          import json,sys
+          refs=[r for r in json.load(open(sys.argv[1])) if r.startswith(sys.argv[2]+'@sha256:')]
+          assert len(refs)==1, refs
+          print(refs[0])
+          PYCODE
+          )
+          docker buildx imagetools inspect --raw "$ref" > "$RESULT_DIR/${variant}-registry-manifest.json"
+          python3 - "$RESULT_DIR" "$variant" "$remote_image" "$ref" <<'PYCODE'
+          import json,os,sys
+          from pathlib import Path
+          root=Path(sys.argv[1]); variant=sys.argv[2]
+          manifest=json.loads((root/f'{variant}-registry-manifest.json').read_text())
+          image_id=(root/f'{variant}-image-id.txt').read_text().strip()
+          assert manifest['config']['digest']==image_id, manifest
+          result={'tag':sys.argv[3], 'pull_ref':sys.argv[4], 'image_id':image_id,
+                  'source_commit':os.environ['SOURCE_COMMIT'], 'build_run':35811697811,
+                  'publish_run':os.environ['GITHUB_RUN_ID']}
+          (root/f'{variant}-published.json').write_text(json.dumps(result,indent=2)+'\n')
+          print(json.dumps(result))
+          PYCODE
+          printf '%s\n' "$ref" > "$RESULT_DIR/${variant}-pull-ref.txt"
+          printf '### %s\n\n`docker pull %s`\n\n' "$variant" "$ref" >> "$GITHUB_STEP_SUMMARY"
+          BASH
+      - name: Publish the runtime image and verify its remote digest
+        run: bash "$RESULT_DIR/publish.sh" runtime
+      - name: Publish the framework image and verify its remote digest
+        run: bash "$RESULT_DIR/publish.sh" framework_final
+      - name: Upload publication evidence without credentials or private binaries
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iaas-image-publish-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.RESULT_DIR }}
+          retention-days: 14
+      - name: Remove temporary registry credentials
+        if: always()
+        run: rm -rf -- "$DOCKER_CONFIG"
