@@ -45,9 +45,14 @@ on:
         required: false
         type: string
         default: "1"
+      concurrency_group:
+        description: "Concurrency group for callers that share a build resource"
+        required: false
+        type: string
+        default: "bytedance-x64-kernel-build-node"
 
 concurrency:
-  group: bytedance-${{ inputs.runner }}
+  group: ${{ inputs.concurrency_group }}
   cancel-in-progress: false
 
 jobs:
