@@ -120,7 +120,9 @@ class KernelArtifactTests(unittest.TestCase):
             else:
                 self.assertEqual(command[-3:-1], ["--continue-at", "100"])
                 kwargs["stdout"].write(data[100:])
-            self.assertEqual(kwargs["timeout"], 900)
+            self.assertIn("--max-time", command)
+            self.assertIn("840", command)
+            self.assertEqual(kwargs["timeout"], 870)
             return SimpleNamespace(returncode=0)
 
         argv = [

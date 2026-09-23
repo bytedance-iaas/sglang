@@ -141,11 +141,14 @@ def main():
                             stdout=stream,
                             stderr=subprocess.PIPE,
                             check=True,
-                            timeout=900,
+                            timeout=870,
                             extra_args=(
-                                ["--continue-at", str(received_before)]
-                                if received_before
-                                else []
+                                ["--max-time", "840"]
+                                + (
+                                    ["--continue-at", str(received_before)]
+                                    if received_before
+                                    else []
+                                )
                             ),
                         )
                 finally:
