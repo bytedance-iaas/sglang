@@ -121,7 +121,11 @@ def main():
     artifact = find_artifact(args.repository, args.run_id, args.name)
     print(
         "Kernel artifact transport: "
-        + ("explicit HTTPS proxy" if os.environ.get("KERNEL_ARTIFACT_HTTPS_PROXY") else "runner default"),
+        + (
+            "explicit HTTPS proxy"
+            if os.environ.get("KERNEL_ARTIFACT_HTTPS_PROXY")
+            else "runner default"
+        ),
         flush=True,
     )
     with tempfile.TemporaryDirectory(dir=args.output) as staging:
