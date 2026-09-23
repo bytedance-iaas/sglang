@@ -654,6 +654,76 @@ class TestEICHiCacheRegression(unittest.TestCase):
         cache.ongoing_load_back.pop(t.id)  # _free_failed_loadback settled it
         self.assertFalse(cache.prefix_loading(child))
 
+    def _finish(self, c, key, prefix, last_node, alloc):
+        kv = torch.cat([prefix, alloc(len(key) - len(prefix))])
+        r2t = kv.view(1, -1).clone()
+        c.req_to_token_pool = SimpleNamespace(req_to_token=r2t)
+        req = SimpleNamespace(
+            origin_input_ids=list(key.token_ids),
+            output_ids=[],
+            extra_key=None,
+            prefix_indices=prefix,
+            last_node=last_node,
+            kv=SimpleNamespace(req_pool_idx=0, cache_protected_len=len(prefix)),
+        )
+        c.cache_finished_req(req, kv_len_to_handle=len(kv))
+
+    def _assert_pool_invariant(self, c, free_ids, total):
+        cached = set()
+        stack = list(c.root_node.children.values())
+        while stack:
+            n = stack.pop()
+            if n.value is not None:
+                cached.update(n.value.tolist())
+            stack.extend(n.children.values())
+        self.assertFalse(cached & free_ids)
+        self.assertEqual(len(free_ids) + c.evictable_size_ + c.protected_size_, total)
+
+    def test_finished_insert_through_inflight_load_keeps_pool_invariant(self):
+        # Found by test_eic_lean_spec. Req A (holding head H) finished while B's
+        # load of the tail T was in flight, hanging A's KV under T. T's load
+        # failed, leaving that KV under an evicted gap; C's insert revived T but
+        # prefix_len skipped it, so kv[protected:prefix_len] freed T's new slots.
+        total = 64
+        c, alloc, free, free_ids = self._make_pool_cache(total, page=4)
+        c.disable_finished_insert = False
+        c._backup_unbacked_path = lambda node: None
+        key8 = RadixKey(list(range(8)), None)
+        c.insert(InsertParams(key=key8, value=alloc(8)))
+        tail = c.root_node.children[key8.child_key(4)]
+        head = c._split_node(tail.key, tail, 4)
+        tail.host_value = torch.arange(4)
+        c._evict_backuped(tail)
+
+        c.inc_lock_ref(head)  # A runs on H
+        c.load_back(c.match_prefix(MatchPrefixParams(key=key8)).best_match_node)
+        key16 = RadixKey(list(range(16)), None)
+        self._finish(c, key16, head.value.clone(), head, alloc)  # A, mid-load
+        c._free_failed_loadback(tail.id, 0)
+
+        c.inc_lock_ref(head)  # C runs on H
+        self._finish(c, key16, head.value.clone(), head, alloc)
+        self._assert_pool_invariant(c, free_ids, total)
+
+    def test_match_ends_at_resident_node_above_failed_load_tail(self):
+        # Found by test_eic_lean_spec. A failed load leaves its tail evicted with
+        # no host KV; an insert revives the node above it without a backup. The
+        # host-hit walk climbed past that resident node, so last_device_node was
+        # shallower than device_indices and the req's lock left slots evictable.
+        c, alloc, free, free_ids = self._make_pool_cache(64, page=4)
+        key = RadixKey(list(range(16)), None)
+        c.insert(InsertParams(key=key, value=alloc(16)))
+        tail = c.root_node.children[key.child_key(4)]
+        top = c._split_node(tail.key, tail, 8)
+        free(tail.value)
+        c.evictable_size_ -= len(tail.value)
+        tail.value = tail.host_value = None  # as _free_failed_loadback leaves it
+
+        m = c.match_prefix(MatchPrefixParams(key=key))
+        self.assertEqual(m.device_indices.tolist(), top.value.tolist())
+        self.assertIs(m.last_device_node, top)
+        self.assertEqual(m.host_hit_length, 0)
+
     # ---- two-stage lockstep protocol tests --------------------------------
 
     class FakeStore:

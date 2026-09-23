@@ -40,6 +40,9 @@ Serving benchmark snapshots: `benchmark/hicache/eic_snapshots/`.
 | `mem_cache/eic_memory_pool.py` | EIC client and host pools (MHA/MLA/NSA/DSv4) |
 | `mem_cache/eic_chunk_cache.py` | `EICChunkCache` / `EICSWAChunkCache` for `--disable-radix-cache` |
 | `mem_cache/eic_pp_reconcile.py` | Cross-PP load-length reconciler |
+| `lean/eic/` | Lean 4 spec of device-slot ownership (`EicSpec.lean`, theorems for #741/#748/#768/#799) and the trace replayer `eic_replay` |
+| `test/registered/unit/mem_cache/test_eic_lean_spec.py` | differential test: random cache op sequences replayed against the spec; skipped without `lake` |
+| `.github/workflows/eic-lean.yml` | runs `lake build` and the differential test on PRs touching EIC cache code |
 
 Upstream APIs these subclass or call, the usual source of silent breakage after
 a refresh: `HiCacheController.__init__`, `HiRadixCache`,
