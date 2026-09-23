@@ -82,48 +82,81 @@ jobs:
           (output/'provenance.json').write_text(json.dumps(values,indent=2)+'\n')
           (output/'metadata.args').write_text(''.join('--build-arg\n'+k+'='+v+'\n' for k,v in values.items()))
           PYCODE
+          python3 - <<'PYCODE'
+          import json,os,subprocess
+          from pathlib import Path
+          root=Path(os.environ['RESULT_DIR'])
+          args=json.loads((root/'provenance.json').read_text())
+          no_proxy='localhost,127.0.0.1,::1,archive.ubuntu.com,security.ubuntu.com,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com'
+          args.update({
+              'CUDA_VERSION':'13.0.3','BUILD_TYPE':'all','BRANCH_TYPE':'local',
+              'INSTALL_IAAS_KERNELS':'1','INSTALL_FLASHINFER_JIT_CACHE':'1',
+              'INSTALL_LOCAL_SGL_KERNEL_WHEEL':'0','INSTALL_AI_DYNAMO':'0','INSTALL_ONION':'1',
+              'CMAKE_BUILD_PARALLEL_LEVEL':subprocess.check_output(['nproc'],text=True).strip(),
+              'HTTP_PROXY':'http://100.68.162.211:3128','HTTPS_PROXY':'http://100.68.162.211:3128',
+              'ALL_PROXY':'http://100.68.162.211:3128','NO_PROXY':no_proxy,'no_proxy':no_proxy,
+              'UBUNTU_MIRROR':'https://archive.ubuntu.com',
+              'BYTED_INTERNAL_EXTRA_TOOLS_APT_URL':'http://mirrors.ivolces.com/extra-tools/ubuntu',
+              'BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL':'https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system',
+          })
+          targets={}
+          for target in ('iaas_kernels_wheel','framework_final','runtime'):
+              config={
+                  'context':'.','dockerfile':'docker/Dockerfile','target':target,
+                  'platforms':['linux/amd64'],'args':args,
+                  'secret':['id=iaas_kernels_token,env=IAAS_KERNELS_READ_TOKEN'],
+              }
+              if target=='iaas_kernels_wheel':
+                  config['output']=['type=local,dest='+str(root/'private-wheel')]
+              else:
+                  config['output']=['type=docker']
+                  config['tags']=[os.environ['IMAGE_BASE']+'-'+target]
+              targets[target]=config
+          bake={'group':{'default':{'targets':list(targets)}},'target':targets}
+          (root/'docker-bake.json').write_text(json.dumps(bake,indent=2)+'\n')
+          PYCODE
+          cat > "$RESULT_DIR/progress.py" <<'PYCODE'
+          import re,sys
+          from pathlib import Path
+          steps={}
+          finished=set()
+          for line in sys.stdin:
+              print(line,end='',flush=True)
+              match=re.match(r'(#\d+) \[([^\]]+) (\d+)/(\d+)\]',line)
+              if match:
+                  steps[match[1]]=(match[2],int(match[3])==int(match[4]))
+              done=re.match(r'(#\d+) DONE ([0-9.]+)s',line)
+              if done and done[1] in steps:
+                  label,is_last=steps[done[1]]
+                  if is_last and label not in finished:
+                      finished.add(label)
+                      message='Completed stage '+label+' (last step '+done[2]+'s)'
+                      message=message.replace('%','%25').replace('\r','%0D').replace('\n','%0A')
+                      print('::notice title=Image build progress::'+message,flush=True)
+          PYCODE
           cat > "$RESULT_DIR/build.sh" <<'BASH'
           #!/usr/bin/env bash
           set -euo pipefail
-          target="${1:?target}"
           : "${IAAS_KERNELS_READ_TOKEN:?repository secret is required}"
           cd "$GITHUB_WORKSPACE/$SOURCE_DIR"
-          mapfile -t metadata_args < "$RESULT_DIR/metadata.args"
-          args=(
-            --builder sgl-private-image-builder
-            --target "$target" --platform linux/amd64 --progress plain
-            -f docker/Dockerfile
-            --build-arg CUDA_VERSION=13.0.3
-            --build-arg BUILD_TYPE=all
-            --build-arg BRANCH_TYPE=local
-            --build-arg INSTALL_IAAS_KERNELS=1
-            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1
-            --build-arg INSTALL_LOCAL_SGL_KERNEL_WHEEL=0
-            --build-arg INSTALL_AI_DYNAMO=0
-            --build-arg INSTALL_ONION=1
-            --build-arg "CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)"
-            --build-arg HTTP_PROXY=http://100.68.162.211:3128
-            --build-arg HTTPS_PROXY=http://100.68.162.211:3128
-            --build-arg ALL_PROXY=http://100.68.162.211:3128
-            --build-arg NO_PROXY=localhost,127.0.0.1,::1,archive.ubuntu.com,security.ubuntu.com,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com
-            --build-arg no_proxy=localhost,127.0.0.1,::1,archive.ubuntu.com,security.ubuntu.com,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com
-            --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com
-            --build-arg BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=http://mirrors.ivolces.com/extra-tools/ubuntu
-            --build-arg BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system
-            --secret id=iaas_kernels_token,env=IAAS_KERNELS_READ_TOKEN
-          )
-          if [ "$target" = iaas_kernels_wheel ]; then
-            args+=(--output "type=local,dest=$RESULT_DIR/private-wheel")
-          else
-            args+=(--load --tag "${IMAGE_BASE}-${target}" --metadata-file "$RESULT_DIR/${target}-metadata.json")
-          fi
-          docker buildx build "${args[@]}" "${metadata_args[@]}" . 2>&1 | tee "$RESULT_DIR/${target}-build.log"
+          docker buildx bake --builder sgl-private-image-builder \
+            --file "$RESULT_DIR/docker-bake.json" --print > "$RESULT_DIR/bake-resolved.json"
+          docker buildx bake --builder sgl-private-image-builder \
+            --file "$RESULT_DIR/docker-bake.json" --progress plain \
+            --metadata-file "$RESULT_DIR/bake-metadata.json" \
+            --allow "fs.write=$RESULT_DIR/private-wheel" \
+            2>&1 | tee "$RESULT_DIR/images-build.log" | python3 -u "$RESULT_DIR/progress.py"
           BASH
           chmod +x "$RESULT_DIR/build.sh"
-      - name: Build the pinned NVLink wheel with BuildKit secret
+      - name: Record builder cache before the build
+        run: |
+          set -euo pipefail
+          docker buildx du --builder sgl-private-image-builder > "$RESULT_DIR/builder-cache-before.txt"
+          docker system df > "$RESULT_DIR/docker-disk-before.txt"
+      - name: Build wheel and both images with shared dependencies
         env:
           IAAS_KERNELS_READ_TOKEN: ${{ secrets.IAAS_KERNELS_READ_TOKEN }}
-        run: bash "$RESULT_DIR/build.sh" iaas_kernels_wheel
+        run: bash "$RESULT_DIR/build.sh"
       - name: Record wheel provenance without uploading private binaries
         run: |
           set -euo pipefail
@@ -138,10 +171,6 @@ jobs:
           assert hashlib.sha256(wheel.read_bytes()).hexdigest()==manifest['wheel_sha256']
           print(json.dumps({'wheel':wheel.name,'sha256':manifest['wheel_sha256'],'revision':manifest['lock']['revision']}))
           PYCODE
-      - name: Build framework image locally
-        env:
-          IAAS_KERNELS_READ_TOKEN: ${{ secrets.IAAS_KERNELS_READ_TOKEN }}
-        run: bash "$RESULT_DIR/build.sh" framework_final
       - name: Verify framework image
         run: |
           set -euo pipefail
@@ -154,10 +183,6 @@ jobs:
             | tee "$RESULT_DIR/framework-private-runtime.txt"
           test "$(docker image inspect "$image" --format '{{index .Config.Labels "ai.sglang.build.commit"}}')" = "$SOURCE_COMMIT"
           docker image inspect "$image" --format '{{.Id}}' | tee "$RESULT_DIR/framework-image-id.txt"
-      - name: Build runtime image locally
-        env:
-          IAAS_KERNELS_READ_TOKEN: ${{ secrets.IAAS_KERNELS_READ_TOKEN }}
-        run: bash "$RESULT_DIR/build.sh" runtime
       - name: Verify runtime image
         run: |
           set -euo pipefail
@@ -180,6 +205,7 @@ jobs:
             ${{ env.RESULT_DIR }}/*.json
             ${{ env.RESULT_DIR }}/*.txt
             ${{ env.RESULT_DIR }}/build.sh
+            ${{ env.RESULT_DIR }}/progress.py
           if-no-files-found: warn
           retention-days: 14
       - name: Remove temporary exported private wheel
