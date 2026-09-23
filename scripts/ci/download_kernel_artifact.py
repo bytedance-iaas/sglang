@@ -1,9 +1,11 @@
 """Download a GitHub kernel artifact and reject partial or corrupt wheels."""
 
 import argparse
+import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -108,16 +110,101 @@ def verify_and_extract(archive, artifact, output):
     return destination
 
 
+def verify_wheel(wheel, expected_sha256):
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+        raise ValueError("Kernel wheel has no authoritative SHA-256")
+    if not wheel.name.startswith("sglang_kernel-") or wheel.suffix != ".whl":
+        raise ValueError("Expected one sglang_kernel wheel")
+    digest = hashlib.sha256()
+    with wheel.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    actual = digest.hexdigest()
+    if actual != expected_sha256:
+        raise ValueError("Kernel wheel SHA-256 mismatch")
+    with zipfile.ZipFile(wheel) as package:
+        if package.testzip() is not None:
+            raise ValueError("Kernel wheel ZIP CRC mismatch")
+        names = package.namelist()
+        for suffix in (".dist-info/WHEEL", ".dist-info/METADATA"):
+            if not any(name.endswith(suffix) for name in names):
+                raise ValueError(f"Kernel wheel missing {suffix}")
+
+
+def recover_tos_wheel(tos_uri, expected_sha256, output):
+    match = re.fullmatch(
+        r"tos://([a-z0-9][a-z0-9.-]{1,61}[a-z0-9])/"
+        r"([0-9A-Za-z._/-]+/sglang_kernel-[0-9A-Za-z.+_-]+\.whl)",
+        tos_uri,
+    )
+    if match is None:
+        raise ValueError("Require a pinned TOS sglang_kernel wheel URI")
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+        raise ValueError("Kernel wheel has no authoritative SHA-256")
+    expected_bucket = os.environ.get("KERNEL_ARTIFACT_TOS_BUCKET", "")
+    expected_prefix = os.environ.get("KERNEL_ARTIFACT_TOS_PREFIX", "").strip("/")
+    if not expected_bucket or not expected_prefix:
+        raise ValueError("TOS bucket and prefix are required")
+    if match.group(1) != expected_bucket or not match.group(2).startswith(
+        expected_prefix + "/"
+    ):
+        raise ValueError("TOS kernel wheel URI is outside the configured prefix")
+    endpoint = os.environ.get("KERNEL_ARTIFACT_TOS_ENDPOINT", "")
+    region = os.environ.get("KERNEL_ARTIFACT_TOS_REGION", "")
+    if not endpoint or not region:
+        raise ValueError("TOS endpoint and region are required")
+    config_b64 = os.environ.get("TOSUTIL_CONFIG_B64", "")
+    if not config_b64:
+        raise ValueError("TOS configuration is required")
+    with tempfile.TemporaryDirectory(dir=output) as staging:
+        config = Path(staging) / "tosutil.conf"
+        config.write_bytes(base64.b64decode(config_b64, validate=True))
+        config.chmod(0o600)
+        wheel = Path(staging) / Path(match.group(2)).name
+        subprocess.run(
+            [
+                "timeout",
+                "20m",
+                "tosutil",
+                "cp",
+                tos_uri,
+                str(wheel),
+                f"-e={endpoint}",
+                f"-re={region}",
+                "-p=8",
+                "-threshold=52428800",
+                "-ps=16777216",
+                "-vchecksum",
+                "-f",
+                f"-conf={config}",
+            ],
+            check=True,
+            timeout=1230,
+        )
+        verify_wheel(wheel, expected_sha256)
+        destination = output / wheel.name
+        os.replace(wheel, destination)
+    print(f"Verified TOS kernel wheel sha256:{expected_sha256}", flush=True)
+    return destination
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repository", required=True)
     parser.add_argument("--run-id", required=True, type=int)
     parser.add_argument("--name", required=True)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--tos-uri", default="")
+    parser.add_argument("--wheel-sha256", default="")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     if list(args.output.glob("*.whl")):
         raise ValueError("Refusing to reuse existing kernel wheels")
+    if args.tos_uri:
+        recover_tos_wheel(args.tos_uri, args.wheel_sha256, args.output)
+        return
+    if args.wheel_sha256:
+        raise ValueError("--wheel-sha256 requires --tos-uri")
     artifact = find_artifact(args.repository, args.run_id, args.name)
     print(
         "Kernel artifact transport: "
