@@ -115,8 +115,12 @@ class KernelArtifactTests(unittest.TestCase):
                 return SimpleNamespace(stdout=json.dumps({"artifacts": [metadata]}))
             downloads.append(command)
             self.assertFalse((self.output / WHEEL).exists())
-            kwargs["stdout"].write(data[:100] if len(downloads) == 1 else data)
-            self.assertEqual(kwargs["timeout"], 300)
+            if len(downloads) == 1:
+                kwargs["stdout"].write(data[:100])
+            else:
+                self.assertEqual(command[-3:-1], ["--continue-at", "100"])
+                kwargs["stdout"].write(data[100:])
+            self.assertEqual(kwargs["timeout"], 900)
             return SimpleNamespace(returncode=0)
 
         argv = [
@@ -136,6 +140,21 @@ class KernelArtifactTests(unittest.TestCase):
             download.main()
         self.assertEqual(len(downloads), 2)
         self.assertEqual((self.output / WHEEL).read_bytes(), wheel)
+
+    def test_explicit_proxy_is_passed_without_exposing_token(self):
+        with patch.dict(
+            download.os.environ,
+            {"KERNEL_ARTIFACT_HTTPS_PROXY": "http://proxy.example:3128"},
+        ), patch.object(
+            download.subprocess,
+            "run",
+            return_value=SimpleNamespace(stdout='{"artifacts": []}'),
+        ) as run:
+            download.github_api("repos/owner/repo/actions/runs/1/artifacts", text=True)
+        command = run.call_args.args[0]
+        self.assertIn("--proxy", command)
+        self.assertIn("http://proxy.example:3128", command)
+        self.assertNotIn("test-token", " ".join(command))
 
     def test_download_timeouts_are_bounded_and_publish_nothing(self):
         _, metadata = self.bundle([(WHEEL, make_wheel())])
@@ -159,7 +178,7 @@ class KernelArtifactTests(unittest.TestCase):
         ) as run:
             with self.assertRaisesRegex(RuntimeError, "verification failed"):
                 download.main()
-        self.assertEqual(run.call_count, 3)
+        self.assertEqual(run.call_count, 6)
         self.assertEqual(list(self.output.iterdir()), [])
 
     def test_expired_artifact_is_rejected_before_download(self):

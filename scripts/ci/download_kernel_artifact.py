@@ -16,6 +16,9 @@ def github_api(endpoint, **kwargs):
     # Supply credentials on stdin, never in process arguments or logs. curl
     # strips Authorization on cross-host redirects (do not use location-trusted).
     header = f"Authorization: Bearer {os.environ['GH_TOKEN']}\n"
+    extra_args = kwargs.pop("extra_args", [])
+    proxy = os.environ.get("KERNEL_ARTIFACT_HTTPS_PROXY", "")
+    proxy_args = ["--proxy", proxy] if proxy else []
     return subprocess.run(
         [
             "curl",
@@ -37,6 +40,8 @@ def github_api(endpoint, **kwargs):
             "Accept: application/vnd.github+json",
             "--header",
             "@-",
+            *proxy_args,
+            *extra_args,
             f"{os.environ.get('GITHUB_API_URL', 'https://api.github.com')}/{endpoint}",
         ],
         input=header if kwargs.get("text") else header.encode(),
@@ -114,38 +119,51 @@ def main():
     if list(args.output.glob("*.whl")):
         raise ValueError("Refusing to reuse existing kernel wheels")
     artifact = find_artifact(args.repository, args.run_id, args.name)
-    for attempt in range(1, 4):
-        started = time.monotonic()
-        received = 0
-        try:
-            with tempfile.TemporaryDirectory(dir=args.output) as staging:
-                archive = Path(staging) / "artifact.zip"
+    print(
+        "Kernel artifact transport: "
+        + ("explicit HTTPS proxy" if os.environ.get("KERNEL_ARTIFACT_HTTPS_PROXY") else "runner default"),
+        flush=True,
+    )
+    with tempfile.TemporaryDirectory(dir=args.output) as staging:
+        archive = Path(staging) / "artifact.zip"
+        for attempt in range(1, 7):
+            started = time.monotonic()
+            received_before = archive.stat().st_size if archive.exists() else 0
+            try:
                 try:
-                    with archive.open("wb") as stream:
+                    with archive.open("ab") as stream:
                         github_api(
                             f"repos/{args.repository}/actions/artifacts/{artifact['id']}/zip",
                             stdout=stream,
                             stderr=subprocess.PIPE,
                             check=True,
-                            timeout=300,
+                            timeout=900,
+                            extra_args=(
+                                ["--continue-at", str(received_before)]
+                                if received_before
+                                else []
+                            ),
                         )
                 finally:
                     received = archive.stat().st_size
                 verify_and_extract(archive, artifact, args.output)
-            return
-        except (subprocess.SubprocessError, ValueError, zipfile.BadZipFile) as exc:
-            # Do not emit signed URLs or response bodies from download errors.
-            print(
-                f"Kernel artifact attempt {attempt}/3 failed: {type(exc).__name__}; "
-                f"curl_exit={getattr(exc, 'returncode', None)}; "
-                f"bytes={received}/{artifact['size_in_bytes']}; "
-                f"elapsed={time.monotonic() - started:.1f}s",
-                flush=True,
-            )
-            if attempt == 3:
-                raise RuntimeError(
-                    "Kernel artifact download/verification failed"
-                ) from None
+                return
+            except (subprocess.SubprocessError, ValueError, zipfile.BadZipFile) as exc:
+                # Do not emit signed URLs or response bodies from download errors.
+                print(
+                    f"Kernel artifact attempt {attempt}/6 failed: {type(exc).__name__}; "
+                    f"curl_exit={getattr(exc, 'returncode', None)}; "
+                    f"bytes={received}/{artifact['size_in_bytes']}; "
+                    f"resumed_from={received_before}; "
+                    f"elapsed={time.monotonic() - started:.1f}s",
+                    flush=True,
+                )
+                if received > artifact["size_in_bytes"]:
+                    archive.unlink()
+                if attempt == 6:
+                    raise RuntimeError(
+                        "Kernel artifact download/verification failed"
+                    ) from None
 
 
 if __name__ == "__main__":
