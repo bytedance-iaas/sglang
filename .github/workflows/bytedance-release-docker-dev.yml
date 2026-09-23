@@ -283,13 +283,18 @@ jobs:
           )
           docker buildx imagetools inspect --raw "$ref" > "$RESULT_DIR/${variant}-registry-manifest.json"
           python3 - "$RESULT_DIR" "$variant" "$remote_image" "$ref" <<'PYCODE'
-          import json,os,sys
+          import hashlib,json,os,sys
           from pathlib import Path
           root=Path(sys.argv[1]); variant=sys.argv[2]
-          manifest=json.loads((root/f'{variant}-registry-manifest.json').read_text())
+          raw=(root/f'{variant}-registry-manifest.json').read_bytes()
+          manifest=json.loads(raw)
           image_id=(root/f'{variant}-image-id.txt').read_text().strip()
-          assert manifest['config']['digest']==image_id, manifest
+          manifest_digest='sha256:'+hashlib.sha256(raw).hexdigest()
+          assert sys.argv[4].endswith('@'+manifest_digest)
+          # containerd image stores expose manifest IDs; classic stores use config IDs.
+          assert image_id in (manifest_digest, manifest['config']['digest'])
           result={'tag':sys.argv[3], 'pull_ref':sys.argv[4], 'image_id':image_id,
+                  'config_digest':manifest['config']['digest'],
                   'source_commit':os.environ['SOURCE_COMMIT'], 'build_run':35811697811,
                   'publish_run':os.environ['GITHUB_RUN_ID']}
           (root/f'{variant}-published.json').write_text(json.dumps(result,indent=2)+'\n')
