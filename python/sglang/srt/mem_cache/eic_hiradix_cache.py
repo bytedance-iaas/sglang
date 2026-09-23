@@ -450,6 +450,16 @@ class EICHiRadixCache(RadixCache):
         key_len = len(radix_key)
         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
 
+        if is_insert and self.ongoing_load_back:
+            # Inserting through an in-flight load hangs resident KV under it; if the
+            # load fails, that KV sits under an evicted gap, and a later insert that
+            # revives the gap frees kv[cache_protected_len:prefix_len] misaligned --
+            # slots both free and cached. Drop this req's KV instead, as
+            # cache_unfinished_req keeps it private.
+            match = self.match_prefix(MatchPrefixParams(key=radix_key))
+            if self.prefix_loading(match.last_device_node):
+                is_insert = False
+
         if is_insert:
             priority = getattr(req, "priority", 0) or 0
             result = self.insert(
@@ -1385,7 +1395,15 @@ class EICHiRadixCache(RadixCache):
         host_hit_length = 0
         last_host_node = last_node
         while last_node.evicted:
-            while not last_node.backuped and last_node.parent is not None:
+            # Skip only evicted nodes without host KV (a failed load-back's
+            # tail). A resident node above them ends the device match even when
+            # not backed up; climbing past it would drop matched slots from the
+            # lock path while they stay in device_indices.
+            while (
+                last_node.evicted
+                and not last_node.backuped
+                and last_node.parent is not None
+            ):
                 last_node = last_node.parent
                 last_host_node = last_node
                 host_hit_length = 0
@@ -1795,7 +1813,15 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         host_hit_length = 0
         last_host_node = last_node
         while last_node.evicted:
-            while not last_node.backuped and last_node.parent is not None:
+            # Skip only evicted nodes without host KV (a failed load-back's
+            # tail). A resident node above them ends the device match even when
+            # not backed up; climbing past it would drop matched slots from the
+            # lock path while they stay in device_indices.
+            while (
+                last_node.evicted
+                and not last_node.backuped
+                and last_node.parent is not None
+            ):
                 last_node = last_node.parent
                 last_host_node = last_node
                 host_hit_length = 0
