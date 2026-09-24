@@ -43,7 +43,6 @@ Serving benchmark snapshots: `benchmark/hicache/eic_snapshots/`.
 | `mem_cache/eic_stats.py` | Dependency-free per-rank `EIC_STATS` line (#778): write ack/mset/mget/mexist errors, eic_hit%, miss reason counts, RPC p50/p95/p99/max; interval `EIC_STATS_INTERVAL_S` (60s) |
 | `test/registered/unit/mem_cache/test_eic_slot_ownership.py` | property test: random cache op sequences, each step checked against the legal per-slot transitions and the three pool counters |
 | `test/registered/unit/mem_cache/test_eic_pp_protocol.py` | exhaustive interleaving search over the real PP load-back verdict code (stage skew, ack timing/size, release, rid reuse, failed kicks); `EIC_PP_MODEL_FULL=1` adds a competing request under a 1-row verdict cap |
-| `.github/workflows/eic-slot-ownership.yml` | runs both tests on PRs touching EIC cache code (the fork's CPU suite does not run) |
 
 Upstream APIs these subclass or call, the usual source of silent breakage after
 a refresh: `HiCacheController.__init__`, `HiRadixCache`,
