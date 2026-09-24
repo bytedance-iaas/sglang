@@ -35,6 +35,7 @@ from sglang.srt.mem_cache.eic_memory_pool import (
     get_eic_config_file_path,
 )
 from sglang.srt.mem_cache.eic_pp_reconcile import eic_pp_unsupported_reason
+from sglang.srt.mem_cache.eic_stats import stats
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool as NSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
@@ -449,6 +450,16 @@ class EICHiRadixCache(RadixCache):
         key_len = len(radix_key)
         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
 
+        if is_insert and self.ongoing_load_back:
+            # Inserting through an in-flight load hangs resident KV under it; if the
+            # load fails, that KV sits under an evicted gap, and a later insert that
+            # revives the gap frees kv[cache_protected_len:prefix_len] misaligned --
+            # slots both free and cached. Drop this req's KV instead, as
+            # cache_unfinished_req keeps it private.
+            match = self.match_prefix(MatchPrefixParams(key=radix_key))
+            if self.prefix_loading(match.last_device_node):
+                is_insert = False
+
         if is_insert:
             priority = getattr(req, "priority", 0) or 0
             result = self.insert(
@@ -807,8 +818,15 @@ class EICHiRadixCache(RadixCache):
         d, hh = st["d"], st["hh"]
         node = st["best_match_node"]
         quota = span - d
-        swa_ok = self._swa_headroom_ok(quota) and self._full_headroom_ok(quota)
-        if quota >= max(self.load_back_threshold, 1) and node is not None and swa_ok:
+        if hh <= 0 or node is None or quota <= 0:
+            reason = "miss.cold_or_probe_fail"
+        elif quota < max(self.load_back_threshold, 1):
+            reason = "miss.below_threshold"
+        elif not (self._swa_headroom_ok(quota) and self._full_headroom_ok(quota)):
+            reason = "miss.headroom"
+        else:
+            reason = None
+        if reason is None:
             node = self._clip_host_chain(node, d + hh - span, span - d)
             if node is not None:
                 indices = self.load_back(node, allow_evict=self.pp_size <= 1)
@@ -818,6 +836,8 @@ class EICHiRadixCache(RadixCache):
                     st["new_indices"] = indices
                     self._loadback_rid[node.id] = rid
                     return  # the LOADED report follows the local EIC ack
+            reason = "miss.dma_incomplete"  # frozen chain broke or load got no KV
+        stats.incr(reason)
         # Nothing kicked on this stage: its admissible length is device-only.
         if not self._pp_active:
             self._admit_verdict[st["h"]] = d
@@ -1305,6 +1325,7 @@ class EICHiRadixCache(RadixCache):
         # extend_range is still None here.
         req.host_hit_length = req.storage_hit_length = max(0, prefix_len - d)
         req.kv.cache_protected_len = prefix_len
+        stats.observe_admit(d, st.get("hh", 0), prefix_len)
         return True
 
     def release_load_admit(self, rid):
@@ -1374,7 +1395,15 @@ class EICHiRadixCache(RadixCache):
         host_hit_length = 0
         last_host_node = last_node
         while last_node.evicted:
-            while not last_node.backuped and last_node.parent is not None:
+            # Skip only evicted nodes without host KV (a failed load-back's
+            # tail). A resident node above them ends the device match even when
+            # not backed up; climbing past it would drop matched slots from the
+            # lock path while they stay in device_indices.
+            while (
+                last_node.evicted
+                and not last_node.backuped
+                and last_node.parent is not None
+            ):
                 last_node = last_node.parent
                 last_host_node = last_node
                 host_hit_length = 0
@@ -1784,7 +1813,15 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         host_hit_length = 0
         last_host_node = last_node
         while last_node.evicted:
-            while not last_node.backuped and last_node.parent is not None:
+            # Skip only evicted nodes without host KV (a failed load-back's
+            # tail). A resident node above them ends the device match even when
+            # not backed up; climbing past it would drop matched slots from the
+            # lock path while they stay in device_indices.
+            while (
+                last_node.evicted
+                and not last_node.backuped
+                and last_node.parent is not None
+            ):
                 last_node = last_node.parent
                 last_host_node = last_node
                 host_hit_length = 0

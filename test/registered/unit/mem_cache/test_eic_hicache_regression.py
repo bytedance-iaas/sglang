@@ -244,6 +244,7 @@ class TestEICHiCacheRegression(unittest.TestCase):
         )
         alloc._expand_to_full_pages = lambda idx: idx
         alloc.dedup_aliased_swa = True
+        alloc.free_group = None
 
         SWATokenToKVPoolAllocator.free_swa(alloc, torch.arange(8))
 
@@ -503,9 +504,9 @@ class TestEICHiCacheRegression(unittest.TestCase):
             req_to_token=r2t, write=lambda idx, v: r2t.__setitem__(idx, v)
         )
         req = SimpleNamespace(
-            fill_ids=list(range(32)),
+            get_fill_ids=lambda: list(range(32)),
             extra_key=None,
-            req_pool_idx=0,
+            kv=SimpleNamespace(req_pool_idx=0),
             cache_protected_len=16,
             last_node=head,
             prefix_indices=own[:16],
@@ -604,13 +605,105 @@ class TestEICHiCacheRegression(unittest.TestCase):
         def mget_mostly_down(keys, option, vals):
             calls.append(list(keys))
             codes = [S.SUCCESS, S.FAILED, S.FAILED, S.FAILED]
-            return S.PARTIAL_FAILED, vals, SimpleNamespace(status_codes=codes)
+            if len(keys) == 4:
+                return S.PARTIAL_FAILED, vals, SimpleNamespace(status_codes=codes)
+            # Even when most keys fail, they are retried once; this backend is
+            # really down and the retry fails too.
+            return (
+                S.PARTIAL_FAILED,
+                vals,
+                SimpleNamespace(status_codes=[S.FAILED] * len(keys)),
+            )
 
         client.connection = SimpleNamespace(mget=mget_mostly_down)
         with mock.patch.object(pool_mod, "eic", fake_eic):
             _, mask = client.batch_get(["k0", "k1", "k2", "k3"])
-        self.assertEqual(len(calls), 1)  # backend down: no retry round
+        self.assertEqual(len(calls), 2)
         self.assertEqual(mask, [True, False, False, False])
+
+    def test_parallel_page_load_matches_serial_and_frees_every_chunk(self):
+        # fanout>1 fetches batches concurrently but must admit the same prefix as
+        # the serial path, keep in-flight chunks within the bounce pool, and
+        # return every chunk to the pool after a failed page or an exception.
+        from concurrent.futures import ThreadPoolExecutor
+
+        from sglang.srt.mem_cache import eic_memory_pool as pool_mod
+
+        S = SimpleNamespace(SUCCESS=0, FAILED=1, PARTIAL_FAILED=2)
+
+        class Buffers(list):
+            def append(self, ptr, size, registered):
+                super().append(ptr)
+
+        fake_eic = SimpleNamespace(
+            StatusCode=S,
+            StringVector=list,
+            IOBuffers=Buffers,
+            GetOption=lambda: SimpleNamespace(),
+        )
+        live = {"n": 0, "max": 0}
+
+        def allocate(n):
+            live["n"] += n
+            live["max"] = max(live["max"], live["n"])
+            objs = [torch.zeros(1) for _ in range(n)]
+            return objs, None, list(range(n)), True
+
+        def free(ptr):
+            live["n"] -= 1
+
+        def make_host(fanout, mget):
+            client = object.__new__(pool_mod.EICKVClient)
+            client.eic_namespace = "ns"
+            client.load_fanout = fanout
+            client.load_page_batch_cfg = 0
+            client.read_chunk_cap = 8
+            client._load_fetch_pool = ThreadPoolExecutor(fanout)
+            client.allocate_eic_read_buffer = allocate
+            client.kv_cache_read_mem_pool = SimpleNamespace(free_to_mempool=free)
+            client.connection = SimpleNamespace(mget=mget)
+            host = object.__new__(pool_mod.EICDeepSeekV4TokenToKVPoolHost)
+            host.eic_client = client
+            host.page_chunk_count = 2
+            host.page_size = 4
+            host._encode_page_chunk_keys = lambda hs: [
+                f"{h}#{c}" for h in hs for c in (0, 1)
+            ]
+            host.copied = []
+            host.device_writeback = lambda dev, pool, idx: host.copied.append(len(idx))
+            return host
+
+        def mget_p5_down(keys, option, vals):
+            codes = [S.FAILED if k.startswith("p5#") else S.SUCCESS for k in keys]
+            status = S.SUCCESS if S.FAILED not in codes else S.PARTIAL_FAILED
+            return status, vals, SimpleNamespace(status_codes=codes)
+
+        pages = [f"p{i}" for i in range(10)]
+        # base batch = 8 chunks // 2 = 4 pages serial; fanout 2 -> 2-page batches.
+        with mock.patch.object(pool_mod, "eic", fake_eic), mock.patch.object(
+            pool_mod, "G_GDRBounceTensorCount", 8
+        ):
+            serial = make_host(1, mget_p5_down)
+            serial_mask = serial.get_page_data(pages, torch.arange(40))
+            parallel = make_host(2, mget_p5_down)
+            parallel_mask = parallel.get_page_data(pages, torch.arange(40))
+
+            self.assertEqual(pool_mod._num_leading_ok(serial_mask), 5)
+            self.assertEqual(pool_mod._num_leading_ok(parallel_mask), 5)
+            self.assertEqual(sum(serial.copied), 10)
+            self.assertEqual(sum(parallel.copied), 10)
+            self.assertLessEqual(live["max"], 8)
+            self.assertEqual(live["n"], 0)
+
+            def mget_raises_on_p3(keys, option, vals):
+                if any(k.startswith("p3#") for k in keys):
+                    raise RuntimeError("rpc down")
+                return mget_p5_down(keys, option, vals)
+
+            broken = make_host(2, mget_raises_on_p3)
+            with self.assertRaises(RuntimeError):
+                broken.get_page_data(pages, torch.arange(40))
+            self.assertEqual(live["n"], 0)
 
     def test_match_stops_at_resident_node_under_evicted_gap(self):
         # A failed load-back frees a chain node whose child was inserted while
@@ -653,6 +746,76 @@ class TestEICHiCacheRegression(unittest.TestCase):
         self.assertTrue(cache.prefix_loading(upper))
         cache.ongoing_load_back.pop(t.id)  # _free_failed_loadback settled it
         self.assertFalse(cache.prefix_loading(child))
+
+    def _finish(self, c, key, prefix, last_node, alloc):
+        kv = torch.cat([prefix, alloc(len(key) - len(prefix))])
+        r2t = kv.view(1, -1).clone()
+        c.req_to_token_pool = SimpleNamespace(req_to_token=r2t)
+        req = SimpleNamespace(
+            origin_input_ids=list(key.token_ids),
+            output_ids=[],
+            extra_key=None,
+            prefix_indices=prefix,
+            last_node=last_node,
+            kv=SimpleNamespace(req_pool_idx=0, cache_protected_len=len(prefix)),
+        )
+        c.cache_finished_req(req, kv_len_to_handle=len(kv))
+
+    def _assert_pool_invariant(self, c, free_ids, total):
+        cached = set()
+        stack = list(c.root_node.children.values())
+        while stack:
+            n = stack.pop()
+            if n.value is not None:
+                cached.update(n.value.tolist())
+            stack.extend(n.children.values())
+        self.assertFalse(cached & free_ids)
+        self.assertEqual(len(free_ids) + c.evictable_size_ + c.protected_size_, total)
+
+    def test_finished_insert_through_inflight_load_keeps_pool_invariant(self):
+        # Found by test_eic_slot_ownership. Req A (holding head H) finished while B's
+        # load of the tail T was in flight, hanging A's KV under T. T's load
+        # failed, leaving that KV under an evicted gap; C's insert revived T but
+        # prefix_len skipped it, so kv[protected:prefix_len] freed T's new slots.
+        total = 64
+        c, alloc, free, free_ids = self._make_pool_cache(total, page=4)
+        c.disable_finished_insert = False
+        c._backup_unbacked_path = lambda node: None
+        key8 = RadixKey(list(range(8)), None)
+        c.insert(InsertParams(key=key8, value=alloc(8)))
+        tail = c.root_node.children[key8.child_key(4)]
+        head = c._split_node(tail.key, tail, 4)
+        tail.host_value = torch.arange(4)
+        c._evict_backuped(tail)
+
+        c.inc_lock_ref(head)  # A runs on H
+        c.load_back(c.match_prefix(MatchPrefixParams(key=key8)).best_match_node)
+        key16 = RadixKey(list(range(16)), None)
+        self._finish(c, key16, head.value.clone(), head, alloc)  # A, mid-load
+        c._free_failed_loadback(tail.id, 0)
+
+        c.inc_lock_ref(head)  # C runs on H
+        self._finish(c, key16, head.value.clone(), head, alloc)
+        self._assert_pool_invariant(c, free_ids, total)
+
+    def test_match_ends_at_resident_node_above_failed_load_tail(self):
+        # Found by test_eic_slot_ownership. A failed load leaves its tail evicted with
+        # no host KV; an insert revives the node above it without a backup. The
+        # host-hit walk climbed past that resident node, so last_device_node was
+        # shallower than device_indices and the req's lock left slots evictable.
+        c, alloc, free, free_ids = self._make_pool_cache(64, page=4)
+        key = RadixKey(list(range(16)), None)
+        c.insert(InsertParams(key=key, value=alloc(16)))
+        tail = c.root_node.children[key.child_key(4)]
+        top = c._split_node(tail.key, tail, 8)
+        free(tail.value)
+        c.evictable_size_ -= len(tail.value)
+        tail.value = tail.host_value = None  # as _free_failed_loadback leaves it
+
+        m = c.match_prefix(MatchPrefixParams(key=key))
+        self.assertEqual(m.device_indices.tolist(), top.value.tolist())
+        self.assertIs(m.last_device_node, top)
+        self.assertEqual(m.host_hit_length, 0)
 
     # ---- two-stage lockstep protocol tests --------------------------------
 
@@ -940,6 +1103,7 @@ class TestEICHiCacheRegression(unittest.TestCase):
         # EIC shared-page mode is device-indexed, so pages beyond device_pages are
         # unreachable: device_indexed=True must clamp to device_pages+1 regardless of
         # --hicache-ratio, while the non-EIC path keeps honoring the ratio.
+        from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
         from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
             _deepseek_v4_num_host_pages,
         )
@@ -949,10 +1113,9 @@ class TestEICHiCacheRegression(unittest.TestCase):
         params = SimpleNamespace(
             token_to_kv_pool_allocator=SimpleNamespace(size_full=339968)
         )
-        args = SimpleNamespace(hicache_size=0, hicache_ratio=2.0)
+        memory = SimpleNamespace(hicache_size=0, hicache_ratio=2.0)
         kwargs = dict(
             params=params,
-            server_args=args,
             kvcache=kv,
             page_size=page_size,
             swa_page_size=swa_page_size,
@@ -960,15 +1123,16 @@ class TestEICHiCacheRegression(unittest.TestCase):
         device_full = 339968 // page_size
         device_swa = 271872 // swa_page_size
 
-        self.assertEqual(
-            _deepseek_v4_num_host_pages(**kwargs, device_indexed=True),
-            (device_full + 1, device_swa + 1),
-        )
-        # Non-EIC host cache genuinely uses mem_pool_host.alloc(), so ratio must hold.
-        self.assertEqual(
-            _deepseek_v4_num_host_pages(**kwargs, device_indexed=False),
-            (device_full * 2, device_swa * 2),
-        )
+        with mock.patch.object(hybrid_pool_assembler, "get_memory", lambda: memory):
+            self.assertEqual(
+                _deepseek_v4_num_host_pages(**kwargs, device_indexed=True),
+                (device_full + 1, device_swa + 1),
+            )
+            # Non-EIC host cache genuinely uses mem_pool_host.alloc(), so ratio must hold.
+            self.assertEqual(
+                _deepseek_v4_num_host_pages(**kwargs, device_indexed=False),
+                (device_full * 2, device_swa * 2),
+            )
 
     def test_eic_calls_the_assembler_with_its_current_signature(self):
         # The port left six kwargs (page_size, tp_group, attn_cp_group,
@@ -1022,7 +1186,9 @@ class TestEICHiCacheRegression(unittest.TestCase):
         )
         cache.req_to_token_pool = SimpleNamespace(free=lambda idx: None)
         cache.cache_finished_req(
-            SimpleNamespace(req_pool_idx=0), is_insert=True, kv_len_to_handle=0
+            SimpleNamespace(kv=SimpleNamespace(req_pool_idx=0)),
+            is_insert=True,
+            kv_len_to_handle=0,
         )
         self.assertEqual(seen, [False])
 
