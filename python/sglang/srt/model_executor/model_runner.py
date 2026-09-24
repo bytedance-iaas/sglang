@@ -416,6 +416,12 @@ class ModelRunner:
             )
             raise
 
+        # Select plugin allocators after setting the device, before distributed
+        # communicators can allocate symmetric memory.
+        from sglang.srt.plugins.fused_moe import prepare_fused_moe_worker
+
+        prepare_fused_moe_worker(server_args)
+
         # Initialize MooncakeTransferEngine BEFORE init_torch_distributed so
         # that the shared TE can be passed to the Mooncake PG backend (avoids
         # creating duplicate TransferEngines).
@@ -668,7 +674,6 @@ class ModelRunner:
             model=self.model,
             model_config=self.model_config,
             is_draft_worker=self.is_draft_worker,
-            spec_algorithm=self.spec_algorithm,
         )
         adjust_hybrid_swa_layer_ids(
             model_config=self.model_config,

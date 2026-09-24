@@ -459,6 +459,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     is_extend_in_batch: bool = False
     can_run_decode_cuda_graph: bool = False
     can_run_dp_prefill_cuda_graph: bool = False
+    can_run_dp_draft_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
 
     # For two-batch overlap
@@ -805,6 +806,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             is_extend_in_batch=batch.is_extend_in_batch,
             can_run_decode_cuda_graph=batch.can_run_decode_cuda_graph,
             can_run_dp_prefill_cuda_graph=batch.can_run_dp_prefill_cuda_graph,
+            can_run_dp_draft_cuda_graph=batch.can_run_dp_draft_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
             spec_algorithm=batch.spec_algorithm,
@@ -952,12 +954,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             model_runner.lora_manager.prepare_lora_batch(ret)
 
         if (
-            getattr(model_runner, "dcp_size", 1) > 1
+            model_runner.ps.attn_dcp_size > 1
             and ret.out_cache_loc is not None
             and is_hip()
         ):
             ret.dcp_kv_mask = (
-                ret.positions % model_runner.dcp_size == model_runner.dcp_rank
+                ret.positions % model_runner.ps.attn_dcp_size
+                == model_runner.ps.attn_dcp_rank
             )
 
         return ret

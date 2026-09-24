@@ -776,6 +776,9 @@ class KimiK3MoE(nn.Module):
         equivalent to `self.experts(routed_input, topk_output)` on an a2a
         backend (combine returns fully-summed rows; `_reduce_latent` then only
         applies the norm)."""
+        if getattr(self.experts, "fused_moe_backend", None) is not None:
+            return self.experts(routed_input, topk_output)
+
         import deep_gemm
 
         from sglang.kernels.ops.attention.dsv4 import mega_moe_pre_dispatch

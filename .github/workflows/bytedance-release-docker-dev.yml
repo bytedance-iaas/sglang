@@ -1,5 +1,9 @@
 name: Bytedance Build and Push Development Docker Images
 
+permissions:
+  actions: read
+  contents: read
+
 on:
   workflow_dispatch:
     inputs:
@@ -37,6 +41,11 @@ on:
         required: false
         type: boolean
         default: true
+      kernel_artifact_run_id:
+        description: "Reuse sgl-kernel-x86-cu13 from this workflow run ID instead of rebuilding it"
+        required: false
+        type: string
+        default: ""
       image_formats:
         description: "Volcengine fork only: CSV of image formats to build (oci, zstd, nydus)."
         required: false
@@ -62,8 +71,11 @@ on:
     - cron: "0 0 * * *"
 
 concurrency:
-  group: release-docker-dev-${{ inputs.private_debug_verify_image != '' && format('verify-{0}', github.run_id) || inputs.tag || inputs.pr_number || 'nightly' }}
-  cancel-in-progress: true
+  # Manual recovery and explicitly named builds must not wait behind a
+  # scheduled build. Keep scheduled publishers serialized to avoid cancelling
+  # between OCI/zstd/nydus tag updates and leaving mixed rolling aliases.
+  group: release-docker-dev-${{ github.event_name == 'schedule' && format('scheduled-{0}', github.ref) || inputs.private_debug_verify_image != '' && format('verify-{0}', github.run_id) || inputs.tag != '' && format('tag-{0}', inputs.tag) || inputs.pr_number != '' && format('pr-{0}', inputs.pr_number) || format('manual-{0}', github.ref) }}
+  cancel-in-progress: false
 
 jobs:
   prepare:
@@ -287,7 +299,7 @@ jobs:
             --push .
 
   build-dev-kernel-wheel:
-    if: ${{ github.repository == 'bytedance-iaas/sglang' && !inputs.private_debug_base_only && inputs.private_debug_verify_image == '' && (github.event_name == 'schedule' || inputs.compile_kernel) }}
+    if: ${{ github.repository == 'bytedance-iaas/sglang' && !inputs.private_debug_base_only && inputs.private_debug_verify_image == '' && inputs.kernel_artifact_run_id == '' && (github.event_name == 'schedule' || inputs.compile_kernel) }}
     strategy:
       fail-fast: false
       matrix:
@@ -299,6 +311,10 @@ jobs:
       checkout_ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
       cuda_version: ${{ matrix.cuda_version }}
       artifact_name: sgl-kernel-${{ matrix.arch_tag }}
+      # Builders and workspaces are run-scoped, and the repository has several
+      # eligible runners. Do not serialize unrelated kernel builds globally.
+      concurrency_group: ${{ format('bytedance-kernel-build-{0}', github.run_id) }}
+    secrets: inherit
 
   build-dev:
     needs: [build-dev-kernel-wheel]
@@ -316,6 +332,7 @@ jobs:
     uses: ./.github/workflows/_bytedance-docker-build-and-publish.yml
     with:
       docker_target: framework_final
+      install_iaas_kernels: true
       checkout_ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
       cuda_key: ${{ matrix.cuda_key }}
       cuda_version: ${{ matrix.cuda_version }}
@@ -325,12 +342,20 @@ jobs:
       tag_mode: ${{ github.event_name == 'schedule' && 'nightly' || 'manual' }}
       tag_value: ${{ inputs.tag }}
       use_environment: prod
-      artifact_name: ${{ (github.event_name == 'schedule' || inputs.compile_kernel) && matrix.artifact_name || '' }}
+      # Serialize only builds that can publish the same tag family. Distinct
+      # explicit tags/PRs can use different build runners concurrently.
+      concurrency_group: ${{ github.event_name == 'schedule' && 'bytedance-docker-publish-dev-nightly' || inputs.tag != '' && format('bytedance-docker-publish-tag-{0}', inputs.tag) || inputs.pr_number != '' && format('bytedance-docker-publish-pr-{0}', inputs.pr_number) || 'bytedance-docker-publish-dev-manual' }}
+      artifact_name: ${{ (inputs.kernel_artifact_run_id != '' || github.event_name == 'schedule' || inputs.compile_kernel) && matrix.artifact_name || '' }}
+      artifact_run_id: ${{ inputs.kernel_artifact_run_id }}
+      # Same-run cold builds use internal TOS transport. Explicit reuse of an
+      # older run remains compatible with its GitHub artifact.
+      kernel_tos_uri: ${{ inputs.kernel_artifact_run_id == '' && needs.build-dev-kernel-wheel.outputs.kernel_tos_uri || '' }}
+      kernel_wheel_sha256: ${{ inputs.kernel_artifact_run_id == '' && needs.build-dev-kernel-wheel.outputs.kernel_wheel_sha256 || '' }}
       image_formats: ${{ github.event_name == 'schedule' && 'oci,zstd,nydus' || inputs.image_formats }}
       extra_build_args: >-
         --build-arg BRANCH_TYPE=local
         --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
-        --build-arg INSTALL_LOCAL_SGL_KERNEL_WHEEL=${{ (github.event_name == 'schedule' || inputs.compile_kernel) && '1' || '0' }}
+        --build-arg INSTALL_LOCAL_SGL_KERNEL_WHEEL=${{ (inputs.kernel_artifact_run_id != '' || github.event_name == 'schedule' || inputs.compile_kernel) && '1' || '0' }}
         --build-arg HTTP_PROXY=http://100.68.162.211:3128
         --build-arg HTTPS_PROXY=http://100.68.162.211:3128
         --build-arg ALL_PROXY=http://100.68.162.211:3128
@@ -346,6 +371,7 @@ jobs:
     uses: ./.github/workflows/_bytedance-docker-build-and-publish.yml
     with:
       docker_target: ${{ inputs.private_debug_docker_target || 'framework_final' }}
+      install_iaas_kernels: ${{ inputs.private_debug_docker_target != 'private_dependency_smoke' }}
       checkout_ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
       cuda_key: cu130
       cuda_version: 13.0.3
@@ -374,6 +400,9 @@ jobs:
     if: ${{ github.repository == 'bytedance-iaas/sglang' && inputs.private_debug_verify_image != '' }}
     environment: prod
     runs-on: x64-docker-build-node
+    concurrency:
+      group: bytedance-x64-docker-build-node
+      cancel-in-progress: false
     env:
       IMAGE_REF: ${{ inputs.private_debug_verify_image }}
       VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
@@ -381,6 +410,11 @@ jobs:
     steps:
       - name: Checkout verification script
         uses: actions/checkout@v4
+
+      - name: Reclaim disposable caches and require verification capacity
+        run: |
+          chmod +x scripts/ci/cleanup_build_runner_disk.sh
+          scripts/ci/cleanup_build_runner_disk.sh --required-gb 50
 
       - name: Login to Volcengine CR
         run: |
@@ -430,3 +464,9 @@ jobs:
             python3 -m pytest -q test/registered/unit/test_runtime_context.py -k TestMoeFlagsGroup
             python3 -m pytest -q test/registered/unit/test_model_overrides.py -k deepseek_spec_moe_resolution
           '
+
+      - name: Remove pulled verification images
+        if: always()
+        run: |
+          docker image prune -af || true
+          df -h /

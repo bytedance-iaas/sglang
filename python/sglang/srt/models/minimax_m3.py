@@ -230,6 +230,34 @@ class _FusedQKVIndexProj(nn.Module):
         return self._qm.apply(self, x, None)
 
 
+def _normalize_scattered_pp_proxy_tensors_for_cuda_graph(
+    pp_proxy_tensors: PPProxyTensors,
+    *,
+    positions: torch.Tensor,
+    attn_tp_size: int,
+) -> PPProxyTensors:
+    """Slice graph dummy PP inputs to the token-local shape used by EP."""
+    global_num_tokens = positions.shape[0]
+    if attn_tp_size <= 1 or global_num_tokens % attn_tp_size != 0:
+        return pp_proxy_tensors
+
+    token_keys = ("hidden_states", "residual")
+    if not all(
+        key in pp_proxy_tensors.tensors
+        and pp_proxy_tensors[key].shape[0] == global_num_tokens
+        for key in token_keys
+    ):
+        return pp_proxy_tensors
+
+    local_num_tokens = global_num_tokens // attn_tp_size
+    return PPProxyTensors(
+        {
+            key: (value[:local_num_tokens] if key in token_keys else value)
+            for key, value in pp_proxy_tensors.tensors.items()
+        }
+    )
+
+
 def build_minimax_fused_qkv_index(model: nn.Module) -> None:
     for module in model.modules():
         if isinstance(module, MiniMaxM3Attention):
@@ -1488,6 +1516,16 @@ class MiniMaxM3Model(nn.Module):
             residual = None
         else:
             assert pp_proxy_tensors is not None
+            first_layer = self.layers[self.start_layer]
+            if (
+                first_layer.layer_scatter_modes.layer_input_mode
+                == ScatterMode.SCATTERED
+            ):
+                pp_proxy_tensors = _normalize_scattered_pp_proxy_tensors_for_cuda_graph(
+                    pp_proxy_tensors,
+                    positions=positions,
+                    attn_tp_size=get_parallel().attn_tp_size,
+                )
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
@@ -1639,17 +1677,11 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                 setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
 
     def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
-        if not self.pp_group.is_last_rank:
-            return
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."
             )
-        self.capture_aux_hidden_states = True
-        self.model.layers_to_capture = [val + 1 for val in layer_ids]
-        for layer_id in self.model.layers_to_capture:
-            if 0 <= layer_id < len(self.model.layers):
-                setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
+        self.set_eagle3_layers_to_capture(layer_ids)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
@@ -1668,7 +1700,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         )
 
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
+        if self.capture_aux_hidden_states and isinstance(hidden_states, tuple):
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:

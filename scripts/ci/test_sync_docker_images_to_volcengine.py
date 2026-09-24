@@ -6,8 +6,8 @@ import io
 import sys
 import unittest
 from pathlib import Path
-from urllib.error import HTTPError
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
