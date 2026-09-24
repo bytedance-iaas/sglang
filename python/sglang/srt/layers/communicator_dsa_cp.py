@@ -18,6 +18,7 @@ from typing import Callable, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
@@ -100,6 +101,15 @@ def dsa_cp_reduce_scatter_hidden_states(
             and local_tokens * pre_reduce.shape[1] * pre_reduce.element_size()
             <= ca_comm.max_push_size
         )
+        if (
+            envs.SGLANG_DSV41_MOE_FINALIZE_REDUCE_SCATTER_STRICT.get()
+            and not can_use_fused
+        ):
+            raise RuntimeError(
+                "Strict fused MoE finalize+RS rejected fallback: "
+                f"message_bytes={local_tokens * pre_reduce.shape[1] * pre_reduce.element_size()}, "
+                f"max_push_size={ca_comm.max_push_size if ca_comm is not None else -1}"
+            )
         if can_use_fused:
             from sglang.kernels.ops.communication.moe_finalize_reduce_scatter import (
                 moe_finalize_reduce_scatter,

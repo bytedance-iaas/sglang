@@ -294,6 +294,7 @@ class GroupCoordinator:
         recovered_rank: bool = False,
         rank_offset: int = 0,
         max_world_size: Optional[int] = None,
+        custom_allreduce_max_push_size: Optional[int] = None,
     ):
         # Set group info
         group_name = group_name or "anonymous"
@@ -481,9 +482,18 @@ class GroupCoordinator:
                     group=self.cpu_group,
                     device=self.device,
                 )
+                ca_kwargs = {}
+                if custom_allreduce_max_push_size is not None:
+                    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+                        CustomAllReduceV2,
+                    )
+
+                    if CAClass is CustomAllReduceV2:
+                        ca_kwargs["max_push_size"] = custom_allreduce_max_push_size
                 self.ca_comm = CAClass(
                     group=self.cpu_group,
                     device=self.device,
+                    **ca_kwargs,
                 )
             except Exception as e:
                 logger.warning(
@@ -2110,6 +2120,7 @@ def init_model_parallel_group(
     recovered_rank: bool = False,
     rank_offset: int = 0,
     max_world_size: Optional[int] = None,
+    custom_allreduce_max_push_size: Optional[int] = None,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
@@ -2137,6 +2148,7 @@ def init_model_parallel_group(
         recovered_rank=recovered_rank,
         rank_offset=rank_offset,
         max_world_size=max_world_size,
+        custom_allreduce_max_push_size=custom_allreduce_max_push_size,
     )
 
 
@@ -2630,6 +2642,12 @@ def initialize_model_parallel(
         recovered_rank=recovered_rank,
         rank_offset=rank_offset,
         max_world_size=max_world_size,
+        custom_allreduce_max_push_size=(
+            envs.SGLANG_DSV41_MOE_FINALIZE_REDUCE_SCATTER_PUSH_SIZE_KB.get() * 1024
+            if envs.SGLANG_DSV41_MOE_FINALIZE_REDUCE_SCATTER.get()
+            and attention_context_model_parallel_size == tensor_model_parallel_size
+            else None
+        ),
     )
 
     if duplicate_tp_group:
@@ -2723,6 +2741,11 @@ def initialize_model_parallel(
             recovered_rank=recovered_rank,
             rank_offset=rank_offset,
             max_world_size=max_world_size,
+            custom_allreduce_max_push_size=(
+                envs.SGLANG_DSV41_MOE_FINALIZE_REDUCE_SCATTER_PUSH_SIZE_KB.get() * 1024
+                if envs.SGLANG_DSV41_MOE_FINALIZE_REDUCE_SCATTER.get()
+                else None
+            ),
         )
 
     from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP

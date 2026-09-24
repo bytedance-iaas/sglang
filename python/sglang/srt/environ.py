@@ -1050,6 +1050,12 @@ class Envs:
     # DSV4.1 SM90 Humming: expose CUTLASS GEMM2 rows to SGLang and fuse
     # finalize + shared add + CP reduce-scatter.
     SGLANG_DSV41_MOE_FINALIZE_REDUCE_SCATTER = EnvBool(False)
+    # Fail instead of silently falling back when deferred finalize + CP
+    # reduce-scatter cannot use the fused push path.
+    SGLANG_DSV41_MOE_FINALIZE_REDUCE_SCATTER_STRICT = EnvBool(False)
+    # Per-slot push workspace for the DSV4.1 attention-CP communicator. This
+    # expands fused finalize capacity without changing other groups' tuning.
+    SGLANG_DSV41_MOE_FINALIZE_REDUCE_SCATTER_PUSH_SIZE_KB = EnvInt(24 * 1024)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
