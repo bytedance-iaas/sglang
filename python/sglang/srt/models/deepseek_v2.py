@@ -1288,7 +1288,17 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
 
-        if pre_quant_input is not None:
+        defer_cp_finalize = (
+            get_forward().defer_cp_moe_shared_add
+            and self.experts.supports_deferred_finalize
+        )
+        if defer_cp_finalize:
+            final_hidden_states = self.experts.forward_deferred_finalize(
+                hidden_states,
+                topk_output,
+                pre_quant_input=pre_quant_input,
+            )
+        elif pre_quant_input is not None:
             final_hidden_states = self.experts(
                 hidden_states,
                 topk_output,
@@ -1321,12 +1331,30 @@ class DeepseekV2MoE(nn.Module):
                 pre_quant_input=pre_quant_input,
             )
 
-        final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
-            self.experts,
-            final_hidden_states,
-            None if self._shared_expert_tp1 else shared_output,
-            self.routed_scaling_factor,
+        defer_cp_shared_add = (
+            get_forward().defer_cp_moe_shared_add
+            and shared_output is not None
+            and not self._shared_expert_tp1
         )
+        if defer_cp_finalize:
+            get_forward().set("cp_moe_deferred_output", final_hidden_states)
+            get_forward().set("cp_moe_shared_output", shared_output)
+            # This value is replaced by the fused finalize-reduce-scatter
+            # before it can escape the CP layer.
+            final_hidden_states = shared_output
+        else:
+            final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
+                self.experts,
+                final_hidden_states,
+                (
+                    None
+                    if self._shared_expert_tp1 or defer_cp_shared_add
+                    else shared_output
+                ),
+                self.routed_scaling_factor,
+            )
+        if defer_cp_shared_add and not defer_cp_finalize:
+            get_forward().set("cp_moe_shared_output", shared_output)
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,

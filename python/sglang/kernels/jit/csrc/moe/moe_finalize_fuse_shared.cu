@@ -67,6 +67,7 @@ constexpr int MAX_TOPK = 64;
 template <typename TypeExpW>
 __global__ void moeFinalizeKernel(
     int numTokens,
+    int numRows,
     int hiddenDim,
     int hiddenDimPadded,
     int topK,
@@ -86,7 +87,7 @@ __global__ void moeFinalizeKernel(
       for (int k = 0; k < topK; k++) {
         int64_t const expandedIdx = tokenIdx * topK + k;
         int64_t const permutedIdx = expandedIdxToPermutedIdx[expandedIdx];
-        if (permutedIdx == -1) {
+        if (permutedIdx < 0 || permutedIdx >= numRows) {
           continue;
         }
         float const scale = static_cast<float>(expertWeightsPtr[expandedIdx]);
@@ -137,6 +138,7 @@ struct IdxPackedTraits<4> {
 template <typename TypeExpW, int TopKUnrollFactor>
 __global__ void moeFinalizeKernelVecLoad(
     int numTokens,
+    int numRows,
     int hiddenDim,
     int hiddenDimPadded,
     int topK,
@@ -199,7 +201,7 @@ __global__ void moeFinalizeKernelVecLoad(
 #pragma unroll
       for (int ki = 0; ki < TopKUnrollFactor; ++ki) {
         int const permutedIdx = permutedIdxArr[ki];
-        if (permutedIdx == -1) {
+        if (permutedIdx < 0 || permutedIdx >= numRows) {
           continue;
         }
         auto const* inputPermutedPtr = inElemPtr + permutedIdx * numElemsInPaddedCol;
@@ -210,7 +212,7 @@ __global__ void moeFinalizeKernelVecLoad(
 #pragma unroll
       for (int ki = 0; ki < TopKUnrollFactor; ++ki) {
         int const permutedIdx = permutedIdxArr[ki];
-        if (permutedIdx == -1) {
+        if (permutedIdx < 0 || permutedIdx >= numRows) {
           continue;
         }
         float const scale = static_cast<float>(scaleArr[ki]);
@@ -249,6 +251,7 @@ __global__ void moeFinalizeKernelVecLoad(
 template <typename TypeExpW>
 void dispatchFinalize(
     int numTokens,
+    int numRows,
     int hiddenDim,
     int hiddenDimPadded,
     int topK,
@@ -279,6 +282,7 @@ void dispatchFinalize(
         &config,
         moeFinalizeKernel<TypeExpW>,
         numTokens,
+        numRows,
         hiddenDim,
         hiddenDimPadded,
         topK,
@@ -303,6 +307,7 @@ void dispatchFinalize(
         &config,
         moeFinalizeKernelVecLoad<TypeExpW, UNROLL>,
         numTokens,
+        numRows,
         hiddenDim,
         hiddenDimPadded,
         topK,
@@ -339,6 +344,7 @@ void moe_finalize_fuse_shared(
   TVM_FFI_ICHECK_EQ(expert_weights.ndim(), 2) << "expert_weights must be 2-D [numTokens, topK]";
 
   int const numTokens = int(out.size(0));
+  int const numRows = int(gemm2_out.size(0));
   int const hiddenDim = int(out.size(1));
   int const hiddenDimPadded = int(gemm2_out.size(1));
   TVM_FFI_ICHECK_LE(top_k, MAX_TOPK);
@@ -377,6 +383,7 @@ void moe_finalize_fuse_shared(
   if (ew_dtype == DLDataType{kDLFloat, 32, 1}) {
     dispatchFinalize<float>(
         numTokens,
+        numRows,
         hiddenDim,
         hiddenDimPadded,
         int(top_k),
@@ -392,6 +399,7 @@ void moe_finalize_fuse_shared(
   } else if (ew_dtype == DLDataType{kDLBfloat, 16, 1}) {
     dispatchFinalize<BF16>(
         numTokens,
+        numRows,
         hiddenDim,
         hiddenDimPadded,
         int(top_k),

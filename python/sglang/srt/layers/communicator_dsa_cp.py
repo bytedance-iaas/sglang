@@ -18,6 +18,7 @@ from typing import Callable, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
@@ -72,14 +73,92 @@ def dsa_cp_gather_hidden_states(hidden_states: torch.Tensor):
     return hidden_states
 
 
-def dsa_cp_reduce_scatter_hidden_states(hidden_states: torch.Tensor):
+def dsa_cp_reduce_scatter_hidden_states(
+    hidden_states: torch.Tensor,
+    pre_reduce: Optional[torch.Tensor] = None,
+    deferred_moe=None,
+):
     attn_dp_size = get_parallel().attn_dp_size
     attn_tp_size = get_parallel().attn_tp_size
     assert attn_dp_size == 1 and attn_tp_size == 1
     cp_size = get_parallel().attn_cp_size
     cp_rank = get_parallel().attn_cp_rank
+    if deferred_moe is not None:
+        assert pre_reduce is not None
+        group = get_parallel().attn_cp_group
+        ca_comm = group.ca_comm
+        local_tokens = deferred_moe.expert_weights.shape[0] // cp_size + int(
+            cp_rank < deferred_moe.expert_weights.shape[0] % cp_size
+        )
+        can_use_fused = (
+            ca_comm is not None
+            and not ca_comm.disabled
+            and ca_comm.obj.push is not None
+            and deferred_moe.gemm2_out.is_contiguous()
+            and deferred_moe.expanded_idx_to_permuted_idx.is_contiguous()
+            and deferred_moe.expert_weights.is_contiguous()
+            and pre_reduce.is_contiguous()
+            and local_tokens * pre_reduce.shape[1] * pre_reduce.element_size()
+            <= ca_comm.max_push_size
+        )
+        if (
+            envs.SGLANG_DSV41_MOE_FINALIZE_REDUCE_SCATTER_STRICT.get()
+            and not can_use_fused
+        ):
+            raise RuntimeError(
+                "Strict fused MoE finalize+RS rejected fallback: "
+                f"message_bytes={local_tokens * pre_reduce.shape[1] * pre_reduce.element_size()}, "
+                f"max_push_size={ca_comm.max_push_size if ca_comm is not None else -1}"
+            )
+        if can_use_fused:
+            from sglang.kernels.ops.communication.moe_finalize_reduce_scatter import (
+                moe_finalize_reduce_scatter,
+            )
+
+            return moe_finalize_reduce_scatter(
+                ca_comm.obj,
+                deferred_moe.gemm2_out,
+                deferred_moe.expanded_idx_to_permuted_idx,
+                deferred_moe.expert_weights,
+                pre_reduce,
+            )
+
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            finalize_flashinfer_trtllm_deferred_output,
+        )
+
+        hidden_states = finalize_flashinfer_trtllm_deferred_output(
+            deferred_moe,
+            pre_reduce,
+        )
+        pre_reduce = None
+
     input_hidden_states = hidden_states
     hidden_states = hidden_states.tensor_split(cp_size)[cp_rank]
+    if pre_reduce is not None:
+        group = get_parallel().attn_cp_group
+        ca_comm = group.ca_comm
+        can_use_custom = (
+            ca_comm is not None
+            and not ca_comm.disabled
+            and ca_comm.obj.push is not None
+            and input_hidden_states.is_contiguous()
+            and pre_reduce.is_contiguous()
+            and input_hidden_states.shape == pre_reduce.shape
+            and input_hidden_states.dtype == pre_reduce.dtype == torch.bfloat16
+            and hidden_states.nbytes <= ca_comm.max_push_size
+        )
+        if can_use_custom:
+            from sglang.kernels.ops.communication import nvlink_comm
+
+            nvlink_comm.reduce_scatter_push(
+                ca_comm.obj,
+                input_hidden_states,
+                hidden_states,
+                pre_reduce=pre_reduce,
+            )
+            return hidden_states
+        input_hidden_states.add_(pre_reduce)
     attn_cp_reduce_scatter_tensor(hidden_states, input_hidden_states)
     return hidden_states
 
@@ -108,7 +187,7 @@ class DSACPLayerCommunicator(LayerCommunicator):
         # SCATTERED in attn tp is different from SCATTERED in global tp when dp_size > 1
         if self.layer_scatter_modes.mlp_mode != ScatterMode.SCATTERED:
             assert self._context.attn_dp_size == 1, (
-                f"dp_size should be 1 when moe_runner_backend is none"
+                "dp_size should be 1 when moe_runner_backend is none"
             )
         self._communicate_simple_fn = DSACPCommunicateSimpleFn.get_fn(
             input_mode=ScatterMode.SCATTERED,
