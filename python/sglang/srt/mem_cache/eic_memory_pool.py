@@ -1791,7 +1791,6 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
 
         host_pool_group, staging_controller = build_deepseek_v4_hicache_stack(
             params=params,
-            server_args=server_args,
             kvcache=device_pool,
             load_cache_event=load_cache_event,
             storage_backend=None,

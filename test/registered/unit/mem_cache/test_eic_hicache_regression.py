@@ -244,6 +244,7 @@ class TestEICHiCacheRegression(unittest.TestCase):
         )
         alloc._expand_to_full_pages = lambda idx: idx
         alloc.dedup_aliased_swa = True
+        alloc.free_group = None
 
         SWATokenToKVPoolAllocator.free_swa(alloc, torch.arange(8))
 
@@ -503,9 +504,9 @@ class TestEICHiCacheRegression(unittest.TestCase):
             req_to_token=r2t, write=lambda idx, v: r2t.__setitem__(idx, v)
         )
         req = SimpleNamespace(
-            fill_ids=list(range(32)),
+            get_fill_ids=lambda: list(range(32)),
             extra_key=None,
-            req_pool_idx=0,
+            kv=SimpleNamespace(req_pool_idx=0),
             cache_protected_len=16,
             last_node=head,
             prefix_indices=own[:16],
@@ -1102,6 +1103,7 @@ class TestEICHiCacheRegression(unittest.TestCase):
         # EIC shared-page mode is device-indexed, so pages beyond device_pages are
         # unreachable: device_indexed=True must clamp to device_pages+1 regardless of
         # --hicache-ratio, while the non-EIC path keeps honoring the ratio.
+        from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
         from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
             _deepseek_v4_num_host_pages,
         )
@@ -1111,10 +1113,9 @@ class TestEICHiCacheRegression(unittest.TestCase):
         params = SimpleNamespace(
             token_to_kv_pool_allocator=SimpleNamespace(size_full=339968)
         )
-        args = SimpleNamespace(hicache_size=0, hicache_ratio=2.0)
+        memory = SimpleNamespace(hicache_size=0, hicache_ratio=2.0)
         kwargs = dict(
             params=params,
-            server_args=args,
             kvcache=kv,
             page_size=page_size,
             swa_page_size=swa_page_size,
@@ -1122,15 +1123,16 @@ class TestEICHiCacheRegression(unittest.TestCase):
         device_full = 339968 // page_size
         device_swa = 271872 // swa_page_size
 
-        self.assertEqual(
-            _deepseek_v4_num_host_pages(**kwargs, device_indexed=True),
-            (device_full + 1, device_swa + 1),
-        )
-        # Non-EIC host cache genuinely uses mem_pool_host.alloc(), so ratio must hold.
-        self.assertEqual(
-            _deepseek_v4_num_host_pages(**kwargs, device_indexed=False),
-            (device_full * 2, device_swa * 2),
-        )
+        with mock.patch.object(hybrid_pool_assembler, "get_memory", lambda: memory):
+            self.assertEqual(
+                _deepseek_v4_num_host_pages(**kwargs, device_indexed=True),
+                (device_full + 1, device_swa + 1),
+            )
+            # Non-EIC host cache genuinely uses mem_pool_host.alloc(), so ratio must hold.
+            self.assertEqual(
+                _deepseek_v4_num_host_pages(**kwargs, device_indexed=False),
+                (device_full * 2, device_swa * 2),
+            )
 
     def test_eic_calls_the_assembler_with_its_current_signature(self):
         # The port left six kwargs (page_size, tp_group, attn_cp_group,
@@ -1184,7 +1186,9 @@ class TestEICHiCacheRegression(unittest.TestCase):
         )
         cache.req_to_token_pool = SimpleNamespace(free=lambda idx: None)
         cache.cache_finished_req(
-            SimpleNamespace(req_pool_idx=0), is_insert=True, kv_len_to_handle=0
+            SimpleNamespace(kv=SimpleNamespace(req_pool_idx=0)),
+            is_insert=True,
+            kv_len_to_handle=0,
         )
         self.assertEqual(seen, [False])
 
