@@ -96,6 +96,16 @@ on:
         required: false
         type: string
         default: ""
+      kernel_tos_uri:
+        description: "Optional immutable TOS URI containing the kernel wheel"
+        required: false
+        type: string
+        default: ""
+      kernel_wheel_sha256:
+        description: "Authoritative SHA-256 required with kernel_tos_uri"
+        required: false
+        type: string
+        default: ""
       image_formats:
         description: "CSV of image formats to build and push. Default builds all three (oci,zstd,nydus); pass a subset to narrow."
         required: false
@@ -315,7 +325,7 @@ jobs:
           scripts/ci/cleanup_build_runner_disk.sh --required-gb 150
 
       - name: Download local sgl-kernel wheel
-        if: ${{ inputs.artifact_name != '' }}
+        if: ${{ inputs.artifact_name != '' || inputs.kernel_tos_uri != '' }}
         # The Actions blob route has sustained less than 0.1 MiB/s from the
         # image runners. Keep the transfer bounded, but allow resumed chunks
         # enough wall time to finish a verified ~372 MiB wheel artifact.
@@ -325,13 +335,25 @@ jobs:
           KERNEL_ARTIFACT_NAME: ${{ inputs.artifact_name }}
           KERNEL_ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id || github.run_id }}
           KERNEL_ARTIFACT_HTTPS_PROXY: http://100.68.162.211:3128
+          KERNEL_ARTIFACT_TOS_ENDPOINT: tos-cn-beijing.volces.com
+          KERNEL_ARTIFACT_TOS_REGION: cn-beijing
+          KERNEL_ARTIFACT_TOS_BUCKET: ai-infra
+          KERNEL_ARTIFACT_TOS_PREFIX: sglang-ci/kernel-wheels
+          KERNEL_ARTIFACT_TOS_URI: ${{ inputs.kernel_tos_uri }}
+          KERNEL_WHEEL_SHA256: ${{ inputs.kernel_wheel_sha256 }}
+          TOSUTIL_CONFIG_B64: ${{ secrets.TOSUTIL_CONFIG_B64 }}
         run: |
+          if [ -n "$KERNEL_ARTIFACT_TOS_URI" ]; then
+            scripts/ci/install_tosutil.sh
+          fi
           python3 -m unittest discover -s scripts/ci -p test_download_kernel_artifact.py
           python3 scripts/ci/download_kernel_artifact.py \
             --repository "$GITHUB_REPOSITORY" \
             --run-id "$KERNEL_ARTIFACT_RUN_ID" \
             --name "$KERNEL_ARTIFACT_NAME" \
-            --output .ci-artifacts/sgl-kernel
+            --output .ci-artifacts/sgl-kernel \
+            --tos-uri "$KERNEL_ARTIFACT_TOS_URI" \
+            --wheel-sha256 "$KERNEL_WHEEL_SHA256"
 
       - name: Set up Docker Buildx with local Docker Hub mirror
         uses: docker/setup-buildx-action@v3

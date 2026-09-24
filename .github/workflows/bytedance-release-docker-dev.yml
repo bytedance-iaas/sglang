@@ -314,6 +314,7 @@ jobs:
       # Builders and workspaces are run-scoped, and the repository has several
       # eligible runners. Do not serialize unrelated kernel builds globally.
       concurrency_group: ${{ format('bytedance-kernel-build-{0}', github.run_id) }}
+    secrets: inherit
 
   build-dev:
     needs: [build-dev-kernel-wheel]
@@ -346,6 +347,10 @@ jobs:
       concurrency_group: ${{ github.event_name == 'schedule' && 'bytedance-docker-publish-dev-nightly' || inputs.tag != '' && format('bytedance-docker-publish-tag-{0}', inputs.tag) || inputs.pr_number != '' && format('bytedance-docker-publish-pr-{0}', inputs.pr_number) || 'bytedance-docker-publish-dev-manual' }}
       artifact_name: ${{ (inputs.kernel_artifact_run_id != '' || github.event_name == 'schedule' || inputs.compile_kernel) && matrix.artifact_name || '' }}
       artifact_run_id: ${{ inputs.kernel_artifact_run_id }}
+      # Same-run cold builds use internal TOS transport. Explicit reuse of an
+      # older run remains compatible with its GitHub artifact.
+      kernel_tos_uri: ${{ inputs.kernel_artifact_run_id == '' && needs.build-dev-kernel-wheel.outputs.kernel_tos_uri || '' }}
+      kernel_wheel_sha256: ${{ inputs.kernel_artifact_run_id == '' && needs.build-dev-kernel-wheel.outputs.kernel_wheel_sha256 || '' }}
       image_formats: ${{ github.event_name == 'schedule' && 'oci,zstd,nydus' || inputs.image_formats }}
       extra_build_args: >-
         --build-arg BRANCH_TYPE=local

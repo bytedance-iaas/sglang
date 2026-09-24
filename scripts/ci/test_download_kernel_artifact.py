@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import importlib.util
 import io
@@ -157,6 +158,92 @@ class KernelArtifactTests(unittest.TestCase):
         self.assertIn("--proxy", command)
         self.assertIn("http://proxy.example:3128", command)
         self.assertNotIn("test-token", " ".join(command))
+
+    def test_tos_wheel_is_downloaded_and_verified(self):
+        wheel_data = make_wheel()
+        wheel_sha256 = hashlib.sha256(wheel_data).hexdigest()
+        tos_uri = f"tos://ai-infra/sglang-ci/kernel-wheels/1/2/1/kernel/{WHEEL}"
+
+        def tos(command, **kwargs):
+            self.assertEqual(command[:4], ["timeout", "20m", "tosutil", "cp"])
+            self.assertEqual(command[4], tos_uri)
+            self.assertIn("-e=tos-cn-beijing.volces.com", command)
+            self.assertIn("-re=cn-beijing", command)
+            config_arg = next(arg for arg in command if arg.startswith("-conf="))
+            config = Path(config_arg.removeprefix("-conf="))
+            self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(config.read_bytes(), b"encrypted-config")
+            self.assertNotIn("encrypted-config", " ".join(command))
+            Path(command[5]).write_bytes(wheel_data)
+            return SimpleNamespace(returncode=0)
+
+        with patch.dict(
+            download.os.environ,
+            {
+                "KERNEL_ARTIFACT_TOS_ENDPOINT": "tos-cn-beijing.volces.com",
+                "KERNEL_ARTIFACT_TOS_REGION": "cn-beijing",
+                "KERNEL_ARTIFACT_TOS_BUCKET": "ai-infra",
+                "KERNEL_ARTIFACT_TOS_PREFIX": "sglang-ci/kernel-wheels",
+                "TOSUTIL_CONFIG_B64": base64.b64encode(
+                    b"encrypted-config"
+                ).decode(),
+            },
+        ), patch.object(download.subprocess, "run", side_effect=tos):
+            result = download.recover_tos_wheel(
+                tos_uri, wheel_sha256, self.output
+            )
+        self.assertEqual(result, self.output / WHEEL)
+        self.assertEqual(result.read_bytes(), wheel_data)
+
+    def test_tos_transport_requires_configuration_before_download(self):
+        tos_uri = f"tos://ai-infra/sglang-ci/kernel-wheels/1/{WHEEL}"
+        with patch.dict(
+            download.os.environ,
+            {
+                "KERNEL_ARTIFACT_TOS_BUCKET": "ai-infra",
+                "KERNEL_ARTIFACT_TOS_PREFIX": "sglang-ci/kernel-wheels",
+                "KERNEL_ARTIFACT_TOS_ENDPOINT": "tos-cn-beijing.volces.com",
+                "KERNEL_ARTIFACT_TOS_REGION": "cn-beijing",
+            },
+            clear=True,
+        ), patch.object(download.subprocess, "run") as run:
+            with self.assertRaisesRegex(ValueError, "configuration"):
+                download.recover_tos_wheel(tos_uri, "0" * 64, self.output)
+            run.assert_not_called()
+
+    def test_tos_transport_rejects_unpinned_or_unverified_input(self):
+        for tos_uri, wheel_sha256, error in (
+            ("https://example.com/kernel.whl", "0" * 64, "pinned TOS"),
+            ("tos://ai-infra/kernel.whl", "0" * 64, "pinned TOS"),
+            (
+                f"tos://other-bucket/sglang-ci/kernel-wheels/1/{WHEEL}",
+                "0" * 64,
+                "configured prefix",
+            ),
+            (
+                f"tos://ai-infra/unrelated/1/{WHEEL}",
+                "0" * 64,
+                "configured prefix",
+            ),
+            (
+                f"tos://ai-infra/sglang-ci/kernel-wheels/1/{WHEEL}",
+                "missing",
+                "authoritative SHA-256",
+            ),
+        ):
+            with patch.object(download.subprocess, "run") as run:
+                with patch.dict(
+                    download.os.environ,
+                    {
+                        "KERNEL_ARTIFACT_TOS_BUCKET": "ai-infra",
+                        "KERNEL_ARTIFACT_TOS_PREFIX": "sglang-ci/kernel-wheels",
+                    },
+                ):
+                    with self.assertRaisesRegex(ValueError, error):
+                        download.recover_tos_wheel(
+                            tos_uri, wheel_sha256, self.output
+                        )
+                run.assert_not_called()
 
     def test_download_timeouts_are_bounded_and_publish_nothing(self):
         _, metadata = self.bundle([(WHEEL, make_wheel())])
