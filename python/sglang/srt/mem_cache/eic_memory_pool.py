@@ -4,6 +4,7 @@ import os
 import queue
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from enum import IntEnum
 from types import SimpleNamespace
@@ -96,6 +97,15 @@ def _status_name(status_code) -> str:
     if status_code == eic.StatusCode.PARTIAL_FAILED:
         return "PARTIAL_FAILED"
     return "FAILED"
+
+
+def _num_leading_ok(success_mask) -> int:
+    n = 0
+    for ok in success_mask:
+        if not ok:
+            break
+        n += 1
+    return n
 
 
 class MemoryStateInt(IntEnum):
@@ -379,21 +389,11 @@ class EICKVClient:
             self.device if G_EnableKVGetGPUDirect else "cpu",
         )
 
-        # Parallel DSv4 load-back. Fetcher threads run only the network mget into
-        # disjoint bounce chunks; the caller repacks on its single GPU stream in
-        # fetch order, so TP collectives/acks above stay identical to serial.
-        # fanout=1 is the original path.
+        # Parallel DSv4 load-back (fanout=1 is the original serial path): fetcher
+        # threads only mget into bounce chunks, the load thread repacks them.
         self.load_fanout = max(1, int(config.get("eic_load_fanout", 1)))
         self.load_page_batch_cfg = int(config.get("eic_load_page_batch", 0))
-        credit_cap = G_GDRBounceTensorCount * (
-            5 if (not G_EnableKVGetGPUDirect and G_EnableGPUNicAffinity) else 1
-        )
-        # Multi-permit reservation so concurrent fetchers reserve a whole batch
-        # atomically or wait: bounds total in-flight GDR chunks to the
-        # registered pool size (no unregistered fallback under contention).
-        self._read_cap = credit_cap
-        self._read_free = credit_cap
-        self._read_cond = threading.Condition()
+        self.read_chunk_cap = self.kv_cache_read_mem_pool.kvcache_mempool.shape[0]
         self._load_fetch_pool = (
             ThreadPoolExecutor(
                 max_workers=self.load_fanout,
@@ -404,7 +404,7 @@ class EICKVClient:
         )
         logger.info(
             f"eic load fanout={self.load_fanout} page_batch_cfg={self.load_page_batch_cfg} "
-            f"bounce_chunks={credit_cap}"
+            f"bounce_chunks={self.read_chunk_cap}"
         )
 
         if G_EnableAsyncKVSet:
@@ -435,17 +435,6 @@ class EICKVClient:
             thread.start()
 
         self._warm_up()
-
-    def _acquire_chunks(self, n):
-        with self._read_cond:
-            while self._read_free < n:
-                self._read_cond.wait()
-            self._read_free -= n
-
-    def _release_chunks(self, n):
-        with self._read_cond:
-            self._read_free += n
-            self._read_cond.notify_all()
 
     def _warm_up(self):
         logger.info("begin warm up eic client")
@@ -654,217 +643,121 @@ class EICKVClient:
         status = eic.StatusCode.SUCCESS if ok else eic.StatusCode.PARTIAL_FAILED
         return status, SimpleNamespace(status_codes=codes)
 
-    def _fetch_batch(self, keys: List[str]):
-        """Network-only half of a get batch; runs on a fetcher thread.
-
-        Reserves bounce-chunk credits and pulls into disjoint bounce chunks. No
-        GPU repack here, so concurrent fetchers have no CUDA-stream dependency.
-        """
+    def _mget_into(self, keys: List[str], objs, registered):
+        """mget `keys` into `objs`, re-getting failed keys once; records the RPC
+        stats and returns (status_code, per-key success_mask)."""
         count = len(keys)
-        self._acquire_chunks(count)
-        handle = {"count": count, "permits": count}
-        try:
-            objs, host_pool, host_indices, registered = (
-                self.allocate_eic_read_buffer(count)
-            )
-            handle.update(
-                objs=objs,
-                host_memory_pool=host_pool,
-                host_indices=host_indices,
-                registered=registered,
-            )
-            data_keys = eic.StringVector()
-            data_vals = eic.IOBuffers()
-            for i, key in enumerate(keys):
-                data_keys.append(key)
-                data_vals.append(
-                    objs[i].data_ptr(),
-                    objs[i].element_size() * objs[i].numel(),
-                    registered,
-                )
-            get_option = eic.GetOption()
-            get_option.ns = self.eic_namespace
-            t0 = time.perf_counter()
-            status_code, _, get_outcome = self.connection.mget(
-                data_keys, get_option, data_vals
-            )
-            first_s = time.perf_counter() - t0
-            stats.observe_lat("mget.first", first_s)
-            stats.observe_slow("mget", first_s, 1.0)
-            if status_code == eic.StatusCode.PARTIAL_FAILED:
-                rf0 = time.perf_counter()
-                status_code, get_outcome = self._refetch_failed(
-                    keys, objs, registered, get_option, get_outcome
-                )
-                stats.observe_lat("mget.refetch_s", time.perf_counter() - rf0)
-
-            success_mask = [True] * count
-            fail_count = 0
-            if status_code == eic.StatusCode.PARTIAL_FAILED:
-                for i, err_code in enumerate(get_outcome.status_codes):
-                    if err_code != eic.StatusCode.SUCCESS:
-                        success_mask[i] = False
-                        fail_count += 1
-            elif status_code != eic.StatusCode.SUCCESS:
-                logger.error(
-                    f"eic mget {count} keys failed, status_code {status_code}"
-                )
-                success_mask = [False] * count
-                fail_count = count
-            if fail_count:
-                logger.warning(
-                    f"eic mget {count} keys failed, fail {fail_count}, "
-                    f"success {count - fail_count}"
-                )
-            stats.record_rpc(
-                "mget",
-                time.perf_counter() - t0,
-                _status_name(status_code),
-                count,
-                fail_count,
-            )
-            handle["success_mask"] = success_mask
-        except Exception:
-            self._release_chunks(count)
-            raise
-        return handle
-
-    def _finalize_batch(self, handle, device_indices, copy_func):
-        """GPU-repack half; caller runs this serially on one stream in fetch
-        order, then returns the bounce chunks to the pool."""
-        success_mask = handle["success_mask"]
-        objs = handle["objs"]
-        registered = handle["registered"]
-        try:
-            suc_count = 0
-            for mask in success_mask:
-                if mask:
-                    suc_count += 1
-                else:
-                    break
-            if suc_count > 0:
-                # device_writeback ends with a stream synchronize, so on return
-                # the chunks are safe for the NIC to reuse.
-                copy_func(
-                    device_indices,
-                    handle["host_memory_pool"],
-                    handle["host_indices"][:suc_count],
-                )
-        finally:
-            if registered:
-                for item in objs:
-                    self.kv_cache_read_mem_pool.free_to_mempool(item.data_ptr())
-            self._release_chunks(handle["permits"])
-        return success_mask
-
-    def _release_fetch(self, handle):
-        """Release a fetched batch without repacking (mirrors serial break)."""
-        if handle["registered"]:
-            for item in handle["objs"]:
-                self.kv_cache_read_mem_pool.free_to_mempool(item.data_ptr())
-        self._release_chunks(handle["permits"])
-
-    def batch_get(
-        self, keys: List[str], device_indices: torch.Tensor = None, copy_func=None
-    ) -> Tuple[Optional[List[torch.Tensor]], List[bool]]:
-        logger.debug(f"eic get {len(keys)}")
-
-        # Get Data: generate data keys and vals
-        get_data_start_time = time.perf_counter()
         data_keys = eic.StringVector()
         data_vals = eic.IOBuffers()
-        objs = None
-        success_mask = [True for _ in range(len(keys))]
-        count = len(keys)
-
-        objs, host_memory_pool, host_indices, registered = (
-            self.allocate_eic_read_buffer(count)
-        )
-
         for i, key in enumerate(keys):
             data_keys.append(key)
             data_vals.append(
                 objs[i].data_ptr(), objs[i].element_size() * objs[i].numel(), registered
             )
-
-        # Get data: recv data buffer tensor
         get_option = eic.GetOption()
         get_option.ns = self.eic_namespace
-        _mget_t0 = time.perf_counter()
-        status_code, data_vals, get_outcome = self.connection.mget(
+        t0 = time.perf_counter()
+        status_code, _, get_outcome = self.connection.mget(
             data_keys, get_option, data_vals
         )
-        _first_s = time.perf_counter() - _mget_t0
-        stats.observe_lat("mget.first", _first_s)
-        stats.observe_slow("mget", _first_s, 1.0)
+        first_s = time.perf_counter() - t0
+        stats.observe_lat("mget.first", first_s)
+        stats.observe_slow("mget", first_s, 1.0)
         if status_code == eic.StatusCode.PARTIAL_FAILED:
-            _rf_t0 = time.perf_counter()
+            rf0 = time.perf_counter()
             status_code, get_outcome = self._refetch_failed(
                 keys, objs, registered, get_option, get_outcome
             )
-            stats.observe_lat("mget.refetch_s", time.perf_counter() - _rf_t0)
+            stats.observe_lat("mget.refetch_s", time.perf_counter() - rf0)
 
-        result = []
-        device_copy = False
-        # copy before free
-        if device_indices is None or copy_func is None:
-            if registered:
-                for obj in objs:
-                    result.append(obj.clone())
-            else:
-                result = objs
-        else:
-            device_copy = True
-
-        fail_count = 0
-        if status_code != eic.StatusCode.SUCCESS:
-            if status_code == eic.StatusCode.PARTIAL_FAILED:
-                for i, err_code in enumerate(get_outcome.status_codes):
-                    success = err_code == eic.StatusCode.SUCCESS
-                    if success:
-                        logger.debug(f"eic get data {keys[i]} success")
-                    else:
-                        logger.debug(
-                            f"eic get data {keys[i]} failed, err_code {err_code}"
-                        )
-                        success_mask[i] = False
-                        fail_count += 1
-            else:
-                logger.error(
-                    f"eic mget {len(keys)} keys failed, status_code {status_code}"
-                )
-                result = None
-                success_mask = [False for _ in range(len(keys))]
-                fail_count = len(keys)
-
-        if fail_count != 0:
-            # Note that fail count only means how many keys failed in this batch get, not really failed in prefix cache
+        success_mask = [True] * count
+        if status_code == eic.StatusCode.PARTIAL_FAILED:
+            for i, err_code in enumerate(get_outcome.status_codes):
+                if err_code != eic.StatusCode.SUCCESS:
+                    success_mask[i] = False
+        elif status_code != eic.StatusCode.SUCCESS:
+            logger.error(f"eic mget {count} keys failed, status_code {status_code}")
+            success_mask = [False] * count
+        fail_count = success_mask.count(False)
+        if fail_count:
+            # Failures of this batch get only, not of the prefix cache.
             logger.warning(
-                f"eic mget {len(keys)} keys failed, fail count {fail_count}, success count {count - fail_count}"
+                f"eic mget {count} keys failed, fail count {fail_count}, success count {count - fail_count}"
             )
         stats.record_rpc(
             "mget",
-            time.perf_counter() - _mget_t0,
+            time.perf_counter() - t0,
             _status_name(status_code),
             count,
             fail_count,
         )
-        if device_copy:
-            suc_count = 0
-            for mask in success_mask:
-                if mask:
-                    suc_count += 1
-                else:
-                    break
-            if suc_count > 0:
-                copy_func(device_indices, host_memory_pool, host_indices[:suc_count])
+        return status_code, success_mask
 
+    def _free_read_buffer(self, objs, registered):
         if registered:
             for item in objs:
                 self.kv_cache_read_mem_pool.free_to_mempool(item.data_ptr())
 
-        get_data_end_time = time.perf_counter()
-        get_data_execution_time = (get_data_end_time - get_data_start_time) * 1e6
+    def _fetch_batch(self, keys: List[str]):
+        """Network half of a get batch, run on a fetcher thread: mget into this
+        batch's own bounce chunks. No GPU work, so fetchers share no stream."""
+        objs, host_pool, host_indices, registered = self.allocate_eic_read_buffer(
+            len(keys)
+        )
+        try:
+            _, success_mask = self._mget_into(keys, objs, registered)
+        except BaseException:
+            self._free_read_buffer(objs, registered)
+            raise
+        return SimpleNamespace(
+            objs=objs,
+            host_pool=host_pool,
+            host_indices=host_indices,
+            registered=registered,
+            success_mask=success_mask,
+        )
+
+    def _finalize_batch(self, fetched, device_indices, copy_func):
+        """GPU half, run on the load thread in batch order; frees the chunks.
+        copy_func ends with a stream sync, so the NIC may reuse them after."""
+        try:
+            suc_count = _num_leading_ok(fetched.success_mask)
+            if suc_count > 0:
+                copy_func(
+                    device_indices,
+                    fetched.host_pool,
+                    fetched.host_indices[:suc_count],
+                )
+        finally:
+            self._free_read_buffer(fetched.objs, fetched.registered)
+        return fetched.success_mask
+
+    def batch_get(
+        self, keys: List[str], device_indices: torch.Tensor = None, copy_func=None
+    ) -> Tuple[Optional[List[torch.Tensor]], List[bool]]:
+        logger.debug(f"eic get {len(keys)}")
+        get_data_start_time = time.perf_counter()
+        count = len(keys)
+        objs, host_memory_pool, host_indices, registered = (
+            self.allocate_eic_read_buffer(count)
+        )
+        status_code, success_mask = self._mget_into(keys, objs, registered)
+
+        device_copy = device_indices is not None and copy_func is not None
+        if status_code not in (eic.StatusCode.SUCCESS, eic.StatusCode.PARTIAL_FAILED):
+            result = None
+        elif device_copy:
+            result = []
+        else:
+            # copy before free
+            result = [obj.clone() for obj in objs] if registered else objs
+        if device_copy:
+            suc_count = _num_leading_ok(success_mask)
+            if suc_count > 0:
+                copy_func(device_indices, host_memory_pool, host_indices[:suc_count])
+        self._free_read_buffer(objs, registered)
+
+        get_data_execution_time = (time.perf_counter() - get_data_start_time) * 1e6
         logger.debug(f"eic get {count} keys data cost %.2f us", get_data_execution_time)
         return result, success_mask
 
@@ -2285,9 +2178,7 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
                 start = page_id * self.page_chunk_count
                 chunk = chunk_mask[start : start + self.page_chunk_count]
                 # all([]) is True: a truncated reply would read as a full hit.
-                page_mask.append(
-                    len(chunk) == self.page_chunk_count and all(chunk)
-                )
+                page_mask.append(len(chunk) == self.page_chunk_count and all(chunk))
             return page_mask
 
         if client.load_fanout <= 1:
@@ -2301,38 +2192,68 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
                 _, chunk_mask = client.batch_get(
                     key, indices, copy_func=self.device_writeback
                 )
-                success_mask.extend(_pages_from_chunks(page_hashes, chunk_mask))
-                if not all(success_mask[-len(page_hashes):]):
+                page_mask = _pages_from_chunks(page_hashes, chunk_mask)
+                success_mask.extend(page_mask)
+                if not all(page_mask):
                     break
             return success_mask
 
-        # Parallel within this one op: network fetches run on a bounded pool and
-        # the chunk credits keep total in-flight GDR <= the registered pool.
-        # Repack stays on this single load stream, strictly in fetch order, so
-        # TP collectives and acks above match the serial path exactly.
-        batches = [
-            (i, content_hashs[i : i + page_batch_size])
-            for i in range(0, len(content_hashs), page_batch_size)
-        ]
-        futures = [
-            client._load_fetch_pool.submit(
-                client._fetch_batch, self._encode_page_chunk_keys(ph)
-            )
-            for _, ph in batches
-        ]
+        # Fetchers mget batches concurrently; this thread repacks them strictly
+        # in batch order on its load stream, so TP collectives and acks above
+        # match the serial path. The in-flight window caps outstanding chunks at
+        # the registered bounce pool; only this thread fills and drains it, so
+        # the head batch it waits on never depends on a later one.
+        window = deque()  # (first page, page_hashes, future), in batch order
+        inflight = 0
         success_mask = []
-        for (i, page_hashes), fut in zip(batches, futures):
-            handle = fut.result()
-            if all(success_mask):
-                indices = device_indices[
-                    i * self.page_size : (i + len(page_hashes)) * self.page_size
-                ]
-                chunk_mask = client._finalize_batch(
-                    handle, indices, self.device_writeback
+
+        def _finalize_head():
+            nonlocal inflight
+            i, page_hashes, fut = window.popleft()
+            inflight -= len(page_hashes) * self.page_chunk_count
+            indices = device_indices[
+                i * self.page_size : (i + len(page_hashes)) * self.page_size
+            ]
+            chunk_mask = client._finalize_batch(
+                fut.result(), indices, self.device_writeback
+            )
+            page_mask = _pages_from_chunks(page_hashes, chunk_mask)
+            success_mask.extend(page_mask)
+            return all(page_mask)
+
+        try:
+            ok = True
+            for i in range(0, len(content_hashs), page_batch_size):
+                page_hashes = content_hashs[i : i + page_batch_size]
+                need = len(page_hashes) * self.page_chunk_count
+                while ok and window and inflight + need > client.read_chunk_cap:
+                    ok = _finalize_head()
+                if not ok:
+                    break
+                window.append(
+                    (
+                        i,
+                        page_hashes,
+                        client._load_fetch_pool.submit(
+                            client._fetch_batch,
+                            self._encode_page_chunk_keys(page_hashes),
+                        ),
+                    )
                 )
-                success_mask.extend(_pages_from_chunks(page_hashes, chunk_mask))
-            else:
-                client._release_fetch(handle)
+                inflight += need
+            while ok and window:
+                ok = _finalize_head()
+        finally:
+            # After a failed batch (the serial path's break) or an exception:
+            # drop batches not yet started and free the chunks of the rest.
+            for _, _, fut in window:
+                if fut.cancel():
+                    continue
+                try:
+                    fetched = fut.result()
+                except Exception:
+                    continue  # _fetch_batch already freed its chunks
+                client._free_read_buffer(fetched.objs, fetched.registered)
         return success_mask
 
 

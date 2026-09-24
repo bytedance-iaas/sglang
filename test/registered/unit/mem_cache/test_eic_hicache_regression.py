@@ -620,6 +620,90 @@ class TestEICHiCacheRegression(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(mask, [True, False, False, False])
 
+    def test_parallel_page_load_matches_serial_and_frees_every_chunk(self):
+        # fanout>1 fetches batches concurrently but must admit the same prefix as
+        # the serial path, keep in-flight chunks within the bounce pool, and
+        # return every chunk to the pool after a failed page or an exception.
+        from concurrent.futures import ThreadPoolExecutor
+
+        from sglang.srt.mem_cache import eic_memory_pool as pool_mod
+
+        S = SimpleNamespace(SUCCESS=0, FAILED=1, PARTIAL_FAILED=2)
+
+        class Buffers(list):
+            def append(self, ptr, size, registered):
+                super().append(ptr)
+
+        fake_eic = SimpleNamespace(
+            StatusCode=S,
+            StringVector=list,
+            IOBuffers=Buffers,
+            GetOption=lambda: SimpleNamespace(),
+        )
+        live = {"n": 0, "max": 0}
+
+        def allocate(n):
+            live["n"] += n
+            live["max"] = max(live["max"], live["n"])
+            objs = [torch.zeros(1) for _ in range(n)]
+            return objs, None, list(range(n)), True
+
+        def free(ptr):
+            live["n"] -= 1
+
+        def make_host(fanout, mget):
+            client = object.__new__(pool_mod.EICKVClient)
+            client.eic_namespace = "ns"
+            client.load_fanout = fanout
+            client.load_page_batch_cfg = 0
+            client.read_chunk_cap = 8
+            client._load_fetch_pool = ThreadPoolExecutor(fanout)
+            client.allocate_eic_read_buffer = allocate
+            client.kv_cache_read_mem_pool = SimpleNamespace(free_to_mempool=free)
+            client.connection = SimpleNamespace(mget=mget)
+            host = object.__new__(pool_mod.EICDeepSeekV4TokenToKVPoolHost)
+            host.eic_client = client
+            host.page_chunk_count = 2
+            host.page_size = 4
+            host._encode_page_chunk_keys = lambda hs: [
+                f"{h}#{c}" for h in hs for c in (0, 1)
+            ]
+            host.copied = []
+            host.device_writeback = lambda dev, pool, idx: host.copied.append(len(idx))
+            return host
+
+        def mget_p5_down(keys, option, vals):
+            codes = [S.FAILED if k.startswith("p5#") else S.SUCCESS for k in keys]
+            status = S.SUCCESS if S.FAILED not in codes else S.PARTIAL_FAILED
+            return status, vals, SimpleNamespace(status_codes=codes)
+
+        pages = [f"p{i}" for i in range(10)]
+        # base batch = 8 chunks // 2 = 4 pages serial; fanout 2 -> 2-page batches.
+        with mock.patch.object(pool_mod, "eic", fake_eic), mock.patch.object(
+            pool_mod, "G_GDRBounceTensorCount", 8
+        ):
+            serial = make_host(1, mget_p5_down)
+            serial_mask = serial.get_page_data(pages, torch.arange(40))
+            parallel = make_host(2, mget_p5_down)
+            parallel_mask = parallel.get_page_data(pages, torch.arange(40))
+
+            self.assertEqual(pool_mod._num_leading_ok(serial_mask), 5)
+            self.assertEqual(pool_mod._num_leading_ok(parallel_mask), 5)
+            self.assertEqual(sum(serial.copied), 10)
+            self.assertEqual(sum(parallel.copied), 10)
+            self.assertLessEqual(live["max"], 8)
+            self.assertEqual(live["n"], 0)
+
+            def mget_raises_on_p3(keys, option, vals):
+                if any(k.startswith("p3#") for k in keys):
+                    raise RuntimeError("rpc down")
+                return mget_p5_down(keys, option, vals)
+
+            broken = make_host(2, mget_raises_on_p3)
+            with self.assertRaises(RuntimeError):
+                broken.get_page_data(pages, torch.arange(40))
+            self.assertEqual(live["n"], 0)
+
     def test_match_stops_at_resident_node_under_evicted_gap(self):
         # A failed load-back frees a chain node whose child was inserted while
         # the load was in flight, leaving resident KV under an evicted gap. The
