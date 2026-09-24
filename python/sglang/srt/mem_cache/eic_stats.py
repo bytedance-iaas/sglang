@@ -79,8 +79,8 @@ class EicStats:
             self._lat[name].append(seconds)
 
     def observe_slow(self, name, seconds, threshold_s):
-        # Cumulative count of samples over a threshold. The latency deques are
-        # sliding windows, so their p99/max repeats one outlier for many dumps;
+        # Cumulative count of samples over a threshold. The latency windows are
+        # sliding, so their p99/max repeats one outlier for many dumps;
         # only this counter differences into a real event rate.
         with self._lock:
             self._c[f"{name}.slow{int(threshold_s)}"] += seconds > threshold_s

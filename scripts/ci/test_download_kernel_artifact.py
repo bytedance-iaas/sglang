@@ -184,14 +184,10 @@ class KernelArtifactTests(unittest.TestCase):
                 "KERNEL_ARTIFACT_TOS_REGION": "cn-beijing",
                 "KERNEL_ARTIFACT_TOS_BUCKET": "ai-infra",
                 "KERNEL_ARTIFACT_TOS_PREFIX": "sglang-ci/kernel-wheels",
-                "TOSUTIL_CONFIG_B64": base64.b64encode(
-                    b"encrypted-config"
-                ).decode(),
+                "TOSUTIL_CONFIG_B64": base64.b64encode(b"encrypted-config").decode(),
             },
         ), patch.object(download.subprocess, "run", side_effect=tos):
-            result = download.recover_tos_wheel(
-                tos_uri, wheel_sha256, self.output
-            )
+            result = download.recover_tos_wheel(tos_uri, wheel_sha256, self.output)
         self.assertEqual(result, self.output / WHEEL)
         self.assertEqual(result.read_bytes(), wheel_data)
 
@@ -240,9 +236,7 @@ class KernelArtifactTests(unittest.TestCase):
                     },
                 ):
                     with self.assertRaisesRegex(ValueError, error):
-                        download.recover_tos_wheel(
-                            tos_uri, wheel_sha256, self.output
-                        )
+                        download.recover_tos_wheel(tos_uri, wheel_sha256, self.output)
                 run.assert_not_called()
 
     def test_download_timeouts_are_bounded_and_publish_nothing(self):
