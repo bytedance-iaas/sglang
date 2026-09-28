@@ -30,6 +30,7 @@ _PP_EAGLE_SUPPORTED_ARCHITECTURES = frozenset(
         "DeepseekV3ForCausalLM",
         "DeepseekV32ForCausalLM",
         "GlmMoeDsaForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
     }
 )
 
@@ -60,7 +61,7 @@ def check_pipeline_parallel_compat(
             "nodes (disaggregation-mode=prefill)"
         )
         assert model_architecture in _PP_EAGLE_SUPPORTED_ARCHITECTURES, (
-            "PP + speculative decoding is only supported for DeepSeek/GLM "
+            "PP + speculative decoding is only supported for DeepSeek/GLM/Qwen4 "
             "models whose last pipeline stage supplies the EAGLE draft "
             f"embedding; got architecture={model_architecture}"
         )

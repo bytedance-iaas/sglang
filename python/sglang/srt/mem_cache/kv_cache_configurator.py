@@ -965,6 +965,41 @@ class KVCacheConfigurator:
             )
         return req_to_token_pool
 
+    def _get_mamba_layer_ids_for_req_pool(self) -> list:
+        mamba_layer_ids = [
+            i
+            for i in self.mambaish_config.mamba2_cache_params.layers
+            if self.layer_info.start_layer <= i < self.layer_info.end_layer
+        ]
+        if max_speculative_num_draft_tokens():
+            for layer_id in getattr(self.mambaish_config, "nextn_layer_ids", []):
+                if layer_id not in mamba_layer_ids:
+                    mamba_layer_ids.append(layer_id)
+        return mamba_layer_ids
+
+    def _get_ple_req_pool_kwargs(self) -> dict[str, Any]:
+        from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
+
+        if not isinstance(self.mambaish_config, Qwen4ExpTextConfig):
+            return {}
+        short_conv_layer_ids = [
+            i
+            for i in self.mambaish_config.short_conv_layer_ids
+            if self.layer_info.start_layer <= i < self.layer_info.end_layer
+        ]
+        return {
+            "short_conv_layer_ids": short_conv_layer_ids,
+            "short_conv_state_shape": (
+                self.mambaish_config.short_conv_state_shape
+                if short_conv_layer_ids
+                else None
+            ),
+            "ngram_context_len": (
+                self.mambaish_config.ngram_context_len if short_conv_layer_ids else 0
+            ),
+            "ngram_eos_token_id": int(self.mambaish_config.eos_token_id),
+        }
+
     def _build_hybrid_mamba_decode_req_pool(
         self,
         *,
@@ -982,13 +1017,7 @@ class KVCacheConfigurator:
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             cache_params=self.mambaish_config.mamba2_cache_params,
-            mamba_layer_ids=(
-                [
-                    i
-                    for i in self.mambaish_config.mamba2_cache_params.layers
-                    if self.layer_info.start_layer <= i < self.layer_info.end_layer
-                ]
-            ),
+            mamba_layer_ids=self._get_mamba_layer_ids_for_req_pool(),
             speculative_num_draft_tokens=max_speculative_num_draft_tokens(),
             speculative_eagle_topk=get_spec().speculative_eagle_topk,
             enable_mamba_extra_buffer=mamba_extra_buffer_enabled(),
@@ -996,6 +1025,7 @@ class KVCacheConfigurator:
             enable_overlap_schedule=not get_schedule().disable_overlap_schedule,
             mamba_size=get_schedule().max_mamba_cache_size,
             start_layer=self.layer_info.start_layer,
+            **self._get_ple_req_pool_kwargs(),
             linear_replayssm_cache_len=get_exec().mamba.linear_replayssm_cache_len,
             mamba_envelope_layout=get_memory().enable_page_major_kv_layout,
             # ReplaySSM spec-verify is for linear-attn models (GDN fold or KDA
@@ -1061,15 +1091,10 @@ class KVCacheConfigurator:
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             cache_params=self.mambaish_config.mamba2_cache_params,
-            mamba_layer_ids=(
-                [
-                    i
-                    for i in self.mambaish_config.mamba2_cache_params.layers
-                    if self.layer_info.start_layer <= i < self.layer_info.end_layer
-                ]
-            ),
+            mamba_layer_ids=self._get_mamba_layer_ids_for_req_pool(),
             enable_mamba_extra_buffer=mamba_extra_buffer_enabled(),
             enable_mamba_extra_buffer_lazy=mamba_extra_buffer_lazy_enabled(),
+            **self._get_ple_req_pool_kwargs(),
             # A PD prefill server never runs TARGET_VERIFY, so skip the
             # verify-only per-draft-token state snapshots (see the draft-head
             # case above: None => the pool skips SpeculativeState).
@@ -1755,7 +1780,36 @@ class KVCacheConfigurator:
             if self.kv_cache_dtype_str == "mxfp8" and not self.use_mla_backend
             else mha_pool_class
         )
-        token_to_kv_pool = HybridLinearKVPool(
+        from sglang.srt.layers.attention.qsa.config import (
+            QSA_VARIANT_TOKENWISE,
+            parse_qsa_profile,
+        )
+        from sglang.srt.mem_cache.qsa_kv_pool import (
+            QSATokenToKVPool,
+            QwenDSATokenToKVPool,
+        )
+
+        qsa_profile = parse_qsa_profile(self.model_config.hf_config)
+        if qsa_profile is None:
+            pool_class = HybridLinearKVPool
+            extra_args["use_mla"] = self.use_mla_backend
+        elif qsa_profile.variant == QSA_VARIANT_TOKENWISE:
+            pool_class = QwenDSATokenToKVPool
+            extra_args.update(
+                qsa_index_kv_heads=qsa_profile.kv_heads,
+                qsa_index_head_dim=qsa_profile.head_dim,
+                qsa_token_budget=qsa_profile.budget,
+            )
+        else:
+            pool_class = QSATokenToKVPool
+            extra_args.update(
+                qsa_index_kv_heads=qsa_profile.kv_heads,
+                qsa_index_head_dim=qsa_profile.head_dim,
+                qsa_compress_ratio=qsa_profile.compress_ratio,
+                qsa_token_topk=qsa_profile.budget,
+                num_request_slots=req_to_token_pool.req_to_token.shape[0],
+            )
+        token_to_kv_pool = pool_class(
             page_size=self.pool_page_size,
             size=max_total_num_tokens,
             dtype=self.kv_cache_dtype,
@@ -1769,7 +1823,6 @@ class KVCacheConfigurator:
             mamba_pool=req_to_token_pool.mamba_pool,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
-            use_mla=self.use_mla_backend,
             start_layer=self.layer_info.start_layer,
             full_kv_pool_class=full_pool_class,
             quant_method=quant_method,

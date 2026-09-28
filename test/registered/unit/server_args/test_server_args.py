@@ -199,10 +199,15 @@ class TestPrepareServerArgs(CustomTestCase):
         check_pipeline_parallel_compat(self._pp_spec_cfg())
 
     def test_target_eagle_mtp_prefill_is_allowed(self):
-        check_pipeline_parallel_compat(
-            self._pp_spec_cfg(speculative_algorithm="EAGLE"),
-            model_architecture=self._PP_EAGLE_SUPPORTED_ARCH,
-        )
+        for architecture in (
+            self._PP_EAGLE_SUPPORTED_ARCH,
+            "Qwen4ExpForConditionalGeneration",
+        ):
+            with self.subTest(architecture=architecture):
+                check_pipeline_parallel_compat(
+                    self._pp_spec_cfg(speculative_algorithm="EAGLE"),
+                    model_architecture=architecture,
+                )
 
     def test_overlap_schedule_is_rejected(self):
         with self.assertRaisesRegex(AssertionError, "overlap schedule"):
@@ -263,6 +268,23 @@ class TestPrepareServerArgs(CustomTestCase):
                 self._pp_spec_cfg(speculative_algorithm="EAGLE"),
                 model_architecture="LlamaForCausalLM",
             )
+
+    def test_ple_embedding_offload_rejects_generic_weight_offload(self):
+        for generic_offload in (
+            {"cpu_offload_gb": 1},
+            {"offload_group_size": 1},
+        ):
+            with (
+                self.subTest(generic_offload=generic_offload),
+                self.assertRaisesRegex(
+                    ValueError, "ple-offload-embedding cannot be combined"
+                ),
+            ):
+                ServerArgs(
+                    model_path="dummy",
+                    ple_offload_embedding=True,
+                    **generic_offload,
+                ).resolve_once()
 
     def test_weight_cache_daemon_allows_static_eplb(self):
         args = ServerArgs(

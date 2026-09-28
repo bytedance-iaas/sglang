@@ -248,7 +248,10 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         existing_backend = object()
         decode_backend = object()
         worker.server_args = _fake_server_args()
-        worker.draft_runner = SimpleNamespace(attn_backend=existing_backend)
+        worker.draft_runner = SimpleNamespace(
+            attn_backend=existing_backend,
+            model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        )
         worker.topk = 1
         worker.speculative_num_steps = 2
         worker.seed_dsa_topk_from_draft_extend = False
@@ -270,7 +273,10 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         decode_backend = object()
         draft_extend_backend = object()
         worker.server_args = _fake_server_args()
-        worker.draft_runner = SimpleNamespace(attn_backend=existing_backend)
+        worker.draft_runner = SimpleNamespace(
+            attn_backend=existing_backend,
+            model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        )
         worker.topk = 1
         worker.speculative_num_steps = 2
         worker.seed_dsa_topk_from_draft_extend = True
@@ -380,6 +386,15 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
             worker.spec_v2_attn_backends,
             (target_backend, decode_backend, fallback_backend),
         )
+
+    def test_non_last_pp_uses_only_target_runner(self):
+        target_runner = SimpleNamespace(attn_backend=object())
+        worker = object.__new__(EAGLEWorkerV2)
+        worker._target_worker = SimpleNamespace(model_runner=target_runner)
+        worker._draft_worker = None
+
+        self.assertIs(worker.last_shared_read_runner, target_runner)
+        self.assertEqual(worker.spec_v2_attn_backends, (target_runner.attn_backend,))
 
 
 if __name__ == "__main__":
