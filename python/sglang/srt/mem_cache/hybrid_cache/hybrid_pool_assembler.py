@@ -1538,6 +1538,13 @@ def _delegate_c128_host_evict(cache, n: int) -> int:
 
 
 class _DeepSeekV4Strategy(StackStrategy):
+    """Build the V4/V4.1 host stack for each PP-local cache shard.
+
+    Cache coordination uses the TP, attention-CP, and PP groups from
+    CacheInitParams, so canonical prefill CP remains replicated and coherent
+    while each PP rank transfers only its local layers.
+    """
+
     def matches(self, kvcache, components):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 

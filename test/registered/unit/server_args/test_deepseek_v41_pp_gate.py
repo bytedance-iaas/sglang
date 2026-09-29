@@ -67,6 +67,18 @@ class TestDeepSeekV41PPGate(unittest.TestCase):
     def test_pp4_tp2_disaggregated_prefill_is_supported(self):
         _validate(_config())
 
+    def test_pp2_tp4_cp4_hicache_prefill_is_supported(self):
+        _validate(
+            _config(
+                pp_size=2,
+                tp_size=4,
+                attn_cp_size=4,
+                enable_prefill_cp=True,
+                enable_hierarchical_cache=True,
+                disable_radix_cache=False,
+            )
+        )
+
     def test_topologies_and_cache_modes(self):
         for pp, tp in ((4, 2), (2, 4), (8, 1)):
             for mode in ("null", "prefill", "decode"):

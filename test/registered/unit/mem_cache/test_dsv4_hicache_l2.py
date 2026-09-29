@@ -225,6 +225,31 @@ class TestC128L2Ownership(CustomTestCase):
 
 
 class TestDSV4PoolAssembly(CustomTestCase):
+    def test_v41_pp2_stage_uses_local_transfer_layers(self):
+        layer_mapping = [None] * 40
+        for layer_id in range(20, 40):
+            ratio = {20: 4, 21: 128, 22: 1, 23: 2}.get(layer_id, 0)
+            layer_mapping[layer_id] = SimpleNamespace(
+                compress_ratio=ratio,
+                compress_layer_id={4: 5, 128: 2}.get(ratio, 0),
+            )
+        kvcache = SimpleNamespace(
+            start_layer=20,
+            end_layer=40,
+            swa_kv_pool=object(),
+            layer_mapping=layer_mapping,
+        )
+
+        mappings = assembler._resolve_deepseek_v4_layer_mappings(kvcache)
+
+        self.assertEqual(mappings.transfer_layer_num, 20)
+        self.assertEqual(mappings.full, {layer: layer for layer in range(20)})
+        self.assertEqual(mappings.swa, mappings.full)
+        self.assertEqual(mappings.c4, {0: 5})
+        self.assertEqual(mappings.c128, {1: 2})
+        self.assertEqual(mappings.c4_state, {0: 0})
+        self.assertEqual(mappings.c4_state_global_layers, [20])
+
     def test_npu_indexer_registers_k_and_scale_as_separate_host_pools(self):
         k_buffer = [torch.empty((2, 32, 1, 4), dtype=torch.int8)]
         scale_buffer = [torch.empty((2, 32, 1, 1), dtype=torch.float16)]
@@ -244,14 +269,18 @@ class TestDSV4PoolAssembly(CustomTestCase):
             unified_region_buffers=lambda ratio: (c4_buffer, 256),
             unified_rope_region_buffers=lambda ratio: None,
         )
+        tp_group = object()
+        cp_group = object()
+        attn_tp_group = object()
+        pp_group = object()
         params = SimpleNamespace(
             page_size=128,
             token_to_kv_pool_allocator=SimpleNamespace(size_full=256),
             mtp_draft_device_pools=[],
-            tp_cache_group=None,
-            attn_cp_cache_group=None,
-            attn_tp_cache_group=None,
-            pp_cache_group=None,
+            tp_cache_group=tp_group,
+            attn_cp_cache_group=cp_group,
+            attn_tp_cache_group=attn_tp_group,
+            pp_cache_group=pp_group,
         )
         mappings = assembler._DeepSeekV4LayerMappings(
             transfer_layer_num=1,
@@ -300,7 +329,9 @@ class TestDSV4PoolAssembly(CustomTestCase):
                 "DeepSeekV4PagedHostPool",
                 side_effect=make_host_pool,
             ),
-            patch.object(assembler, "HybridCacheController", return_value=controller),
+            patch.object(
+                assembler, "HybridCacheController", return_value=controller
+            ) as controller_cls,
         ):
             group, built_controller = assembler.build_deepseek_v4_hicache_stack(
                 params=params,
@@ -317,6 +348,10 @@ class TestDSV4PoolAssembly(CustomTestCase):
         self.assertEqual((k_host.item_bytes, scale_host.item_bytes), (128, 64))
         self.assertEqual((k_host.slot_page_size, scale_host.slot_page_size), (128, 128))
         self.assertIs(built_controller, controller)
+        controller_kwargs = controller_cls.call_args.kwargs
+        self.assertIs(controller_kwargs["attn_cp_group"], cp_group)
+        self.assertIs(controller_kwargs["attn_tp_group"], attn_tp_group)
+        self.assertIs(controller_kwargs["pp_group"], pp_group)
 
 
 if __name__ == "__main__":
