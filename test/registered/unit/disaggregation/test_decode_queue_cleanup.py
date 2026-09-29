@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
+    DecodeRequest,
     DecodeTransferQueue,
     HiCacheRestoreResult,
 )
@@ -32,6 +33,55 @@ class FakeReceiver:
 
 
 class TestDecodeQueueCleanup(CustomTestCase):
+    def _expiry_queue(self, now):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.pp_size = 1
+        queue.prealloc_deadline = 300
+        queue.gloo_group = None
+
+        def entry(rid, age, rebootstrap=False):
+            req = SimpleNamespace(rid=rid, finished_reason=None)
+            return DecodeRequest(
+                req=req,
+                kv_receiver=FakeReceiver(),
+                is_rebootstrap=rebootstrap,
+                enqueue_time=now - age,
+            )
+
+        queue.queue = [
+            entry("fresh", 10),
+            entry("expired", 301),
+            entry("rebootstrap", 900, rebootstrap=True),
+        ]
+        return queue
+
+    def _run_expiry(self, queue, now, peer_flags=None):
+        def all_reduce(tensor, op=None, group=None):
+            if peer_flags is not None:  # another rank's verdict, merged by MAX
+                for i, flag in enumerate(peer_flags):
+                    tensor[i] = max(int(tensor[i]), flag)
+
+        aborted = []
+        with patch(
+            "sglang.srt.disaggregation.decode.time.monotonic", return_value=now
+        ), patch("torch.distributed.all_reduce", side_effect=all_reduce), patch(
+            "sglang.srt.disaggregation.decode.prepare_abort",
+            side_effect=lambda req, *a, **k: aborted.append(req.rid),
+        ):
+            queue._abort_expired_prealloc()
+        return aborted
+
+    def test_prealloc_past_bootstrap_timeout_is_aborted(self):
+        queue = self._expiry_queue(now=1000.0)
+        self.assertEqual(self._run_expiry(queue, 1000.0), ["expired"])
+
+    def test_prealloc_expiry_follows_any_rank(self):
+        # This rank sees "fresh" as young; a slower-clocked peer already
+        # expired it. All ranks must abort the same set.
+        queue = self._expiry_queue(now=1000.0)
+        aborted = self._run_expiry(queue, 1000.0, peer_flags=[1, 0, 0])
+        self.assertEqual(aborted, ["fresh", "expired"])
+
     def test_paged_swa_retraction_resume_uses_physical_page_budget(self):
         # resume_retracted_reqs reads the retraction backend off the disagg
         # bag, so the case publishes a config instead of injecting one.
