@@ -275,6 +275,12 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
 
 
 def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
+    """Validate V4.1 features.
+
+    Ordinary PP with canonical prefill CP may use HiCache. The V4.1 cache
+    stack keeps transfer maps PP-stage-local and synchronizes cache state
+    across the attention-CP and PP groups.
+    """
     from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
         is_unified_kv_triton,
     )

@@ -674,6 +674,11 @@ class ForwardFlags:
         "fuse_mlp_allreduce": False,
         "mlp_reduce_scatter": False,
         "flashinfer_trtllm_bypass": False,
+        # DSV4.1 prefill-CP: leave the rank-partial shared expert separate so
+        # the custom ReduceScatter can add it before cross-rank reduction.
+        "defer_cp_moe_shared_add": False,
+        "cp_moe_shared_output": None,
+        "cp_moe_deferred_output": None,
         # LayerNorm sequence parallelism region; see layers/layernorm_sp.py.
         "sp_active": False,
     }

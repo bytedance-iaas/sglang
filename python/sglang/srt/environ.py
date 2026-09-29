@@ -1047,6 +1047,15 @@ class Envs:
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)
     # Use FlashInfer's fused atomic CUTLASS/CuTe DSL MoE finalize.
     SGLANG_FLASHINFER_MOE_FUSED_FINALIZE = EnvBool(True)
+    # DSV4.1 SM90 Humming: expose CUTLASS GEMM2 rows to SGLang and fuse
+    # finalize + shared add + CP reduce-scatter.
+    SGLANG_DSV41_MOE_FINALIZE_REDUCE_SCATTER = EnvBool(False)
+    # Fail instead of silently falling back when deferred finalize + CP
+    # reduce-scatter cannot use the fused push path.
+    SGLANG_DSV41_MOE_FINALIZE_REDUCE_SCATTER_STRICT = EnvBool(False)
+    # Per-slot push workspace for the DSV4.1 attention-CP communicator. This
+    # expands fused finalize capacity without changing other groups' tuning.
+    SGLANG_DSV41_MOE_FINALIZE_REDUCE_SCATTER_PUSH_SIZE_KB = EnvInt(24 * 1024)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
@@ -1539,6 +1548,10 @@ class Envs:
     # Keep mHC residuals token-sharded between Attention ReduceScatter and the
     # next Attention input AllGather. Opt-in: DSV4.1 SM90 TP8/EP8 MegaMoE decode.
     SGLANG_DSV41_MEGAMOE_REDUCE_SCATTER = EnvBool(False)
+    # Fuse the rank-partial shared-expert output into the DSV4.1 prefill-CP
+    # ReduceScatter push. Falls back to add + NCCL when the custom communicator
+    # or its push workspace cannot cover the local output shard.
+    SGLANG_DSV41_CP_MOE_FUSED_REDUCE_SCATTER = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 

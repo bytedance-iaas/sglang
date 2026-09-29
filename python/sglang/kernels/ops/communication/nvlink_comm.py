@@ -88,9 +88,10 @@ def reduce_scatter_push(
     input: torch.Tensor,
     output: torch.Tensor,
     residual: torch.Tensor | None = None,
+    pre_reduce: torch.Tensor | None = None,
 ) -> None:
     _jit_push_module(input.dtype, comm.world_size).reduce_scatter(
-        comm, input, output, residual
+        comm, input, output, residual, pre_reduce
     )
 
 

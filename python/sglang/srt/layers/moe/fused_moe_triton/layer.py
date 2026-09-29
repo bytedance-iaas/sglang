@@ -491,6 +491,10 @@ class FusedMoE(torch.nn.Module):
         self.supports_deferred_finalize = (
             get_moe_runner_backend().is_flashinfer_trtllm()
             and (nvfp4_deferred or qwen35_fp8_deferred)
+        ) or (
+            envs.SGLANG_DSV41_MOE_FINALIZE_REDUCE_SCATTER.get()
+            and get_moe_runner_backend().is_flashinfer_mxfp4()
+            and getattr(self.quant_method, "_use_sm90_humming", False)
         )
         global _deferred_finalize_info_logged
         if not _deferred_finalize_info_logged:
@@ -1631,15 +1635,23 @@ class FusedMoE(torch.nn.Module):
         pre_quant_input: Optional[Tuple] = None,
     ):
         assert self.quant_method is not None
-        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-            flashinfer_trtllm_deferred_finalize_context,
-        )
+        if get_moe_runner_backend().is_flashinfer_mxfp4():
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+                flashinfer_cutlass_deferred_finalize_context,
+            )
 
+            context = flashinfer_cutlass_deferred_finalize_context()
+        else:
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                flashinfer_trtllm_deferred_finalize_context,
+            )
+
+            context = flashinfer_trtllm_deferred_finalize_context()
         dispatch_output = self._dispatch_with_pre_quant(
             hidden_states, topk_output, pre_quant_input
         )
 
-        with flashinfer_trtllm_deferred_finalize_context():
+        with context:
             combine_input = self.run_moe_core(dispatch_output=dispatch_output)
 
         return self.dispatcher.combine(combine_input=combine_input)
