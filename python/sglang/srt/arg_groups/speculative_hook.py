@@ -516,6 +516,20 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
     return checkpoint_bundles_dspark_draft(model_config_of(server_args).hf_config)
 
 
+def _supports_dspark_deepep(server_args: ServerArgs) -> bool:
+    cfg = resolving_view(server_args)
+    if cfg.moe_a2a_backend != "deepep":
+        return False
+    if cfg.moe_runner_backend == "deep_gemm":
+        return True
+    return (
+        get_platform().is_sm90
+        and cfg.moe_runner_backend == "flashinfer_mxfp4"
+        and cfg.flashinfer_mxfp4_moe_precision == "fp8"
+        and model_config_of(server_args).is_fp4_experts
+    )
+
+
 def _handle_dspark(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     _is_npu = cfg.device.startswith("npu")
@@ -528,11 +542,20 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     if cfg.enable_dp_attention and cfg.dp_size > 1:
         if not cfg.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
-        if not _is_npu and cfg.moe_a2a_backend not in ("none", "megamoe"):
+        supports_dp_moe = cfg.moe_a2a_backend in (
+            "none",
+            "megamoe",
+        ) or _supports_dspark_deepep(server_args)
+        if not _is_npu and not supports_dp_moe:
             raise ValueError(
-                "DSpark with dp attention supports moe_a2a_backend 'none' "
-                "(built-in TP MoE) or 'megamoe', got "
-                f"{cfg.moe_a2a_backend!r}."
+                "DSpark with dp attention supports moe_a2a_backend='none', "
+                "'megamoe', or 'deepep' with a supported runner "
+                "('deep_gemm', or SM90 FlashInfer Humming MXFP4xFP8); "
+                f"got moe_a2a_backend={cfg.moe_a2a_backend!r}, "
+                f"moe_runner_backend={cfg.moe_runner_backend!r}, "
+                "flashinfer_mxfp4_moe_precision="
+                f"{cfg.flashinfer_mxfp4_moe_precision!r}, "
+                f"is_fp4_experts={model_config_of(server_args).is_fp4_experts!r}."
             )
         if not _is_npu and cfg.moe_a2a_backend != "none":
             from sglang.srt.speculative.ragged_verify import (
@@ -614,10 +637,13 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                     "PP DSpark with dp attention requires --dp-size == --tp-size "
                     "so each attention DP lane has attn_tp=1."
                 )
-            if cfg.moe_a2a_backend != "none":
+            if cfg.moe_a2a_backend != "none" and not (
+                not _is_npu and _supports_dspark_deepep(server_args)
+            ):
                 raise ValueError(
                     "PP DSpark with dp attention currently requires "
-                    "--moe-a2a-backend none (built-in TP MoE)."
+                    "--moe-a2a-backend none (built-in TP MoE), or DeepEP "
+                    "with a supported DeepGEMM/FlashInfer Humming runner."
                 )
         if (
             cfg.disaggregation_mode == "prefill"

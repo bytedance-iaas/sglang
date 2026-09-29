@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
@@ -32,7 +33,10 @@ def _plain_hf_config() -> SimpleNamespace:
 
 
 def _make_dspark_server_args(
-    *, model_path: str, hf_config: SimpleNamespace
+    *,
+    model_path: str,
+    hf_config: SimpleNamespace,
+    is_fp4_experts: bool = False,
 ) -> ServerArgs:
     server_args = ServerArgs(model_path="dummy")
     server_args.model_path = model_path
@@ -40,7 +44,10 @@ def _make_dspark_server_args(
     server_args.speculative_algorithm = "DSPARK"
     server_args.speculative_draft_model_path = None
     server_args.speculative_dspark_block_size = 5
-    server_args._model_config = SimpleNamespace(hf_config=hf_config)
+    server_args._model_config = SimpleNamespace(
+        hf_config=hf_config,
+        is_fp4_experts=is_fp4_experts,
+    )
     return server_args
 
 
@@ -94,24 +101,70 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
 class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
     """Gate contract for DSpark + dp attention + MoE a2a backends."""
 
-    def _dp_server_args(self, *, moe_a2a_backend: str) -> ServerArgs:
+    def _dp_server_args(
+        self,
+        *,
+        moe_a2a_backend: str,
+        moe_runner_backend: str = "auto",
+        is_fp4_experts: bool = False,
+        flashinfer_mxfp4_moe_precision: str = "default",
+    ) -> ServerArgs:
         server_args = _make_dspark_server_args(
-            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+            model_path=_BUNDLED_MODEL_PATH,
+            hf_config=_bundled_hf_config(),
+            is_fp4_experts=is_fp4_experts,
         )
         server_args.enable_dp_attention = True
         server_args.enable_dp_lm_head = True
         server_args.dp_size = 2
         server_args.tp_size = 2
         server_args.moe_a2a_backend = moe_a2a_backend
+        server_args.moe_runner_backend = moe_runner_backend
+        server_args.flashinfer_mxfp4_moe_precision = flashinfer_mxfp4_moe_precision
         return server_args
 
-    def test_only_megamoe_is_admitted(self):
-        """Both sides of the allowlist: megamoe passes, others raise by name."""
+    @patch(
+        "sglang.srt.arg_groups.speculative_hook.get_platform",
+        return_value=SimpleNamespace(is_sm90=True),
+    )
+    def test_supported_a2a_backends_are_admitted(self, _):
         with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
             _handle_dspark(self._dp_server_args(moe_a2a_backend="megamoe"))
-            for backend in ("deepep", "pplx"):
-                with self.assertRaisesRegex(ValueError, backend):
-                    _handle_dspark(self._dp_server_args(moe_a2a_backend=backend))
+            _handle_dspark(
+                self._dp_server_args(
+                    moe_a2a_backend="deepep",
+                    moe_runner_backend="deep_gemm",
+                )
+            )
+            _handle_dspark(
+                self._dp_server_args(
+                    moe_a2a_backend="deepep",
+                    moe_runner_backend="flashinfer_mxfp4",
+                    flashinfer_mxfp4_moe_precision="fp8",
+                    is_fp4_experts=True,
+                )
+            )
+
+    @patch(
+        "sglang.srt.arg_groups.speculative_hook.get_platform",
+        return_value=SimpleNamespace(is_sm90=True),
+    )
+    def test_deepep_rejects_unsupported_runner(self, _):
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            for runner, precision, is_fp4_experts in (
+                ("triton", "fp8", True),
+                ("flashinfer_mxfp4", "bf16", True),
+                ("flashinfer_mxfp4", "fp8", False),
+            ):
+                with self.assertRaisesRegex(ValueError, "supported runner"):
+                    _handle_dspark(
+                        self._dp_server_args(
+                            moe_a2a_backend="deepep",
+                            moe_runner_backend=runner,
+                            flashinfer_mxfp4_moe_precision=precision,
+                            is_fp4_experts=is_fp4_experts,
+                        )
+                    )
 
     def test_a2a_backend_with_compact_verify_mode_raises(self):
         server_args = self._dp_server_args(moe_a2a_backend="megamoe")
@@ -182,6 +235,46 @@ class TestDsparkReplicatedPPDraft(CustomTestCase):
         args.moe_a2a_backend = "megamoe"
         with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
             with self.assertRaisesRegex(ValueError, "built-in TP MoE"):
+                _handle_dspark(args)
+
+    @patch(
+        "sglang.srt.arg_groups.speculative_hook.get_platform",
+        return_value=SimpleNamespace(is_sm90=True),
+    )
+    def test_dp8_tp8_flashinfer_humming_deepep_is_admitted(self, _):
+        args = self._replicated_args("decode")
+        args.enable_dp_attention = True
+        args.enable_dp_lm_head = True
+        args.dp_size = 8
+        args.tp_size = 8
+        args.moe_a2a_backend = "deepep"
+        args.moe_runner_backend = "flashinfer_mxfp4"
+        args.flashinfer_mxfp4_moe_precision = "fp8"
+        args.speculative_moe_a2a_backend = "deepep"
+        args.speculative_moe_runner_backend = "flashinfer_mxfp4"
+        args._model_config.is_fp4_experts = True
+
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            _handle_dspark(args)
+
+    @patch(
+        "sglang.srt.arg_groups.speculative_hook.get_platform",
+        return_value=SimpleNamespace(is_sm90=True),
+    )
+    def test_pp_flashinfer_humming_deepep_requires_matching_draft_a2a(self, _):
+        args = self._replicated_args("decode")
+        args.enable_dp_attention = True
+        args.enable_dp_lm_head = True
+        args.dp_size = 8
+        args.tp_size = 8
+        args.moe_a2a_backend = "deepep"
+        args.moe_runner_backend = "flashinfer_mxfp4"
+        args.flashinfer_mxfp4_moe_precision = "fp8"
+        args.speculative_moe_a2a_backend = "none"
+        args._model_config.is_fp4_experts = True
+
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            with self.assertRaisesRegex(ValueError, "must match"):
                 _handle_dspark(args)
 
     def test_prefill_requires_only_prefill_graph_disabled(self):

@@ -127,13 +127,14 @@ class DeepEPMoE(FusedMoE):
         ):
             self.deprecate_flag = True
         elif (
-            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and get_moe_runner_backend().is_deep_gemm()
-            and quant_config is not None
-            and quant_config.get_name() == "mxfp4"
-        ):
-            # MXFP4 experts (e.g. Kimi K3) on the DeepGEMM fp8_fp4 W4A8 path:
-            # route through the modern FusedMoE runner (Mxfp4MoEMethod.apply).
+            (
+                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and get_moe_runner_backend().is_deep_gemm()
+            )
+            or get_moe_runner_backend().is_flashinfer_mxfp4()
+        ) and (quant_config is not None and quant_config.get_name() == "mxfp4"):
+            # MXFP4 experts using the modern runner stack. This includes the
+            # DeepEP adapter for SM90 FlashInfer Humming W4A8.
             self.deprecate_flag = True
         elif (
             quant_config is None
@@ -254,7 +255,6 @@ class DeepEPMoE(FusedMoE):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
-
         if self.deprecate_flag:
             return super().forward_impl(
                 hidden_states,
@@ -281,7 +281,6 @@ class DeepEPMoE(FusedMoE):
         self,
         dispatch_output: DispatchOutput,
     ):
-
         if self.deprecate_flag:
             return super().run_moe_core(dispatch_output)
 

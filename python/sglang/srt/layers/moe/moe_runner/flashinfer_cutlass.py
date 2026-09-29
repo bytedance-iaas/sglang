@@ -338,6 +338,141 @@ def fused_experts_none_to_flashinfer_mxfp4(
     )
 
 
+@register_fused_func("deepep", "flashinfer_mxfp4")
+def fused_experts_deepep_to_flashinfer_mxfp4(
+    dispatch_output,
+    quant_info: MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+):
+    """Run SM90 Humming MXFP4xFP8 after DeepEP dispatch.
+
+    Normal dispatch already has token-major rows and can use its routed expert
+    ids directly. Low-latency dispatch is expert-major, so flatten it and route
+    each row to its owning local expert with unit weights; DeepEP combine then
+    applies the original routing weights while dropping masked padding rows.
+    """
+    from sglang.srt.layers.moe.token_dispatcher.deepep import (
+        DeepEPLLCombineInput,
+        DeepEPLLDispatchOutput,
+        DeepEPNormalCombineInput,
+        DeepEPNormalDispatchOutput,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.standard import (
+        StandardDispatchOutput,
+    )
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+    if not isinstance(quant_info, FlashInferCutlassMxfp4MoeQuantInfo):
+        raise TypeError(
+            "DeepEP + flashinfer_mxfp4 requires CUTLASS MXFP4 quantization, "
+            f"got {type(quant_info)}."
+        )
+    humming_scales = (
+        quant_info.w13_humming_residual_scale,
+        quant_info.w2_humming_residual_scale,
+        quant_info.humming_fc2_act_scale,
+    )
+    if not all(scale is not None for scale in humming_scales):
+        raise ValueError(
+            "DeepEP + flashinfer_mxfp4 requires the SM90 Humming MXFP4xFP8 path "
+            "(--flashinfer-mxfp4-moe-precision fp8)."
+        )
+    if dispatch_output.hidden_states_scale is not None:
+        raise ValueError(
+            "DeepEP + FlashInfer Humming requires BF16 dispatch; use "
+            "--deepep-dispatcher-output-dtype bf16."
+        )
+
+    if isinstance(dispatch_output, DeepEPNormalDispatchOutput):
+        standard_output = _fused_experts_flashinfer_mxfp4_cutlass(
+            StandardDispatchOutput(
+                hidden_states=dispatch_output.hidden_states,
+                hidden_states_scale=None,
+                topk_output=StandardTopKOutput(
+                    topk_weights=dispatch_output.topk_weights,
+                    topk_ids=dispatch_output.topk_ids,
+                    router_logits=None,
+                ),
+            ),
+            quant_info,
+            runner_config,
+        )
+        return DeepEPNormalCombineInput(
+            hidden_states=standard_output.hidden_states,
+            topk_ids=dispatch_output.topk_ids,
+            topk_weights=dispatch_output.topk_weights,
+        )
+
+    if not isinstance(dispatch_output, DeepEPLLDispatchOutput):
+        raise TypeError(
+            "DeepEP + flashinfer_mxfp4 received unsupported dispatch output "
+            f"{type(dispatch_output)}."
+        )
+
+    hidden_states = dispatch_output.hidden_states
+    num_local_experts = int(quant_info.w13_weight.shape[0])
+    if dispatch_output.masked_m.numel() != num_local_experts:
+        raise ValueError(
+            "DeepEP masked expert count does not match local MXFP4 weights: "
+            f"{dispatch_output.masked_m.numel()} != {num_local_experts}."
+        )
+    if hidden_states.ndim == 3:
+        if hidden_states.shape[0] != num_local_experts:
+            raise ValueError(
+                "DeepEP masked input has an unexpected expert dimension: "
+                f"{hidden_states.shape[0]} != {num_local_experts}."
+            )
+        max_tokens_per_expert = int(hidden_states.shape[1])
+    elif hidden_states.ndim == 2:
+        if hidden_states.shape[0] % num_local_experts != 0:
+            raise ValueError(
+                "DeepEP masked input rows must be divisible by the local "
+                f"expert count: {hidden_states.shape[0]} % {num_local_experts}."
+            )
+        max_tokens_per_expert = hidden_states.shape[0] // num_local_experts
+    else:
+        raise ValueError(
+            "DeepEP masked input must be rank 2 or 3, got "
+            f"shape={tuple(hidden_states.shape)}."
+        )
+
+    flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+    local_expert_ids = torch.arange(
+        num_local_experts,
+        dtype=torch.int32,
+        device=hidden_states.device,
+    )
+    # FlashInfer receives global expert ids and uses ep_rank/ep_size to select
+    # the local weight shard.
+    global_expert_ids = local_expert_ids + quant_info.moe_ep_rank * num_local_experts
+    synthetic_topk_ids = global_expert_ids.repeat_interleave(
+        max_tokens_per_expert
+    ).unsqueeze(1)
+    synthetic_topk_weights = torch.ones(
+        (flat_hidden_states.shape[0], 1),
+        dtype=dispatch_output.topk_weights.dtype,
+        device=hidden_states.device,
+    )
+    standard_output = _fused_experts_flashinfer_mxfp4_cutlass(
+        StandardDispatchOutput(
+            hidden_states=flat_hidden_states,
+            hidden_states_scale=None,
+            topk_output=StandardTopKOutput(
+                topk_weights=synthetic_topk_weights,
+                topk_ids=synthetic_topk_ids,
+                router_logits=None,
+            ),
+        ),
+        quant_info,
+        runner_config,
+    )
+    return DeepEPLLCombineInput(
+        hidden_states=standard_output.hidden_states.reshape_as(hidden_states),
+        topk_ids=dispatch_output.topk_ids,
+        topk_weights=dispatch_output.topk_weights,
+    )
+
+
 def _fused_experts_flashinfer_mxfp4_cutlass(
     dispatch_output: StandardDispatchOutput,
     quant_info: FlashInferCutlassMxfp4MoeQuantInfo,

@@ -27,6 +27,7 @@ from sglang.srt.layers.moe.utils import (
     DispatcherOutputDtype,
     get_deepep_config,
     get_deepep_output_dtype,
+    get_moe_runner_backend,
     is_tbo_enabled,
 )
 from sglang.srt.utils import (
@@ -652,8 +653,12 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
+        if (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            or get_moe_runner_backend().is_flashinfer_mxfp4()
+            or _use_aiter
+            or _is_npu
+        ):
             output = hidden_states
         else:
             raise NotImplementedError()  # triton runner was supported but it's temporarily disabled
