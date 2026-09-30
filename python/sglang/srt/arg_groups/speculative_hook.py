@@ -619,10 +619,10 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             )
         if cfg.attn_cp_size != 1:
             raise ValueError("PP DSpark currently requires attention CP=1.")
-        if not cfg.disable_radix_cache:
+        if not cfg.disable_radix_cache and cfg.disaggregation_mode != "prefill":
             raise ValueError(
-                "PP DSpark currently requires --disable-radix-cache because "
-                "draft context is owned by a request, not by a shared prefix."
+                "PP DSpark Decode currently requires --disable-radix-cache. "
+                "Radix-backed draft context is supported on Prefill only."
             )
         if cfg.enable_mixed_chunk:
             declare_resolution(

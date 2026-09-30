@@ -28,6 +28,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
+    get_memory,
     get_parallel,
     get_schedule,
     get_spec,
@@ -191,6 +192,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         self._replicated_pp_decode = (
             self._replicated_pp_draft and disaggregation_mode == "decode"
+        )
+        self._replicate_pp_prefill_context = (
+            self._replicated_pp_draft
+            and self._is_pd_prefill
+            and not get_memory().disable_radix_cache
         )
         self._pp_candidates = weakref.WeakKeyDictionary()
         self._is_context_only_pp_prefill_rank = (
@@ -831,7 +837,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         )
         next_token_ids = batch_output.next_token_ids
-        self._tp_sync.sync(SpecTpSyncSite.DSPARK_TARGET, next_token_ids)
+        if next_token_ids is not None:
+            self._tp_sync.sync(SpecTpSyncSite.DSPARK_TARGET, next_token_ids)
         new_seq_lens = batch.seq_lens
         batch_output.new_seq_lens = new_seq_lens
         if on_publish is not None:
@@ -1563,9 +1570,16 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "Replicated PP DSpark result does not match the forward batch: "
                 f"forward_rids={state.rids}, result_rids={rids}."
             )
-        rows, token_rows = owned_token_rows(
-            rids, state.token_counts, self.ps.pp_rank, self.ps.pp_size
-        )
+        if self._replicate_pp_prefill_context:
+            # A later radix hit can be assigned to either rid-based draft owner.
+            # Keep both Prefill replicas complete while the target token slots
+            # (and the draft slots indexed by them) are retained by the tree.
+            rows = list(range(len(rids)))
+            token_rows = list(range(sum(state.token_counts)))
+        else:
+            rows, token_rows = owned_token_rows(
+                rids, state.token_counts, self.ps.pp_rank, self.ps.pp_size
+            )
         if not rows:
             return
         index = torch.tensor(token_rows, dtype=torch.int64, device=self.device)

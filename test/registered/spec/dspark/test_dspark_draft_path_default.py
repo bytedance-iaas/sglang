@@ -300,10 +300,23 @@ class TestDsparkReplicatedPPDraft(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "bundled DeepSeek-V4"):
             _handle_dspark(args)
 
-    def test_radix_cache_is_rejected(self):
+    def test_prefill_radix_cache_is_admitted(self):
+        args = self._replicated_args("prefill")
+        args.disable_radix_cache = False
+        with (
+            envs.SGLANG_RAGGED_VERIFY_MODE.override("static"),
+            patch(
+                "sglang.srt.speculative.dspark_components.dspark_config."
+                "read_draft_checkpoint_config",
+                return_value=None,
+            ),
+        ):
+            _handle_dspark(args)
+
+    def test_decode_radix_cache_is_rejected(self):
         args = self._replicated_args("decode")
         args.disable_radix_cache = False
-        with self.assertRaisesRegex(ValueError, "disable-radix-cache"):
+        with self.assertRaisesRegex(ValueError, "Decode.*disable-radix-cache"):
             _handle_dspark(args)
 
 

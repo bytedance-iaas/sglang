@@ -14,14 +14,14 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.layers.layernorm import RMSNorm  # noqa: E402
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod  # noqa: E402
-from sglang.srt.mem_cache.kv_cache_builder import get_draft_kv_pool  # noqa: E402
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
 from sglang.srt.managers.utils import GenerationBatchResult  # noqa: E402
-from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig  # noqa: E402
+from sglang.srt.mem_cache.kv_cache_builder import get_draft_kv_pool  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import (  # noqa: E402
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig  # noqa: E402
 from sglang.srt.model_executor.runner.base_runner import (  # noqa: E402
     _allocate_decode_buffers,
 )
@@ -42,13 +42,13 @@ from sglang.srt.speculative.dspark_components.dspark_config import (  # noqa: E4
 from sglang.srt.speculative.dspark_components.dspark_pp import (  # noqa: E402
     draft_owner,
 )
+from sglang.srt.speculative.dspark_components.dspark_verify import (  # noqa: E402
+    TargetVerifyExecutor,
+)
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (  # noqa: E402
     DSparkWorkerV2,
     PPDSparkCommitState,
     _is_context_only_pp_prefill_rank,
-)
-from sglang.srt.speculative.dspark_components.dspark_verify import (  # noqa: E402
-    TargetVerifyExecutor,
 )
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -131,6 +131,7 @@ class TestDSparkPPContext(CustomTestCase):
         worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
         worker.device = "cpu"
         worker.ps = SimpleNamespace(pp_rank=0, pp_size=2)
+        worker._replicate_pp_prefill_context = False
         worker._kv_injector = Mock()
         state = PPDSparkCommitState(
             rids=tuple(rids),
@@ -153,6 +154,34 @@ class TestDSparkPPContext(CustomTestCase):
         self.assertTrue(torch.equal(kwargs["projected_context"], projected[:2]))
         self.assertTrue(torch.equal(kwargs["cache_loc"], torch.tensor([10, 11])))
         self.assertTrue(torch.equal(kwargs["positions"], torch.tensor([0, 1])))
+
+    def test_radix_prefill_commit_writes_all_rows_on_each_replica(self):
+        worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker.device = "cpu"
+        worker.ps = SimpleNamespace(pp_rank=0, pp_size=2)
+        worker._replicate_pp_prefill_context = True
+        worker._kv_injector = Mock()
+        state = PPDSparkCommitState(
+            rids=("request-a", "request-b"),
+            cache_loc=torch.tensor([10, 11, 20, 21, 22]),
+            cache_loc_2d=None,
+            positions=torch.tensor([0, 1, 7, 8, 9]),
+            state_slot=None,
+            token_counts=(2, 3),
+        )
+        projected = torch.arange(20).view(5, 4)
+
+        worker.commit_pp_draft_context(
+            state=state,
+            rids=state.rids,
+            projected_context=projected,
+            commit_lens=None,
+        )
+
+        kwargs = worker._kv_injector.inject_projected_context.call_args.kwargs
+        self.assertTrue(torch.equal(kwargs["projected_context"], projected))
+        self.assertTrue(torch.equal(kwargs["cache_loc"], state.cache_loc))
+        self.assertTrue(torch.equal(kwargs["positions"], state.positions))
 
     @patch(
         "sglang.srt.speculative.dspark_components.dspark_worker_v2.alloc_verify_window"
@@ -222,8 +251,8 @@ class TestDSparkPPContext(CustomTestCase):
             verify_result,
         )[1]
         worker._proposer = Mock()
-        worker._proposer.run_idle_participation.side_effect = (
-            lambda batch: calls.append(("draft", batch))
+        worker._proposer.run_idle_participation.side_effect = lambda batch: (
+            calls.append(("draft", batch))
         )
         worker._idle_verify_ragged_layout = Mock(return_value=None)
         idle_result = object()
@@ -323,9 +352,7 @@ class TestDSparkPPContext(CustomTestCase):
 
         with patch(
             "sglang.srt.managers.scheduler_pp_mixin.get_spec",
-            return_value=SimpleNamespace(
-                speculative_dspark_pp_replicated_draft=False
-            ),
+            return_value=SimpleNamespace(speculative_dspark_pp_replicated_draft=False),
         ):
             SchedulerPPMixin._pp_launch_batch(
                 scheduler, 0, batch, None, metadata, deque()
