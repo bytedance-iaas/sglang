@@ -458,11 +458,14 @@ class TestDecodePrebuilt(unittest.TestCase):
         new_batch = MagicMock()
         # get_new_prebuilt_batch reads the published disagg config
         # (disaggregation_decode_enable_radix_cache).
-        with patch(
-            "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
-            return_value=new_batch,
-        ) as init_new, get_context().override_server_args(
-            disaggregation_decode_enable_radix_cache=False
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
+                return_value=new_batch,
+            ) as init_new,
+            get_context().override_server_args(
+                disaggregation_decode_enable_radix_cache=False
+            ),
         ):
             ret = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
                 scheduler, scheduler.running_batch
@@ -490,11 +493,14 @@ class TestDecodePrebuilt(unittest.TestCase):
         )
         new_batch.process_prebuilt.side_effect = lambda *_: call_order.append("process")
 
-        with patch(
-            "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
-            return_value=new_batch,
-        ), get_context().override_server_args(
-            disaggregation_decode_enable_radix_cache=False
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
+                return_value=new_batch,
+            ),
+            get_context().override_server_args(
+                disaggregation_decode_enable_radix_cache=False
+            ),
         ):
             ret = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
                 scheduler, scheduler.running_batch
@@ -505,6 +511,32 @@ class TestDecodePrebuilt(unittest.TestCase):
             scheduler.forward_stream
         )
         self.assertEqual(call_order, ["prepare", "wait", "process"])
+
+    def test_prebuilt_selection_respects_pp_micro_batch_limit(self):
+        scheduler = self._new_scheduler(enable_overlap=False)
+        scheduler.req_to_token_pool.size = 16
+        scheduler.max_running_requests = 16
+        scheduler.running_batch.batch_size.return_value = 6
+        scheduler.waiting_queue = [MagicMock(rid=f"request-{i}") for i in range(4)]
+
+        new_batch = MagicMock()
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
+                return_value=new_batch,
+            ) as init_new,
+            get_context().override_server_args(
+                disaggregation_decode_enable_radix_cache=False,
+                pp_max_micro_batch_size=8,
+            ),
+        ):
+            SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
+                scheduler, scheduler.running_batch
+            )
+
+        selected_reqs = init_new.call_args.args[0]
+        self.assertEqual(len(selected_reqs), 2)
+        self.assertEqual(len(scheduler.waiting_queue), 2)
 
 
 if __name__ == "__main__":
