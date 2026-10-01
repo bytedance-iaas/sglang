@@ -202,7 +202,13 @@ struct StreamingTopK {
     const auto smem = static_cast<Smem*>(_smem);
     const auto tx = threadIdx.x;
     const auto num_above = smem->match.above_count;
-    if (tx < num_above) params.transform(tx);
+    // num_above can exceed kBlockSize when K > kBlockSize; loop kAbovePerBlock chunks.
+    constexpr uint32_t kAbovePerBlock = (K + kBlockSize - 1) / kBlockSize;
+#pragma unroll
+    for (uint32_t i = 0; i < kAbovePerBlock; ++i) {
+      const uint32_t idx = tx + i * kBlockSize;
+      if (idx < num_above) params.transform(idx);
+    }
     const auto num_equal = smem->counter_eq;
     if (num_above >= K || num_equal == 0) return;
     const auto clamped_ties = min(num_equal, kMaxTies);
