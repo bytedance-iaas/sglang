@@ -8,9 +8,8 @@ import os
 import time
 from contextlib import nullcontext
 from datetime import datetime
-from typing import Any, Dict, List, Tuple
+from typing import Dict, List, Tuple
 
-import ray
 import torch
 import triton
 import triton.language as tl
@@ -22,7 +21,16 @@ from common_utils import (
     get_model_config,
     sort_config,
 )
-from ray.experimental.tqdm_ray import tqdm
+
+try:
+    import ray
+    from ray.experimental.tqdm_ray import tqdm
+except ImportError:
+    ray = None
+
+    def tqdm(iterable, **_kwargs):
+        return iterable
+
 
 from sglang.kernels.ops.moe.fused_moe_triton_kernels import clear_b_tma_desc_cache
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
@@ -593,7 +601,9 @@ class BenchmarkWorker:
         self.seed = seed
         # Get the device ID to allocate tensors and kernels
         # on the respective GPU.
-        self.device_id = 0 if not ray.is_initialized() else int(ray.get_gpu_ids()[0])
+        self.device_id = (
+            0 if ray is None or not ray.is_initialized() else int(ray.get_gpu_ids()[0])
+        )
         set_global_server_args_for_scheduler(server_args)
 
     def benchmark(
@@ -1054,24 +1064,6 @@ def main(args: argparse.Namespace):
 
     assert args.tune
 
-    ray.init()
-    num_gpus = int(ray.available_resources()["GPU"])
-    workers = [
-        ray.remote(num_gpus=1)(BenchmarkWorker).remote(args.seed, server_args)
-        for _ in range(num_gpus)
-    ]
-
-    def _distribute(method: str, inputs: List[Any]) -> List[Any]:
-        outputs = []
-        worker_idx = 0
-        for input_args in inputs:
-            worker = workers[worker_idx]
-            worker_method = getattr(worker, method)
-            output = worker_method.remote(*input_args)
-            outputs.append(output)
-            worker_idx = (worker_idx + 1) % num_gpus
-        return ray.get(outputs)
-
     search_space = load_search_space(args.search_space_file)
     if block_shape is not None:
         block_n, block_k = block_shape[0], block_shape[1]
@@ -1096,29 +1088,42 @@ def main(args: argparse.Namespace):
     )
 
     start = time.perf_counter()
-    configs = _distribute(
-        "tune",
-        [
-            (
-                batch_size,
-                E,
-                shard_intermediate_size,
-                hidden_size,
-                topk,
-                dtype,
-                use_fp8_w8a8,
-                use_int8_w8a8,
-                use_int8_w8a16,
-                use_int4_w4a16,
-                block_shape,
-                search_space,
-                topk_ids_dir,
-                args.ep_size,
-                args.enable_tune_up_tma,
-            )
-            for batch_size in batch_sizes
-        ],
-    )
+    tune_inputs = [
+        (
+            batch_size,
+            E,
+            shard_intermediate_size,
+            hidden_size,
+            topk,
+            dtype,
+            use_fp8_w8a8,
+            use_int8_w8a8,
+            use_int8_w8a16,
+            use_int4_w4a16,
+            block_shape,
+            search_space,
+            topk_ids_dir,
+            args.ep_size,
+            args.enable_tune_up_tma,
+        )
+        for batch_size in batch_sizes
+    ]
+    if args.no_ray:
+        worker = BenchmarkWorker(args.seed, server_args)
+        configs = [worker.tune(*input_args) for input_args in tune_inputs]
+    else:
+        if ray is None:
+            raise RuntimeError("Ray is unavailable; pass --no-ray for serial tuning")
+        ray.init()
+        num_gpus = int(ray.available_resources()["GPU"])
+        workers = [
+            ray.remote(num_gpus=1)(BenchmarkWorker).remote(args.seed, server_args)
+            for _ in range(num_gpus)
+        ]
+        outputs = []
+        for worker_idx, input_args in enumerate(tune_inputs):
+            outputs.append(workers[worker_idx % num_gpus].tune.remote(*input_args))
+        configs = ray.get(outputs)
     print(f"{configs=}", flush=True)
     cur_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     with open(f"tuning_result_{cur_time}.txt", "w") as f:
@@ -1181,6 +1186,11 @@ if __name__ == "__main__":
     parser.add_argument("--disable-shared-experts-fusion", action="store_true")
     parser.add_argument("--configs", type=int, nargs="+", required=False)
     parser.add_argument("--topk-ids-dir", type=str, required=True)
+    parser.add_argument(
+        "--no-ray",
+        action="store_true",
+        help="Tune serially on the current GPU without importing or starting Ray.",
+    )
     parser.add_argument(
         "--search-space-file",
         type=str,
