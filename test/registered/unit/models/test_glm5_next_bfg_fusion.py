@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
-
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.models import glm5_next
@@ -107,86 +107,123 @@ class TestGlm5NextBfgFusion(unittest.TestCase):
         )
         weights = {name: torch.randn(shape) for name, shape in shapes.items()}
         x = torch.randn(7, hidden)
-        for ignored, expected_route in (
-            (QKV + BFG, (True, False)),
-            (BFG, (False, True)),
-            ((), (False, False)),
-        ):
-            for attn_tp, rank in ((1, 0), (2, 0), (2, 1)):
-                with (
-                    self.subTest(route=expected_route, attn_tp=attn_tp, rank=rank),
-                    get_parallel().override(
-                        tp_size=4,
-                        tp_rank=rank,
-                        attn_tp_size=attn_tp,
-                        attn_tp_rank=rank,
-                        attn_dp_size=4 // attn_tp,
-                        attn_dp_rank=0,
-                        attn_cp_size=1,
-                        attn_cp_rank=0,
-                        moe_tp_size=4,
-                    ),
-                ):
-                    quant = MockFp8Config(ignored)
-                    attention = glm5_next.Glm5NextLinearAttention(
-                        layer_idx=0,
-                        hidden_size=hidden,
-                        config=SimpleNamespace(
-                            linear_attn_config={
-                                "head_dim": dim,
-                                "num_heads": heads,
-                                "short_conv_kernel_size": 4,
-                            }
+        for ignored in (QKV + BFG, BFG, ()):
+            can_fuse_a = all(name in ignored for name in QKV + BFG)
+            can_fuse_bfg = all(name in ignored for name in BFG)
+            for fusion_mode in ("full", "a_only", "off"):
+                expected_route = (
+                    can_fuse_a and fusion_mode in {"full", "a_only"},
+                    can_fuse_a and fusion_mode == "full",
+                    not can_fuse_a and can_fuse_bfg and fusion_mode == "full",
+                )
+                for attn_tp, rank in ((1, 0), (2, 0), (2, 1)):
+                    with (
+                        self.subTest(
+                            mode=fusion_mode,
+                            route=expected_route,
+                            attn_tp=attn_tp,
+                            rank=rank,
                         ),
-                        quant_config=quant,
-                        prefix=PREFIX,
-                    )
-                    self.assertEqual(
-                        (attention.do_fuse_qkvbfg, attention.fuse_bfg), expected_route
-                    )
-                    for parameter in attention.parameters():
-                        parameter.fill_(torch.nan)
-                    model = SimpleNamespace(
-                        config=SimpleNamespace(n_routed_experts=0),
-                        num_fused_shared_experts=0,
-                        quant_config=quant,
-                        named_parameters=lambda: (
-                            (f"{PREFIX}.{name}", param)
-                            for name, param in attention.named_parameters()
+                        envs.SGLANG_OPT_GLM5_NEXT_KDA_PROJECTION_FUSION_MODE.override(
+                            fusion_mode
                         ),
-                    )
-                    with patch.object(
-                        glm5_next.DeepseekV2WeightLoaderMixin, "post_load_weights"
+                        get_parallel().override(
+                            tp_size=4,
+                            tp_rank=rank,
+                            attn_tp_size=attn_tp,
+                            attn_tp_rank=rank,
+                            attn_dp_size=4 // attn_tp,
+                            attn_dp_rank=0,
+                            attn_cp_size=1,
+                            attn_cp_rank=0,
+                            moe_tp_size=4,
+                        ),
                     ):
-                        glm5_next.Glm5NextForConditionalGeneration.load_weights(
-                            model,
-                            [
-                                (f"{PREFIX}.{name}.weight", w)
-                                for name, w in weights.items()
-                            ],
+                        quant = MockFp8Config(ignored)
+                        attention = glm5_next.Glm5NextLinearAttention(
+                            layer_idx=0,
+                            hidden_size=hidden,
+                            config=SimpleNamespace(
+                                linear_attn_config={
+                                    "head_dim": dim,
+                                    "num_heads": heads,
+                                    "short_conv_kernel_size": 4,
+                                }
+                            ),
+                            quant_config=quant,
+                            prefix=PREFIX,
                         )
-
-                    def linear(value, name):
-                        weight = weights[name]
-                        if name not in ("f_a_proj", "g_a_proj"):
-                            weight = weight.chunk(attn_tp, dim=0)[rank]
-                        return F.linear(value, weight)
-
-                    expected = (
-                        torch.cat([linear(x, name) for name in QKV], dim=-1),
-                        linear(x, "b_proj"),
-                        linear(linear(x, "f_a_proj"), "f_b_proj"),
-                        linear(linear(x, "g_a_proj"), "g_b_proj"),
-                    )
-                    forward = (
-                        attention.forward_qkvbfg_fused
-                        if attention.do_fuse_qkvbfg
-                        else attention.forward_qkvbfg
-                    )
-                    for actual, reference in zip(forward(x, None), expected):
-                        torch.testing.assert_close(
-                            actual, reference, atol=1e-5, rtol=1e-5
+                        self.assertEqual(
+                            (
+                                attention.fuse_qkvbfg_a,
+                                attention.fuse_fg_b,
+                                attention.fuse_bfg,
+                            ),
+                            expected_route,
                         )
+                        for parameter in attention.parameters():
+                            parameter.fill_(torch.nan)
+                        model = SimpleNamespace(
+                            config=SimpleNamespace(n_routed_experts=0),
+                            num_fused_shared_experts=0,
+                            quant_config=quant,
+                            named_parameters=lambda: (
+                                (f"{PREFIX}.{name}", param)
+                                for name, param in attention.named_parameters()
+                            ),
+                        )
+                        with patch.object(
+                            glm5_next.DeepseekV2WeightLoaderMixin,
+                            "post_load_weights",
+                        ):
+                            glm5_next.Glm5NextForConditionalGeneration.load_weights(
+                                model,
+                                [
+                                    (f"{PREFIX}.{name}.weight", w)
+                                    for name, w in weights.items()
+                                ],
+                            )
+
+                        def linear(value, name):
+                            weight = weights[name]
+                            if name not in ("f_a_proj", "g_a_proj"):
+                                weight = weight.chunk(attn_tp, dim=0)[rank]
+                            return F.linear(value, weight)
+
+                        expected = (
+                            torch.cat([linear(x, name) for name in QKV], dim=-1),
+                            linear(x, "b_proj"),
+                            linear(linear(x, "f_a_proj"), "f_b_proj"),
+                            linear(linear(x, "g_a_proj"), "g_b_proj"),
+                        )
+                        forward = (
+                            attention.forward_qkvbfg_fused
+                            if attention.fuse_qkvbfg_a
+                            else attention.forward_qkvbfg
+                        )
+                        for actual, reference in zip(forward(x, None), expected):
+                            torch.testing.assert_close(
+                                actual, reference, atol=1e-5, rtol=1e-5
+                            )
+
+    def test_invalid_projection_fusion_mode_fails_closed(self):
+        with (
+            envs.SGLANG_OPT_GLM5_NEXT_KDA_PROJECTION_FUSION_MODE.override("invalid"),
+            self.assertRaisesRegex(ValueError, "off, full, a_only"),
+        ):
+            glm5_next.Glm5NextLinearAttention(
+                layer_idx=0,
+                hidden_size=16,
+                config=SimpleNamespace(
+                    linear_attn_config={
+                        "head_dim": 8,
+                        "num_heads": 4,
+                        "short_conv_kernel_size": 4,
+                    }
+                ),
+                quant_config=MockFp8Config(QKV + BFG),
+                prefix=PREFIX,
+            )
 
     def test_each_quantized_gate_projection_disables_fusion(self):
         for quantized in BFG:
