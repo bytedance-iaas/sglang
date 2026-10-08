@@ -293,6 +293,17 @@ def wo_a_fp8_gemm_enabled(quant_config: Optional[QuantizationConfig]) -> bool:
 _MHC_POST_MULT_VALUE = 2.0
 _HC_PRENORM_DEEPGEMM_MIN_TOKENS = 1024
 
+
+def _use_sm90_mhc_stats_overlap(num_tokens: int) -> bool:
+    """Whether an SM90 decode graph may fuse and overlap mHC statistics."""
+    extra_token_counts = (
+        envs.SGLANG_OPT_MHC_STATS_OVERLAP_EXTRA_TOKEN_COUNTS.get() or ()
+    )
+    return num_tokens == 1 or (
+        1 < num_tokens <= 16 and num_tokens in extra_token_counts
+    )
+
+
 DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
     ("gate_up_proj", "gate_proj", 0),
     ("gate_up_proj", "up_proj", 1),
@@ -3238,7 +3249,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             and torch.version.cuda is not None
             and (
                 get_platform().is_blackwell
-                or (get_platform().is_sm90 and x.shape[0] == 1)
+                or (
+                    get_platform().is_sm90
+                    and _use_sm90_mhc_stats_overlap(x.shape[0])
+                    and (x.shape[0] == 1 or stats_stream is not None)
+                )
             )
             and x.dtype == torch.bfloat16
         ):
@@ -3367,7 +3382,10 @@ class DeepseekV4DecoderLayer(nn.Module):
                     and hidden_states.shape[0] > 0
                 )
             )
-            and (not get_platform().is_sm90 or hidden_states.shape[0] == 1)
+            and (
+                not get_platform().is_sm90
+                or _use_sm90_mhc_stats_overlap(hidden_states.shape[0])
+            )
             else None
         )
 
@@ -3402,6 +3420,15 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_attn_base,
             stats_stream,
         )
+        eager_sm90_overlap = (
+            stats_stream is not None
+            and get_platform().is_sm90
+            and hidden_states.shape[0] > 1
+            and _use_sm90_mhc_stats_overlap(hidden_states.shape[0])
+        )
+        if eager_sm90_overlap:
+            stats_stream.wait_stream(torch.cuda.current_stream())
+        attn_stats_result = attn_stats() if eager_sm90_overlap else None
         x = self._hc_combine(
             hidden_states,
             apply_pre=prev_pre,
@@ -3470,7 +3497,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             attn_pre = attn_mhc.pre
             hidden_states = attn_mhc.output
         else:
-            attn_pre, attn_post, attn_comb = attn_stats()
+            attn_pre, attn_post, attn_comb = (
+                attn_stats_result if attn_stats_result is not None else attn_stats()
+            )
             if stats_stream is not None:
                 torch.cuda.current_stream().wait_stream(stats_stream)
             hidden_states = self.hc_post(x, residual, attn_post, attn_comb)
@@ -3484,6 +3513,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_ffn_base,
             stats_stream,
         )
+        if eager_sm90_overlap:
+            stats_stream.wait_stream(torch.cuda.current_stream())
+        ffn_stats_result = ffn_stats() if eager_sm90_overlap else None
         x = self._hc_combine(
             hidden_states,
             apply_pre=attn_pre,
@@ -3546,7 +3578,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             mhc.materialize_stats()
             ffn_pre, ffn_post, ffn_comb = mhc.pre, mhc.post, mhc.comb
         else:
-            ffn_pre, ffn_post, ffn_comb = ffn_stats()
+            ffn_pre, ffn_post, ffn_comb = (
+                ffn_stats_result if ffn_stats_result is not None else ffn_stats()
+            )
         if mhc is not None and mhc.output is not None:
             hidden_states = mhc.output
             if next_input is not None and mhc.quantized is not None:
