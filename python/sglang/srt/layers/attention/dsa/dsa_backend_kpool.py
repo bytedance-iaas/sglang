@@ -55,16 +55,22 @@ class DeepseekSparseAttnBackendKPoolMixin:
         topk_indices: Optional[torch.Tensor],
         dsa_impl: _DSA_IMPL_T,
     ) -> _DSA_IMPL_T:
-        if (
-            topk_indices is None
-            or self.dsa_index_kpool <= 1
-            or dsa_impl != "flashmla_sparse"
-        ):
+        if topk_indices is None or self.dsa_index_kpool <= 1:
             return dsa_impl
         if self.device_sm_major >= 10:
-            return "trtllm"
-        if self.device_sm_major == 9:
+            return "trtllm" if dsa_impl in ("flashmla_sparse", "flashmla_kv") else dsa_impl
+        if self.device_sm_major == 9 and dsa_impl == "flashmla_sparse":
             return "fa3"
+        if (
+            self.device_sm_major == 9
+            and dsa_impl == "flashmla_kv"
+            and self.dsa_kv_cache_store_fp8
+            and self.qk_rope_head_dim == 0
+        ):
+            # GLM-5.3-Flash stores group-scaled FP8 NoPE rows. TileLang's
+            # sparse reader dequantizes only the selected rows and supports the
+            # index_topk + live-tail width used by KPool draft-extend.
+            return "tilelang"
         return dsa_impl
 
     def _kpool_index_page_size(self) -> int:
