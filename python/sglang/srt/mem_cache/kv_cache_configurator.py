@@ -1376,11 +1376,22 @@ class KVCacheConfigurator:
         )
 
     def _get_mamba_layer_ids_for_req_pool(self) -> list:
-        mamba_layer_ids = [
+        target_layer_ids = [
             i
             for i in self.mambaish_config.mamba2_cache_params.layers
             if self.layer_info.start_layer <= i < self.layer_info.end_layer
         ]
+        # GLM-5.3's NextN blocks are MLA rather than KDA. Each draft worker
+        # receives its own one-layer pool through clone_with_new_mamba(), so
+        # adding those ids to the target pool creates unreachable state/ring
+        # rows and makes ReplaySSM fold work on state the target never executes.
+        if (
+            self.hybrid_kda_config is not None
+            and getattr(self.model_config.hf_config, "model_type", None) == "glm5_next"
+        ):
+            return target_layer_ids
+
+        mamba_layer_ids = target_layer_ids
         if max_speculative_num_draft_tokens():
             for layer_id in getattr(self.mambaish_config, "nextn_layer_ids", []):
                 if layer_id not in mamba_layer_ids:

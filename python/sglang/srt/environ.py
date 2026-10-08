@@ -1403,6 +1403,11 @@ class Envs:
     # Experimental; auto-falls back to eager if the backend's prep is not capturable.
     SGLANG_ENABLE_METADATA_GLUE_GRAPH = EnvBool(False)
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
+    # Preserve the measured GLM-5.3-Flash projection controls while keeping
+    # upstream's #39688 full-fusion behavior as the default. ``a_only`` keeps
+    # the merged qkv/beta/f_a/g_a projection but executes f_b/g_b separately;
+    # ``off`` is the rollback path.
+    SGLANG_OPT_GLM5_NEXT_KDA_PROJECTION_FUSION_MODE = EnvStr("full")
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
