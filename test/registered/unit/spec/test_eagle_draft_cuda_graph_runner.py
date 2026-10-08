@@ -23,6 +23,7 @@ from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
+    _is_qualified_dsa_draft_metadata_glue,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -90,6 +91,7 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         runner.seq_len_fill_value = SEQ_LEN_FILL_VALUE
         runner.require_mlp_tp_gather = False
         runner.require_gathered_buffer = False
+        runner._metadata_glue = None
         runner.model_runner = SimpleNamespace(
             model_config=SimpleNamespace(vocab_size=8, model_is_mrope=False),
             server_args=SimpleNamespace(speculative_use_rejection_sampling=False),
@@ -201,6 +203,34 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         for observation in backend.observations:
             self.assertIsNone(observation.seq_lens_sum, msg=observation.phase)
         self.assertIsNone(forward_batch.seq_lens_sum)
+
+    def test_dsa_draft_glue_uses_effective_hopper_tail_backend(self):
+        def leaf(**updates):
+            values = dict(
+                dsa_decode_impl="flashmla_kv",
+                dsa_index_kpool=4,
+                physical_page_size=64,
+                dsa_index_topk=2048,
+                effective_backend="tilelang",
+            )
+            values.update(updates)
+            result = SimpleNamespace(**values)
+            result._resolve_kpool_tail_backend = (
+                lambda topk, impl, result=result: result.effective_backend
+            )
+            return result
+
+        self.assertTrue(_is_qualified_dsa_draft_metadata_glue([leaf(), leaf()]))
+        for bad_leaf in (
+            leaf(effective_backend="flashmla_kv"),
+            leaf(dsa_index_kpool=1),
+            leaf(physical_page_size=1),
+            leaf(dsa_index_topk=1024),
+        ):
+            with self.subTest(bad_leaf=bad_leaf):
+                self.assertFalse(
+                    _is_qualified_dsa_draft_metadata_glue([leaf(), bad_leaf])
+                )
 
 
 if __name__ == "__main__":
