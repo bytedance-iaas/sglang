@@ -1,8 +1,9 @@
 import copy
 import logging
 import weakref
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
+from contextlib import nullcontext
+from dataclasses import dataclass, replace
+from typing import Callable, Optional, Protocol, runtime_checkable
 
 import torch
 
@@ -172,9 +173,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.page_size = get_schedule().page_size
         self.device = target_worker.device
         self._draft_worker = None
-        self.enable_dp_spec_prefill_coordination = (
-            envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
-        )
+        self.enable_dp_spec_prefill_coordination = False
         parallel = get_parallel()
         self.ps = parallel
         self._draft_is_moe = draft_is_deepseek_v4()

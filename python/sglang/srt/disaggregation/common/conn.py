@@ -41,10 +41,8 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_parallel,
     get_serving,
-    max_prefill_buffer_tokens,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.network import (
     NetworkAddress,
     get_local_ip_auto,

@@ -25,7 +25,7 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
 
     def test_pp_dspark_owner_count_uses_optional_trailing_slot(self):
         sync_info = dp_attn.MLPSyncBatchInfo(
-            num_dp_ranks=1,
+            dp_size=1,
             tp_size=1,
             cp_size=1,
             num_tokens=2,
