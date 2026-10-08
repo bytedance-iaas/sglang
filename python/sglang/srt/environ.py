@@ -1402,7 +1402,6 @@ class Envs:
     # into a small CUDA graph, collapsing its host dispatch cost to one launch.
     # Experimental; auto-falls back to eager if the backend's prep is not capturable.
     SGLANG_ENABLE_METADATA_GLUE_GRAPH = EnvBool(False)
-    SGLANG_ENABLE_DSA_DRAFT_METADATA_GLUE_GRAPH = EnvBool(True)
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # Preserve the measured GLM-5.3-Flash projection controls while keeping
     # upstream's #39688 full-fusion behavior as the default. ``a_only`` keeps
