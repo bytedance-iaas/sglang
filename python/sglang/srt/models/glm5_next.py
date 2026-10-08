@@ -413,13 +413,31 @@ class Glm5NextLinearAttention(nn.Module):
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
-        self.do_fuse_qkvbfg = self._can_fuse_proj(
+        can_fuse_qkvbfg = self._can_fuse_proj(
             quant_config, prefix, "fused_qkvbfg_a_proj", "fused_fg_b_proj"
         )
-        self.fuse_bfg = not self.do_fuse_qkvbfg and self._can_fuse_proj(
-            quant_config, prefix, "fused_bfg_a_proj", "fused_fg_b_proj"
+        fusion_mode = envs.SGLANG_OPT_GLM5_NEXT_KDA_PROJECTION_FUSION_MODE.get()
+        if fusion_mode not in {"off", "full", "a_only"}:
+            raise ValueError(
+                "SGLANG_OPT_GLM5_NEXT_KDA_PROJECTION_FUSION_MODE must be "
+                "one of: off, full, a_only"
+            )
+        self.fuse_qkvbfg_a = can_fuse_qkvbfg and fusion_mode in {
+            "full",
+            "a_only",
+        }
+        self.fuse_fg_b = can_fuse_qkvbfg and fusion_mode == "full"
+        self.fuse_bfg = (
+            not can_fuse_qkvbfg
+            and fusion_mode == "full"
+            and self._can_fuse_proj(
+                quant_config, prefix, "fused_bfg_a_proj", "fused_fg_b_proj"
+            )
         )
-        if self.do_fuse_qkvbfg:
+        # Keep the historical attribute for callers that inspect whether the
+        # full upstream #39688 path is active.
+        self.do_fuse_qkvbfg = self.fuse_fg_b
+        if self.fuse_qkvbfg_a:
             self.qkvb_sizes = [
                 projection_size,
                 projection_size,
@@ -441,13 +459,31 @@ class Glm5NextLinearAttention(nn.Module):
                 self.num_heads // head_shard_size,
                 2 * self.head_dim,
             ]
-            self.fused_fg_b_proj = ColumnParallelBatchedLinear(
-                2,
-                self.head_dim,
-                projection_size,
-                dtype=self.fused_qkvbfg_a_proj.params_dtype,
-                parallel_group="attn_tp",
-            )
+            if self.fuse_fg_b:
+                self.fused_fg_b_proj = ColumnParallelBatchedLinear(
+                    2,
+                    self.head_dim,
+                    projection_size,
+                    dtype=self.fused_qkvbfg_a_proj.params_dtype,
+                    parallel_group="attn_tp",
+                )
+            else:
+                self.f_b_proj = ColumnParallelLinear(
+                    self.head_dim,
+                    projection_size,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.f_b_proj",
+                    parallel_group="attn_tp",
+                )
+                self.g_b_proj = ColumnParallelLinear(
+                    self.head_dim,
+                    projection_size,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.g_b_proj",
+                    parallel_group="attn_tp",
+                )
         else:
             self.qkv_proj = QKVParallelLinear(
                 self.hidden_size,
@@ -609,9 +645,14 @@ class Glm5NextLinearAttention(nn.Module):
 
         qkv, beta, fg_a_states = torch.split(fused_states, self.split_sizes, dim=-1)
 
-        forget_gate, g_proj_states = self.fused_fg_b_proj(
-            fg_a_states.view(-1, 2, self.head_dim).transpose(0, 1)
-        )
+        if self.fuse_fg_b:
+            forget_gate, g_proj_states = self.fused_fg_b_proj(
+                fg_a_states.view(-1, 2, self.head_dim).transpose(0, 1)
+            )
+        else:
+            f_a_states, g_a_states = fg_a_states.split(self.head_dim, dim=-1)
+            forget_gate = self.f_b_proj(f_a_states)[0]
+            g_proj_states = self.g_b_proj(g_a_states)[0]
 
         return (
             qkv,
@@ -629,7 +670,7 @@ class Glm5NextLinearAttention(nn.Module):
         if forward_batch.forward_mode.is_idle():
             return hidden_states
 
-        if self.do_fuse_qkvbfg:
+        if self.fuse_qkvbfg_a:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
                 hidden_states, forward_batch
             )
