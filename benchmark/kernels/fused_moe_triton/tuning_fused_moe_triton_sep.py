@@ -48,6 +48,44 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 device_module = get_device_module()
 
+_CONFIG_KEYS = {
+    "BLOCK_SIZE_M",
+    "BLOCK_SIZE_N",
+    "BLOCK_SIZE_K",
+    "GROUP_SIZE_M",
+    "num_warps",
+    "num_stages",
+}
+
+
+def load_search_space(path: str | None) -> List[Dict[str, int]]:
+    if path is None:
+        return get_configs_compute_bound()
+
+    with open(path) as f:
+        search_space = json.load(f)
+    if not isinstance(search_space, list) or not search_space:
+        raise ValueError("--search-space-file must contain a non-empty JSON list")
+
+    normalized = []
+    seen = set()
+    for index, config in enumerate(search_space):
+        if not isinstance(config, dict) or set(config) != _CONFIG_KEYS:
+            raise ValueError(
+                f"search-space config {index} must contain exactly "
+                f"{sorted(_CONFIG_KEYS)}"
+            )
+        if not all(isinstance(value, int) and value > 0 for value in config.values()):
+            raise ValueError(
+                f"search-space config {index} values must be positive integers"
+            )
+        identity = tuple((key, config[key]) for key in sorted(_CONFIG_KEYS))
+        if identity in seen:
+            raise ValueError(f"search-space config {index} is a duplicate")
+        seen.add(identity)
+        normalized.append(config)
+    return normalized
+
 
 @dataclasses.dataclass
 class MoeInputs:
@@ -965,7 +1003,8 @@ def main(args: argparse.Namespace):
     if len(batch_sizes) == 1:
         worker = BenchmarkWorker(args.seed, server_args)
         if args.tune:
-            search_space = get_configs_compute_bound()
+            search_space = load_search_space(args.search_space_file)
+            print(f"Start tuning over {len(search_space)} configurations...")
             worker.tune(
                 batch_sizes[0],
                 E,
@@ -1033,7 +1072,7 @@ def main(args: argparse.Namespace):
             worker_idx = (worker_idx + 1) % num_gpus
         return ray.get(outputs)
 
-    search_space = get_configs_compute_bound()
+    search_space = load_search_space(args.search_space_file)
     if block_shape is not None:
         block_n, block_k = block_shape[0], block_shape[1]
         search_space = [
@@ -1142,6 +1181,11 @@ if __name__ == "__main__":
     parser.add_argument("--disable-shared-experts-fusion", action="store_true")
     parser.add_argument("--configs", type=int, nargs="+", required=False)
     parser.add_argument("--topk-ids-dir", type=str, required=True)
+    parser.add_argument(
+        "--search-space-file",
+        type=str,
+        help="JSON file containing an explicit list of Triton configs to evaluate with --tune.",
+    )
     parser.add_argument("--cmp-configs", type=str, nargs="+", required=False)
     parser.add_argument(
         "--enable-tune-up-tma",
