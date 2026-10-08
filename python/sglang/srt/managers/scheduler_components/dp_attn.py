@@ -266,15 +266,6 @@ def _update_gather_batch(
         batch.draft_global_num_tokens_for_logprob = (
             mlp_sync_info.global_pp_dspark_owned_num_tokens
         )
-    if envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
-        # Fresh counts have not yet been adjusted by the coordination plan.
-        batch.dp_spec_prefill_coordination_applied = False
-        info = mlp_sync_info.tp0_info_cpu
-        batch.dp_spec_prefill_coordination_metadata = (
-            mlp_sync_info.global_num_tokens,
-            mlp_sync_info.global_num_tokens_for_logprob,
-            info[:, 3],
-        )
     if not skip_global_metadata:
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
@@ -305,7 +296,7 @@ def _pp_dspark_owned_num_tokens(
     return sum(draft_owner(req.rid, pp_size) == pp_rank for req in local_batch.reqs)
 
 
-def should_skip_scheduler_all_gather(num_dp_ranks: int) -> bool:
+def should_skip_scheduler_all_gather(dp_size: int) -> bool:
     """Return whether scheduler metadata is already local and rank-invariant.
 
     With one attention-DP rank there is no cross-DP state to reconcile.  The
@@ -316,7 +307,7 @@ def should_skip_scheduler_all_gather(num_dp_ranks: int) -> bool:
     DP1.
     """
 
-    return num_dp_ranks == 1 or envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+    return dp_size == 1 or envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
 
 
 def _local_decode_cuda_graph_vote(

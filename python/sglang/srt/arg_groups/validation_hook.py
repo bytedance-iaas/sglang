@@ -18,7 +18,6 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
 )
-from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
@@ -50,9 +49,6 @@ def check_pipeline_parallel_compat(
             "Pipeline parallel DSPARK requires PD disaggregation with "
             "--speculative-dspark-pp-replicated-draft"
         )
-        assert (
-            not envs.SGLANG_ENABLE_PP_SPEC.get()
-        ), "SGLANG_ENABLE_PP_SPEC does not support DSPARK PD prefill"
     elif cfg.speculative_algorithm is not None:
         assert (
             cfg.speculative_algorithm.upper() == "EAGLE"
@@ -132,7 +128,7 @@ def check_server_args(server_args: Any):
     check_lora_server_args(server_args)
 
     # Check speculative decoding
-    if cfg.speculative_draft_scheduling_policy == "bubble":
+    if getattr(cfg, "speculative_draft_scheduling_policy", "tail") == "bubble":
         assert (
             cfg.speculative_algorithm or ""
         ).upper() == "DSPARK" and cfg.speculative_dspark_pp_replicated_draft, (

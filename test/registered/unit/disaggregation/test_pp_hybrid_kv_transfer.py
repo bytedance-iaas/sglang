@@ -6,8 +6,6 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from sglang.srt.disaggregation.ascend.conn import AscendKVManager
-from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.srt.disaggregation.prefill import _transfer_start_layer

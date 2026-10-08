@@ -50,8 +50,6 @@ from sglang.srt.disaggregation.utils import (
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
     resolve_dcp_dst_entry_indices,
-    should_send_replicated_state,
-    slice_dsa_tail_dst_ptrs_for_pp,
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
@@ -153,6 +151,7 @@ class KVArgsRegisterInfo:
     dst_dcp_rank: int = 0
     requires_dcp_relayout: bool = False
     dcp_token_item_lens: Optional[List[int]] = None
+    dst_kv_item_lens: List[int] = dataclasses.field(default_factory=list)
     staging_base_ptr: int = 0
     staging_total_size: int = 0
     staging: Optional[StagingRegisterInfo] = None
@@ -1087,8 +1086,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # Draft buffers break the flat [K block, V block] layout, so pair by
             # layer ID instead of the half-split used by get_mha_kv_ptrs_with_pp.
             if any(
-                item_len != src_kv_item_len
-                for item_len in self.kv_args.kv_item_lens
+                item_len != src_kv_item_len for item_len in self.kv_args.kv_item_lens
             ):
                 logger.error(
                     f"[{mooncake_session_id}] head-sliced transfer assumes one item "

@@ -32,14 +32,8 @@ from sglang.srt.disaggregation.mooncake.conn import (
 )
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
-    build_transfer_entry_pairs,
-    compute_mamba_state_slice_byte_blocks,
-    get_qsa_pending_state_indices,
-    poll_and_all_reduce,
-    poll_and_all_reduce_attn_cp_tp_group,
-    poll_and_all_reduce_with_staging,
+    get_dsv4_c128_state_indices,
     setup_state_kv_args,
-    should_send_replicated_state,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
@@ -56,27 +50,6 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestDisaggregationWire(unittest.TestCase):
-    def test_sender_clear_keeps_abort_ack_until_writes_drain(self):
-        manager = object.__new__(MooncakeKVManager)
-        sender = object.__new__(MooncakeKVSender)
-        sender.kv_mgr, sender.bootstrap_room = manager, 42
-        for outstanding in (0, 1):
-            with self.subTest(outstanding=outstanding):
-                manager.request_status = {42: KVPoll.Failed}
-                manager._staging_outstanding = {42: outstanding}
-                manager._deferred_ack_targets = {42: ("127.0.0.1", 1234)}
-                manager._deferred_ack_fanout_snapshots = {}
-                manager.transfer_infos = {}
-                with patch.object(manager, "_send_abort_ack") as ack:
-                    sender.clear()
-                    if outstanding:
-                        ack.assert_not_called()
-                        manager._staging_outstanding[42] = 0
-                        manager._maybe_ack_drained_abort(42)
-                    ack.assert_called_once_with("127.0.0.1", 1234, 42)
-                    manager._maybe_ack_drained_abort(42)
-                    ack.assert_called_once()
-
     def test_mooncake_registration_staging_fields(self):
         msg = [
             b"room",
@@ -97,6 +70,8 @@ class TestDisaggregationWire(unittest.TestCase):
             b"4096",
             b"4",
             b"2",
+            b"",
+            struct.pack("2Q", 128, 256),
         ]
 
         info = KVArgsRegisterInfo.from_zmq(msg)
@@ -105,9 +80,7 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertEqual(info.staging_total_size, 4096)
         self.assertEqual(info.dst_dcp_size, 4)
         self.assertEqual(info.dst_dcp_rank, 2)
-        self.assertEqual(info.dst_kv_item_lens, [])
-        info = KVArgsRegisterInfo.from_zmq(msg + [b"", struct.pack("Q", 128)])
-        self.assertEqual(info.dst_kv_item_lens, [128])
+        self.assertEqual(info.dst_kv_item_lens, [128, 256])
 
     def test_int_lists_roundtrip(self):
         cases = [
@@ -214,269 +187,6 @@ class TestCPReplicatedStateTransfer(unittest.TestCase):
                 manager._get_dsa_cache_transfer_skip_flags(None),
                 (False, True),
             )
-
-
-class TestQwen4StateWire(unittest.TestCase):
-    @staticmethod
-    def _qsa_pool(layer_id: int):
-        pool = object.__new__(QSATokenToKVPool)
-        pool.full_kv_pool = object()
-        pool.get_state_buf_infos = lambda: ([10], [100], [20])
-        pool.get_state_dim_per_tensor = lambda: [4]
-        pool.get_state_conv_shard_groups = lambda: [None]
-        pool.get_state_slice_outer_counts = lambda: [1]
-        pool.get_state_layer_ids = lambda: [2]
-        pool.page_size = 4
-        pool.qsa_compress_ratio = 2
-        pool.qsa_compressed_page_size = 2
-        pool.full_attention_layer_id_mapping = {layer_id: 0}
-        pool.qsa_key_state_buffer_pool = [torch.zeros((6, 1, 8), dtype=torch.bfloat16)]
-        pool.qsa_rope_position_buffer = torch.zeros((6, 3), dtype=torch.int64)
-        pool.qsa_compressed_k_buffer_pool = [
-            torch.zeros((6, 1, 8), dtype=torch.bfloat16)
-        ]
-        return pool
-
-    def test_qsa_pending_payload_uses_nested_request_pool_row(self):
-        req = SimpleNamespace(kv=ReqKvInfo(req_pool_idx=7))
-
-        np.testing.assert_array_equal(
-            get_qsa_pending_state_indices(req),
-            np.array([7], dtype=np.int32),
-        )
-
-    def test_qsa_registers_request_ring_and_page_state_separately(self):
-        pool = self._qsa_pool(24)
-
-        kv_args = SimpleNamespace()
-        setup_state_kv_args(kv_args, pool)
-
-        self.assertEqual(
-            kv_args.state_types,
-            [StateType.MAMBA, StateType.QSA_PENDING, StateType.QSA_COMPRESSED],
-        )
-        # Pending entries are whole two-row request rings; compressed-K remains
-        # a two-row compressed page corresponding to one four-token KV page.
-        self.assertEqual(kv_args.state_item_lens[1:], [[32, 48], [32]])
-        self.assertEqual(
-            kv_args.state_layer_ids[1:],
-            [[24, QSA_ROPE_STATE_LAYER_ID], [24]],
-        )
-
-    def test_qsa_draft_state_uses_reserved_layer_id_band(self):
-        target_pool = self._qsa_pool(24)
-        draft_pool = self._qsa_pool(0)
-
-        kv_args = SimpleNamespace()
-        setup_state_kv_args(
-            kv_args,
-            target_pool,
-            draft_token_to_kv_pool=draft_pool,
-            total_kv_layers=48,
-        )
-
-        self.assertEqual(
-            kv_args.state_types,
-            [StateType.MAMBA, StateType.QSA_PENDING, StateType.QSA_COMPRESSED],
-        )
-        self.assertEqual(
-            kv_args.state_layer_ids[1:],
-            [
-                [24, QSA_ROPE_STATE_LAYER_ID, 48, 49],
-                [24, 48],
-            ],
-        )
-        self.assertEqual(
-            [len(entries) for entries in kv_args.state_data_ptrs[1:]],
-            [4, 2],
-        )
-
-    def test_qsa_stage_without_qsa_layers_does_not_register_rope_ring(self):
-        pool = object.__new__(QSATokenToKVPool)
-        pool.full_kv_pool = object()
-        pool.get_state_buf_infos = lambda: ([10], [100], [20])
-        pool.get_state_dim_per_tensor = lambda: [4]
-        pool.get_state_conv_shard_groups = lambda: [None]
-        pool.get_state_slice_outer_counts = lambda: [1]
-        pool.get_state_layer_ids = lambda: [2]
-        pool.page_size = 4
-        pool.qsa_compress_ratio = 2
-        pool.qsa_compressed_page_size = 2
-        pool.full_attention_layer_id_mapping = {}
-        pool.qsa_key_state_buffer_pool = []
-        pool.qsa_rope_position_buffer = torch.zeros((6, 3), dtype=torch.int64)
-        pool.qsa_compressed_k_buffer_pool = []
-
-        kv_args = SimpleNamespace()
-        setup_state_kv_args(kv_args, pool)
-
-        # Keep the component slots aligned across PP stages, but expose no QSA
-        # buffers or layer ids from a stage that cannot produce their contents.
-        self.assertEqual(
-            kv_args.state_types,
-            [StateType.MAMBA, StateType.QSA_PENDING, StateType.QSA_COMPRESSED],
-        )
-        self.assertEqual(kv_args.state_data_ptrs[1:], [[], []])
-        self.assertEqual(kv_args.state_data_lens[1:], [[], []])
-        self.assertEqual(kv_args.state_item_lens[1:], [[], []])
-        self.assertEqual(kv_args.state_layer_ids[1:], [[], []])
-
-    def test_compact_qsa_entries_map_by_global_layer_id(self):
-        self.assertEqual(
-            build_transfer_entry_pairs(
-                [24, QSA_ROPE_STATE_LAYER_ID],
-                [0, 12, 24, QSA_ROPE_STATE_LAYER_ID],
-                2,
-                4,
-            ),
-            [(0, 2), (1, 3)],
-        )
-
-    def _qsa_compressed_manager(self, *, src_item_len):
-        manager = object.__new__(MooncakeKVManager)
-        manager.attn_tp_size = 4
-        manager.pp_size = 1
-        manager.is_mla_backend = False
-        manager.is_hybrid_mla_backend = False
-        manager.kv_args = SimpleNamespace(
-            engine_rank=0,
-            state_types=[StateType.QSA_COMPRESSED],
-            state_data_ptrs=[[1000]],
-            state_item_lens=[[src_item_len]],
-            state_dim_per_tensor=[[]],
-            state_layer_ids=[[24]],
-        )
-        manager.sent = []
-        manager._send_kvcache_generic = lambda **kw: manager.sent.append(kw) or 0
-        return manager
-
-    def test_qsa_compressed_layout_mismatch_rejected_before_transfer(self):
-        """Equal attention TP with fp8 on one peer only halves that peer's
-        compressed item length. The transfer uses the source length as the
-        destination stride, so the mismatch must be rejected before any write."""
-        req = SimpleNamespace(mooncake_session_id="session", dst_state_indices=[[3]])
-        decode_info = SimpleNamespace(
-            dst_attn_tp_size=4,
-            dst_state_data_ptrs=[[2000]],
-            dst_state_item_lens=[[16]],
-            dst_state_dim_per_tensor=[[]],
-            dst_state_layer_ids=[[24]],
-        )
-        manager = self._qsa_compressed_manager(src_item_len=32)
-        with self.assertRaisesRegex(RuntimeError, "QSA_COMPRESSED layout differs"):
-            MooncakeKVManager.maybe_send_extra(
-                manager, req, [[3]], None, target_rank_registration_info=decode_info
-            )
-        self.assertEqual(manager.sent, [])
-
-        manager = self._qsa_compressed_manager(src_item_len=16)
-        rc = MooncakeKVManager.maybe_send_extra(
-            manager, req, [[3]], None, target_rank_registration_info=decode_info
-        )
-        self.assertEqual(rc, 0)
-        self.assertEqual(len(manager.sent), 1)
-        self.assertEqual(manager.sent[0]["item_lens"], [16])
-
-    def test_replicated_state_tp_policy(self):
-        for src_tp, dst_tp, rank, expected in (
-            (4, 1, 0, True),
-            (4, 1, 1, False),
-            (1, 4, 0, True),
-            (4, 4, 3, True),
-        ):
-            with self.subTest(src_tp=src_tp, dst_tp=dst_tp, rank=rank):
-                self.assertEqual(
-                    should_send_replicated_state(
-                        src_attn_tp_size=src_tp,
-                        dst_attn_tp_size=dst_tp,
-                        local_tp_rank_in_group=rank,
-                    ),
-                    expected,
-                )
-
-        common = dict(
-            src_item_len=96,
-            dst_item_len=96,
-            src_dim=0,
-            dst_dim=0,
-            outer_count=1,
-            src_attn_tp_size=4,
-            dst_attn_tp_size=1,
-            dst_tp_rank_in_group=0,
-        )
-        self.assertEqual(
-            compute_mamba_state_slice_byte_blocks(**common, local_tp_rank_in_group=0),
-            [(0, 0, 96)],
-        )
-        self.assertEqual(
-            compute_mamba_state_slice_byte_blocks(**common, local_tp_rank_in_group=1),
-            [],
-        )
-        with self.assertRaisesRegex(ValueError, "must divide"):
-            should_send_replicated_state(
-                src_attn_tp_size=3,
-                dst_attn_tp_size=2,
-                local_tp_rank_in_group=0,
-            )
-
-
-class TestMooncakeTransferInfoIsDummy(unittest.TestCase):
-    """Truth table for mooncake's payload-inferred is_dummy, with frames built
-    as KVSender sends them: kv and aux are empty iff dummy, state indices are
-    gated on dummy, decode_prefix_len and required_dst_info_num are sent
-    unconditionally."""
-
-    def _frames(self, kv, aux, state, prefix):
-        return [
-            b"7",
-            b"127.0.0.1",
-            b"1234",
-            b"session",
-            kv,
-            aux,
-            state,
-            b"1",
-            prefix,
-            b"",
-        ]
-
-    def test_real_transfer_is_not_dummy(self):
-        kv = np.array([3, 5], dtype=np.int32)
-        info = TransferInfo.from_zmq(
-            self._frames(kv.tobytes(), b"4", pack_int_lists([[1]], "i"), b"0")
-        )
-
-        self.assertFalse(info.is_dummy)
-        np.testing.assert_array_equal(info.dst_kv_indices, kv)
-        self.assertEqual(info.dst_aux_index, 4)
-        self.assertEqual(info.dst_state_indices, [[1]])
-
-    def test_full_prefix_hit_with_empty_kv_is_not_dummy(self):
-        # Empty kv indices serialize to an empty frame, so only the non-empty
-        # aux frame distinguishes a full-prefix-hit transfer from a dummy one.
-        info = TransferInfo.from_zmq(
-            self._frames(np.array([], dtype=np.int32).tobytes(), b"4", b"", b"128")
-        )
-
-        self.assertFalse(info.is_dummy)
-        self.assertEqual(info.dst_aux_index, 4)
-        self.assertEqual(info.decode_prefix_len, 128)
-
-    def test_dummy_parses_dummy_and_clears_payload_fields(self):
-        info = TransferInfo.from_zmq(self._frames(b"", b"", b"", b"0"))
-
-        self.assertTrue(info.is_dummy)
-        self.assertEqual(info.dst_kv_indices.size, 0)
-        self.assertIsNone(info.dst_aux_index)
-        self.assertEqual(info.dst_state_indices, [])
-
-    def test_dummy_with_prefix_hit_still_parses_dummy(self):
-        # decode_prefix_len is sent unconditionally and the inference ignores
-        # it, so a dummy rank with a decode-side prefix hit stays dummy.
-        info = TransferInfo.from_zmq(self._frames(b"", b"", b"", b"128"))
-
-        self.assertTrue(info.is_dummy)
-        self.assertEqual(info.decode_prefix_len, 128)
 
 
 class TestGroupConcurrentContiguous(unittest.TestCase):
@@ -854,7 +564,7 @@ def _make_dsv4_target(*, unified, mapping=None):
     pool.get_unified_swa_ring_buf_infos = lambda: (
         _buf_infos(12) if unified else ([], [], [])
     )
-    pool.get_request_state_buf_infos = lambda: ([], [], [])
+    pool.get_c128_state_buf_infos = lambda: ([], [], [])
     return pool
 
 

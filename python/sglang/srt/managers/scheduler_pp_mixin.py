@@ -199,7 +199,7 @@ class SchedulerPPMixin:
                 d2h_event = None
                 exchange_outputs_before_forward = _pp_exchange_outputs_before_forward(
                     cur_batch=cur_batch,
-                    spec_relay=self._pp_spec_relay,
+                    spec_relay=getattr(self, "_pp_spec_relay", False),
                     is_last_rank=self.pp_group.is_last_rank,
                     async_batch_depth=get_parallel().pp_async_batch_depth,
                 ) or (
@@ -657,6 +657,7 @@ class SchedulerPPMixin:
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.ps.pp_size + get_parallel().pp_async_batch_depth
+        self._pp_spec_relay = False
         # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
         self.require_attn_tp_allgather = (
             not get_parallel().enable_dsa_prefill_context_parallel
@@ -1112,7 +1113,7 @@ class SchedulerPPMixin:
             "next_token_ids": result.next_token_ids,
         }
 
-        if self._pp_spec_relay and result.accept_lens is not None:
+        if getattr(self, "_pp_spec_relay", False) and result.accept_lens is not None:
             # PP+spec verify round: earlier stages need the accept results to
             # mirror seq_lens/KV bookkeeping and the bonus token to root the
             # next round's verify chain.
@@ -1167,7 +1168,10 @@ class SchedulerPPMixin:
         if (
             pp_dspark_projected_context is None
             and draft_input is not None
-            and not batch.spec_algorithm.is_dspark()
+            and not (
+                getattr(batch, "spec_algorithm", None) is not None
+                and batch.spec_algorithm.is_dspark()
+            )
             and draft_input.topk_p is not None
         ):
             tensor_dict["draft_topk_p"] = draft_input.topk_p.contiguous()
@@ -1197,6 +1201,7 @@ class SchedulerPPMixin:
         tensor_dict: Dict[str, torch.Tensor],
         async_send: bool = True,
         msg_type: str = "default",
+        ready_event: Optional[torch.Event] = None,
     ):
         # Warn once if using default untyped messages
         if msg_type == "default":
@@ -1205,6 +1210,8 @@ class SchedulerPPMixin:
                 "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
             )
         tensor_dict["__msg_type__"] = msg_type
+        if ready_event is not None:
+            self.device_module.current_stream().wait_event(ready_event)
         p2p_work = []
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
@@ -1836,7 +1843,7 @@ class SchedulerPPMixin:
         # pp_size > 1.
         needs_pairing = (
             is_xpu()
-            or self._pp_spec_relay
+            or getattr(self, "_pp_spec_relay", False)
             or get_spec().speculative_dspark_pp_replicated_draft
         )
         send_first = (not needs_pairing) or ((get_parallel().pp_rank % 2) == 0)
@@ -2001,7 +2008,7 @@ class SchedulerPPMixin:
         elif should_recv:
             # Recv only (no send needed)
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
-                recv_dict, _ = self._pp_recv_dict_from_prev_stage()
+                recv_dict = self._pp_recv_dict_from_prev_stage()
             _handle_recv_dict(recv_dict)
 
         return next_pp_outputs, batch_result, d2h_event, send_output_work

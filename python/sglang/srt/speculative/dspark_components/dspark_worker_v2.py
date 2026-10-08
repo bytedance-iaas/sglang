@@ -1,8 +1,9 @@
 import copy
 import logging
 import weakref
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
+from contextlib import nullcontext
+from dataclasses import dataclass, replace
+from typing import Callable, Optional, Protocol, runtime_checkable
 
 import torch
 
@@ -172,14 +173,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.page_size = get_schedule().page_size
         self.device = target_worker.device
         self._draft_worker = None
-        self.enable_dp_spec_prefill_coordination = (
-            envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
-        )
+        self.enable_dp_spec_prefill_coordination = False
         parallel = get_parallel()
         self.ps = parallel
         self._draft_is_moe = draft_is_deepseek_v4()
         self._draft_dp_context_enabled = (
-            parallel.attn_dp_enabled and not self._draft_is_moe
+            parallel.enable_dp_attention and not self._draft_is_moe
         )
         disaggregation_mode = get_disagg().disaggregation_mode
         self._is_pd_prefill = disaggregation_mode == "prefill"
@@ -188,7 +187,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         self._hosts_draft = self._replicated_pp_draft or parallel.pp_group.is_last_rank
         self._pp_draft_dp_enabled = (
-            self._replicated_pp_draft and parallel.attn_dp_enabled
+            self._replicated_pp_draft and parallel.enable_dp_attention
         )
         self._replicated_pp_decode = (
             self._replicated_pp_draft and disaggregation_mode == "decode"
@@ -353,7 +352,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             mask_token_id=self._mask_token_id,
             draft_block_spec_info=self._draft_block_spec_info,
             tp_sync=self._tp_sync,
-            dp_moe_sync=self._draft_is_moe and get_parallel().attn_dp_enabled,
+            dp_moe_sync=self._draft_is_moe and get_parallel().enable_dp_attention,
             force_draft_embedding=self._replicated_pp_draft,
         )
         self._verify_epilogue = None
@@ -827,7 +826,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         pp_proxy_tensors,
         capture_hidden_mode: CaptureHiddenMode,
     ) -> GenerationBatchResult:
-        if get_parallel().attn_dp_enabled:
+        if get_parallel().enable_dp_attention:
             batch_output = self.target_worker.forward_batch_generation(
                 batch,
                 pp_proxy_tensors=pp_proxy_tensors,
@@ -905,7 +904,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if batch.forward_mode.is_idle():
             self._observers.note_idle_decode_step()
-            if get_parallel().attn_dp_enabled:
+            if get_parallel().enable_dp_attention:
                 idle_layout = self._idle_verify_ragged_layout(batch)
                 if self._replicated_pp_decode:
                     idle_verify_result = self._verify_executor.run_idle_participation(
@@ -934,7 +933,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 draft_idle=(
                     self._replicated_pp_decode
                     and self._draft_is_moe
-                    and get_parallel().attn_dp_enabled
+                    and get_parallel().enable_dp_attention
                 ),
             )
 

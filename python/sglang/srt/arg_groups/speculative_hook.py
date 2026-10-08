@@ -427,13 +427,18 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 enable_mixed_chunk=False,
             )
             logger.warning("Mixed chunked prefill is disabled for PP DSpark.")
-        if cfg.attn_dp_size > 1:
+        if cfg.dp_size > 1:
+            declare_resolution(
+                server_args,
+                "_handle_dspark",
+                enable_dp_attention_local_control_broadcast=True,
+            )
             # attention CP is required to be 1 above, so full attention DP is
-            # equivalent to attn_dp_size == tp_size.
-            if cfg.attn_dp_size != cfg.tp_size:
+            # equivalent to dp_size == tp_size.
+            if cfg.dp_size != cfg.tp_size:
                 raise ValueError(
                     "PP DSpark with dp attention requires attn_tp_size=1 "
-                    "(set --attn-dp-size == --tp-size)."
+                    "(set --dp-size == --tp-size)."
                 )
             if cfg.moe_a2a_backend != "none":
                 raise ValueError(

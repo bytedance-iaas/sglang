@@ -150,12 +150,10 @@ class PPDSparkDraftCoordinator:
 
         if not scheduler.pp_group.is_first_rank or work.pp_outputs is None:
             raise RuntimeError("Invalid PP DSpark deferred draft work owner.")
-        tensor_dict, recv_event = scheduler._pp_recv_typed_dict(
+        tensor_dict = scheduler._pp_recv_typed_dict(
             expected_kind="dspark_draft",
             all_gather_group=scheduler.attn_tp_group,
         )
-        if recv_event is not None:
-            scheduler.forward_stream.wait_event(recv_event)
         work.pp_outputs.tensors.update(pack_proposal(0, proposal))
         work.pp_outputs.tensors.update(tensor_dict)
         for owner in range(get_parallel().pp_size):

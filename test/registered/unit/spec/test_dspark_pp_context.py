@@ -144,6 +144,46 @@ class TestDSparkPPContext(CustomTestCase):
         self.assertIn("next_token_ids", next_outputs.tensors)
         self.assertEqual(send_work, [])
 
+    def test_batched_result_relay_recv_only_uses_typed_dict_contract(self):
+        d2h_event = Mock()
+        batch_result = SimpleNamespace(logits_output=None)
+        target = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_prebuilt=Mock(return_value=False)),
+            return_logprob=False,
+        )
+        recv_dict = {"next_token_ids": torch.ones(1)}
+        scheduler = SimpleNamespace(
+            pp_group=SimpleNamespace(is_last_rank=False),
+            attn_tp_group=object(),
+            copy_stream_ctx=nullcontext(),
+            copy_stream=Mock(),
+            schedule_stream=Mock(),
+            device_module=SimpleNamespace(
+                Event=Mock(return_value=d2h_event),
+                current_stream=Mock(),
+            ),
+            _pp_recv_dict_from_prev_stage=Mock(return_value=recv_dict),
+            _pp_prep_batch_result=Mock(return_value=batch_result),
+        )
+
+        next_outputs, result, event, send_work = (
+            SchedulerPPMixin._pp2_send_recv_output_tensors_batched(
+                scheduler,
+                next_first_rank_mb_id=0,
+                next_mb_id=0,
+                mbs=[target],
+                mb_metadata=[object()],
+                last_rank_comm_queue=deque(),
+                pp_outputs=None,
+            )
+        )
+
+        scheduler._pp_recv_dict_from_prev_stage.assert_called_once_with()
+        self.assertIs(next_outputs.tensors, recv_dict)
+        self.assertIs(result, batch_result)
+        self.assertIs(event, d2h_event)
+        self.assertEqual(send_work, [])
+
     def test_forward_snapshot_copies_draft_counts_only_for_replicated_dspark(self):
         snapshot = SimpleNamespace()
         req = object()
@@ -325,7 +365,7 @@ class TestDSparkPPContext(CustomTestCase):
 
     @patch(
         "sglang.srt.speculative.dspark_components.dspark_worker_v2.get_parallel",
-        return_value=SimpleNamespace(attn_dp_enabled=True),
+        return_value=SimpleNamespace(enable_dp_attention=True),
     )
     def test_replicated_final_idle_lane_defers_draft_to_scheduler(self, _):
         calls = []
@@ -378,7 +418,7 @@ class TestDSparkPPContext(CustomTestCase):
 
     @patch(
         "sglang.srt.speculative.dspark_components.dspark_worker_v2.get_parallel",
-        return_value=SimpleNamespace(attn_dp_enabled=True),
+        return_value=SimpleNamespace(enable_dp_attention=True),
     )
     def test_replicated_nonfinal_idle_lane_only_forwards_verify_proxy(self, _):
         worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
@@ -551,7 +591,7 @@ class TestDSparkPPContext(CustomTestCase):
             _pp_commit_comm_work=Mock(),
             forward_stream_ctx=nullcontext(),
             forward_stream=Mock(),
-            _pp_recv_typed_dict=Mock(return_value=(remote, None)),
+            _pp_recv_typed_dict=Mock(return_value=remote),
             model_worker=SimpleNamespace(
                 prepare_pp_draft=Mock(return_value=local),
                 install_pp_draft=Mock(),

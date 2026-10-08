@@ -2,8 +2,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import torch
-
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
     _handle_dspark,
@@ -169,18 +167,21 @@ class TestDsparkReplicatedPPDraft(CustomTestCase):
     def test_dp4_tp4_builtin_moe_is_admitted(self):
         args = self._replicated_args("decode")
         args.enable_dp_lm_head = True
-        args.attn_dp_size = 4
+        args.dp_size = 4
         args.tp_size = 4
         args.moe_a2a_backend = "none"
         with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
             _handle_dspark(args)
+        self.assertTrue(
+            resolution_result(args, "enable_dp_attention_local_control_broadcast")
+        )
 
-        args.attn_dp_size = 2
+        args.dp_size = 2
         with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
             with self.assertRaisesRegex(ValueError, "attn_tp_size=1"):
                 _handle_dspark(args)
 
-        args.attn_dp_size = 4
+        args.dp_size = 4
         args.moe_a2a_backend = "megamoe"
         with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
             with self.assertRaisesRegex(ValueError, "built-in TP MoE"):
@@ -227,38 +228,6 @@ class TestDsparkReplicatedPPDraft(CustomTestCase):
         args.disable_radix_cache = False
         with self.assertRaisesRegex(ValueError, "Decode.*disable-radix-cache"):
             _handle_dspark(args)
-
-
-class TestDsparkFoldedSamplingDefault(CustomTestCase):
-    def test_sharded_greedy_default_and_sampling_override(self):
-        from sglang.srt.environ import DsparkFoldedSampling, envs
-        from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
-            _resolve_folded_sampling,
-        )
-
-        model = SimpleNamespace(
-            lm_head=SimpleNamespace(org_vocab_size=128, weight=torch.empty(1)),
-            markov_head=SimpleNamespace(supports_sharded_greedy=True),
-        )
-        args = dict(
-            model=model,
-            gamma=5,
-            max_bs=64,
-            device="cpu",
-            tp_rank=0,
-            available_memory_gb=16,
-        )
-        with envs.SGLANG_DSPARK_FOLDED_SAMPLING.override(
-            DsparkFoldedSampling.AUTO.value
-        ):
-            self.assertFalse(_resolve_folded_sampling(**args))
-            model.markov_head.supports_sharded_greedy = False
-            self.assertTrue(_resolve_folded_sampling(**args))
-        model.markov_head.supports_sharded_greedy = True
-        with envs.SGLANG_DSPARK_FOLDED_SAMPLING.override(
-            DsparkFoldedSampling.FORCE.value
-        ):
-            self.assertTrue(_resolve_folded_sampling(**args))
 
 
 if __name__ == "__main__":
