@@ -8,8 +8,10 @@ small quant_info payload and route through ``MoeRunner``.
 
 from __future__ import annotations
 
+import contextvars
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Generator, Optional
 
 import torch
 
@@ -37,6 +39,21 @@ if TYPE_CHECKING:
         StandardCombineInput,
         StandardDispatchOutput,
     )
+
+_deferred_finalize_enabled: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "flashinfer_cutlass_deferred_finalize_enabled", default=False
+)
+
+
+@contextmanager
+def flashinfer_cutlass_deferred_finalize_context(
+    enabled: bool = True,
+) -> Generator[None, None, None]:
+    token = _deferred_finalize_enabled.set(enabled)
+    try:
+        yield
+    finally:
+        _deferred_finalize_enabled.reset(token)
 
 
 @dataclass
@@ -432,10 +449,22 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
     # new keyword at all on the existing W4A16/MXFP8 paths, so those paths keep
     # working with SGLang's currently pinned release.
     humming_kwargs = {"use_wfp4afp8_humming": True} if use_wfp4afp8_humming else {}
-    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
-        out = torch.empty(x.shape[0], out_hidden, dtype=output_dtype, device=x.device)
+    deferred_finalize = _deferred_finalize_enabled.get()
+    if deferred_finalize:
+        assert use_wfp4afp8_humming
+        assert not do_pad
+        from sglang.kernels.ops.moe.cutlass_moe_deferred import (
+            cutlass_fused_moe_deferred,
+        )
+    else:
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            out = torch.empty(
+                x.shape[0], out_hidden, dtype=output_dtype, device=x.device
+            )
 
-    flashinfer_cutlass_fused_moe(
+    moe_kwargs = dict(
         input=x,
         token_selected_experts=topk_ids.to(torch.int32),
         token_final_scales=topk_weights,
@@ -461,9 +490,22 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
             else ActivationType.Swiglu
         ),
         tune_max_num_tokens=next_power_of_2(x.shape[0]),
+        **humming_kwargs,
+    )
+    if deferred_finalize:
+        return StandardCombineInput(
+            hidden_states=cutlass_fused_moe_deferred(
+                num_tokens=x.shape[0],
+                hidden_size=out_hidden,
+                top_k=topk_weights.shape[1],
+                **moe_kwargs,
+            )
+        )
+
+    flashinfer_cutlass_fused_moe(
         output=out,
         use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
-        **humming_kwargs,
+        **moe_kwargs,
     )
 
     if do_pad:
