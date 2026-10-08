@@ -58,7 +58,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
         if (
             topk_indices is None
             or self.dsa_index_kpool <= 1
-            or dsa_impl not in ("flashmla_sparse", "flashmla_kv")
+            or dsa_impl != "flashmla_sparse"
         ):
             return dsa_impl
         if self.device_sm_major >= 10:
