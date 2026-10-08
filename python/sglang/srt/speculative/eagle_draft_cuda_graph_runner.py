@@ -67,31 +67,6 @@ if TYPE_CHECKING:
 _GREEDY_VARIANT = "greedy"
 
 
-def _is_qualified_dsa_draft_metadata_glue(leaves) -> bool:
-    """Gate glue capture on the effective Hopper pooled-tail backend.
-
-    GLM-5.3 declares ``flashmla_kv`` but KPool live tails are routed to
-    TileLang at forward time. Check that resolved backend instead of the
-    declared CLI value; keep the geometry exact so another DSA layout cannot
-    silently inherit a graph whose Python-visible branches differ.
-    """
-    if not leaves:
-        return False
-    for leaf in leaves:
-        if (
-            leaf.dsa_index_kpool != 4
-            or leaf.physical_page_size != 64
-            or leaf.dsa_index_topk != 2048
-        ):
-            return False
-        if (
-            leaf._resolve_kpool_tail_backend(object(), leaf.dsa_decode_impl)
-            != "tilelang"
-        ):
-            return False
-    return True
-
-
 @dataclass
 class EagleDraftInputBuffers(ForwardInputBuffers):
     input_ids: torch.Tensor
@@ -345,7 +320,13 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         if not isinstance(self.draft_attn_backend, DeepseekSparseAttnMultiStepBackend):
             return None
         leaves = self.draft_attn_backend.attn_backends
-        if not _is_qualified_dsa_draft_metadata_glue(leaves):
+        if not leaves or not all(
+            leaf.dsa_decode_impl == "trtllm"
+            and leaf.dsa_index_kpool == 4
+            and leaf.real_page_size == 64
+            and leaf.dsa_index_topk == 2048
+            for leaf in leaves
+        ):
             return None
         return MetadataGlueGraph(self.device, leaves=leaves)
 

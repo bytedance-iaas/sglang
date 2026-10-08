@@ -104,6 +104,5 @@ class MetadataGlueGraph:
 
         st["meta"] = [(b, b.forward_metadata) for b in self._leaves(attn_backend)]
         st["graph"] = graph
-        logger.info("Metadata glue graph captured for key %s", key)
         # Capture records without executing; replay once to do this step's prep.
         graph.replay()
