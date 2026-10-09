@@ -1,73 +1,27 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import List, Optional, Union
 
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
-from sglang.srt.runtime_context import get_platform
-
-if TYPE_CHECKING:
-    from sglang.srt.layers.attention.dsv4.candidate_indexer_deep_gemm import (
-        DeepGemmCandidateIndexer,
-    )
+from sglang.srt.layers.attention.dsv4.v41_indexer.types import CandidateMetadata
 
 
-class CandidateMetadata:
-    """Base of an implementation's published state on
-    ``DSV4Metadata.candidate_metadata``."""
-
-
-@dataclass(frozen=True)
-class IndexerInputs:
-    """One index-source layer's operands on the paged fp4 decode path (one query
-    row per request, or per draft token under verify)."""
-
-    q_fp4: torch.Tensor  # [rows, 1, heads, 64] int8, packed fp4
-    q_sf: torch.Tensor  # [rows, 1, heads] int32, packed ue8m0
-    k_cache: torch.Tensor  # [pages, page_size, 1, 68] uint8, the layer's index-K pool
-    weights: torch.Tensor  # [rows, heads] bf16/fp32 head weights
-    metadata: PagedIndexerMetadata  # this ratio's lengths, page table and plans
-    # [rows] int, one request id per query row, the rows of one request
-    # consecutive (verify: its draft tokens); None = every row its own request
-    request_ids: Optional[torch.Tensor] = None
-
-    @property
-    def num_rows(self) -> int:
-        return self.q_fp4.shape[0]
-
-
-def make_candidate_indexer(
-    topk_blocks: int, block_size: int
-) -> Optional[DeepGemmCandidateIndexer]:
-    """The paged fp4 decode path's two-level indexer; None on Hopper, whose decode
-    indexer selects through masks inline."""
-    if topk_blocks <= 0 or get_platform().device_sm < 100:
-        return None
-    from sglang.srt.layers.deep_gemm_wrapper.configurer import (
-        DEEPGEMM_PAGED_SPARSE_MQA_LOGITS,
-    )
-
-    if not DEEPGEMM_PAGED_SPARSE_MQA_LOGITS:
-        raise RuntimeError(
-            "the candidate indexer needs DeepGEMM's paged sparse MQA logits "
-            "(sgl-deep-gemm >= 0.2.0 with SGLANG_ENABLE_JIT_DEEPGEMM on)"
-        )
-    from sglang.srt.layers.attention.dsv4.candidate_indexer_deep_gemm import (
-        DeepGemmCandidateIndexer,
-    )
-
-    return DeepGemmCandidateIndexer(topk_blocks, block_size)
-
-
-# TODO(candidate): Hopper decode and prefill still select through these masks
-# inline in the backend; move them behind the protocol as publish/select_prefill.
 @dataclass
 class CandidateMasks(CandidateMetadata):
     mask: Optional[torch.Tensor] = None  # decode: [rows, width] bool
     request_masks: Optional[List[torch.Tensor]] = None  # prefill: [rows_b, lc_b] each
+
+    def tail(self, rows_per_request: List[int]) -> CandidateMasks:
+        assert self.request_masks is not None
+        return CandidateMasks(
+            request_masks=[
+                mask[-rows:] if rows else mask[:0]
+                for mask, rows in zip(self.request_masks, rows_per_request, strict=True)
+            ]
+        )
 
 
 @dataclass

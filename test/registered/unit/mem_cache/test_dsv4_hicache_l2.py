@@ -80,7 +80,7 @@ class TestDSV4DecodeCapacity(CustomTestCase):
             ),
         )
         tree_cache = SimpleNamespace(
-            is_chunk_cache=lambda: False,
+            supports_prefix_sharing=lambda: True,
             evict=MagicMock(side_effect=evict),
         )
 
@@ -242,7 +242,7 @@ class TestDSV4PoolAssembly(CustomTestCase):
 
         mappings = assembler._resolve_deepseek_v4_layer_mappings(kvcache)
 
-        self.assertEqual(mappings.transfer_layer_num, 20)
+        self.assertEqual(mappings.transfer_layer_id_max, 20)
         self.assertEqual(mappings.full, {layer: layer for layer in range(20)})
         self.assertEqual(mappings.swa, mappings.full)
         self.assertEqual(mappings.c4, {0: 5})
@@ -283,7 +283,7 @@ class TestDSV4PoolAssembly(CustomTestCase):
             pp_cache_group=pp_group,
         )
         mappings = assembler._DeepSeekV4LayerMappings(
-            transfer_layer_num=1,
+            transfer_layer_id_max=1,
             full={0: 0},
             swa={},
             c4={0: 0},

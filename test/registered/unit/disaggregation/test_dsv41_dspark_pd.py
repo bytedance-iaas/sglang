@@ -65,6 +65,8 @@ class TestDSV41DSparkPD(CustomTestCase):
             enable_encoder_swa_bounded_replay=False,
             enable_decoder_swa_bounded_replay=True,
             enable_dp_attention=True,
+            attn_dp_size=1,
+            ep_join_mode=None,
             enable_prefill_cp=False,
             enable_prefill_context_parallel=False,
             dp_size=8,
@@ -99,6 +101,7 @@ class TestDSV41DSparkPD(CustomTestCase):
                     with self.subTest(role=role, dp_size=dp_size):
                         cfg.disaggregation_mode = role
                         cfg.dp_size = dp_size
+                        cfg.attn_dp_size = dp_size
                         if dp_size == 1:
                             hook.validate_deepseek_v41_features(object())
                         else:
@@ -234,6 +237,8 @@ class TestDSV41DSparkPD(CustomTestCase):
             dp_size=1,
             dcp_size=1,
             enable_dp_attention=False,
+            attn_dp_size=1,
+            ep_join_mode=None,
             enable_prefill_cp=False,
             enable_prefill_context_parallel=False,
             attn_cp_size=1,
@@ -254,6 +259,8 @@ class TestDSV41DSparkPD(CustomTestCase):
                     disaggregation_mode="decode",
                     enable_prefill_cp=True,
                     enable_dp_attention=True,
+                    attn_dp_size=1,
+                    ep_join_mode=None,
                     attn_cp_size=8,
                 ),
                 False,
@@ -277,6 +284,8 @@ class TestDSV41DSparkPD(CustomTestCase):
             enable_two_batch_overlap=False,
             dsv4_attn_backend="triton",
             enable_dp_attention=True,
+            attn_dp_size=1,
+            ep_join_mode=None,
             enable_prefill_cp=True,
             enable_prefill_context_parallel=False,
             disaggregation_mode="prefill",
@@ -417,7 +426,7 @@ class TestDSV41DSparkPD(CustomTestCase):
         self.assertEqual(sorted(owned), pages.tolist())
         self.assertEqual(len(owned), len(set(owned)))
 
-    def test_prefill_cp_uses_torch_indexer_before_sm100(self):
+    def test_prefill_cp_passes_rank_local_request_rows(self):
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             DeepseekV4AttnBackend,
         )
@@ -425,59 +434,37 @@ class TestDSV41DSparkPD(CustomTestCase):
 
         backend = object.__new__(DeepseekV4AttnBackend)
         backend.forward_metadata = SimpleNamespace(late_layer_tail=None)
-        backend._use_dense_fp4_prefill_indexer = Mock(return_value=True)
-        backend._use_sm90_fp8_prefill_indexer = Mock(return_value=False)
-        backend._low_ratio_index_topk_dense = Mock()
-        backend._low_ratio_index_topk_sm90_prefill = Mock()
-        backend._low_ratio_index_topk_torch = Mock()
+        backend._low_ratio_index_topk = Mock()
         layer = SimpleNamespace(compressor=None, indexer=object())
-        forward_batch = SimpleNamespace(
+        batch = SimpleNamespace(
             attn_cp_metadata=SimpleNamespace(total_seq_lens=8),
-            extend_seq_lens_cpu=[8],
-            extend_seq_lens=torch.tensor([8], dtype=torch.int32),
-            req_pool_indices=torch.tensor([7], dtype=torch.int32),
-            seq_lens_cpu=torch.tensor([8], dtype=torch.int32),
-            positions=torch.arange(8),
             forward_mode=ForwardMode.EXTEND,
+            extend_seq_lens_cpu=[1, 7],
+            extend_seq_lens=torch.tensor([1, 7], dtype=torch.int32),
+            req_pool_indices=torch.tensor([6, 7], dtype=torch.int32),
+            positions=torch.arange(8),
         )
-        x = torch.zeros(4, 8)
-        q_lora = torch.zeros(4, 4)
-        positions = torch.arange(4)
-
-        with (
-            patch(
-                "sglang.srt.layers.attention.deepseek_v4_backend.get_parallel",
-                return_value=SimpleNamespace(attn_cp_rank=0, attn_cp_size=2),
-            ),
-            patch(
-                "sglang.srt.layers.attention.deepseek_v4_backend._is_sm100_or_newer",
-                return_value=False,
-            ),
+        x, q_lora, positions = torch.zeros(4, 8), torch.zeros(4, 4), torch.arange(4)
+        with patch(
+            "sglang.srt.layers.attention.deepseek_v4_backend.get_parallel",
+            return_value=SimpleNamespace(attn_cp_rank=1, attn_cp_size=2),
         ):
             backend._forward_low_ratio_sources_cp(
                 layer=layer,
                 x=x,
                 q_lora=q_lora,
                 positions=positions,
-                forward_batch=forward_batch,
+                forward_batch=batch,
                 run_compressor=False,
                 run_indexer=True,
             )
-
-        backend._low_ratio_index_topk_dense.assert_not_called()
-        backend._low_ratio_index_topk_sm90_prefill.assert_not_called()
-        args = backend._low_ratio_index_topk_torch.call_args.args
+        args = backend._low_ratio_index_topk.call_args.args
         self.assertIs(args[0], layer)
         torch.testing.assert_close(args[1], x)
         torch.testing.assert_close(args[2], q_lora)
         torch.testing.assert_close(args[3], torch.full((4,), 7, dtype=torch.int64))
-        torch.testing.assert_close(args[4], positions.to(torch.int64))
-        self.assertIs(
-            backend._low_ratio_index_topk_torch.call_args.kwargs["request_ids"],
-            forward_batch.req_pool_indices,
-        )
         self.assertEqual(
-            backend._low_ratio_index_topk_torch.call_args.kwargs["q_lens_cpu"], [4]
+            backend._low_ratio_index_topk.call_args.kwargs["rows_per_request"], [0, 4]
         )
 
     def test_prefill_cp_uses_sm90_fp8_indexer_when_enabled(self):
@@ -487,56 +474,21 @@ class TestDSV41DSparkPD(CustomTestCase):
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
         backend = object.__new__(DeepseekV4AttnBackend)
-        backend.forward_metadata = SimpleNamespace(late_layer_tail=None)
-        backend._use_dense_fp4_prefill_indexer = Mock(return_value=True)
         backend._use_sm90_fp8_prefill_indexer = Mock(return_value=True)
-        backend._low_ratio_index_topk_dense = Mock()
         backend._low_ratio_index_topk_sm90_prefill = Mock()
-        backend._low_ratio_index_topk_torch = Mock()
-        layer = SimpleNamespace(compressor=None, indexer=object())
-        forward_batch = SimpleNamespace(
-            attn_cp_metadata=SimpleNamespace(total_seq_lens=8),
-            extend_seq_lens_cpu=[8],
-            extend_seq_lens=torch.tensor([8], dtype=torch.int32),
-            req_pool_indices=torch.tensor([7], dtype=torch.int32),
-            seq_lens_cpu=torch.tensor([8], dtype=torch.int32),
-            positions=torch.arange(8),
-            forward_mode=ForwardMode.EXTEND,
+        layer = SimpleNamespace(indexer=SimpleNamespace(is_candidate_source=False))
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND, req_pool_indices=torch.tensor([6, 7])
         )
-        x = torch.zeros(4, 8)
-        q_lora = torch.zeros(4, 4)
-        positions = torch.arange(4)
-
-        with (
-            patch(
-                "sglang.srt.layers.attention.deepseek_v4_backend.get_parallel",
-                return_value=SimpleNamespace(attn_cp_rank=0, attn_cp_size=2),
-            ),
-            patch(
-                "sglang.srt.layers.attention.deepseek_v4_backend._is_sm100_or_newer",
-                return_value=False,
-            ),
-        ):
-            backend._forward_low_ratio_sources_cp(
-                layer=layer,
-                x=x,
-                q_lora=q_lora,
-                positions=positions,
-                forward_batch=forward_batch,
-                run_compressor=False,
-                run_indexer=True,
-            )
-
-        backend._low_ratio_index_topk_dense.assert_not_called()
-        backend._low_ratio_index_topk_torch.assert_not_called()
+        x, q, pos = torch.zeros(4, 8), torch.zeros(4, 4), torch.arange(4)
+        backend._low_ratio_index_topk(
+            layer, x, q, torch.full((4,), 7), pos, batch, rows_per_request=[0, 4]
+        )
         call = backend._low_ratio_index_topk_sm90_prefill.call_args
         self.assertIs(call.args[0], layer)
         torch.testing.assert_close(call.args[1], x)
-        torch.testing.assert_close(call.args[2], q_lora)
-        torch.testing.assert_close(call.args[3], positions.to(torch.int64))
-        self.assertIs(call.args[4], forward_batch)
-        self.assertIs(call.kwargs["request_ids"], forward_batch.req_pool_indices)
-        self.assertEqual(call.kwargs["q_lens_cpu"], [4])
+        self.assertIs(call.kwargs["request_ids"], batch.req_pool_indices)
+        self.assertEqual(call.kwargs["q_lens_cpu"], [0, 4])
 
     def test_sm90_fp8_prefill_indexer_dispatch_guards(self):
         from sglang.srt.environ import envs
@@ -572,58 +524,55 @@ class TestDSV41DSparkPD(CustomTestCase):
                 )
 
     def test_prefill_cp_torch_indexer_keeps_empty_request_placeholders(self):
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
-            DeepseekV4AttnBackend,
-        )
 
-        backend = object.__new__(DeepseekV4AttnBackend)
-        page_indices = torch.empty((3, 1), dtype=torch.int32)
-        backend.forward_metadata = SimpleNamespace(
-            core_metadata=SimpleNamespace(
-                sparse_page_indices=Mock(return_value=page_indices),
-                sparse_raw_indices=Mock(return_value=None),
-            ),
-            candidate_metadata=None,
+        from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
+            DenseBlocksBackend,
         )
-        backend.req_to_token = torch.arange(24).view(8, 3)
-        backend.token_to_kv_pool = SimpleNamespace(
+        from sglang.srt.layers.attention.dsv4.v41_indexer.types import PrefillInputs
+
+        pool = SimpleNamespace(
             get_low_ratio_index_k_dequant=Mock(
                 side_effect=lambda _layer_id, slots: torch.zeros(len(slots), 1)
             )
         )
-        indexer = SimpleNamespace(
-            index_topk=1,
-            is_candidate_source=True,
-            uses_candidates=False,
+        backend = DenseBlocksBackend(
+            token_to_kv_pool=pool,
+            req_to_token=torch.arange(24).view(8, 3),
             candidate_topk_blocks=1,
             candidate_block_size=1,
+            use_deep_gemm_prefill=False,
+        )
+        indexer = SimpleNamespace(
+            index_topk=1,
             queries=Mock(return_value=torch.zeros(3, 1, 1)),
             head_weights=Mock(return_value=torch.zeros(3, 1)),
             scores=Mock(
                 side_effect=lambda q, k, _w: torch.zeros(q.shape[0], k.shape[0])
             ),
         )
-        layer = SimpleNamespace(
-            compress_ratio=1,
+        inputs = PrefillInputs(
             indexer=indexer,
             layer_id=0,
+            compress_ratio=1,
             freqs_cis=torch.zeros(3, 1),
+            x=torch.zeros(3, 1),
+            q_lora=torch.zeros(3, 1),
+            positions=torch.arange(3),
+            req_rows=torch.full((3,), 7),
+            req_pool_indices=torch.tensor([6, 7]),
+            kv_page_table=torch.zeros(3, 1, dtype=torch.int32),
+            seq_lens_cpu=[0, 3],
+            rows_per_request=[0, 3],
+            rows_per_request_device=torch.tensor([0, 3]),
+            out_raw_indices=torch.empty(3, 1, dtype=torch.int32),
+            out_page_indices=torch.empty(3, 1, dtype=torch.int32),
         )
-
-        backend._low_ratio_index_topk_torch(
-            layer,
-            torch.zeros(3, 1),
-            torch.zeros(3, 1),
-            torch.full((3,), 7, dtype=torch.int64),
-            torch.arange(3),
-            request_ids=torch.tensor([6, 7]),
-            q_lens_cpu=[0, 3],
-        )
-
-        masks = backend.forward_metadata.candidate_metadata.request_masks
-        self.assertEqual(len(masks), 2)
-        self.assertEqual(tuple(masks[0].shape), (0, 0))
-        self.assertEqual(tuple(masks[1].shape), (3, 3))
+        published = backend.publish_prefill(inputs)
+        self.assertEqual(published.rows_per_request, [0, 3])
+        self.assertEqual(published.blocks.shape, (3, 1))
+        tail = published.tail([0, 1])
+        torch.testing.assert_close(tail.blocks, published.blocks[-1:])
+        self.assertEqual(tail.rows_per_request, [0, 1])
 
     def test_c2_handoff_keeps_request_ring_indexing(self):
         self.assertEqual(
@@ -723,7 +672,7 @@ class TestDSV41DSparkPD(CustomTestCase):
         engram.layer_hash_index = 0
 
         def forward_layer(**kwargs):
-            return kwargs["hidden_states"], torch.zeros_like(kwargs["hidden_states"])
+            return kwargs["state"]
 
         model = object.__new__(DeepseekV4Model)
         torch.nn.Module.__init__(model)
@@ -740,6 +689,7 @@ class TestDSV41DSparkPD(CustomTestCase):
         model.engram_embed_prefetch_stream = None
         model.layers = [
             SimpleNamespace(
+                hc_cfg=object(),
                 engram=engram,
                 forward_hc_pre_from_prev=forward_layer,
             )
@@ -747,6 +697,7 @@ class TestDSV41DSparkPD(CustomTestCase):
         model.dspark_layers_to_capture = None
         forward_batch = SimpleNamespace(
             input_ids=torch.arange(128),
+            contains_mm_inputs=lambda: True,
             forward_mode=SimpleNamespace(is_extend=lambda: True),
             attn_cp_metadata=SimpleNamespace(total_seq_lens=128),
         )
@@ -803,7 +754,7 @@ class TestDSV41DSparkPD(CustomTestCase):
             seen_input_ids.append(
                 (kwargs["input_ids"].clone(), kwargs["input_ids_global"].clone())
             )
-            return kwargs["hidden_states"], torch.ones_like(kwargs["hidden_states"])
+            return kwargs["state"]
 
         model = object.__new__(DeepseekV4Model)
         torch.nn.Module.__init__(model)
@@ -819,8 +770,12 @@ class TestDSV41DSparkPD(CustomTestCase):
         model.engram_hasher = None
         model.engram_embed_prefetch_stream = None
         model.layers = [
-            SimpleNamespace(engram=None, forward_hc_pre_from_prev=forward_layer),
-            SimpleNamespace(engram=None, forward_hc_pre_from_prev=forward_layer),
+            SimpleNamespace(
+                hc_cfg=object(), engram=None, forward_hc_pre_from_prev=forward_layer
+            ),
+            SimpleNamespace(
+                hc_cfg=object(), engram=None, forward_hc_pre_from_prev=forward_layer
+            ),
         ]
         model.dspark_layers_to_capture = None
         full_cp_metadata = object()

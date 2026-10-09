@@ -16,6 +16,8 @@ def _config(**overrides):
         "tp_size": 2,
         "attn_cp_size": 1,
         "dp_size": 1,
+        "attn_dp_size": 1,
+        "ep_join_mode": None,
         "dcp_size": 1,
         "enable_prefill_cp": False,
         "enable_dp_attention": False,

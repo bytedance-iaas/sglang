@@ -6,7 +6,6 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import prime_rope_cos_sin
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
@@ -37,6 +36,7 @@ from sglang.srt.models.deepseek_v4 import (
     _is_npu,
     wo_a_fp8_gemm_enabled,
 )
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
@@ -210,6 +210,20 @@ class DeepseekV4ModelNextN(nn.Module):
 
 
 class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
+    @classmethod
+    def get_hf_to_sglang_mapper(cls, config) -> Optional[WeightsMapper]:
+        mapper = super().get_hf_to_sglang_mapper(config)
+        if mapper is None:
+            return None
+        # The draft builds mtp.0 as model.decoder, with e_proj/h_proj beside it.
+        return mapper | WeightsMapper(
+            orig_to_new_prefix={
+                "mtp.0.e_proj": "model.e_proj",
+                "mtp.0.h_proj": "model.h_proj",
+                "mtp.0.": "model.decoder.",
+            }
+        )
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -219,7 +233,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.tp_size = get_parallel().tp_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.quant_config = quant_config
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
         self.determine_num_fused_shared_experts()

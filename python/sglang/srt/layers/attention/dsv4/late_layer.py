@@ -59,8 +59,8 @@ class LateLayerDPLayout:
     def prepare(cls, input_ids: torch.Tensor, batch: ForwardBatch) -> LateLayerDPLayout:
         from sglang.srt.distributed import get_tp_group
         from sglang.srt.layers.dp_attention import (
-            get_attention_dp_rank,
-            get_attention_dp_size,
+            dp_gather_slot,
+            dp_gather_width,
             world_dp_gather_enabled,
         )
         from sglang.srt.runtime_context import get_parallel
@@ -81,10 +81,10 @@ class LateLayerDPLayout:
         attn_tp_size = get_parallel().attn_tp_size
         # Attention TP ranks own replicas of the same local token rows.
         counts = gathered.tolist()[::attn_tp_size]
-        assert len(counts) == get_attention_dp_size()
+        assert len(counts) == dp_gather_width()
         return cls.from_counts(
             counts,
-            dp_rank=get_attention_dp_rank(),
+            dp_rank=dp_gather_slot(),
             attn_tp_size=attn_tp_size,
             batch=batch,
             device=input_ids.device,

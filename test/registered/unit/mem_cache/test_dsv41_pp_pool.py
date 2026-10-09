@@ -4,7 +4,10 @@ from types import SimpleNamespace
 import numpy as np
 
 from sglang.srt.disaggregation.utils import build_kv_layer_ids
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+    DeepSeekV4TokenToKVPool,
+    collect_sources_by_ratio,
+)
 from sglang.srt.model_executor.pool_configurator import (
     resolve_dsv4_local_pool_layout,
 )
@@ -15,6 +18,7 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 def _pool(start, end):
     pool = object.__new__(DeepSeekV4TokenToKVPool)
+    pool._unified_kv = False
     pool._stage_start = start
     pool._stage_end = end
     pool.compression_ratios = [0, 0] + [2] * 18 + [1] * 20
@@ -41,7 +45,11 @@ class TestDeepSeekV41PPPool(unittest.TestCase):
         pool = _pool(30, 40)
 
         self.assertEqual(
-            DeepSeekV4TokenToKVPool._collect_sources_by_ratio(pool),
+            collect_sources_by_ratio(
+                pool.compression_ratios,
+                pool.kv_source_layers,
+                range(pool._stage_start, pool._stage_end),
+            ),
             {1: [20]},
         )
 
