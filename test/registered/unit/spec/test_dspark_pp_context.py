@@ -1,8 +1,9 @@
+import os
 import unittest
 from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import torch
 
@@ -36,6 +37,9 @@ from sglang.srt.models.deepseek_v4_dspark import (  # noqa: E402
     DeepseekV4ForCausalLMDSpark,
 )
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2  # noqa: E402
+from sglang.srt.speculative.dspark_components.dspark_config import (  # noqa: E402
+    resolve_single_owner_pp_rank,
+)
 from sglang.srt.speculative.dspark_components.dspark_pp import (  # noqa: E402
     draft_owner,
 )
@@ -51,6 +55,25 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class TestDSparkPPContext(CustomTestCase):
+    def test_linear_accept_index_matches_flat_verify_rows(self):
+        worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker.verify_num_draft_tokens = 6
+        worker.device = torch.device("cpu")
+        worker._linear_accept_index_cache = None
+
+        first = worker._linear_accept_index(2)
+        self.assertTrue(
+            torch.equal(
+                first,
+                torch.tensor(
+                    [[0, 1, 2, 3, 4, 5], [6, 7, 8, 9, 10, 11]],
+                    dtype=torch.int32,
+                ),
+            )
+        )
+        cache = worker._linear_accept_index_cache
+        self.assertEqual(worker._linear_accept_index(1).data_ptr(), cache.data_ptr())
+
     def test_batched_result_relay_gate_is_cuda_pp2_replicated_dspark_only(self):
         cases = [
             (True, 2, True, True, True),
@@ -251,10 +274,10 @@ class TestDSparkPPContext(CustomTestCase):
 
     def test_replicated_commit_writes_only_locally_owned_rows(self):
         rids = []
-        for owner in range(2):
+        for request_index, owner in enumerate((0, 1, 0)):
             suffix = 0
             while True:
-                rid = f"owner-{owner}-{suffix}"
+                rid = f"owner-{owner}-{request_index}-{suffix}"
                 if draft_owner(rid, 2) == owner:
                     rids.append(rid)
                     break
@@ -267,25 +290,44 @@ class TestDSparkPPContext(CustomTestCase):
         worker._kv_injector = Mock()
         state = PPDSparkCommitState(
             rids=tuple(rids),
-            cache_loc=torch.tensor([10, 11, 20, 21, 22]),
-            cache_loc_2d=None,
-            positions=torch.tensor([0, 1, 7, 8, 9]),
+            cache_loc=torch.tensor([10, 11, 20, 21, 22, 30]),
+            cache_loc_2d=torch.tensor([[10, 11], [20, 21], [30, 31]]),
+            positions=torch.tensor([0, 1, 7, 8, 9, 14]),
             state_slot=None,
-            token_counts=(2, 3),
+            token_counts=(2, 3, 1),
         )
-        projected = torch.arange(20).view(5, 4)
+        projected = torch.arange(24).view(6, 4)
+        commit_lens = torch.tensor([2, 3, 1])
 
-        worker.commit_pp_draft_context(
-            state=state,
-            rids=tuple(rids),
-            projected_context=projected,
-            commit_lens=None,
-        )
+        arange = torch.arange
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_worker_v2.torch.arange",
+            wraps=arange,
+        ) as mock_arange:
+            worker.commit_pp_draft_context(
+                state=state,
+                rids=tuple(rids),
+                projected_context=projected,
+                commit_lens=commit_lens,
+            )
 
         kwargs = worker._kv_injector.inject_projected_context.call_args.kwargs
-        self.assertTrue(torch.equal(kwargs["projected_context"], projected[:2]))
-        self.assertTrue(torch.equal(kwargs["cache_loc"], torch.tensor([10, 11])))
-        self.assertTrue(torch.equal(kwargs["positions"], torch.tensor([0, 1])))
+        self.assertEqual(
+            mock_arange.call_args_list,
+            [
+                call(0, 1, dtype=torch.int64, device="cpu"),
+                call(2, 3, dtype=torch.int64, device="cpu"),
+                call(0, 2, dtype=torch.int64, device="cpu"),
+                call(5, 6, dtype=torch.int64, device="cpu"),
+            ],
+        )
+        self.assertTrue(torch.equal(kwargs["projected_context"], projected[[0, 1, 5]]))
+        self.assertTrue(torch.equal(kwargs["cache_loc"], torch.tensor([10, 11, 30])))
+        self.assertTrue(
+            torch.equal(kwargs["cache_loc_2d"], torch.tensor([[10, 11], [30, 31]]))
+        )
+        self.assertTrue(torch.equal(kwargs["positions"], torch.tensor([0, 1, 14])))
+        self.assertTrue(torch.equal(kwargs["commit_lens"], torch.tensor([2, 1])))
 
     def test_radix_prefill_commit_writes_all_rows_on_each_replica(self):
         worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
@@ -303,14 +345,26 @@ class TestDSparkPPContext(CustomTestCase):
         )
         projected = torch.arange(20).view(5, 4)
 
-        worker.commit_pp_draft_context(
-            state=state,
-            rids=state.rids,
-            projected_context=projected,
-            commit_lens=None,
-        )
+        arange = torch.arange
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_worker_v2.torch.arange",
+            wraps=arange,
+        ) as mock_arange:
+            worker.commit_pp_draft_context(
+                state=state,
+                rids=state.rids,
+                projected_context=projected,
+                commit_lens=None,
+            )
 
         kwargs = worker._kv_injector.inject_projected_context.call_args.kwargs
+        self.assertEqual(
+            mock_arange.call_args_list,
+            [
+                call(2, dtype=torch.int64, device="cpu"),
+                call(5, dtype=torch.int64, device="cpu"),
+            ],
+        )
         self.assertTrue(torch.equal(kwargs["projected_context"], projected))
         self.assertTrue(torch.equal(kwargs["cache_loc"], state.cache_loc))
         self.assertTrue(torch.equal(kwargs["positions"], state.positions))
@@ -653,6 +707,27 @@ class TestDSparkPPContext(CustomTestCase):
             scheduler.forward_stream
         )
 
+    def test_full_projection_fast_path_requires_final_pp_owner(self):
+        with patch.dict(
+            os.environ,
+            {"SGLANG_PP_LAYER_PARTITION": "6,5,6,5,6,5,5,5"},
+        ):
+            self.assertEqual(
+                resolve_single_owner_pp_rank(
+                    target_layer_ids=[40, 41, 42],
+                    num_hidden_layers=43,
+                    pp_size=8,
+                ),
+                7,
+            )
+            self.assertIsNone(
+                resolve_single_owner_pp_rank(
+                    target_layer_ids=[35, 40],
+                    num_hidden_layers=43,
+                    pp_size=8,
+                )
+            )
+
     def test_pp_spec_verify_buffers_use_token_axis(self):
         max_bs = 64
         num_tokens_per_req = 6
@@ -742,30 +817,10 @@ class TestDSparkPPContext(CustomTestCase):
         )
         model.capture_aux_hidden_states = False
 
-        with patch(
-            "sglang.srt.models.deepseek_v4.get_spec",
-            return_value=SimpleNamespace(speculative_dspark_pp_replicated_draft=True),
-        ):
-            model.set_dspark_layers_to_capture([5, 12, 18, 25])
+        model.set_dspark_layers_to_capture([5, 12, 18, 25])
 
         self.assertTrue(model.capture_aux_hidden_states)
         self.assertEqual(model.model.dspark_layers_to_capture, [12, 18])
-
-    def test_deepseek_v4_non_replicated_capture_stays_on_last_pp_rank(self):
-        model = DeepseekV4ForCausalLM.__new__(DeepseekV4ForCausalLM)
-        torch.nn.Module.__init__(model)
-        model.pp_group = SimpleNamespace(is_last_rank=False)
-        model.model = SimpleNamespace(dspark_layers_to_capture=None)
-        model.capture_aux_hidden_states = False
-
-        with patch(
-            "sglang.srt.models.deepseek_v4.get_spec",
-            return_value=SimpleNamespace(speculative_dspark_pp_replicated_draft=False),
-        ):
-            model.set_dspark_layers_to_capture([5, 12, 18, 25])
-
-        self.assertFalse(model.capture_aux_hidden_states)
-        self.assertIsNone(model.model.dspark_layers_to_capture)
 
 
 if __name__ == "__main__":

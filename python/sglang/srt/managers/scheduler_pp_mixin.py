@@ -5,6 +5,7 @@ import math
 import time
 from array import array
 from collections import defaultdict, deque
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -678,6 +679,8 @@ class SchedulerPPMixin:
         self.pp_dspark_draft = PPDSparkDraftCoordinator(self)
         self.send_proxy_requires_forward_fence = False
         self.launch_event = None
+        self.pp_comm_stream = None
+        self.pp_comm_stream_ctx = nullcontext()
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
             defaultdict(deque)
         )
@@ -1031,6 +1034,13 @@ class SchedulerPPMixin:
         for p2p_work in work:
             p2p_work.work.wait()
         work.clear()
+
+    def _pp_record_comm_event(self: Scheduler) -> Optional[torch.Event]:
+        if self.pp_comm_stream is None:
+            return None
+        event = self.device_module.Event()
+        event.record(self.pp_comm_stream)
+        return event
 
     def _pp_commit_send_output_work_and_preprocess_output_tensors(
         self: Scheduler,
@@ -1389,6 +1399,15 @@ class SchedulerPPMixin:
                 bonus_tokens=pp_outputs["dspark_bonus_tokens"],
                 new_seq_lens=new_seq_lens,
             )
+            if accept_lens is not None:
+                self._pp_spec_commit_relayed_accept(
+                    batch=batch,
+                    fwd_batch=fwd_batch,
+                    fwd_rids=list(fwd_rids),
+                    live_rids=list(live_rids),
+                    verify_out_cache_loc=mb_metadata.verify_out_cache_loc,
+                    pp_outputs=pp_outputs,
+                )
             batch.spec_info = next_draft_input
             batch.seq_lens = new_seq_lens
             if batch.seq_lens_cpu is not None:

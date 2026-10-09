@@ -162,7 +162,6 @@ from sglang.srt.runtime_context import (
     get_forward,
     get_parallel,
     get_platform,
-    get_spec,
 )
 
 if not _is_hip:
@@ -3285,17 +3284,10 @@ class DeepseekV4ForCausalLM(nn.Module):
         return self.model.get_input_embeddings()
 
     def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
-        replicated_pp_draft = get_spec().speculative_dspark_pp_replicated_draft
-        if not replicated_pp_draft and not self.pp_group.is_last_rank:
-            return
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."
             )
-        if not replicated_pp_draft:
-            self.capture_aux_hidden_states = True
-            self.model.dspark_layers_to_capture = list(layer_ids)
-            return
         local_layer_ids = [
             int(layer_id)
             for layer_id in layer_ids

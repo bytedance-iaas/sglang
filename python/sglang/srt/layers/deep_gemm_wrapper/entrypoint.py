@@ -189,6 +189,7 @@ def gemm_nt_f8f8bf16(
             lhs,
             rhs,
             out,
+            compiled_dims="n",
         )
 
 
