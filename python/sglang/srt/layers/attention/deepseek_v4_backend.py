@@ -3880,6 +3880,7 @@ class DeepseekV4AttnBackend(
                 consume,
                 candidates=candidates,
                 visible=visible,
+                group_size=group_size,
             )
             if indexer.is_candidate_source:
                 publish = candidate_blocks if compact else candidate_mask

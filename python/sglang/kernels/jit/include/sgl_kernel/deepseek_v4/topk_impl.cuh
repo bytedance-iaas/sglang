@@ -324,6 +324,69 @@ struct TopKConfig {
     }
   }
 
+  // A coarse FP16 bin can contain more than kMaxNumTie distinct FP32
+  // values. Selecting from a truncated tie buffer would silently lose winners.
+  // Re-scan only in that exceptional case; identical ties retain the fast path.
+  SGL_DEVICE static bool overflow_has_distinct_values(const TopKProblem& problem, float lo, float hi, float first) {
+    bool differs = false;
+    for (uint32_t idx = problem.input_start + threadIdx.x; idx < problem.seq_len; idx += kBlockSize) {
+      const float value = problem.in[idx];
+      differs |= value >= lo && value < hi && value != first;
+    }
+    return __syncthreads_or(differs);
+  }
+
+  SGL_DEVICE static void full_radix_select(const TopKProblem& problem, TieHandleSmem* smem) {
+    const uint32_t tx = threadIdx.x;
+    const uint32_t lane = tx % kWarpSize;
+    const uint32_t warp_id = tx / kWarpSize;
+    uint32_t prefix = 0, mask = 0;
+    uint32_t remain = problem.topk;
+    uint32_t total = problem.seq_len - problem.input_start;
+    for (int round = 0; round < 4; ++round) {
+      const uint32_t shift = 24 - round * 8;
+      if (tx < kRadixSize) smem->histogram[0][tx] = 0;
+      __syncthreads();
+      for (uint32_t idx = problem.input_start + tx; idx < problem.seq_len; idx += kBlockSize) {
+        const uint32_t key = extract_exact_bin(problem.in[idx]);
+        if ((key & mask) == prefix) atomicAdd(&smem->histogram[0][(key >> shift) & 255], 1);
+      }
+      __syncthreads();
+      uint32_t count = 0, inc = 0;
+      if (tx < kRadixSize) {
+        count = smem->histogram[0][tx];
+        inc = warp_inclusive_sum(lane, count);
+        if (lane == kWarpSize - 1) smem->warp_sum[warp_id] = inc;
+      }
+      __syncthreads();
+      if (tx < kRadixSize) {
+        const uint32_t inter = warp::reduce_sum(lane < warp_id ? smem->warp_sum[lane] : 0);
+        const uint32_t above = total - inter - inc;
+        if (above < remain && above + count >= remain) smem->match = {tx, above, count};
+      }
+      __syncthreads();
+      const auto match = smem->match;
+      prefix |= match.bin << shift;
+      mask |= 255u << shift;
+      remain -= match.above_count;
+      total = match.equal_count;
+      __syncthreads();
+    }
+    if (tx == 0) smem->counter = smem->counter_final = 0;
+    __syncthreads();
+    const uint32_t base = problem.topk - remain;
+    for (uint32_t idx = problem.input_start + tx; idx < problem.seq_len; idx += kBlockSize) {
+      const uint32_t key = extract_exact_bin(problem.in[idx]);
+      if (key > prefix) {
+        const uint32_t pos = atomicAdd(&smem->counter, 1);
+        if (pos < base) problem.emit(pos, idx);
+      } else if (key == prefix) {
+        const uint32_t pos = atomicAdd(&smem->counter_final, 1);
+        if (pos < remain) problem.emit(base + pos, idx);
+      }
+    }
+  }
+
   /// Exact radix select over the tie candidates: each thread owns kItems
   /// strided elements (inactive beyond num_ties). Requires
   /// num_ties <= kItems * kBlockSize.
@@ -643,6 +706,9 @@ struct TopKRegister : TopKRadixBase<12> {
     const auto count_gt = smem->count_gt;
     const auto count_eq = smem->count_eq;
     const auto remain_topk = count_gt < topk ? topk - count_gt : 0;
+    if (count_eq > kMaxNumTie && overflow_has_distinct_values(problem, v_lo, v_hi, smem->tie_values[0].value)) {
+      return full_radix_select(problem, &smem->tie_handle);
+    }
     const auto tie_count = min(count_eq, kMaxNumTie);
     handle_tie(smem->tie_values, problem, count_gt, tie_count, remain_topk, &smem->tie_handle);
   }
@@ -720,6 +786,9 @@ struct TopKStreaming : TopKRadixBase<12> {
     const auto count_gt = smem->count_gt;
     const auto count_eq = smem->count_eq;
     const auto remain_topk = count_gt < topk ? topk - count_gt : 0;
+    if (count_eq > kMaxNumTie && overflow_has_distinct_values(problem, v_lo, v_hi, smem->tie_values[0].value)) {
+      return full_radix_select(problem, &smem->tie_handle);
+    }
     const auto tie_count = min(count_eq, kMaxNumTie);
     handle_tie(smem->tie_values, problem, count_gt, tie_count, remain_topk, &smem->tie_handle);
   }
