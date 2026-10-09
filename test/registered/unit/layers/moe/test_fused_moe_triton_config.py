@@ -42,6 +42,51 @@ def test_down_moe_reuses_tuned_up_config_when_separate_config_is_absent(
         fused_moe_triton_config.get_moe_configs.cache_clear()
 
 
+def test_h20_triton_3_8_loads_paired_glm53_configs(monkeypatch):
+    monkeypatch.delenv("SGLANG_MOE_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(fused_moe_triton_config.triton, "__version__", "3.8.0")
+    monkeypatch.setattr(
+        fused_moe_triton_config, "get_device_name", lambda: "NVIDIA H20"
+    )
+    fused_moe_triton_config.get_moe_configs.cache_clear()
+
+    expected_m = {
+        1,
+        2,
+        4,
+        8,
+        16,
+        24,
+        32,
+        48,
+        64,
+        96,
+        128,
+        256,
+        512,
+        1024,
+        1536,
+        2048,
+        3072,
+        4096,
+    }
+    try:
+        with get_context().override_server_args(enable_deterministic_inference=False):
+            up = fused_moe_triton_config.get_moe_configs(72, 2048, "fp8_w8a8", 128, 128)
+            down = fused_moe_triton_config.get_moe_configs(
+                72, 2048, "fp8_w8a8", 128, 128, down_moe=True
+            )
+
+        assert up is not None and down is not None
+        assert set(up) == set(down) == expected_m
+        assert all(up[m]["BLOCK_SIZE_M"] == down[m]["BLOCK_SIZE_M"] for m in expected_m)
+        assert all(down[m]["USE_TMA"] is True for m in expected_m)
+        assert all(up[m]["USE_TMA"] is True for m in expected_m if m <= 512)
+        assert all(up[m]["USE_TMA"] is False for m in expected_m if m >= 1024)
+    finally:
+        fused_moe_triton_config.get_moe_configs.cache_clear()
+
+
 def test_int4_tuner_filename_uses_runtime_down_projection_dimension(monkeypatch):
     monkeypatch.setattr(
         common_utils,
