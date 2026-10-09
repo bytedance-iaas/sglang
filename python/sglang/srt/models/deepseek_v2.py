@@ -21,10 +21,8 @@
 from __future__ import annotations
 
 import logging
-import os
 from contextlib import contextmanager, nullcontext
 from functools import cached_property
-from pathlib import Path
 from typing import (
     Any,
     Callable,
@@ -1230,42 +1228,6 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states += shared_output
         return final_hidden_states
 
-    def _maybe_dump_triton_tuning_topk_ids(
-        self, hidden_states: torch.Tensor, topk_output
-    ) -> None:
-        """Diagnostic-only capture for the separate Triton MoE tuner.
-
-        The tuner expects global expert IDs before EP localization, named by
-        global model layer and sample index. The environment variable is unset
-        in normal serving; when set, each target MoE layer writes two samples,
-        plus a third sample for the first 16 MoE layers, for exactly 100 files
-        on GLM-5.3-Flash (layers 3..44).
-        """
-        output_dir = os.getenv("SGLANG_MOE_TUNING_TOPK_IDS_DIR")
-        if (
-            not output_dir
-            or self.is_nextn
-            or hidden_states.shape[0] < 4096
-            or get_parallel().attn_tp_rank != 0
-            or get_is_capture_mode()
-            or torch.cuda.is_current_stream_capturing()
-            or not hasattr(topk_output, "topk_ids")
-        ):
-            return
-
-        max_samples = 3 if self.layer_id < 19 else 2
-        sample_idx = getattr(self, "_triton_tuning_sample_idx", 0)
-        if sample_idx >= max_samples:
-            return
-
-        output_path = Path(output_dir)
-        output_path.mkdir(parents=True, exist_ok=True)
-        destination = output_path / (
-            f"topk_ids_layer{self.layer_id}_idx{sample_idx}.pt"
-        )
-        torch.save(topk_output.topk_ids.detach().cpu(), destination)
-        self._triton_tuning_sample_idx = sample_idx + 1
-
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
@@ -1342,7 +1304,6 @@ class DeepseekV2MoE(nn.Module):
                     expert_location_dispatch_info=dispatch_info,
                     **topk_kwargs,
                 )
-            self._maybe_dump_triton_tuning_topk_ids(hidden_states, topk_output)
         else:
             pre_quant_input = None
             shared_output = None
