@@ -2150,11 +2150,12 @@ class ServerArgs:
     ] = False
     speculative_dspark_pp_replicated_draft: A[
         bool,
-        "Experimental DSPARK mode for PP2. Replicate the TP draft model on both "
-        "pipeline stages, with a fixed owner per request and next-round proposal "
-        "relay. Requires a bundled DeepSeek-V4 checkpoint, PD on both endpoints, "
-        "greedy sampling, static verify, disabled radix cache, and no mixed chunk "
-        "or context parallelism. Full attention DP is supported with "
+        "Experimental DSPARK mode for pipeline parallelism. Replicate the TP draft "
+        "model on every pipeline stage, with a fixed owner per request and "
+        "next-round proposal relay. Prefill supports PP > 1; Decode currently "
+        "supports PP2. Requires a bundled DeepSeek-V4 checkpoint, PD on both "
+        "endpoints, greedy sampling, static verify, disabled radix cache, and no "
+        "mixed chunk or context parallelism. Full attention DP is supported with "
         "attn_dp_size == tp_size. Decode CUDA graphs are supported; prefill CUDA "
         "graphs must be disabled.",
         NS("spec"),

@@ -744,15 +744,21 @@ class CommonKVManager(BaseKVManager):
             else:
                 required_prefill_response_num *= info.attn_cp_size // self.attn_cp_size
 
-        # PP rank mapping — decode pp size should be equal to prefill pp size or 1
-        assert self.pp_size == info.pp_size or self.pp_size == 1, (
-            f"Decode pp size ({self.pp_size}) should be equal to prefill pp size ({info.pp_size}) or 1",
+        # A decode stage may gather from a contiguous group of finer-grained
+        # prefill stages, provided both pipeline partitions align evenly.
+        assert info.pp_size % self.pp_size == 0, (
+            f"Prefill pp size ({info.pp_size}) should be a multiple of decode "
+            f"pp size ({self.pp_size})",
         )
-        if info.pp_size == self.pp_size:
-            target_pp_ranks = [self.pp_rank]
-        else:
-            target_pp_ranks = list(range(info.pp_size))
-            required_prefill_response_num *= info.pp_size // self.pp_size
+        prefill_stages_per_decode_stage = info.pp_size // self.pp_size
+        target_pp_rank_start = self.pp_rank * prefill_stages_per_decode_stage
+        target_pp_ranks = list(
+            range(
+                target_pp_rank_start,
+                target_pp_rank_start + prefill_stages_per_decode_stage,
+            )
+        )
+        required_prefill_response_num *= prefill_stages_per_decode_stage
 
         info.target_tp_rank = target_tp_rank
         info.target_tp_ranks = target_tp_ranks

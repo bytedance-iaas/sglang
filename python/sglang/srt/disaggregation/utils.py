@@ -934,11 +934,10 @@ def build_kv_layer_ids(
     Returns [] for pools that cannot report ids, leaving the peers on positional
     pairing.
     """
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-
-    if not isinstance(token_to_kv_pool, HybridLinearKVPool):
+    get_layer_ids = getattr(token_to_kv_pool, "get_kv_layer_ids", None)
+    if get_layer_ids is None:
         return []
-    layer_ids = token_to_kv_pool.get_kv_layer_ids()
+    layer_ids = get_layer_ids()
     if draft_token_to_kv_pool is None:
         return layer_ids
 

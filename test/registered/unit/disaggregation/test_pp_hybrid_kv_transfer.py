@@ -6,13 +6,14 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.common.conn import CommonKVManager, PrefillServerInfo
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.srt.disaggregation.prefill import _transfer_start_layer
 from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
     build_transfer_entry_pairs,
 )
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -65,6 +66,101 @@ class TestTransferStartLayer(CustomTestCase):
                 pool=SimpleNamespace(start_layer=30), hf_text_config=cfg
             ),
             30,
+        )
+
+
+class TestAsymmetricPPRankMapping(CustomTestCase):
+    def test_pp4_prefill_maps_to_contiguous_pp2_decode_stage_groups(self):
+        info = PrefillServerInfo(
+            attn_tp_size=4,
+            attn_cp_size=1,
+            dp_size=1,
+            pp_size=4,
+            page_size=256,
+            kv_cache_dtype="fp8_e4m3",
+            follow_bootstrap_room=True,
+        )
+        for decode_pp_rank, expected_prefill_pp_ranks in (
+            (0, [0, 1]),
+            (1, [2, 3]),
+        ):
+            with self.subTest(decode_pp_rank=decode_pp_rank):
+                manager = CommonKVManager.__new__(CommonKVManager)
+                manager.attn_tp_size = 8
+                manager.attn_cp_size = 1
+                manager.attn_cp_rank = 0
+                manager.enable_all_cp_ranks_for_transfer = False
+                manager.is_mla_backend = True
+                manager.is_hybrid_mla_backend = True
+                manager.pp_size = 2
+                manager.pp_rank = decode_pp_rank
+                manager.kv_args = SimpleNamespace(engine_rank=decode_pp_rank * 8)
+
+                manager._resolve_rank_mapping(info)
+
+                self.assertEqual(info.target_pp_ranks, expected_prefill_pp_ranks)
+                self.assertEqual(info.required_prefill_response_num, 2)
+                self.assertEqual(info.required_dst_info_num, 2)
+
+    def test_prefill_pp_must_be_multiple_of_decode_pp(self):
+        manager = CommonKVManager.__new__(CommonKVManager)
+        manager.attn_tp_size = 4
+        manager.attn_cp_size = 1
+        manager.attn_cp_rank = 0
+        manager.enable_all_cp_ranks_for_transfer = False
+        manager.is_mla_backend = True
+        manager.is_hybrid_mla_backend = True
+        manager.pp_size = 2
+        manager.pp_rank = 0
+        manager.kv_args = SimpleNamespace(engine_rank=0)
+        info = PrefillServerInfo(
+            attn_tp_size=4,
+            attn_cp_size=1,
+            dp_size=1,
+            pp_size=3,
+            page_size=256,
+            kv_cache_dtype="fp8_e4m3",
+            follow_bootstrap_room=True,
+        )
+
+        with self.assertRaisesRegex(AssertionError, "multiple"):
+            manager._resolve_rank_mapping(info)
+
+
+class TestDeepSeekV4AsymmetricPPLayerIds(CustomTestCase):
+    def _pool(self, *, start: int, end: int, ratios: list[int]):
+        pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+        pool._stage_start = start
+        pool._stage_end = end
+        pool.compression_ratios = ratios
+        return pool
+
+    def test_pp4_stage_pairs_into_containing_pp2_stage(self):
+        ratios = [4, 128, 4, 128, 4, 128, 4, 128]
+        src_ids = build_kv_layer_ids(
+            token_to_kv_pool=self._pool(start=2, end=4, ratios=ratios),
+            draft_token_to_kv_pool=None,
+            num_draft_entries=0,
+            num_hidden_layers=len(ratios),
+        )
+        dst_ids = build_kv_layer_ids(
+            token_to_kv_pool=self._pool(start=0, end=4, ratios=ratios),
+            draft_token_to_kv_pool=None,
+            num_draft_entries=0,
+            num_hidden_layers=len(ratios),
+        )
+
+        self.assertEqual(src_ids, [2, 2, 3])
+        self.assertEqual(dst_ids, [0, 2, 0, 2, 1, 3])
+        self.assertEqual(
+            build_transfer_entry_pairs(
+                src_ids,
+                dst_ids,
+                len(src_ids),
+                len(dst_ids),
+                allow_positional_fallback=False,
+            ),
+            [(0, 1), (1, 3), (2, 5)],
         )
 
 

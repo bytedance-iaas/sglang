@@ -122,11 +122,11 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
 
 
 class TestDsparkReplicatedPPDraft(CustomTestCase):
-    def _replicated_args(self, mode: str) -> ServerArgs:
+    def _replicated_args(self, mode: str, pp_size: int = 2) -> ServerArgs:
         server_args = _make_dspark_server_args(
             model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
         )
-        server_args.pp_size = 2
+        server_args.pp_size = pp_size
         server_args.disaggregation_mode = mode
         server_args.speculative_dspark_pp_replicated_draft = True
         server_args.disable_cuda_graph = True
@@ -145,6 +145,22 @@ class TestDsparkReplicatedPPDraft(CustomTestCase):
                 _handle_dspark(args)
                 self.assertFalse(resolution_result(args, "enable_mixed_chunk"))
                 self.assertEqual(args.speculative_draft_scheduling_policy, "tail")
+
+    def test_pp4_prefill_is_admitted_but_decode_is_rejected(self):
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            prefill_args = self._replicated_args("prefill", pp_size=4)
+            _handle_dspark(prefill_args)
+            self.assertFalse(resolution_result(prefill_args, "enable_mixed_chunk"))
+
+            with self.assertRaisesRegex(ValueError, "Decode.*pp-size 2"):
+                _handle_dspark(self._replicated_args("decode", pp_size=4))
+
+    def test_replicated_draft_requires_pipeline_parallelism(self):
+        with (
+            envs.SGLANG_RAGGED_VERIFY_MODE.override("static"),
+            self.assertRaisesRegex(ValueError, "greater than 1"),
+        ):
+            _handle_dspark(self._replicated_args("prefill", pp_size=1))
 
     def test_bubble_policy_requires_replicated_pp_draft(self):
         args = self._replicated_args("decode")
