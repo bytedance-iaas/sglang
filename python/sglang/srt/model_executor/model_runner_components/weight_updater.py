@@ -46,12 +46,15 @@ def _unsupported_derived_weight_cache_error(
     if model is not None and any(
         getattr(module, "_hc_attn_tf32_parts", None) is not None
         or getattr(module, "_hc_ffn_tf32_parts", None) is not None
+        or getattr(module, "_hc_attn_bf16_parts", None) is not None
+        or getattr(module, "_hc_ffn_bf16_parts", None) is not None
         for module in model.modules()
     ):
         return (
             "Online weight updates are not supported while compensated mHC "
             "weight splits are active: captured CUDA graphs retain these derived "
-            "weights. Restart with SGLANG_OPT_DEEPGEMM_HC_PRENORM=0 to use "
+            "weights. Restart with SGLANG_OPT_DEEPGEMM_HC_PRENORM=0 and "
+            "SGLANG_OPT_DSV41_SM90_MHC_BF16X3=0 to use "
             "online weight updates."
         )
 

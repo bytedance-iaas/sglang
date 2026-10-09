@@ -2686,6 +2686,18 @@ class DeepseekV4DecoderLayer(nn.Module):
         self._hc_attn_tf32_parts = self._hc_ffn_tf32_parts = None
         self._hc_attn_bf16_parts = self._hc_ffn_bf16_parts = None
         if (
+            get_platform().is_sm90
+            and envs.SGLANG_OPT_DSV41_SM90_MHC_BF16X3.get()
+            and self.hc_attn_fn.shape == (24, 20480)
+            and getattr(self.config, "model_type", None) == "deepseek_v41"
+            and not is_batch_invariant_mode_enabled()
+        ):
+            from sglang.kernels.ops.layernorm.mhc import split_bf16_hc_weight
+
+            self._hc_attn_bf16_parts = split_bf16_hc_weight(self.hc_attn_fn.data)
+            self._hc_ffn_bf16_parts = split_bf16_hc_weight(self.hc_ffn_fn.data)
+
+        if (
             self.hc_pre_from_prev_sublayer
             and get_platform().is_sm100
             and self.hc_attn_fn.shape == (24, 20480)
@@ -2930,7 +2942,13 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_pre_from_prev_sublayer
                 and get_platform().is_sm90
                 and x.is_cuda
-                and 1 <= x.shape[0] <= 64
+                and (
+                    1 <= x.shape[0] <= 64
+                    or (
+                        envs.SGLANG_OPT_DSV41_SM90_MHC_BF16X3.get()
+                        and x.shape[0] <= 2048
+                    )
+                )
                 and x.shape[1] == 5120
                 and residual.shape == (x.shape[0], 4, 5120)
                 and x.dtype == residual.dtype == torch.bfloat16
@@ -3233,6 +3251,54 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         x_flat = x.flatten(1)
 
+        from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+        if (
+            x.is_cuda
+            and torch.version.cuda is not None
+            and get_platform().is_sm90
+            and envs.SGLANG_OPT_DSV41_SM90_MHC_BF16X3.get()
+            and x.dtype == torch.bfloat16
+            and x_flat.is_contiguous()
+            and 0 < x.shape[0] <= 2048
+            and not is_batch_invariant_mode_enabled()
+        ):
+            weight_parts = (
+                getattr(self, "_hc_attn_bf16_parts", None)
+                if hc_fn is self.hc_attn_fn
+                else (
+                    getattr(self, "_hc_ffn_bf16_parts", None)
+                    if hc_fn is self.hc_ffn_fn
+                    else None
+                )
+            )
+            if weight_parts is not None:
+                from sglang.kernels.ops.layernorm.mhc import (
+                    hc_mix_stats_sinkhorn_sm90_bf16x3,
+                )
+
+                main_stream = torch.cuda.current_stream()
+                if stats_stream is not None:
+                    x.record_stream(stats_stream)
+                with (
+                    torch.cuda.stream(stats_stream)
+                    if stats_stream is not None
+                    else nullcontext()
+                ):
+                    result = hc_mix_stats_sinkhorn_sm90_bf16x3(
+                        x_flat,
+                        weight_parts,
+                        hc_scale,
+                        hc_base,
+                        self.hc_sinkhorn_iters,
+                        self.rms_norm_eps,
+                        self.hc_eps,
+                    )
+                if stats_stream is not None:
+                    for coefficient in result:
+                        coefficient.record_stream(main_stream)
+                return result
+
         if (
             x.is_cuda
             and torch.version.cuda is not None
@@ -3525,9 +3591,11 @@ class DeepseekV4DecoderLayer(nn.Module):
         # the compact DP layout and attention-TP-aligned communication buffers.
         with (
             context,
-            late_dp_layout.activate(forward_batch)
-            if late_dp_layout is not None
-            else nullcontext(),
+            (
+                late_dp_layout.activate(forward_batch)
+                if late_dp_layout is not None
+                else nullcontext()
+            ),
         ):
             x = self._run_moe_ffn_dp_sync(
                 late_dp_layout.pad(x) if late_dp_layout is not None else x,
@@ -4454,9 +4522,11 @@ class DeepseekV4Model(nn.Module):
                     # Sharded tables need identical IDs on every TP rank for
                     # their reduction; shared tables can look up local rows.
                     emb = engram.embed(
-                        token_parallel.local(layer_hash_ids)
-                        if engram.embed._shared
-                        else layer_hash_ids,
+                        (
+                            token_parallel.local(layer_hash_ids)
+                            if engram.embed._shared
+                            else layer_hash_ids
+                        ),
                         forward_batch,
                     )
                     if not engram.embed._shared:
@@ -4783,11 +4853,14 @@ class DeepseekV4Model(nn.Module):
 
             metadata.candidate_metadata = CandidateMasks(
                 mask=tensors.get("pp_candidate_mask"),
-                request_masks=[
-                    tensors[f"pp_candidate_{index}"] for index in range(candidate_count)
-                ]
-                if candidate_count
-                else None,
+                request_masks=(
+                    [
+                        tensors[f"pp_candidate_{index}"]
+                        for index in range(candidate_count)
+                    ]
+                    if candidate_count
+                    else None
+                ),
             )
         candidate_ratio = tensors.get("pp_candidate_ratio")
         index_metadata = (

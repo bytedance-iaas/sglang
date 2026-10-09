@@ -2290,6 +2290,76 @@ def _hc_mix_reduce_sinkhorn_kernel(
     tl.store(comb_ptr + row * HC * HC + jj * HC + kk, comb)
 
 
+@triton.jit
+def _hc_mix_reduce_sinkhorn_tree_kernel(
+    part_mix_ptr,
+    part_sq_ptr,
+    scale_ptr,
+    base_ptr,
+    pre_ptr,
+    post_ptr,
+    comb_ptr,
+    m,
+    inv_k,
+    rms_eps,
+    MIX: tl.constexpr,
+    HC: tl.constexpr,
+    NUM_SLICES: tl.constexpr,
+    ITERS: tl.constexpr,
+    EPS: tl.constexpr,
+    part_mix_residual_ptr=None,
+):
+    """One CTA per row keeps the sinkhorn reductions two-dimensional."""
+    row = tl.program_id(0)
+    if row >= m:
+        return
+    j = tl.arange(0, HC)
+    jj = j[:, None]
+    kk = j[None, :]
+
+    tl.static_assert(NUM_SLICES <= 128)
+    slices = tl.arange(0, 128)
+    off = (slices * m + row) * MIX
+    vpre = tl.load(
+        part_mix_ptr + off[:, None] + j[None, :], slices[:, None] < NUM_SLICES, 0
+    )
+    vpost = tl.load(
+        part_mix_ptr + off[:, None] + HC + j[None, :], slices[:, None] < NUM_SLICES, 0
+    )
+    vcomb = tl.load(
+        part_mix_ptr
+        + off[:, None, None]
+        + 2 * HC
+        + jj[None, :, :] * HC
+        + kk[None, :, :],
+        slices[:, None, None] < NUM_SLICES,
+        0,
+    )
+    a_pre = tl.sum(vpre, 0)
+    a_post = tl.sum(vpost, 0)
+    a_comb = tl.sum(vcomb, 0)
+    sq = tl.sum(tl.load(part_sq_ptr + slices * m + row, slices < NUM_SLICES, 0), 0)
+    rsqrt = 1.0 / tl.sqrt(sq * inv_k + rms_eps)
+
+    s0 = tl.load(scale_ptr + 0)
+    s1 = tl.load(scale_ptr + 1)
+    s2 = tl.load(scale_ptr + 2)
+
+    pre = tl.sigmoid(a_pre * rsqrt * s0 + tl.load(base_ptr + j)) + EPS
+    tl.store(pre_ptr + row * HC + j, pre)
+    post = 2.0 * tl.sigmoid(a_post * rsqrt * s1 + tl.load(base_ptr + HC + j))
+    tl.store(post_ptr + row * HC + j, post)
+
+    comb = a_comb * rsqrt * s2 + tl.load(base_ptr + 2 * HC + jj * HC + kk)
+    comb = tl.exp(comb - tl.max(comb, axis=1)[:, None])
+    comb = comb / tl.sum(comb, axis=1)[:, None] + EPS
+    comb = comb / (tl.sum(comb, axis=0)[None, :] + EPS)
+    for _ in tl.static_range(ITERS - 1):
+        comb = comb / (tl.sum(comb, axis=1)[:, None] + EPS)
+        comb = comb / (tl.sum(comb, axis=0)[None, :] + EPS)
+    tl.store(comb_ptr + row * HC * HC + jj * HC + kk, comb)
+
+
 def hc_mix_stats_sinkhorn(
     x_flat: torch.Tensor,
     hc_fn: torch.Tensor,
@@ -2489,6 +2559,68 @@ def hc_mix_stats_sinkhorn_bf16x3(
         ITERS=sinkhorn_iters,
         EPS=hc_eps,
         num_warps=1,
+    )
+    return pre, post, comb
+
+
+def hc_mix_stats_sinkhorn_sm90_bf16x3(
+    x: torch.Tensor,
+    weight_parts,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    sinkhorn_iters: int,
+    rms_eps: float,
+    hc_eps: float,
+    hc_mult: int = 4,
+    reduce_warps: int = 1,
+):
+    m, k = x.shape
+    mix = (2 + hc_mult) * hc_mult
+    slices = _num_slices_for(k)
+    assert x.is_contiguous() and x.dtype == torch.bfloat16 and 0 < m <= 2048
+    assert k % (slices * _HC_MIX_BLOCK_K) == 0
+    assert len(weight_parts) == 3
+    assert all(
+        w.shape == (mix, k) and w.dtype == torch.bfloat16 and w.is_contiguous()
+        for w in weight_parts
+    )
+    part_mix = torch.empty((slices, m, mix), device=x.device, dtype=torch.float32)
+    sq = torch.empty((slices, m), device=x.device, dtype=torch.float32)
+    pre = torch.empty((m, hc_mult), device=x.device, dtype=torch.float32)
+    post = torch.empty_like(pre)
+    comb = torch.empty((m, hc_mult, hc_mult), device=x.device, dtype=torch.float32)
+    _hc_mix_stats_bf16x3_kernel[(triton.cdiv(m, 64), slices)](
+        x,
+        *weight_parts,
+        part_mix,
+        sq,
+        m,
+        K=k,
+        K_PER_SLICE=k // slices,
+        MIX_COLS=mix,
+        MIX_PAD=triton.next_power_of_2(mix),
+        BLOCK_K=_HC_MIX_BLOCK_K,
+        BLOCK_M=64,
+        num_warps=8,
+        num_stages=1,
+    )
+    _hc_mix_reduce_sinkhorn_tree_kernel[(m,)](
+        part_mix,
+        sq,
+        scale,
+        base,
+        pre,
+        post,
+        comb,
+        m,
+        1.0 / k,
+        rms_eps,
+        MIX=mix,
+        HC=hc_mult,
+        NUM_SLICES=slices,
+        ITERS=sinkhorn_iters,
+        EPS=hc_eps,
+        num_warps=reduce_warps,
     )
     return pre, post, comb
 
