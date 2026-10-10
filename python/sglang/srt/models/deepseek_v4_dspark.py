@@ -271,7 +271,14 @@ class DSparkAttention(MqaAttentionBase):
         q_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         q, _ = self.wq_a(x)
-        q = self.q_norm(q)
+        fused = None
+        if self.is_dsv41 and envs.SGLANG_OPT_DSV41_SM90_Q_LORA_QUANT.get():
+            from sglang.srt.layers.attention.dsv4.sm90_q_lora import (
+                try_normalize_q_lora_sm90,
+            )
+
+            fused = try_normalize_q_lora_sm90(q, self.q_norm, self.wq_b)
+        q = self.q_norm(q) if fused is None else fused[1]
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if not self.q_head_norm:

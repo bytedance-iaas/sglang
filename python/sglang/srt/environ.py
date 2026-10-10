@@ -1637,6 +1637,11 @@ class Envs:
     # Triton; larger 64-head shapes use grouped K reuse. Unsupported
     # layouts, ordinary decode and compact/ragged verify retain the default path.
     SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER = EnvBool(False)
+    # Experimental attention fusions; independent switches for GPU A/B.
+    # Static c2 target-verify: pair pooling, BF16 cast, RMSNorm and metadata.
+    SGLANG_OPT_DSV41_SM90_C2_VERIFY_FUSION = EnvBool(False)
+    # Target/draft Q-LoRA: dual BF16 + backend-compatible block-FP8 outputs.
+    SGLANG_OPT_DSV41_SM90_Q_LORA_QUANT = EnvBool(False)
     # Opt-in SM90 prefill indexer that converts packed FP4 keys once per request
     # and fuses FP8 scoring across heads. Supports eager regular and CP prefill.
     SGLANG_OPT_DSV41_SM90_PREFILL_INDEXER = EnvBool(False)

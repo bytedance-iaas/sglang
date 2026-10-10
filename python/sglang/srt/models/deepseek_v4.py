@@ -1362,10 +1362,21 @@ class MQALayer(MqaAttentionBase):
 
     def _normalize_q_lora(
         self, q: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor | Mxfp8SwizzledInput]:
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor | Mxfp8SwizzledInput | Tuple[torch.Tensor, torch.Tensor],
+    ]:
         # The indexer needs the BF16 normalized row; wq_b needs the quantized one.
         if _is_hip:
             return _hip.q_norm_for_wq_b(self, q)
+        if self.is_dsv41 and envs.SGLANG_OPT_DSV41_SM90_Q_LORA_QUANT.get():
+            from sglang.srt.layers.attention.dsv4.sm90_q_lora import (
+                try_normalize_q_lora_sm90,
+            )
+
+            fused = try_normalize_q_lora_sm90(q, self.q_norm, self.wq_b)
+            if fused is not None:
+                return fused
         method = self.wq_b.quant_method
         if (
             _is_cuda
@@ -1403,7 +1414,10 @@ class MQALayer(MqaAttentionBase):
         self,
         x: torch.Tensor,
         qkv_a: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor | Mxfp8SwizzledInput]:
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor | Mxfp8SwizzledInput | Tuple[torch.Tensor, torch.Tensor],
+    ]:
         if qkv_a is not None:
             q = qkv_a[..., : self.q_lora_rank]
         else:

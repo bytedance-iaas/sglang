@@ -457,3 +457,76 @@ to the initcheck command. The signatures are `computeBlockDigitCounts+0x260`
 and `computeBlockwiseWithinKCounts+0x380`, each a four-byte global read. An
 intentional uninitialized-read Triton negative control still reports an error
 with the same file, confirming that it does not suppress arbitrary new kernels.
+
+## Experimental SM90 attention fusions
+
+These two independent switches default to **off**. They were implemented without
+access to a CUDA machine; GPU compilation, numerical tests, sanitizer runs and
+serving performance are still unverified. Enable only for A/B testing, before
+starting the server / capturing CUDA Graphs.
+
+| Switch | Fused work | Eligibility |
+| --- | --- | --- |
+| `SGLANG_OPT_DSV41_SM90_C2_VERIFY_FUSION=1` | Pair lookup, FP32 softmax pooling, BF16 rounding, RMSNorm and output-position calculation; a second kernel updates the ring | SM90, c2 target verify, fixed request-major groups, FP32 ring. Compact verify, draft, ordinary decode and prefill keep their existing paths. |
+| `SGLANG_OPT_DSV41_SM90_Q_LORA_QUANT=1` | Q-LoRA RMSNorm plus FP8 quantization, with a BF16 output for the indexer | DSV4.1 target and DSpark draft, SM90, BF16 `[M,1280]`, `1 <= M <= 384`; supported resolved block-FP8 runner only. |
+
+Q-LoRA supports DeepGEMM group-128 FP32 column-major scales (TMA-aligned group
+stride) and Triton / packed Humming group-32 UE8M0 scales stored as row-major
+FP32 powers of two. Unsupported runners, MXFP8 views, incompatible weight shapes,
+batch-invariant / deterministic execution and the existing group-32 BF16 GEMM
+shortcut retain the unfused path. A flag being enabled does not imply every
+layer qualifies. Check for `_rmsnorm_group_fp8_kernel` and
+`_c2_verify_pool_norm_kernel` in a trace to confirm dispatch.
+
+The c2 fusion keeps the two projection GEMMs and the existing RoPE / quantization
+/ cache-store code. Index-K still receives the pre-RoPE BF16 latent. Ring reads
+and writes are separate launches so that speculative wraparound cannot overwrite
+a partner before another row reads it. Graph padding never writes live state.
+
+Run correctness first from the repository root:
+
+```bash
+PYTHONPATH=python python -m pytest -q \
+  test/registered/kernels/ops/attention/dsv4/test_sm90_attention_fusion.py
+compute-sanitizer --tool memcheck --error-exitcode=1 \
+  python test/registered/kernels/ops/attention/dsv4/test_sm90_attention_fusion.py
+```
+
+The tests cover odd/even starts, wraparound, replayed/rejected positions, live
+request zero beside graph padding, strided projection/state views, BF16 norm
+outputs, FP8 bytes/scales, GEMM consumption and CUDA Graph replay. c2 and quant
+stages use exact comparisons; Q-LoRA RMSNorm allows small reduction-order
+differences from the existing norm kernel. Serving accuracy and DSpark acceptance
+must still be compared.
+
+For isolated latency measurements without model weights:
+
+```bash
+PYTHONPATH=python python benchmark/kernels/attention/bench_dsv41_sm90_attention_fusion.py \
+  --batches 64 128 192 256 320 384 --dp 8 --verify-tokens 6 \
+  --output /tmp/dsv41-sm90-attention-fusion.json
+```
+
+This emits GPU identity, shapes and repeated CUDA Graph timings in microseconds.
+It excludes projections, attention, KV stores, MoE and communication; its results
+are **not** TPOT or a forecast of end-to-end speedup.
+
+For the serving experiment, retain the same model, MegaMoE configuration,
+DP8 attention + EP8, graph sizes and DSpark 5+1 settings. Restart the server for
+each row of this matrix, keeping any existing indexer optimization flags fixed:
+
+| Run | C2_VERIFY_FUSION | Q_LORA_QUANT |
+| --- | --- | --- |
+| Baseline | 0 | 0 |
+| Compression only | 1 | 0 |
+| Q-LoRA only | 0 | 1 |
+| Both | 1 | 1 |
+
+Sweep total active requests 64/128/192/256/320/384 at contexts
+8K/16K/32K/128K. Under even DP distribution and fixed six-token verification,
+these correspond to 48/96/144/192/240/288 target rows per rank, before graph
+padding. Record actual graph rows and per-rank batch skew, mean TPOT, accepted
+tokens per speculative iteration, draft/verify time, throughput and any OOM.
+The requested success criterion is mean TPOT < 10 ms; kernel latency alone does
+not establish it. Keep output lengths and actual contexts matched between runs,
+and report configurations that cannot fit rather than comparing different loads.

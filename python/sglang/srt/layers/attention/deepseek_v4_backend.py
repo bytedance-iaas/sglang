@@ -2901,6 +2901,8 @@ class DeepseekV4AttnBackend(
     def _low_ratio_compress(self, layer, x, req, pos, forward_batch) -> None:
         if forward_batch.forward_mode.is_decode():
             self._low_ratio_compress_decode(layer, x, req, pos)
+        elif self._can_use_sm90_c2_verify_fusion(layer, x, forward_batch):
+            self._low_ratio_compress_sm90_verify(layer, x, req, pos)
         elif (
             forward_batch.forward_mode.is_target_verify()
             and not self.is_dspark_draft
@@ -2944,6 +2946,60 @@ class DeepseekV4AttnBackend(
                     and layer.compressor.use_fused_compress
                 ),
             )
+
+    def _can_use_sm90_c2_verify_fusion(self, layer, x, forward_batch) -> bool:
+        if not (
+            envs.SGLANG_OPT_DSV41_SM90_C2_VERIFY_FUSION.get()
+            and x.is_cuda
+            and torch.version.cuda is not None
+            and _is_sm90()
+            and forward_batch.forward_mode.is_target_verify()
+            and not self.is_dspark_draft
+            and layer.compress_ratio == 2
+            and not layer.compressor.use_fused_compress
+            and read_ragged_verify_mode() is not RaggedVerifyMode.COMPACT
+            and self.speculative_num_draft_tokens is not None
+            and self.speculative_num_draft_tokens > 1
+            and x.shape[0] > 0
+            and x.shape[0]
+            == forward_batch.batch_size * self.speculative_num_draft_tokens
+            and layer.compressor.norm.weight.numel() in (128, 512)
+        ):
+            return False
+        from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+        from sglang.srt.runtime_context import get_exec
+
+        if (
+            is_batch_invariant_mode_enabled()
+            or get_exec().deterministic.enable_deterministic_inference
+        ):
+            return False
+        state = self.token_to_kv_pool.get_attention_compress_states(layer.layer_id)
+        return state.ring_size > 0 and state.kv_score_buffer.kv.dtype == torch.float32
+
+    def _low_ratio_compress_sm90_verify(self, layer, x, req, pos) -> None:
+        from sglang.kernels.ops.attention.dsv4.c2_verify_pool import c2_verify_pool_norm
+
+        core = self.forward_metadata.core_metadata
+        state = self.token_to_kv_pool.get_attention_compress_states(layer.layer_id)
+        kv, score = layer.compressor.project(x)
+        n = pos.shape[0]
+        latent, group_pos, slots = c2_verify_pool_norm(
+            kv,
+            score,
+            pos,
+            core.raw_out_loc[:n],
+            core.c2_out_loc[:n],
+            req,
+            state.kv_score_buffer.kv,
+            state.kv_score_buffer.score,
+            layer.compressor.norm.weight,
+            layer.compressor.norm.eps,
+            ring_size=state.ring_size,
+        )
+        self._low_ratio_write_group(
+            layer, latent, slots, group_pos, already_normalized=True
+        )
 
     def _low_ratio_in_prefill_graph(self) -> bool:
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
@@ -3184,9 +3240,10 @@ class DeepseekV4AttnBackend(
         group_pos,
         *,
         fuse_index_store=False,
+        already_normalized=False,
     ) -> None:
         pool = self.token_to_kv_pool
-        latent = layer.compressor.finish(pooled)
+        latent = pooled if already_normalized else layer.compressor.finish(pooled)
         freqs = layer.freqs_cis[group_pos]
         # Index keys come from the pre-RoPE latent, so publish them first. Stored
         # as fp4 (per-32 ue8m0, no hadamard), matching the reference indexer.
