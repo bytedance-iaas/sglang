@@ -18,6 +18,7 @@ from typing import Callable, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
@@ -39,7 +40,10 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_parallel,
+    max_prefill_buffer_tokens,
+)
 
 
 def dsa_enable_prefill_cp():
@@ -80,12 +84,146 @@ def dsa_cp_gather_hidden_states(hidden_states: torch.Tensor):
     return hidden_states
 
 
-def dsa_cp_reduce_scatter_hidden_states(hidden_states: torch.Tensor):
+def dsa_cp_fused_ag_shared_experts_eligible(
+    mlp,
+    forward_batch: ForwardBatch,
+    hidden_states: torch.Tensor,
+) -> bool:
+    from sglang.srt.distributed import get_tp_group
+    from sglang.srt.layers.attention.dsa.utils import (
+        is_dsa_prefill_cp_round_robin_split,
+    )
+    from sglang.srt.model_executor.runner import get_is_capture_mode
+
+    if not envs.SGLANG_DSV41_CP_AG_SHARED_GEMM.get() or get_is_capture_mode():
+        return False
+    if not dsa_use_prefill_cp(forward_batch):
+        return False
+    if not is_dsa_prefill_cp_round_robin_split():
+        return False
+    parallel = get_parallel()
+    if parallel.attn_dp_size != 1 or parallel.attn_tp_size != 1:
+        return False
+    comm = get_tp_group().torch_symm_mem_comm
+    if comm is None or comm.disabled or comm.world_size != parallel.attn_cp_size:
+        return False
+    if hidden_states.dtype != torch.bfloat16 or not hidden_states.is_contiguous():
+        return False
+    if hidden_states.shape[0] <= 0:
+        return False
+    if hidden_states.shape[0] * parallel.attn_cp_size > max_prefill_buffer_tokens():
+        return False
+    metadata = getattr(forward_batch, "attn_cp_metadata", None)
+    per_rank_tokens = getattr(metadata, "per_rank_actual_token", None)
+    if per_rank_tokens is not None:
+        if len(set(per_rank_tokens)) != 1:
+            return False
+    elif sum(forward_batch.extend_seq_lens_cpu) % parallel.attn_cp_size != 0:
+        return False
+    if (
+        getattr(mlp, "num_fused_shared_experts", 0) != 0
+        or getattr(mlp, "_shared_expert_tp1", False)
+        or not getattr(mlp, "shared_experts_is_fp8", False)
+        or getattr(mlp, "shared_experts_weight_block_size", None) != [128, 128]
+    ):
+        return False
+    shared = getattr(mlp, "shared_experts", None)
+    gate_up = getattr(shared, "gate_up_proj", None)
+    return (
+        gate_up is not None
+        and hasattr(gate_up, "weight")
+        and hasattr(gate_up, "weight_scale_inv")
+    )
+
+
+def dsa_cp_fused_ag_shared_experts(
+    mlp,
+    forward_batch: ForwardBatch,
+    hidden_states: torch.Tensor,
+):
+    """Gather the CP shard while computing shared-expert gate/up."""
+    if not dsa_cp_fused_ag_shared_experts_eligible(mlp, forward_batch, hidden_states):
+        return dsa_cp_gather_hidden_states(hidden_states), None
+
+    from sglang.srt.distributed import get_tp_group
+    from sglang.srt.distributed.device_communicators.symm_mem_kernels import (
+        maybe_fused_ag_shared_experts,
+    )
+
+    comm = get_tp_group().torch_symm_mem_comm
+    comm.set_use_cp_fused_ag(True)
+    try:
+        gathered, gate_up = maybe_fused_ag_shared_experts(
+            hidden_states, mlp.shared_experts.gate_up_proj
+        )
+    finally:
+        comm.set_use_cp_fused_ag(False)
+    if gathered is None or gate_up is None:
+        return dsa_cp_gather_hidden_states(hidden_states), None
+    shared_output = mlp.shared_experts(
+        gathered,
+        precomputed_gate_up=gate_up,
+    )
+    return gathered, shared_output
+
+
+def dsa_cp_reduce_scatter_hidden_states(
+    hidden_states: torch.Tensor,
+    pre_reduce: Optional[torch.Tensor] = None,
+    deferred_moe=None,
+):
     attn_dp_size = get_parallel().attn_dp_size
     attn_tp_size = get_parallel().attn_tp_size
     assert attn_dp_size == 1 and attn_tp_size == 1
     cp_size = get_parallel().attn_cp_size
     cp_rank = get_parallel().attn_cp_rank
+    if deferred_moe is not None:
+        assert pre_reduce is not None
+        group = get_parallel().attn_cp_group
+        ca_comm = group.ca_comm
+        num_tokens = deferred_moe.expert_weights.shape[0]
+        local_tokens = num_tokens // cp_size + int(cp_rank < num_tokens % cp_size)
+        message_bytes = local_tokens * pre_reduce.shape[1] * pre_reduce.element_size()
+        can_use_fused = (
+            ca_comm is not None
+            and not ca_comm.disabled
+            and ca_comm.obj.push is not None
+            and deferred_moe.gemm2_out.is_contiguous()
+            and deferred_moe.expanded_idx_to_permuted_idx.is_contiguous()
+            and deferred_moe.expert_weights.is_contiguous()
+            and pre_reduce.is_contiguous()
+            and message_bytes <= ca_comm.max_push_size
+        )
+        if (
+            envs.SGLANG_DSV41_MOE_FINALIZE_REDUCE_SCATTER_STRICT.get()
+            and not can_use_fused
+        ):
+            raise RuntimeError(
+                "Strict fused MoE finalize+RS rejected fallback: "
+                f"message_bytes={message_bytes}, "
+                f"max_push_size={ca_comm.max_push_size if ca_comm else -1}"
+            )
+        if can_use_fused:
+            from sglang.kernels.ops.communication.moe_finalize_reduce_scatter import (
+                moe_finalize_reduce_scatter,
+            )
+
+            return moe_finalize_reduce_scatter(
+                ca_comm.obj,
+                deferred_moe.gemm2_out,
+                deferred_moe.expanded_idx_to_permuted_idx,
+                deferred_moe.expert_weights,
+                pre_reduce,
+            )
+
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            finalize_flashinfer_trtllm_deferred_output,
+        )
+
+        hidden_states = finalize_flashinfer_trtllm_deferred_output(
+            deferred_moe,
+            pre_reduce,
+        )
     input_hidden_states = hidden_states
     hidden_states = hidden_states.tensor_split(cp_size)[cp_rank]
     attn_cp_reduce_scatter_tensor(hidden_states, input_hidden_states)
@@ -117,7 +255,7 @@ class DSACPLayerCommunicator(LayerCommunicator):
         if self.layer_scatter_modes.mlp_mode != ScatterMode.SCATTERED:
             assert (
                 self._context.attn_dp_size == 1
-            ), f"dp_size should be 1 when moe_runner_backend is none"
+            ), "dp_size should be 1 when moe_runner_backend is none"
         self._communicate_simple_fn = DSACPCommunicateSimpleFn.get_fn(
             input_mode=ScatterMode.SCATTERED,
             output_mode=ScatterMode.SCATTERED,

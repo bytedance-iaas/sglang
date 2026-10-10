@@ -978,6 +978,11 @@ class Envs:
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)
     # Use FlashInfer's fused atomic CUTLASS/CuTe DSL MoE finalize.
     SGLANG_FLASHINFER_MOE_FUSED_FINALIZE = EnvBool(True)
+    # DSV4.1 SM90 Humming collective fusion for prefill CP.
+    SGLANG_DSV41_CP_AG_SHARED_GEMM = EnvBool(False)
+    SGLANG_DSV41_MOE_FINALIZE_REDUCE_SCATTER = EnvBool(False)
+    SGLANG_DSV41_MOE_FINALIZE_REDUCE_SCATTER_STRICT = EnvBool(False)
+    SGLANG_DSV41_MOE_FINALIZE_REDUCE_SCATTER_PUSH_SIZE_KB = EnvInt(24 * 1024)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)

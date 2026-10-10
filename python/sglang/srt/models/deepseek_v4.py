@@ -55,7 +55,7 @@ from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.communicator_dsa_cp import (
-    dsa_cp_gather_hidden_states,
+    dsa_cp_fused_ag_shared_experts,
     dsa_cp_reduce_scatter_hidden_states,
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
@@ -2240,6 +2240,15 @@ class DeepseekV4DecoderLayer(nn.Module):
         input_ids_global: torch.Tensor,
     ) -> torch.Tensor:
         _use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
+        _fuse_cp_moe_reduce_scatter = (
+            envs.SGLANG_DSV41_MOE_FINALIZE_REDUCE_SCATTER.get()
+            and _use_cp
+            and get_moe_a2a_backend().is_none()
+            and get_platform().is_sm90
+            and hidden_states.is_cuda
+            and not get_is_capture_mode()
+            and self.mlp.experts.supports_deferred_finalize
+        )
         _use_tp_moe_gather = (
             not _use_cp
             and get_parallel().attn_dp_size > 1
@@ -2296,10 +2305,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             and getattr(self.mlp, "shared_experts", None) is not None
             and getattr(self.mlp, "_shared_expert_tp1", False)
         )
+        cp_precomputed_shared_output = None
         if _use_cp:
             moe_a2a_backend = get_moe_a2a_backend()
             if moe_a2a_backend.is_none():
-                hidden_states = dsa_cp_gather_hidden_states(hidden_states)
+                hidden_states, cp_precomputed_shared_output = (
+                    dsa_cp_fused_ag_shared_experts(
+                        self.mlp,
+                        forward_batch,
+                        hidden_states,
+                    )
+                )
             else:
                 assert (
                     moe_a2a_backend.is_deepep()
@@ -2329,7 +2345,13 @@ class DeepseekV4DecoderLayer(nn.Module):
         # Skip the MoE-internal post-experts all_reduce when we will do the
         # reduce via reduce_scatterv/reduce_scatter at the combine below
         # (else double-reduce).
-        with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
+        with get_forward().scoped(
+            mlp_reduce_scatter=mlp_reduce_scatter,
+            cp_moe_precomputed_shared_output=cp_precomputed_shared_output,
+            defer_cp_moe_shared_add=_fuse_cp_moe_reduce_scatter,
+            cp_moe_shared_output=None,
+            cp_moe_deferred_output=None,
+        ):
             hidden_states = self.mlp(
                 hidden_states,
                 forward_batch,
@@ -2337,8 +2359,14 @@ class DeepseekV4DecoderLayer(nn.Module):
                 input_ids_global=input_ids_global,
                 skip_shared_experts=_do_shared_local,
             )
+            cp_moe_shared_output = get_forward().cp_moe_shared_output
+            cp_moe_deferred_output = get_forward().cp_moe_deferred_output
         if _use_cp and get_moe_a2a_backend().is_none():
-            hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
+            hidden_states = dsa_cp_reduce_scatter_hidden_states(
+                hidden_states,
+                pre_reduce=cp_moe_shared_output,
+                deferred_moe=cp_moe_deferred_output,
+            )
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_tp_group()),

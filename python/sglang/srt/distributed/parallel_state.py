@@ -295,6 +295,7 @@ class GroupCoordinator:
         recovered_rank: bool = False,
         rank_offset: int = 0,
         max_world_size: Optional[int] = None,
+        custom_allreduce_max_push_size: Optional[int] = None,
     ):
         # Set group info
         group_name = group_name or "anonymous"
@@ -476,9 +477,18 @@ class GroupCoordinator:
                     group=self.cpu_group,
                     device=self.device,
                 )
+                ca_kwargs = {}
+                if custom_allreduce_max_push_size is not None:
+                    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+                        CustomAllReduceV2,
+                    )
+
+                    if CAClass is CustomAllReduceV2:
+                        ca_kwargs["max_push_size"] = custom_allreduce_max_push_size
                 self.ca_comm = CAClass(
                     group=self.cpu_group,
                     device=self.device,
+                    **ca_kwargs,
                 )
             except Exception as e:
                 logger.warning(
@@ -502,7 +512,13 @@ class GroupCoordinator:
             logger.info("[AR] All-reduce call path: NCCL (custom AR disabled)")
 
         self.torch_symm_mem_comm: Optional[TorchSymmMemCommunicator] = None
-        if self.use_torch_symm_mem_all_reduce and self.world_size > 1:
+        if (
+            self.use_torch_symm_mem_all_reduce
+            or (
+                envs.SGLANG_DSV41_CP_AG_SHARED_GEMM.get()
+                and group_name in ("tp", "attn_cp")
+            )
+        ) and self.world_size > 1:
             self.torch_symm_mem_comm = TorchSymmMemCommunicator(
                 group=self.cpu_group,
                 device=self.device,
@@ -938,7 +954,7 @@ class GroupCoordinator:
             return "pymscclpp"
         if (
             self.torch_symm_mem_comm is not None
-            and not self.torch_symm_mem_comm.disabled
+            and not self.torch_symm_mem_comm.allreduce_disabled
             and self.torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
         ):
             return "torch_symm_mem"
@@ -1004,7 +1020,7 @@ class GroupCoordinator:
             assert not qr_comm.disabled
             out = qr_comm.quick_all_reduce(input_)
         elif outplace_all_reduce_method == "torch_symm_mem":
-            assert not torch_symm_mem_comm.disabled
+            assert not torch_symm_mem_comm.allreduce_disabled
             out = torch_symm_mem_comm.all_reduce(input_)
         elif outplace_all_reduce_method == "pymscclpp":
             assert not pymscclpp_comm.disabled
@@ -1022,7 +1038,7 @@ class GroupCoordinator:
             pynccl_comm.all_reduce(input_)
         elif (
             torch_symm_mem_comm is not None
-            and not torch_symm_mem_comm.disabled
+            and not torch_symm_mem_comm.allreduce_disabled
             and torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
         ):
             torch_symm_mem_comm.all_reduce(input_, out=input_)
@@ -2035,6 +2051,7 @@ def init_model_parallel_group(
     recovered_rank: bool = False,
     rank_offset: int = 0,
     max_world_size: Optional[int] = None,
+    custom_allreduce_max_push_size: Optional[int] = None,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
@@ -2062,6 +2079,7 @@ def init_model_parallel_group(
         recovered_rank=recovered_rank,
         rank_offset=rank_offset,
         max_world_size=max_world_size,
+        custom_allreduce_max_push_size=custom_allreduce_max_push_size,
     )
 
 
@@ -2602,6 +2620,12 @@ def initialize_model_parallel(
         recovered_rank=recovered_rank,
         rank_offset=rank_offset,
         max_world_size=max_world_size,
+        custom_allreduce_max_push_size=(
+            envs.SGLANG_DSV41_MOE_FINALIZE_REDUCE_SCATTER_PUSH_SIZE_KB.get() * 1024
+            if envs.SGLANG_DSV41_MOE_FINALIZE_REDUCE_SCATTER.get()
+            and attention_context_model_parallel_size == tensor_model_parallel_size
+            else None
+        ),
     )
 
     if duplicate_tp_group:
@@ -2693,6 +2717,11 @@ def initialize_model_parallel(
             recovered_rank=recovered_rank,
             rank_offset=rank_offset,
             max_world_size=max_world_size,
+            custom_allreduce_max_push_size=(
+                envs.SGLANG_DSV41_MOE_FINALIZE_REDUCE_SCATTER_PUSH_SIZE_KB.get() * 1024
+                if envs.SGLANG_DSV41_MOE_FINALIZE_REDUCE_SCATTER.get()
+                else None
+            ),
         )
 
     if duplicate_attn_cp_group and is_hip():

@@ -12,7 +12,11 @@ from sglang.srt.distributed.device_communicators.all_reduce_utils import (
     TORCH_SYMM_MEM_ALL_REDUCE_MAX_SIZES,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    max_prefill_buffer_tokens,
+)
 from sglang.srt.utils import is_cuda, is_hip
 
 try:
@@ -61,8 +65,13 @@ class TorchSymmMemCommunicator:
         """
 
         self.disabled = True
+        self.allreduce_disabled = True
+        self.use_cp_fused_ag = False
         self.buffer = None
         self.max_size = 0
+        self._ag_gemm_ctx = None
+        self._ag_gemm_key = None
+        self._ag_gemm_stream: Optional[torch.cuda.Stream] = None
 
         if not torch_symm_mem_available:
             return
@@ -113,15 +122,59 @@ class TorchSymmMemCommunicator:
             dtype=self.dtype,
         )
         handle = torch_symm_mem.rendezvous(self.buffer, self.group.group_name)
+        self.disabled = False
         if handle.multicast_ptr == 0:
             logger.warning(
                 "TorchSymmMemCommunicator: torch symmetric memory "
-                "multicast operations are not supported."
+                "multicast operations are not supported; all-reduce disabled."
             )
-            self.buffer = None
-            self.disabled = True
+            self.allreduce_disabled = True
             return
-        self.disabled = False
+        self.allreduce_disabled = False
+
+    def set_use_cp_fused_ag(self, value: bool) -> None:
+        self.use_cp_fused_ag = value
+
+    @staticmethod
+    def get_active_comm() -> "Optional[TorchSymmMemCommunicator]":
+        from sglang.srt.distributed import get_tp_group
+
+        comm = get_tp_group().torch_symm_mem_comm
+        if comm is None or comm.disabled or not comm.use_cp_fused_ag:
+            return None
+        return comm
+
+    def get_or_create_ag_gemm_ctx(self, K: int, NUM_COMM_SMS: int = 0):
+        if self.disabled:
+            return None
+        cp = get_parallel().attn_cp_group
+        key = (K, NUM_COMM_SMS, cp.world_size)
+        if self._ag_gemm_key == key and self._ag_gemm_ctx is not None:
+            return self._ag_gemm_ctx
+        if self._ag_gemm_ctx is not None:
+            self._ag_gemm_ctx.finalize()
+            self._ag_gemm_ctx = None
+            self._ag_gemm_key = None
+
+        from sglang.srt.distributed.device_communicators.symm_mem_kernels import (
+            create_allgather_gemm_context_symm_mem,
+        )
+
+        if self._ag_gemm_stream is None:
+            self._ag_gemm_stream = torch.cuda.Stream(device=self.device, priority=-1)
+        max_tokens = max_prefill_buffer_tokens()
+        self._ag_gemm_ctx = create_allgather_gemm_context_symm_mem(
+            ag_stream=self._ag_gemm_stream,
+            rank=cp.rank_in_group,
+            world_size=cp.world_size,
+            max_M=(max_tokens + cp.world_size - 1) // cp.world_size,
+            K=K,
+            NUM_COMM_SMS=NUM_COMM_SMS,
+            enable_multicast=False,
+            group=cp.cpu_group,
+        )
+        self._ag_gemm_key = key
+        return self._ag_gemm_ctx
 
     def should_torch_symm_mem_allreduce(self, inp: torch.Tensor):
         """
@@ -136,7 +189,7 @@ class TorchSymmMemCommunicator:
         Returns:
             True if the symmetric-memory path can handle this tensor.
         """
-        if self.disabled:
+        if self.disabled or self.allreduce_disabled:
             return False
         if inp.device != self.device:
             return False
