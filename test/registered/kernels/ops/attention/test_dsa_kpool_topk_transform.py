@@ -142,7 +142,7 @@ class TestDsaKpoolTopkTransform(CustomTestCase):
         out = fast_kpool_topk_transform_fused(
             score=score,
             lengths=lengths,
-            pool_size=POOL_SIZE,
+            kpool=POOL_SIZE,
             topk=group_topk * POOL_SIZE,
             page_table=page_table,
             topk_indices_offset=topk_indices_offset,
@@ -331,7 +331,7 @@ class TestDsaKpoolTopkTransform(CustomTestCase):
         out = fast_kpool_topk_transform_fused(
             score=score.cuda(),
             lengths=lengths.cuda(),
-            pool_size=pool_size,
+            kpool=pool_size,
             topk=topk,
             page_table=page_table.cuda(),
             seq_lens=seq_lens.cuda(),
