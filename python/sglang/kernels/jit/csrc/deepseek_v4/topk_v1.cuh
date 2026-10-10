@@ -73,7 +73,6 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const 
   ::sglang::device::legacy_radix_topk::
       select<kTopKBlockSize, kMaxTopK, static_cast<int>(kSMEM / (2 * sizeof(int32_t)))>(
           input, output, 0, static_cast<int>(length), static_cast<int>(topk));
-  __syncthreads();
 }
 
 template <bool kUsePDL>

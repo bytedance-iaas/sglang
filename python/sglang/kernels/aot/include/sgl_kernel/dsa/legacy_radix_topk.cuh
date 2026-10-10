@@ -9,9 +9,7 @@ namespace sglang::device::legacy_radix_topk {
 
 inline constexpr int kRadix = 256;
 
-// The legacy DSA selectors first partition finite FP32 scores by the high byte
-// of their ordered FP16 representation. This keeps their common-case binning
-// and performance unchanged. Exact refinement uses the monotone FP32 key.
+// Coarse bin: high byte of the ordered FP16 value, as in the original selectors.
 __device__ __forceinline__ uint8_t coarse_key(float x) {
   const __half h = __float2half_rn(x);
   const uint16_t bits = __half_as_ushort(h);
@@ -24,19 +22,9 @@ __device__ __forceinline__ uint32_t exact_key(float x) {
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 
-// Exact, allocation-free radix selection for the legacy DSA kernels.
-//
-// The normal path preserves the original two-stash algorithm. Its threshold
-// bin is safe to materialize because it fits below the shared-memory capacity.
-// At or above that capacity, we instead rescan the coarse bin while descending
-// the four bytes of the ordered FP32 key. No candidate is emitted or discarded
-// before the exact cutoff is known; the final scan then fills disjoint strict
-// and exact-tie output ranges.
-//
-// Scores must be finite. For valid input (length > topk > 0), every output slot
-// is filled with a distinct index in [0, length). Defensive initialization and
-// bounds checks turn any violated invariant into -1 padding instead of an
-// out-of-bounds store or a garbage page-table lookup.
+// Exact radix top-k over finite scores. A threshold bin that fits the stash
+// keeps the original two-stash refinement; a larger one is refined by rescanning
+// the input. Unfilled output slots stay -1.
 template <int BlockSize, int OutputCapacity, int StashEntries>
 __device__ __forceinline__ void
 select(const float* __restrict__ input, int32_t* __restrict__ output, int row_start, int length, int topk) {
@@ -108,37 +96,49 @@ select(const float* __restrict__ input, int32_t* __restrict__ output, int row_st
   const int coarse_population = histogram[coarse_threshold] - histogram[coarse_threshold + 1];
   __syncthreads();
   if (coarse_population >= StashEntries) {
-    // Emit the values above the coarse threshold once. The oversized bin is
-    // then refined without intermediate emissions: four histogram passes find
-    // the exact cutoff, and one final pass writes the strictly-greater values
-    // and the required number of exact ties into disjoint output ranges.
-    for (int idx = tx; idx < length; idx += BlockSize) {
-      if (coarse_key(input[row_start + idx]) > coarse_threshold) {
-        const int pos = atomicAdd(&counter, 1);
-        if (pos < topk) output[pos] = idx;
-      }
-    }
-    __syncthreads();
-
+    // Find the exact cutoff one key byte per pass. Pass L counts byte L and
+    // emits what byte L-1 placed strictly above the cutoff; pass 0 emits the
+    // values above the coarse bin and pass 4 the last strict values and ties.
     uint32_t prefix = 0;
+    int last_threshold = -1;
     int strict_count = 0;
-#pragma unroll 4
-    for (int level = 0; level < 4; ++level) {
-      const int shift = 24 - level * 8;
-      const uint32_t prefix_mask = level == 0 ? 0u : (~0u << (32 - level * 8));
-
-      if (tx < kRadix + 1) histogram[tx] = 0;
-      if (tx == 0) threshold_bin_id = -1;
+#pragma unroll 1
+    for (int level = 0; level <= 4; ++level) {
+      const uint32_t mask = level == 0 ? 0u : (~0u << (32 - level * 8));
+      const uint32_t last_mask = level <= 1 ? 0u : (~0u << (40 - level * 8));
+      const int last_shift = 32 - level * 8;
+      if (level < 4) {
+        if (tx < kRadix + 1) histogram[tx] = 0;
+        if (tx == 0) threshold_bin_id = -1;
+      }
       __syncthreads();
 
       for (int idx = tx; idx < length; idx += BlockSize) {
         const float value = input[row_start + idx];
-        if (coarse_key(value) != coarse_threshold) continue;
+        const int bin = coarse_key(value);
+        if (bin != coarse_threshold) {
+          if (level == 0 && bin > coarse_threshold) {
+            const int pos = atomicAdd(&counter, 1);
+            if (pos < topk) output[pos] = idx;
+          }
+          continue;
+        }
         const uint32_t key = exact_key(value);
-        if ((key & prefix_mask) != prefix) continue;
-        atomicAdd(&histogram[(key >> shift) & 0xFFu], 1);
+        if (level > 0 && (key & last_mask) == (prefix & last_mask) &&
+            static_cast<int>((key >> last_shift) & 0xFFu) > last_threshold) {
+          const int pos = atomicAdd(&num_input[0], 1);
+          if (pos < strict_count) output[coarse_above + pos] = idx;
+        } else if ((key & mask) == prefix) {
+          if (level < 4) {
+            atomicAdd(&histogram[(key >> (24 - level * 8)) & 0xFFu], 1);
+          } else {
+            const int pos = atomicAdd(&num_input[1], 1);
+            if (pos < remaining) output[coarse_above + strict_count + pos] = idx;
+          }
+        }
       }
       __syncthreads();
+      if (level == 4) return;
 
       run_cumsum();
       if (tx < kRadix && histogram[tx] >= remaining && histogram[tx + 1] < remaining) {
@@ -151,36 +151,15 @@ select(const float* __restrict__ input, int32_t* __restrict__ output, int row_st
       const int above = histogram[threshold + 1];
       strict_count += above;
       remaining -= above;
-      prefix |= static_cast<uint32_t>(threshold) << shift;
-      // Every thread consumes the shared threshold/cumulative histogram above;
-      // do not let a faster warp clear them for the next refinement round.
+      prefix |= static_cast<uint32_t>(threshold) << (24 - level * 8);
+      last_threshold = threshold;
+      // All threads must read the histogram before the next pass clears it.
       __syncthreads();
     }
-
-    if (tx == 0) {
-      num_input[0] = 0;
-      num_input[1] = 0;
-    }
-    __syncthreads();
-    for (int idx = tx; idx < length; idx += BlockSize) {
-      const float value = input[row_start + idx];
-      if (coarse_key(value) != coarse_threshold) continue;
-      const uint32_t key = exact_key(value);
-      if (key > prefix) {
-        const int pos = atomicAdd(&num_input[0], 1);
-        if (pos < strict_count) output[coarse_above + pos] = idx;
-      } else if (key == prefix) {
-        const int pos = atomicAdd(&num_input[1], 1);
-        if (pos < remaining) output[coarse_above + strict_count + pos] = idx;
-      }
-    }
-    __syncthreads();
     return;
   }
 
-  // The complete coarse threshold bin fits below capacity: keep the original
-  // stash/refine path, now with unconditional state initialization and bounded
-  // emissions.
+  // The threshold bin fits the stash: original two-stash refinement.
   if (tx < kRadix + 1) histogram[tx] = 0;
   __syncthreads();
   for (int idx = tx; idx < length; idx += BlockSize) {
