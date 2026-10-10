@@ -318,6 +318,7 @@ class DeepseekV2MLP(nn.Module):
         x,
         forward_batch=None,
         gemm_output_zero_allocator: BumpAllocator = None,
+        precomputed_gate_up: Optional[torch.Tensor] = None,
         gateup_pre_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         if (self.tp_size == 1) and x.shape[0] == 0:
@@ -348,7 +349,9 @@ class DeepseekV2MLP(nn.Module):
             out, _ = self.down_proj((out_fp4, out_scale))
             return out
 
-        if gateup_pre_quant is not None:
+        if precomputed_gate_up is not None:
+            gate_up = precomputed_gate_up
+        elif gateup_pre_quant is not None:
             # SGLANG_OPT_MOE_QUANT_ONCE: reuse the caller's per-token-group-128
             # fp8 (q, scale) of x for the gate_up GEMM instead of re-quantizing
             # inside the fp8 linear method. q rows may be padded to a multiple
@@ -1084,7 +1087,7 @@ class DeepseekV2MoE(nn.Module):
         # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): shared expert is computed on the LOCAL
         # hidden in the decoder layer (before the dp gather) and added after the
         # reduce_scatterv. When set, never compute/add it here (on the global buffer).
-        shared_output = None
+        shared_output = get_forward().cp_moe_precomputed_shared_output
         if hidden_states.shape[0] > 0:
             # Quantize-once (SGLANG_OPT_MOE_QUANT_ONCE): only worthwhile when
             # the shared expert also runs here on the same tensor.
@@ -1097,6 +1100,7 @@ class DeepseekV2MoE(nn.Module):
                 not defer_shared
                 and not self._fuse_shared_experts_inside_sbo
                 and not skip_shared_experts
+                and shared_output is None
             ):
                 shared_output = self._forward_shared_experts(
                     hidden_states,
@@ -1153,7 +1157,16 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
 
-        if pre_quant_input is not None:
+        defer_cp_finalize = (
+            get_forward().defer_cp_moe_shared_add
+            and self.experts.supports_deferred_finalize
+        )
+        if defer_cp_finalize:
+            final_hidden_states = self.experts.forward_deferred_finalize(
+                hidden_states,
+                topk_output,
+            )
+        elif pre_quant_input is not None:
             final_hidden_states = self.experts(
                 hidden_states,
                 topk_output,
@@ -1179,6 +1192,7 @@ class DeepseekV2MoE(nn.Module):
             and hidden_states.shape[0] > 0
             and not self._fuse_shared_experts_inside_sbo
             and not skip_shared_experts
+            and shared_output is None
         ):
             shared_output = self._forward_shared_experts(
                 hidden_states,
@@ -1186,12 +1200,28 @@ class DeepseekV2MoE(nn.Module):
                 pre_quant_input=pre_quant_input,
             )
 
-        final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
-            self.experts,
-            final_hidden_states,
-            None if self._shared_expert_tp1 else shared_output,
-            self.routed_scaling_factor,
+        defer_cp_shared_add = (
+            get_forward().defer_cp_moe_shared_add
+            and shared_output is not None
+            and not self._shared_expert_tp1
         )
+        if defer_cp_finalize:
+            get_forward().set("cp_moe_deferred_output", final_hidden_states)
+            get_forward().set("cp_moe_shared_output", shared_output)
+            final_hidden_states = shared_output
+        else:
+            final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
+                self.experts,
+                final_hidden_states,
+                (
+                    None
+                    if self._shared_expert_tp1 or defer_cp_shared_add
+                    else shared_output
+                ),
+                self.routed_scaling_factor,
+            )
+            if defer_cp_shared_add:
+                get_forward().set("cp_moe_shared_output", shared_output)
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
