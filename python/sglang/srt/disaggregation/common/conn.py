@@ -29,6 +29,7 @@ from sglang.srt.disaggregation.base.conn import (
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     filter_kv_indices_for_cp_rank,
+    get_dsv41_spec_layout,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.environ import envs
@@ -102,6 +103,7 @@ class PrefillServerInfo:
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
     enable_dsa_cache_layer_split: bool = False
+    dsv41_spec_layout: Optional[dict] = None
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -153,6 +155,7 @@ class CommonKVManager(BaseKVManager):
     ):
         self.kv_args = args
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
+        self.dsv41_spec_layout = get_dsv41_spec_layout(args)
         self.kv_item_lens_sum = sum(args.kv_item_lens)
         self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
         self.is_mla_backend = is_mla_backend
@@ -741,15 +744,21 @@ class CommonKVManager(BaseKVManager):
             else:
                 required_prefill_response_num *= info.attn_cp_size // self.attn_cp_size
 
-        # PP rank mapping — decode pp size should be equal to prefill pp size or 1
-        assert self.pp_size == info.pp_size or self.pp_size == 1, (
-            f"Decode pp size ({self.pp_size}) should be equal to prefill pp size ({info.pp_size}) or 1",
+        # A decode stage may gather from a contiguous group of finer-grained
+        # prefill stages, provided both pipeline partitions align evenly.
+        assert info.pp_size % self.pp_size == 0, (
+            f"Prefill pp size ({info.pp_size}) should be a multiple of decode "
+            f"pp size ({self.pp_size})",
         )
-        if info.pp_size == self.pp_size:
-            target_pp_ranks = [self.pp_rank]
-        else:
-            target_pp_ranks = list(range(info.pp_size))
-            required_prefill_response_num *= info.pp_size // self.pp_size
+        prefill_stages_per_decode_stage = info.pp_size // self.pp_size
+        target_pp_rank_start = self.pp_rank * prefill_stages_per_decode_stage
+        target_pp_ranks = list(
+            range(
+                target_pp_rank_start,
+                target_pp_rank_start + prefill_stages_per_decode_stage,
+            )
+        )
+        required_prefill_response_num *= prefill_stages_per_decode_stage
 
         info.target_tp_rank = target_tp_rank
         info.target_tp_ranks = target_tp_ranks
@@ -820,6 +829,7 @@ class CommonKVManager(BaseKVManager):
             "rank_port": self.rank_port,
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.kv_cache_dtype_str,
+            "dsv41_spec_layout": self.dsv41_spec_layout,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
             # Self-register the HTTP API port so the decode can derive the PD
@@ -1679,6 +1689,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.dp_size = None
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
+        self.dsv41_spec_layout: Optional[dict] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
@@ -1840,6 +1851,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 pp_size=self.pp_size,
                 page_size=self.page_size,
                 kv_cache_dtype=self.kv_cache_dtype,
+                dsv41_spec_layout=self.dsv41_spec_layout,
                 follow_bootstrap_room=(
                     self.follow_bootstrap_room
                     if self.follow_bootstrap_room is not None

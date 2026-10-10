@@ -2148,6 +2148,26 @@ class ServerArgs:
         "off the schedule is byte-for-byte unchanged.",
         NS("spec"),
     ] = False
+    speculative_dspark_pp_replicated_draft: A[
+        bool,
+        "Experimental DSPARK mode for pipeline parallelism. Replicate the TP draft "
+        "model on every pipeline stage, with a fixed owner per request and "
+        "next-round proposal relay. Prefill supports PP > 1; Decode currently "
+        "supports PP2. Requires a bundled DeepSeek-V4 checkpoint, PD on both "
+        "endpoints, greedy sampling, static verify, disabled radix cache, and no "
+        "mixed chunk or context parallelism. Full attention DP is supported with "
+        "attn_dp_size == tp_size. Decode CUDA graphs are supported; prefill CUDA "
+        "graphs must be disabled.",
+        NS("spec"),
+    ] = False
+    speculative_draft_scheduling_policy: A[
+        Literal["tail", "bubble"],
+        "Draft scheduling policy for replicated PP DSPARK. 'tail' drafts inline "
+        "after verify and preserves the default behavior. 'bubble' queues "
+        "owner-local draft work and dispatches it only after the stage's target "
+        "forward has been submitted.",
+        NS("spec"),
+    ] = "tail"
     speculative_accept_threshold_single: A[
         float,
         "Accept a draft token if its probability in the target model is greater than this threshold.",

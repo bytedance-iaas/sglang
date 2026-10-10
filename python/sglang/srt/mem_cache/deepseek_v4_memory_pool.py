@@ -727,6 +727,21 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         return data_ptrs, data_lens, item_lens
 
+    def get_kv_layer_ids(self) -> List[int]:
+        """Global layer id for each entry returned by get_contiguous_buf_infos."""
+        stage_layer_ids = list(range(self._stage_start, self._stage_end))
+        c4_layer_ids = [
+            layer_id
+            for layer_id in stage_layer_ids
+            if self.compression_ratios[layer_id] == 4
+        ]
+        c128_layer_ids = [
+            layer_id
+            for layer_id in stage_layer_ids
+            if self.compression_ratios[layer_id] == 128
+        ]
+        return c4_layer_ids + c4_layer_ids + c128_layer_ids
+
     def get_unified_swa_ring_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         """SWA-ring region [0, swa_pages) of every unified_kv layer, addressed
         per-row by ring slot. Shipped as the StateType.SWA_RING PD component."""

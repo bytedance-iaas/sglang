@@ -70,6 +70,8 @@ class TestDisaggregationWire(unittest.TestCase):
             b"4096",
             b"4",
             b"2",
+            b"",
+            struct.pack("2Q", 128, 256),
         ]
 
         info = KVArgsRegisterInfo.from_zmq(msg)
@@ -78,6 +80,7 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertEqual(info.staging_total_size, 4096)
         self.assertEqual(info.dst_dcp_size, 4)
         self.assertEqual(info.dst_dcp_rank, 2)
+        self.assertEqual(info.dst_kv_item_lens, [128, 256])
 
     def test_int_lists_roundtrip(self):
         cases = [
@@ -445,12 +448,13 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             # positions are passed through unremapped.
             ("other", False, False, False, unremapped),
         ):
-            with self.subTest(platform=platform), envs.SGLANG_DSA_FUSE_TOPK.override(
-                True
-            ), patch(
-                "sglang.srt.layers.attention.dsa.utils.is_cuda", return_value=cuda
-            ), patch(
-                "sglang.srt.layers.attention.dsa.utils.is_hip", return_value=hip
+            with (
+                self.subTest(platform=platform),
+                envs.SGLANG_DSA_FUSE_TOPK.override(True),
+                patch(
+                    "sglang.srt.layers.attention.dsa.utils.is_cuda", return_value=cuda
+                ),
+                patch("sglang.srt.layers.attention.dsa.utils.is_hip", return_value=hip),
             ):
                 self.assertEqual(
                     should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend=True),
@@ -551,6 +555,9 @@ def _buf_infos(*ptrs):
 def _make_dsv4_target(*, unified, mapping=None):
     pool = object.__new__(DeepSeekV4TokenToKVPool)
     pool._unified_kv = unified
+    pool.compression_ratios = [0]
+    pool._stage_start = 0
+    pool._stage_end = 1
     pool.page_size = 256
     pool.sliding_window = 128
     pool.full_to_swa_index_mapping = mapping
@@ -569,6 +576,8 @@ def _make_dsv4_draft(*, unified, mapping=None):
     pool = object.__new__(DeepSeekV4TokenToKVPool)
     pool._unified_kv = unified
     pool.compression_ratios = [0]
+    pool._stage_start = 0
+    pool._stage_end = 1
     pool.page_size = 256
     pool.sliding_window = 128
     pool.full_to_swa_index_mapping = mapping
@@ -590,26 +599,35 @@ def _make_dsv4_draft(*, unified, mapping=None):
 
 
 class TestDSV4DraftStateRegistration(unittest.TestCase):
-    def test_draft_state_is_a_separate_component(self):
+    def test_draft_state_is_packed_with_target_component(self):
         mapping = torch.arange(16)
         cases = [
             (
                 "paged",
                 _make_dsv4_target(unified=False, mapping=mapping),
                 _make_dsv4_draft(unified=False, mapping=mapping),
-                [StateType.SWA, StateType.SWA],
-                [[11]],
+                [StateType.SWA],
+                0,
+                [[0, 1]],
             ),
             (
                 "unified",
                 _make_dsv4_target(unified=True),
                 _make_dsv4_draft(unified=True),
-                [StateType.SWA, StateType.SWA_RING, StateType.SWA_RING],
-                [[11], [12]],
+                [StateType.SWA, StateType.SWA_RING],
+                1,
+                [[], [0, 1]],
             ),
         ]
 
-        for name, target, draft, expected_types, target_ptrs in cases:
+        for (
+            name,
+            target,
+            draft,
+            expected_types,
+            packed_index,
+            expected_layer_ids,
+        ) in cases:
             with self.subTest(name=name):
                 if draft._unified_kv:
                     expected_infos = draft.get_unified_swa_ring_buf_infos()
@@ -617,13 +635,17 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
                     expected_infos = draft.get_state_buf_infos()
                 kv_args = KVArgs()
 
-                setup_state_kv_args(kv_args, target, draft)
+                setup_state_kv_args(kv_args, target, draft, total_kv_layers=1)
 
                 self.assertEqual(kv_args.state_types, expected_types)
-                self.assertEqual(kv_args.state_data_ptrs[:-1], target_ptrs)
-                self.assertEqual(kv_args.state_data_ptrs[-1], expected_infos[0])
-                self.assertEqual(kv_args.state_data_lens[-1], expected_infos[1])
-                self.assertEqual(kv_args.state_item_lens[-1], expected_infos[2])
+                self.assertEqual(
+                    kv_args.state_data_ptrs[packed_index],
+                    [11 if not draft._unified_kv else 12] + expected_infos[0],
+                )
+                self.assertEqual(
+                    kv_args.state_layer_ids,
+                    expected_layer_ids,
+                )
 
 
 if __name__ == "__main__":

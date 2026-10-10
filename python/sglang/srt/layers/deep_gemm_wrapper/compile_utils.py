@@ -346,6 +346,7 @@ class _NormalWarmupExecutor(_BaseWarmupExecutor):
             (self.lhs_q[:m], self.lhs_s[:m]),
             (self.rhs_q, self.rhs_s),
             self.out[:m],
+            compiled_dims="n",
         )
 
 

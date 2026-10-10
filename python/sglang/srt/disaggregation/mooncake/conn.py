@@ -151,6 +151,7 @@ class KVArgsRegisterInfo:
     dst_dcp_rank: int = 0
     requires_dcp_relayout: bool = False
     dcp_token_item_lens: Optional[List[int]] = None
+    dst_kv_item_lens: List[int] = dataclasses.field(default_factory=list)
     staging_base_ptr: int = 0
     staging_total_size: int = 0
     staging: Optional[StagingRegisterInfo] = None
@@ -162,8 +163,8 @@ class KVArgsRegisterInfo:
             endpoint=msg[1].decode("ascii"),
             dst_port=int(msg[2].decode("ascii")),
             mooncake_session_id=msg[3].decode("ascii"),
-            dst_kv_ptrs=list(struct.unpack(f"{len(msg[4])//8}Q", msg[4])),
-            dst_aux_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
+            dst_kv_ptrs=list(struct.unpack(f"{len(msg[4]) // 8}Q", msg[4])),
+            dst_aux_ptrs=list(struct.unpack(f"{len(msg[5]) // 8}Q", msg[5])),
             dst_state_data_ptrs=unpack_int_lists(msg[6], "Q"),
             dst_tp_rank=int(msg[7].decode("ascii")),
             dst_attn_tp_size=int(msg[8].decode("ascii")),
@@ -197,6 +198,11 @@ class KVArgsRegisterInfo:
             ),
             dst_dcp_rank=(
                 int(msg[17].decode("ascii")) if len(msg) > 17 and msg[17] != b"" else 0
+            ),
+            dst_kv_item_lens=(
+                list(struct.unpack(f"{len(msg[19]) // 8}Q", msg[19]))
+                if len(msg) > 19 and msg[19]
+                else []
             ),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14, slot_ids_index=18),
@@ -1079,7 +1085,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if src_layer_ids or dst_layer_ids:
             # Draft buffers break the flat [K block, V block] layout, so pair by
             # layer ID instead of the half-split used by get_mha_kv_ptrs_with_pp.
-            if any(l != src_kv_item_len for l in self.kv_args.kv_item_lens):
+            if any(
+                item_len != src_kv_item_len for item_len in self.kv_args.kv_item_lens
+            ):
                 logger.error(
                     f"[{mooncake_session_id}] head-sliced transfer assumes one item "
                     f"length for every KV entry, got {set(self.kv_args.kv_item_lens)}"
@@ -1351,6 +1359,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             else:
                 dst_data_ptrs, dst_item_lens, dst_dim_per_tensor = [], [], []
                 dst_state_layer_ids = []
+
             dst_indices = (
                 req.dst_state_indices[i] if i < len(req.dst_state_indices) else []
             )
@@ -1451,6 +1460,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
                         executor=executor,
                         state_type=st,
+                        src_layer_ids=src_state_layer_ids,
+                        dst_layer_ids=dst_state_layer_ids,
                     )
                     or rc
                 )
@@ -2337,7 +2348,6 @@ class MooncakeFailureExceptionMixin:
 
 
 class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
-
     def __init__(
         self,
         mgr: MooncakeKVManager,
@@ -2526,6 +2536,10 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                             dst_dcp_size,
                             dst_dcp_rank,
                             packed_staging_slot_layer_ids,
+                            struct.pack(
+                                f"{len(self.kv_mgr.kv_args.kv_item_lens)}Q",
+                                *self.kv_mgr.kv_args.kv_item_lens,
+                            ),
                         ]
                     )
             except zmq.ZMQError:

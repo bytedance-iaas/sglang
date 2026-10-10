@@ -1306,6 +1306,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
             if (
+                pp_proxy_tensors is not None
+                and self.buffers.pp_proxy_tensors is not None
+            ):
+                # The pre-planned verify path ran before the incoming PP proxy
+                # was available. Refresh the stable buffers read by the graph.
+                for key, src in pp_proxy_tensors.tensors.items():
+                    dst = self.buffers.pp_proxy_tensors.get(key)
+                    if dst is not None:
+                        dst[: src.shape[0]].copy_(src)
+            if (
                 not is_ragged
                 and self.model_runner.spec_algorithm.is_dflash_family()
                 and self.model_runner.is_draft_worker
@@ -1512,7 +1522,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         else:
             assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            # PP proxy tensors are token-major. Speculative verify carries
+            # multiple token rows per request, unlike one-token decode.
+            return PPProxyTensors(
+                {k: v[: self.raw_num_token] for k, v in output.tensors.items()}
+            )
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None

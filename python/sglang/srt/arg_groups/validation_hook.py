@@ -37,17 +37,19 @@ _PP_EAGLE_SUPPORTED_ARCHITECTURES = frozenset(
 def check_pipeline_parallel_compat(
     cfg: Any, *, model_architecture: Optional[str] = None
 ) -> None:
-    """Validate the speculative-decoding contract of the PP relay.
-
-    The relay in ``scheduler_pp_mixin`` reconstructs an ``EagleDraftInput``
-    from top-k proposals and target hidden states.  Admit only the topology
-    that exercises that contract today instead of silently treating every
-    speculative algorithm as EAGLE-shaped.
-    """
+    """Validate features used with pipeline parallelism."""
     assert (
         cfg.disable_overlap_schedule
     ), "Pipeline parallelism is not compatible with overlap schedule"
-    if cfg.speculative_algorithm is not None:
+    if cfg.speculative_algorithm == "DSPARK":
+        assert (
+            cfg.disaggregation_mode in ("prefill", "decode")
+            and cfg.speculative_dspark_pp_replicated_draft
+        ), (
+            "Pipeline parallel DSPARK requires PD disaggregation with "
+            "--speculative-dspark-pp-replicated-draft"
+        )
+    elif cfg.speculative_algorithm is not None:
         assert (
             cfg.speculative_algorithm.upper() == "EAGLE"
             and not cfg.enable_multi_layer_eagle
@@ -126,6 +128,14 @@ def check_server_args(server_args: Any):
     check_lora_server_args(server_args)
 
     # Check speculative decoding
+    if getattr(cfg, "speculative_draft_scheduling_policy", "tail") == "bubble":
+        assert (
+            cfg.speculative_algorithm or ""
+        ).upper() == "DSPARK" and cfg.speculative_dspark_pp_replicated_draft, (
+            "--speculative-draft-scheduling-policy=bubble requires DSPARK "
+            "with --speculative-dspark-pp-replicated-draft"
+        )
+
     if cfg.speculative_algorithm is not None:
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
