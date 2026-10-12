@@ -38,6 +38,7 @@ class PPDSparkCandidate:
     identity: PPDSparkIdentity
     draft_block_ids: object
     draft_tokens: object
+    draft_hidden: object = None
     confidence: object = None
 
 
