@@ -128,6 +128,108 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 mega_moe.should_use_mega_moe(moe, torch.zeros((17, 4)))
             self.assertTrue(mega_moe.should_use_mega_moe(moe, torch.zeros((16, 4))))
 
+    def test_eager_shared_expert_overlap_is_opt_in_native_fp8_only(self):
+        native_moe = SimpleNamespace(
+            alt_stream=object(),
+            num_fused_shared_experts=0,
+            shared_experts=object(),
+            experts=SimpleNamespace(_mega_moe_native_fp8=True),
+        )
+        with (
+            patch.object(mega_moe, "get_is_capture_mode", return_value=False),
+            patch.object(
+                mega_moe.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_EAGER_OVERLAP_SHARED_EXPERTS,
+                "get",
+                return_value=False,
+            ),
+        ):
+            self.assertFalse(
+                mega_moe.should_overlap_eager_mega_moe_shared_experts(
+                    native_moe, num_tokens=1
+                )
+            )
+
+        with (
+            patch.object(mega_moe, "get_is_capture_mode", return_value=False),
+            patch.object(
+                mega_moe.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_EAGER_OVERLAP_SHARED_EXPERTS,
+                "get",
+                return_value=True,
+            ),
+        ):
+            self.assertTrue(
+                mega_moe.should_overlap_eager_mega_moe_shared_experts(
+                    native_moe, num_tokens=1
+                )
+            )
+            native_moe.experts._mega_moe_native_fp8 = False
+            self.assertFalse(
+                mega_moe.should_overlap_eager_mega_moe_shared_experts(
+                    native_moe, num_tokens=1
+                )
+            )
+            native_moe.experts._mega_moe_native_fp8 = True
+            self.assertFalse(
+                mega_moe.should_overlap_eager_mega_moe_shared_experts(
+                    native_moe, num_tokens=0
+                )
+            )
+            del native_moe.shared_experts
+            self.assertFalse(
+                mega_moe.should_overlap_eager_mega_moe_shared_experts(
+                    native_moe, num_tokens=1
+                )
+            )
+
+    def test_eager_shared_expert_overlap_uses_graph_stream_order(self):
+        events = []
+
+        class FakeStream:
+            def __init__(self, name):
+                self.name = name
+
+            def wait_stream(self, other):
+                events.append(f"{self.name}_wait_{other.name}")
+
+        current_stream = FakeStream("current")
+        alt_stream = FakeStream("alt")
+
+        def run_shared(_hidden_states):
+            events.append("shared")
+            return torch.ones((1, 4))
+
+        def run_routed(*_args):
+            events.append("routed")
+            return torch.zeros((1, 4))
+
+        moe = SimpleNamespace(
+            alt_stream=alt_stream,
+            num_fused_shared_experts=0,
+            _forward_shared_experts=run_shared,
+        )
+        with (
+            patch.object(
+                mega_moe,
+                "should_overlap_eager_mega_moe_shared_experts",
+                return_value=True,
+            ),
+            patch.object(mega_moe, "get_is_capture_mode", return_value=False),
+            patch.object(
+                mega_moe.torch.cuda,
+                "current_stream",
+                return_value=current_stream,
+            ),
+            patch.object(mega_moe.torch.cuda, "stream", return_value=nullcontext()),
+            patch.object(mega_moe, "_run_mega_routed", side_effect=run_routed),
+        ):
+            actual = mega_moe.forward_mega_moe(moe, torch.zeros((1, 4)))
+
+        self.assertEqual(
+            events,
+            ["alt_wait_current", "shared", "routed", "current_wait_alt"],
+        )
+        torch.testing.assert_close(actual, torch.ones((1, 4)))
+
     def test_native_fp8_builder_requantizes_and_keeps_fallback_layout(self):
         layer = SimpleNamespace(
             w13_weight=torch.nn.Parameter(
@@ -163,9 +265,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         ):
             mega_moe.build_native_fp8_mega_moe_experts_weights(layer)
 
-        self.assertEqual(
-            fake_deep_gemm.transform_sf_into_required_layout.call_count, 2
-        )
+        self.assertEqual(fake_deep_gemm.transform_sf_into_required_layout.call_count, 2)
         self.assertTrue(layer._mega_moe_native_fp8)
         self.assertTrue(layer._mega_moe_weights_built)
         self.assertEqual(

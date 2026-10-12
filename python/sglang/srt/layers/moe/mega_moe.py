@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Optional
 
@@ -43,6 +44,8 @@ if TYPE_CHECKING:
 
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
+_eager_shared_expert_overlap_logged = False
+logger = logging.getLogger(__name__)
 
 
 def _mega_moe_mma_type(experts=None) -> str:
@@ -172,6 +175,32 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     return False
 
 
+def should_overlap_eager_mega_moe_shared_experts(
+    moe: DeepseekV2MoE, num_tokens: int
+) -> bool:
+    """Use the existing graph two-stream ordering for eligible eager FP8 work.
+
+    The native FP8 MegaMoE builder is fail-closed and has no safe local-runner
+    fallback after its weight transform. Restrict the eager experiment to that
+    exact path, one real shared expert, and a non-empty batch. Other MegaMoE MMA
+    types keep their established behavior.
+    """
+    eligible = (
+        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_EAGER_OVERLAP_SHARED_EXPERTS.get()
+        and not get_is_capture_mode()
+        and moe.alt_stream is not None
+        and moe.num_fused_shared_experts == 0
+        and hasattr(moe, "shared_experts")
+        and getattr(moe.experts, "_mega_moe_native_fp8", False)
+        and num_tokens > 0
+    )
+    global _eager_shared_expert_overlap_logged
+    if eligible and not _eager_shared_expert_overlap_logged:
+        _eager_shared_expert_overlap_logged = True
+        logger.info("Eager native-FP8 MegaMoE/shared-expert overlap engaged")
+    return eligible
+
+
 def forward_mega_moe(
     moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
@@ -180,14 +209,17 @@ def forward_mega_moe(
 ) -> torch.Tensor:
     num_tokens = hidden_states.shape[0]
 
-    sbo_overlap_flag = (
+    overlap_shared_experts = (
         moe.alt_stream is not None
         and moe.num_fused_shared_experts == 0
         and num_tokens > 0
-        and get_is_capture_mode()
+        and (
+            get_is_capture_mode()
+            or should_overlap_eager_mega_moe_shared_experts(moe, num_tokens)
+        )
     )
 
-    if sbo_overlap_flag:
+    if overlap_shared_experts:
         current_stream = torch.cuda.current_stream()
         moe.alt_stream.wait_stream(current_stream)
         shared_output = moe._forward_shared_experts(hidden_states)
@@ -201,7 +233,7 @@ def forward_mega_moe(
             moe, hidden_states, forward_batch, input_ids_global, num_tokens
         )
 
-    if sbo_overlap_flag:
+    if overlap_shared_experts:
         current_stream.wait_stream(moe.alt_stream)
 
     if shared_output is not None:
@@ -472,9 +504,11 @@ def build_native_fp8_mega_moe_experts_weights(experts) -> None:
             scale_k32 = ceil_to_ue8m0(
                 blocks.abs().float().amax(dim=-1).clamp_min(1e-4) / 448.0
             )
-            weight.data = (blocks / scale_k32.unsqueeze(-1)).to(
-                torch.float8_e4m3fn
-            ).reshape_as(dequant)
+            weight.data = (
+                (blocks / scale_k32.unsqueeze(-1))
+                .to(torch.float8_e4m3fn)
+                .reshape_as(dequant)
+            )
             scale.data = deep_gemm.transform_sf_into_required_layout(
                 scale_k32,
                 mn=n,
@@ -488,9 +522,7 @@ def build_native_fp8_mega_moe_experts_weights(experts) -> None:
         (experts.w13_weight.data, experts.w13_weight_scale_inv.data), "fp8xfp8"
     )
     w13_sf_utccp = _transpose_mega_moe_sf_for_utccp(w13_sf_interleaved)
-    w2_sf_utccp = _transpose_mega_moe_sf_for_utccp(
-        experts.w2_weight_scale_inv.data
-    )
+    w2_sf_utccp = _transpose_mega_moe_sf_for_utccp(experts.w2_weight_scale_inv.data)
 
     # MegaMoE is fail-closed for this backend, so these parameters may use its
     # K32/interleaved representation. A non-MegaMoE server loads the checkpoint
