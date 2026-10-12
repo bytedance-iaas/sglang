@@ -420,14 +420,14 @@ pub struct QueueMetrics {
 /// Queue processor that handles queued requests
 pub struct QueueProcessor {
     token_bucket: Arc<TokenBucket>,
-    queue_rx: mpsc::UnboundedReceiver<QueuedRequest>,
+    queue_rx: mpsc::Receiver<QueuedRequest>,
     queue_timeout: Duration,
 }
 
 impl QueueProcessor {
     pub fn new(
         token_bucket: Arc<TokenBucket>,
-        queue_rx: mpsc::UnboundedReceiver<QueuedRequest>,
+        queue_rx: mpsc::Receiver<QueuedRequest>,
         queue_timeout: Duration,
     ) -> Self {
         Self {
@@ -456,9 +456,8 @@ impl QueueProcessor {
         debug!("Starting concurrency queue processor");
 
         // Process requests serially to preserve FIFO admission. Each waiting request future owns
-        // a semaphore slot, so this transport can be unbounded without making the admission queue
-        // unbounded. A cancelled future releases its slot immediately even if its transport entry
-        // has not been received yet.
+        // a semaphore slot across both channel enqueue and permit wait, so the channel and the
+        // processor together cannot exceed queue_size live waiters.
         while let Some(mut queued) = self.queue_rx.recv().await {
             // Check timeout immediately
             let elapsed = queued.queued_at.elapsed();
@@ -502,7 +501,7 @@ impl QueueProcessor {
 
 /// State for the concurrency limiter
 pub struct ConcurrencyLimiter {
-    pub queue_tx: Option<mpsc::UnboundedSender<QueuedRequest>>,
+    pub queue_tx: Option<mpsc::Sender<QueuedRequest>>,
     pub queue_slots: Option<Arc<Semaphore>>,
 }
 
@@ -522,7 +521,7 @@ impl ConcurrencyLimiter {
                 None,
             ),
             (Some(bucket), size) if size > 0 => {
-                let (queue_tx, queue_rx) = mpsc::unbounded_channel();
+                let (queue_tx, queue_rx) = mpsc::channel(size);
                 let processor = QueueProcessor::new(bucket, queue_rx, queue_timeout);
                 (
                     Self {
@@ -638,9 +637,9 @@ pub async fn concurrency_limit_middleware(
                 permit_tx,
             };
 
-            // The semaphore slot above is the single queue-capacity authority. This unbounded
-            // transport cannot retain capacity after a client future is cancelled.
-            match queue_tx.send(queued) {
+            // The semaphore slot above is the single queue-capacity authority. Waiting to enqueue
+            // is part of this request future, so cancellation releases the slot immediately.
+            match queue_tx.send(queued).await {
                 Ok(_) => {
                     // On successful enqueue, update embeddings queue counter if applicable
                     if is_embeddings {
@@ -1118,7 +1117,7 @@ mod tests {
             .try_acquire(1.0)
             .await
             .expect("initial limiter capacity should be available");
-        let (queue_tx, queue_rx) = mpsc::unbounded_channel();
+        let (queue_tx, queue_rx) = mpsc::channel(2);
         let (first_tx, first_rx) = oneshot::channel();
         let (second_tx, mut second_rx) = oneshot::channel();
 
@@ -1127,12 +1126,14 @@ mod tests {
                 queued_at: Instant::now(),
                 permit_tx: first_tx,
             })
+            .await
             .expect("queue processor receiver should be open");
         queue_tx
             .send(QueuedRequest {
                 queued_at: Instant::now(),
                 permit_tx: second_tx,
             })
+            .await
             .expect("queue processor receiver should be open");
         drop(queue_tx);
 
@@ -1168,13 +1169,14 @@ mod tests {
             .try_acquire(1.0)
             .await
             .expect("initial limiter capacity should be available");
-        let (queue_tx, queue_rx) = mpsc::unbounded_channel();
+        let (queue_tx, queue_rx) = mpsc::channel(1);
         let (permit_tx, permit_rx) = oneshot::channel();
         queue_tx
             .send(QueuedRequest {
                 queued_at: Instant::now(),
                 permit_tx,
             })
+            .await
             .expect("queue processor receiver should be open");
         drop(queue_tx);
 
@@ -1193,7 +1195,7 @@ mod tests {
     #[tokio::test]
     async fn queue_processor_returns_token_when_queued_request_is_cancelled() {
         let token_bucket = Arc::new(TokenBucket::new(1, 0));
-        let (queue_tx, queue_rx) = mpsc::unbounded_channel();
+        let (queue_tx, queue_rx) = mpsc::channel(1);
         let (permit_tx, permit_rx) = oneshot::channel();
 
         drop(permit_rx);
@@ -1202,6 +1204,7 @@ mod tests {
                 queued_at: Instant::now(),
                 permit_tx,
             })
+            .await
             .expect("queue processor receiver should be open");
         drop(queue_tx);
 
@@ -1218,7 +1221,7 @@ mod tests {
     #[tokio::test]
     async fn queued_token_is_returned_when_receiver_drops_after_grant() {
         let token_bucket = Arc::new(TokenBucket::new(1, 0));
-        let (queue_tx, queue_rx) = mpsc::unbounded_channel();
+        let (queue_tx, queue_rx) = mpsc::channel(1);
         let (permit_tx, permit_rx) = oneshot::channel();
 
         queue_tx
@@ -1226,6 +1229,7 @@ mod tests {
                 queued_at: Instant::now(),
                 permit_tx,
             })
+            .await
             .expect("queue processor receiver should be open");
         drop(queue_tx);
 
