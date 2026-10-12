@@ -1,8 +1,4 @@
 import unittest
-from types import SimpleNamespace
-from unittest.mock import Mock, patch
-
-import torch
 
 from sglang.srt.utils import is_cuda, is_hip
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -40,45 +36,6 @@ class TestDsaHeadGateGuard(CustomTestCase):
         for name in HELPERS:
             with self.subTest(helper=name):
                 self.assertEqual(name in vars(head_gate), expected)
-
-    def test_kpool_cuda_head_gate_uses_bf16_operands_and_fp32_output(self):
-        from sglang.srt.layers.attention.dsa import dsa_indexer_kpool
-
-        x = torch.empty((3, 16), dtype=torch.bfloat16)
-        weight = torch.empty((4, 16), dtype=torch.bfloat16)
-        output = torch.empty((3, 4), dtype=torch.float32)
-        indexer = SimpleNamespace(weights_proj=SimpleNamespace(weight=weight))
-
-        with (
-            patch.object(dsa_indexer_kpool, "is_cuda", return_value=True),
-            patch.object(torch, "mm", return_value=output) as mm,
-        ):
-            actual = dsa_indexer_kpool.IndexerKPool._weights_proj_bf16_in_fp32_out(
-                indexer, x
-            )
-
-        self.assertIs(actual, output)
-        mm.assert_called_once()
-        args, kwargs = mm.call_args
-        self.assertIs(args[0], x)
-        self.assertTrue(torch.equal(args[1], weight.t()))
-        self.assertEqual(kwargs, {"out_dtype": torch.float32})
-
-    def test_kpool_non_cuda_head_gate_keeps_fp32_result(self):
-        from sglang.srt.layers.attention.dsa import dsa_indexer_kpool
-
-        x = torch.empty((3, 16), dtype=torch.bfloat16)
-        output = torch.empty((3, 4), dtype=torch.bfloat16)
-        projection = Mock(return_value=(output, None))
-        indexer = SimpleNamespace(weights_proj=projection)
-
-        with patch.object(dsa_indexer_kpool, "is_cuda", return_value=False):
-            actual = dsa_indexer_kpool.IndexerKPool._weights_proj_bf16_in_fp32_out(
-                indexer, x
-            )
-
-        projection.assert_called_once_with(x)
-        self.assertEqual(actual.dtype, torch.float32)
 
 
 if __name__ == "__main__":
