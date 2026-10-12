@@ -211,13 +211,14 @@ class IndexerKPool(MultiPlatformOp):
             quant_config=quant_config,
             prefix=add_prefix("wk", prefix),
         )
-        # Keep weights_proj in FP32 because its accumulation/scale path requires FP32;
-        # checkpoint BF16 weights are cast on load.
+        # Keep the checkpoint's BF16 operands resident and request FP32 output
+        # from the CUDA GEMM. This preserves FP32 accumulation/output without
+        # materializing an FP32 input copy or a persistent FP32 weight.
         self.weights_proj = ReplicatedLinear(
             self.hidden_size,
             self.n_heads,
             bias=False,
-            params_dtype=torch.float32,
+            params_dtype=torch.bfloat16,
             prefix=add_prefix("weights_proj", prefix),
         )
         self.k_norm = LayerNorm(self.head_dim, dtype=torch.float32)
@@ -235,16 +236,23 @@ class IndexerKPool(MultiPlatformOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
+    def _weights_proj_bf16_in_fp32_out(self, x: torch.Tensor) -> torch.Tensor:
+        if is_cuda():
+            return torch.mm(x, self.weights_proj.weight.t(), out_dtype=torch.float32)
+
+        weights, _ = self.weights_proj(x)
+        return weights.float()
+
     @torch.compile(dynamic=True)
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
-        weights, _ = self.weights_proj(x.float())
+        weights = self._weights_proj_bf16_in_fp32_out(x)
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
 
     @torch.compile(dynamic=True)
     def _project_and_scale_head_gates(self, x: torch.Tensor) -> torch.Tensor:
-        weights, _ = self.weights_proj(x.float())
+        weights = self._weights_proj_bf16_in_fp32_out(x)
         return weights * self.n_heads**-0.5
 
     @torch.compile(dynamic=True)
