@@ -130,6 +130,7 @@ if TYPE_CHECKING:
 
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
+_cp_local_prepare_fusion_logged = False
 
 
 if _is_cuda or _is_hip:
@@ -255,8 +256,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
             and not is_neox_style
         )
-        self.alt_stream = alt_stream
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        self.use_dsa_cp_local_prepare_fusion = (
+            self.use_dsa_indexer_fusion
+            and self.dsa_enable_prefill_cp
+            and envs.SGLANG_ENABLE_DSA_CP_LOCAL_PREPARE_FUSION.get()
+        )
+        self.alt_stream = alt_stream
         if self.dsa_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
         else:
@@ -601,6 +607,106 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         key = rotate_activation(key)
 
         return key
+
+    def _fused_cp_local_prepare(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Prepare CP-local Q/K with fused math, then materialize BF16 K.
+
+        This is deliberately narrower than ``_fused_q_prepare_and_store``:
+        CP-v2 owns only an interleaved logical slice on each rank, so K must be
+        gathered back into global token order before the existing page-cache
+        writer runs.  Keep that collective, its BF16 payload, and the writer
+        unchanged; fuse only the rank-local Q/K math that precedes it.
+        """
+
+        assert self.use_dsa_cp_local_prepare_fusion
+        assert forward_batch.attn_cp_metadata is not None
+        assert is_cp_v2_active(forward_batch)
+
+        q_scale_gate = self.softmax_scale * self.n_heads**-0.5
+
+        if self.alt_stream is None:
+            kw, _ = self.wk_weights_proj(x)
+            key_raw, weights_raw = kw.split([self.head_dim, self.n_heads], dim=-1)
+            q = self.wq_b(q_lora)[0].view(-1, self.n_heads, self.head_dim)
+            q_fp8, weights = fused_q_indexer_rope_first_quant(
+                q.contiguous(),
+                weights_raw,
+                q_scale_gate,
+                self._indexer_cos_sin_cache,
+                positions,
+            )
+            key = fused_k_indexer_norm_rope(
+                key_raw,
+                self.k_norm.weight,
+                self.k_norm.bias,
+                self.k_norm.variance_epsilon,
+                self._indexer_cos_sin_cache,
+                positions,
+            )
+            key = get_cp_strategy().materialize_full_indexer_k_cache(key, forward_batch)
+        else:
+            # Match the non-CP fused path's two overlap stages:
+            #   q GEMM (alt) || fused wk/head-gate GEMM (current), then
+            #   fused local K + BF16 gather (alt) || fused Q (current).
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            with torch.cuda.stream(self.alt_stream):
+                q = self.wq_b(q_lora)[0].view(-1, self.n_heads, self.head_dim)
+
+            kw, _ = self.wk_weights_proj(x)
+            key_raw, weights_raw = kw.split([self.head_dim, self.n_heads], dim=-1)
+
+            current_stream.wait_stream(self.alt_stream)
+            self.alt_stream.wait_stream(current_stream)
+            q_fp8, weights = fused_q_indexer_rope_first_quant(
+                q.contiguous(),
+                weights_raw,
+                q_scale_gate,
+                self._indexer_cos_sin_cache,
+                positions,
+            )
+            with torch.cuda.stream(self.alt_stream):
+                key = fused_k_indexer_norm_rope(
+                    key_raw,
+                    self.k_norm.weight,
+                    self.k_norm.bias,
+                    self.k_norm.variance_epsilon,
+                    self._indexer_cos_sin_cache,
+                    positions,
+                )
+                key = get_cp_strategy().materialize_full_indexer_k_cache(
+                    key, forward_batch
+                )
+            current_stream.wait_stream(self.alt_stream)
+
+        global _cp_local_prepare_fusion_logged
+        if not _cp_local_prepare_fusion_logged:
+            logger.info(
+                "DSA CP-v2 local prepare fusion engaged: fused local Q/K, "
+                "BF16 index-K gather and existing FP8 cache store preserved"
+            )
+            _cp_local_prepare_fusion_logged = True
+
+        return q_fp8, weights, key
+
+    def _can_use_cp_local_prepare_fusion(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        in_piecewise_or_breakable_cuda_graph: bool,
+    ) -> bool:
+        return (
+            self.use_dsa_cp_local_prepare_fusion
+            and not in_piecewise_or_breakable_cuda_graph
+            and forward_batch.attn_cp_metadata is not None
+            and is_cp_v2_active(forward_batch)
+        )
 
     def _fused_k_prepare_and_store(
         self,
@@ -1663,7 +1769,20 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self.weights_proj, "set_lora", False
         )
 
-        if (
+        if self._can_use_cp_local_prepare_fusion(
+            forward_batch,
+            in_piecewise_or_breakable_cuda_graph=in_piecewise_or_breakable_cuda_graph,
+        ):
+            q_fp8, weights, key = self._fused_cp_local_prepare(
+                x, q_lora, positions, forward_batch
+            )
+            self._store_index_k_cache(
+                forward_batch=forward_batch,
+                layer_id=layer_id,
+                key=key,
+                act_quant=act_quant,
+            )
+        elif (
             self.use_dsa_indexer_fusion
             and not in_piecewise_or_breakable_cuda_graph
             and forward_batch.attn_cp_metadata is None

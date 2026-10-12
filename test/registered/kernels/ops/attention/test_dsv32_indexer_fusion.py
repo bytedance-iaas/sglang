@@ -270,6 +270,125 @@ def test_indexer_uses_replaced_rope_cache_for_fused_kernels():
     assert ((q_fp8.float() * scale - q_ref).abs() <= 0.0625 * q_ref.abs() + scale).all()
 
 
+@pytest.mark.parametrize("total_tokens", [1, 7, 8, 9, 63, 65])
+def test_cp8_interleave_tail_local_k_matches_global_reference(total_tokens):
+    """Local fused K preparation composes with CP8 interleave gather.
+
+    The real CP-v2 strategy pads every rank to a common physical row count but
+    gathers only its logical prefix.  Reconstruct that operation explicitly so
+    uneven tails and empty logical ranks cannot leak padded rows into index-K.
+    """
+
+    _skip_if_unavailable()
+    dev = "cuda"
+    cp_size = 8
+    physical_rank_len = max(1, (total_tokens + cp_size - 1) // cp_size)
+    g = torch.Generator(device=dev).manual_seed(1000 + total_tokens)
+    cos, sin, cos_sin_cache, positions = _make_inputs(total_tokens)
+    key_global = torch.randn(
+        total_tokens, HEAD_DIM, dtype=torch.bfloat16, device=dev, generator=g
+    )
+    weight = torch.randn(HEAD_DIM, dtype=torch.float32, device=dev, generator=g)
+    bias = torch.randn(HEAD_DIM, dtype=torch.float32, device=dev, generator=g)
+
+    global_ref = fused_k_indexer_norm_rope(
+        key_global, weight, bias, EPS, cos_sin_cache, positions
+    )
+
+    gathered_physical = []
+    logical_lens = []
+    for rank in range(cp_size):
+        local_key = key_global[rank::cp_size]
+        local_positions = positions[rank::cp_size]
+        logical_lens.append(local_key.shape[0])
+
+        padded_key = torch.zeros(
+            physical_rank_len, HEAD_DIM, dtype=torch.bfloat16, device=dev
+        )
+        padded_positions = torch.zeros(
+            physical_rank_len, dtype=positions.dtype, device=dev
+        )
+        padded_key[: local_key.shape[0]] = local_key
+        padded_positions[: local_positions.shape[0]] = local_positions
+        local_out = fused_k_indexer_norm_rope(
+            padded_key, weight, bias, EPS, cos_sin_cache, padded_positions
+        )
+        gathered_physical.append(local_out)
+
+    flattened = torch.cat(gathered_physical, dim=0)
+    restored_rows = []
+    for token in range(total_tokens):
+        rank = token % cp_size
+        local_row = token // cp_size
+        assert local_row < logical_lens[rank]
+        restored_rows.append(flattened[rank * physical_rank_len + local_row])
+    restored = torch.stack(restored_rows)
+    torch.cuda.synchronize()
+
+    assert torch.equal(restored, global_ref)
+
+
+@pytest.mark.parametrize("total_tokens", [7, 9, 65])
+def test_cp8_interleave_tail_store_matches_global_reference(total_tokens):
+    """CP-local fused prepare plus reorder preserves page64 cache bytes."""
+
+    _skip_if_unavailable()
+    if not can_use_dsa_fused_store(torch.bfloat16, torch.int64, PAGE_SIZE):
+        pytest.skip("fused store JIT unavailable")
+
+    dev = "cuda"
+    cp_size = 8
+    physical_rank_len = (total_tokens + cp_size - 1) // cp_size
+    g = torch.Generator(device=dev).manual_seed(2000 + total_tokens)
+    _, _, cos_sin_cache, positions = _make_inputs(total_tokens)
+    key_global = torch.randn(
+        total_tokens, HEAD_DIM, dtype=torch.bfloat16, device=dev, generator=g
+    )
+    weight = torch.randn(HEAD_DIM, dtype=torch.float32, device=dev, generator=g)
+    bias = torch.randn(HEAD_DIM, dtype=torch.float32, device=dev, generator=g)
+
+    global_key = fused_k_indexer_norm_rope(
+        key_global, weight, bias, EPS, cos_sin_cache, positions
+    )
+    restored_parts = []
+    for rank in range(cp_size):
+        local_key = key_global[rank::cp_size]
+        local_positions = positions[rank::cp_size]
+        padded_key = torch.zeros(
+            physical_rank_len, HEAD_DIM, dtype=torch.bfloat16, device=dev
+        )
+        padded_positions = torch.zeros(
+            physical_rank_len, dtype=positions.dtype, device=dev
+        )
+        padded_key[: local_key.shape[0]] = local_key
+        padded_positions[: local_positions.shape[0]] = local_positions
+        restored_parts.append(
+            fused_k_indexer_norm_rope(
+                padded_key, weight, bias, EPS, cos_sin_cache, padded_positions
+            )
+        )
+    flattened = torch.cat(restored_parts, dim=0)
+    restored = torch.stack(
+        [
+            flattened[(token % cp_size) * physical_rank_len + token // cp_size]
+            for token in range(total_tokens)
+        ]
+    )
+
+    loc = torch.randperm(total_tokens * 3, device=dev)[:total_tokens].to(torch.int64)
+    num_pages = int(loc.max().item()) // PAGE_SIZE + 2
+    buf_ref = torch.zeros(
+        num_pages, BYTES_PER_TOKEN * PAGE_SIZE, dtype=torch.uint8, device=dev
+    )
+    buf_cp = torch.zeros_like(buf_ref)
+    fused_store_index_k_cache(global_key, buf_ref, loc, PAGE_SIZE)
+    fused_store_index_k_cache(restored, buf_cp, loc, PAGE_SIZE)
+    torch.cuda.synchronize()
+
+    assert torch.equal(restored, global_key)
+    assert torch.equal(buf_cp, buf_ref)
+
+
 if __name__ == "__main__":
     import sys
 
