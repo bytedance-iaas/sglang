@@ -8,6 +8,15 @@ import torch
 _original_sm90_generator = None
 
 
+def _cutlass_routing_map_to_token_major(
+    routing_map: torch.Tensor,
+    *,
+    num_tokens: int,
+    top_k: int,
+) -> torch.Tensor:
+    return routing_map.view(top_k, num_tokens).transpose(0, 1).contiguous().view(-1)
+
+
 def _replace_once(source: str, old: str, new: str) -> str:
     count = source.count(old)
     if count != 1:
@@ -181,7 +190,13 @@ def cutlass_fused_moe_deferred(
         **kwargs,
     )
     gemm2_out = storage[:gemm2_numel].view(expanded_rows, hidden_size)
-    expanded_idx = storage[gemm2_numel:].view(torch.int32)
+    # CUTLASS stores this map as [top_k, num_tokens], while SGLang's deferred
+    # finalize ABI indexes it as [num_tokens, top_k].
+    expanded_idx = _cutlass_routing_map_to_token_major(
+        storage[gemm2_numel:].view(torch.int32),
+        num_tokens=num_tokens,
+        top_k=top_k,
+    )
     return FlashInferTrtllmDeferredFinalizeOutput(
         gemm2_out=gemm2_out,
         expert_weights=kwargs["token_final_scales"],
