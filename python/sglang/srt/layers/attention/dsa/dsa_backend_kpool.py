@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.kpool_plan import (
     init_kpool_extend_metadata,
     init_kpool_write_plan,
@@ -32,6 +33,16 @@ class _KPoolForwardInputs:
 class DeepseekSparseAttnBackendKPoolMixin:
     """KPool-specific metadata and tail handling for the DSA backend."""
 
+    def _use_kpool_flashmla_v32(self, dsa_impl: _DSA_IMPL_T) -> bool:
+        return (
+            envs.SGLANG_EXPERIMENTAL_DSA_KPOOL_FLASHMLA_V32.get()
+            and self.dsa_index_kpool > 1
+            and self.device_sm_major == 9
+            and dsa_impl == "flashmla_kv"
+            and self.dsa_kv_cache_store_fp8
+            and self.qk_rope_head_dim == 0
+        )
+
     def _check_kpool_tail_backend(
         self,
         topk_indices: Optional[torch.Tensor],
@@ -42,6 +53,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
             topk_indices is None
             or self.dsa_index_kpool <= 1
             or dsa_impl in ("fa3", "tilelang", "trtllm")
+            or self._use_kpool_flashmla_v32(dsa_impl)
         ):
             return
         raise NotImplementedError(
@@ -58,7 +70,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
         if topk_indices is None or self.dsa_index_kpool <= 1:
             return dsa_impl
         if self.device_sm_major >= 10:
-            return "trtllm" if dsa_impl in ("flashmla_sparse", "flashmla_kv") else dsa_impl
+            return (
+                "trtllm" if dsa_impl in ("flashmla_sparse", "flashmla_kv") else dsa_impl
+            )
         if self.device_sm_major == 9 and dsa_impl == "flashmla_sparse":
             return "fa3"
         if (
@@ -67,6 +81,8 @@ class DeepseekSparseAttnBackendKPoolMixin:
             and self.dsa_kv_cache_store_fp8
             and self.qk_rope_head_dim == 0
         ):
+            if self._use_kpool_flashmla_v32(dsa_impl):
+                return "flashmla_kv"
             # GLM-5.3-Flash stores group-scaled FP8 NoPE rows. TileLang's
             # sparse reader dequantizes only the selected rows and supports the
             # index_topk + live-tail width used by KPool draft-extend.

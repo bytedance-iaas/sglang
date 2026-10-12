@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Dict,
@@ -302,6 +302,10 @@ class DSAMetadata:
     pooled_paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
     kpool_extend_plan: Optional[KPoolExtendPlan] = None
     kpool_write_plan: Optional[KPoolWritePlan] = None
+    # Mutable FlashMLASchedMeta objects are owned by one eager/captured batch
+    # metadata instance. Graph capture therefore keeps the scheduler buffers
+    # alive without sharing them across batch sizes or phases.
+    kpool_flashmla_sched_meta: dict[tuple, object] = field(default_factory=dict)
 
 
 @torch.compile
@@ -492,7 +496,6 @@ class DeepseekSparseAttnBackend(
         self._triton_sparse_mla_workspaces: dict[
             int, list[tuple[torch.Tensor, torch.Tensor]]
         ] = {}
-
         # Hoisted per-call imports of set_dsa_prefill_impl. Module-scope
         # imports would cycle through model_executor (which imports the
         # attention backends); backend init runs after those modules are
@@ -3119,24 +3122,69 @@ class DeepseekSparseAttnBackend(
             # inefficiently quantize the whole cache
             kv_cache = quantize_k_cache(kv_cache)
 
-        indices = page_table_1.unsqueeze(1)
-        assert (
-            indices.shape[-1] == self.dsa_index_topk
-        )  # requirement of FlashMLA decode kernel
+        use_kpool_native_v32 = self._use_kpool_flashmla_v32("flashmla_kv")
+        if use_kpool_native_v32:
+            from sgl_kernel.flash_mla import FlashMLASchedMeta
+
+            padding = (-page_table_1.shape[-1]) % 64
+            if padding:
+                page_table_1 = torch.nn.functional.pad(
+                    page_table_1, (0, padding), value=-1
+                )
+            indices = page_table_1.unsqueeze(1)
+            if not getattr(self, "_kpool_flashmla_v32_dispatch_logged", False):
+                logger.info(
+                    "Activated experimental DSA KPool native FlashMLA route: "
+                    "kv_format=%s rows=%d query_heads=%d padded_query_heads=%d "
+                    "source_width=%d padded_width=%d",
+                    self.flashmla_kv_format,
+                    q_all.shape[0],
+                    num_q_heads,
+                    target_q_heads,
+                    indices.shape[-1] - padding,
+                    indices.shape[-1],
+                )
+                self._kpool_flashmla_v32_dispatch_logged = True
+            stream_id = int(torch.cuda.current_stream(q_input.device).cuda_stream)
+            sched_key = (
+                stream_id,
+                q_input.shape[0],
+                q_input.shape[1],
+                q_input.shape[2],
+                kv_cache.shape[1],
+                indices.shape[-1],
+            )
+            scheduler = metadata.kpool_flashmla_sched_meta.get(sched_key)
+            if scheduler is None:
+                scheduler = FlashMLASchedMeta()
+                metadata.kpool_flashmla_sched_meta[sched_key] = scheduler
+            tile_scheduler_metadata = scheduler
+            num_splits = None
+            cache_seqlens_arg = None
+            block_table = None
+        else:
+            indices = page_table_1.unsqueeze(1)
+            assert (
+                indices.shape[-1] == self.dsa_index_topk
+            )  # requirement of the legacy FlashMLA decode metadata path
+            tile_scheduler_metadata = metadata.flashmla_metadata.flashmla_metadata
+            num_splits = metadata.flashmla_metadata.num_splits
+            cache_seqlens_arg = cache_seqlens
+            # doc says it is not used, but legacy tensor metadata requires one
+            block_table = torch.empty(
+                (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
+            )
 
         o, _ = flash_mla_with_kvcache(
             q=q_input,
             k_cache=kv_cache,
-            cache_seqlens=cache_seqlens,
+            cache_seqlens=cache_seqlens_arg,
             head_dim_v=v_head_dim,
-            tile_scheduler_metadata=metadata.flashmla_metadata.flashmla_metadata,
-            num_splits=metadata.flashmla_metadata.num_splits,
+            tile_scheduler_metadata=tile_scheduler_metadata,
+            num_splits=num_splits,
             softmax_scale=sm_scale,
             indices=indices,
-            # doc says it is not used, but if pass in None then error
-            block_table=torch.empty(
-                (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
-            ),
+            block_table=block_table,
             is_fp8_kvcache=True,
             kv_format=self.flashmla_kv_format,
         )

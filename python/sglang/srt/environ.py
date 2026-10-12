@@ -1326,6 +1326,11 @@ class Envs:
     # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
+    # Experimental H20/SM90 path: keep GLM's 528-byte group-scaled FP8 NoPE
+    # KPool rows native and let FlashMLA consume the tail-extended sparse table.
+    # V3.2 does not support dynamic topk_length, so the consumer pads the fixed
+    # Graph width to a 64-column multiple and marks invalid columns with -1.
+    SGLANG_EXPERIMENTAL_DSA_KPOOL_FLASHMLA_V32 = EnvBool(False)
 
     # ===================================================================
     # Kernel selection and fused backends
