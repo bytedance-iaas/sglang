@@ -71,7 +71,7 @@ use crate::{
 pub struct AppState {
     pub router: Arc<dyn RouterTrait>,
     pub context: Arc<AppContext>,
-    pub concurrency_queue_tx: Option<tokio::sync::mpsc::Sender<QueuedRequest>>,
+    pub concurrency_queue_tx: Option<tokio::sync::mpsc::UnboundedSender<QueuedRequest>>,
     pub concurrency_queue_slots: Option<Arc<tokio::sync::Semaphore>>,
     pub is_draining: Arc<AtomicBool>,
     pub router_manager: Option<Arc<RouterManager>>,
