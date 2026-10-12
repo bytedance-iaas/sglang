@@ -640,6 +640,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 q_scale_gate,
                 self._indexer_cos_sin_cache,
                 positions,
+                self.scale_fmt,
             )
             key = fused_k_indexer_norm_rope(
                 key_raw,
@@ -670,6 +671,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 q_scale_gate,
                 self._indexer_cos_sin_cache,
                 positions,
+                self.scale_fmt,
             )
             with torch.cuda.stream(self.alt_stream):
                 key = fused_k_indexer_norm_rope(

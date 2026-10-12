@@ -74,6 +74,7 @@ class TestDSACPPrepareFusionGate(unittest.TestCase):
         self.indexer.head_dim = 4
         self.indexer.n_heads = 2
         self.indexer.softmax_scale = 0.5
+        self.indexer.scale_fmt = "ue8m0"
         self.indexer.k_norm = SimpleNamespace(
             weight=torch.ones(4),
             bias=torch.zeros(4),
@@ -127,6 +128,7 @@ class TestDSACPPrepareFusionGate(unittest.TestCase):
         fused_q.assert_called_once()
         fused_k.assert_called_once()
         self.assertIs(fused_q.call_args.args[4], positions)
+        self.assertEqual(fused_q.call_args.args[5], "ue8m0")
         self.assertIs(fused_k.call_args.args[5], positions)
         strategy.materialize_full_indexer_k_cache.assert_called_once_with(
             key_local, self.batch

@@ -456,7 +456,13 @@ struct FusedQIndexerRopeHadamardQuantParams {
   uint32_t num_heads;
 };
 
-template <typename DType, typename PosT, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true>
+template <
+    typename DType,
+    typename PosT,
+    bool kUsePDL,
+    bool kRopeFirst = false,
+    bool kHadamard = true,
+    bool kScaleUE8M0 = false>
 Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQIndexerRopeHadamardQuantParams params) {
   using namespace device;
 
@@ -529,6 +535,15 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
     data[1] = x_real * fxi + x_imag * fxr;
     data[2] = y_real * fyr - y_imag * fyi;
     data[3] = y_real * fyi + y_imag * fyr;
+    if constexpr (kScaleUE8M0) {
+      // The existing CP path writes rotary output back into the BF16 query
+      // tensor before act_quant.  Preserve that rounding point so the opt-in
+      // fused CP path does not silently change FP8 Q bytes.
+#pragma unroll
+      for (int i = 0; i < kVecSize; ++i) {
+        data[i] = cast<float>(cast<DType>(data[i]));
+      }
+    }
   }
 
   PDLTriggerSecondary<kUsePDL>();
@@ -574,8 +589,17 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
       local_max = math::max(local_max, math::abs(data[i]));
     }
     const auto abs_max = warp::reduce_max(local_max);
-    const auto scale = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
-    const auto inv_scale = 1.0f / scale;
+    const auto scale_raw = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
+    float scale;
+    float inv_scale;
+    if constexpr (kScaleUE8M0) {
+      const auto scale_ue8m0 = cast_to_ue8m0(scale_raw);
+      inv_scale = inv_scale_ue8m0(scale_ue8m0);
+      scale = 1.0f / inv_scale;
+    } else {
+      scale = scale_raw;
+      inv_scale = 1.0f / scale_raw;
+    }
     OutStorage result;
     result[0] = pack_fp8(data[0] * inv_scale, data[1] * inv_scale);
     result[1] = pack_fp8(data[2] * inv_scale, data[3] * inv_scale);
@@ -587,10 +611,11 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
   }
 }
 
-template <typename DType, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true>
+template <typename DType, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true, bool kScaleUE8M0 = false>
 struct FusedQIndexerRopeHadamardQuantKernel {
   template <typename PosT>
-  static constexpr auto kernel = fused_q_indexer_rope_hadamard_quant<DType, PosT, kUsePDL, kRopeFirst, kHadamard>;
+  static constexpr auto kernel =
+      fused_q_indexer_rope_hadamard_quant<DType, PosT, kUsePDL, kRopeFirst, kHadamard, kScaleUE8M0>;
 
   static void forward(
       const tvm::ffi::TensorView q_input,

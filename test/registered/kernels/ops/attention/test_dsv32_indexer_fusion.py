@@ -17,11 +17,13 @@ from __future__ import annotations
 import pytest
 import torch
 
+from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
 from sglang.kernels.ops.attention.dsv4 import fused_q_indexer_rope_first_quant
 from sglang.kernels.ops.attention.fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
 )
+from sglang.kernels.ops.attention.rope import apply_rope_with_cos_sin_cache_inplace
 from sglang.kernels.ops.quantization.dsv32 import (
     fused_k_indexer_norm_rope,
     fused_k_indexer_norm_rope_store,
@@ -181,6 +183,40 @@ def test_q_rope_quant_matches_reference(pos_dtype):
     assert (
         err <= 0.0625 * ref.abs() + scale
     ).all(), f"max fp8 dequant error {err.max().item()}"
+
+
+@pytest.mark.parametrize("pos_dtype", [torch.int32, torch.int64])
+def test_q_rope_quant_ue8m0_matches_cp_unfused_quantization(pos_dtype):
+    """The CP fused Q path must preserve the model's UE8M0 scale contract."""
+
+    _skip_if_unavailable()
+    dev = "cuda"
+    B, n_heads = 37, 64
+    cos, sin, cos_sin_cache, positions = _make_inputs(B, pos_dtype=pos_dtype)
+    q = torch.randn(B, n_heads, HEAD_DIM, dtype=torch.bfloat16, device=dev)
+    weight = torch.randn(B, n_heads, dtype=torch.bfloat16, device=dev)
+    weight_scale = 0.137
+
+    q_fp8, weights_out = fused_q_indexer_rope_first_quant(
+        q, weight, weight_scale, cos_sin_cache, positions, "ue8m0"
+    )
+
+    old_query = q.clone().contiguous()
+    dummy_key = torch.empty(B, 1, ROPE_DIM, dtype=torch.bfloat16, device=dev)
+    apply_rope_with_cos_sin_cache_inplace(
+        positions=positions,
+        q=old_query[..., :ROPE_DIM],
+        k=dummy_key,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=False,
+        fused_args=None,
+    )
+    old_q_fp8, old_scale = act_quant(old_query, HEAD_DIM, "ue8m0")
+    old_weights = weight.float() * weight_scale * old_scale.squeeze(-1)
+    torch.cuda.synchronize()
+
+    assert torch.equal(q_fp8, old_q_fp8)
+    torch.testing.assert_close(weights_out.squeeze(-1), old_weights, atol=0, rtol=0)
 
 
 # ----------------------------------------------------------------------------
