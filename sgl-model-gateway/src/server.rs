@@ -72,6 +72,8 @@ pub struct AppState {
     pub router: Arc<dyn RouterTrait>,
     pub context: Arc<AppContext>,
     pub concurrency_queue_tx: Option<tokio::sync::mpsc::Sender<QueuedRequest>>,
+    pub concurrency_queue_slots: Option<Arc<tokio::sync::Semaphore>>,
+    pub is_draining: Arc<AtomicBool>,
     pub router_manager: Option<Arc<RouterManager>>,
     pub mesh_handler: Option<Arc<MeshServerHandler>>,
     pub mesh_sync_manager: Option<Arc<MeshSyncManager>>,
@@ -100,6 +102,17 @@ async fn liveness() -> Response {
 }
 
 async fn readiness(State(state): State<Arc<AppState>>) -> Response {
+    if state.is_draining.load(Ordering::Acquire) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "not ready",
+                "reason": "router is draining"
+            })),
+        )
+            .into_response();
+    }
+
     let workers = state.context.worker_registry.get_all();
     let healthy_workers: Vec<_> = workers.iter().filter(|w| w.is_healthy()).collect();
 
@@ -984,6 +997,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         router,
         context: app_context.clone(),
         concurrency_queue_tx: limiter.queue_tx.clone(),
+        concurrency_queue_slots: limiter.queue_slots.clone(),
+        is_draining: Arc::new(AtomicBool::new(false)),
         router_manager: Some(router_manager),
         mesh_handler,
         mesh_sync_manager,
@@ -1037,6 +1052,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // Initialize control plane authentication if configured
     let control_plane_auth_state =
         crate::auth::ControlPlaneAuthState::try_init(config.control_plane_auth.as_ref()).await;
+    let is_draining = app_state.is_draining.clone();
 
     let app = build_app(
         app_state,
@@ -1061,6 +1077,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let grace_period = Duration::from_secs(config.shutdown_grace_period_secs);
     spawn(async move {
         shutdown_signal().await;
+        is_draining.store(true, Ordering::Release);
         handle_clone.graceful_shutdown(Some(grace_period));
     });
 

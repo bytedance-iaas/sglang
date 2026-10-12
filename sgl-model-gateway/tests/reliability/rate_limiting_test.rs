@@ -22,6 +22,20 @@ use crate::common::{AppTestContext, TestRouterConfig, TestWorkerConfig};
 mod rate_limiting_tests {
     use super::*;
 
+    async fn send_generate(app: axum::Router, label: &str) -> StatusCode {
+        let payload = json!({
+            "text": label,
+            "stream": false
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+        app.oneshot(req).await.unwrap().status()
+    }
+
     /// Test that concurrent requests are handled within limits
     #[tokio::test]
     async fn test_concurrent_requests_within_limit() {
@@ -258,6 +272,107 @@ mod rate_limiting_tests {
             errors
         );
 
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_strict_concurrency_and_queue_full_statuses() {
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .random_policy()
+            .host("127.0.0.1")
+            .port(3404)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(10)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(1)
+            .rate_limit_tokens_per_second(0)
+            .queue_size(1)
+            .queue_timeout_secs(2)
+            .build_unchecked();
+        let ctx =
+            AppTestContext::new_with_config(config, vec![TestWorkerConfig::slow(19304, 400)]).await;
+        let app = ctx.create_app().await;
+
+        let first = tokio::spawn(send_generate(app.clone(), "active"));
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let second = tokio::spawn(send_generate(app.clone(), "queued"));
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let third_status = send_generate(app, "rejected").await;
+
+        assert_eq!(third_status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(first.await.unwrap(), StatusCode::OK);
+        assert_eq!(second.await.unwrap(), StatusCode::OK);
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_queue_timeout_is_distinct_from_request_timeout() {
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .random_policy()
+            .host("127.0.0.1")
+            .port(3405)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(10)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(1)
+            .rate_limit_tokens_per_second(0)
+            .queue_size(1)
+            .queue_timeout_secs(1)
+            .build_unchecked();
+        let ctx =
+            AppTestContext::new_with_config(config, vec![TestWorkerConfig::slow(19305, 1_500)])
+                .await;
+        let app = ctx.create_app().await;
+
+        let first = tokio::spawn(send_generate(app.clone(), "active"));
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let queued_status = send_generate(app, "times out in queue").await;
+
+        assert_eq!(queued_status, StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(first.await.unwrap(), StatusCode::OK);
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_waiter_releases_queue_capacity_immediately() {
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .random_policy()
+            .host("127.0.0.1")
+            .port(3406)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(10)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(1)
+            .rate_limit_tokens_per_second(0)
+            .queue_size(1)
+            .queue_timeout_secs(2)
+            .build_unchecked();
+        let ctx =
+            AppTestContext::new_with_config(config, vec![TestWorkerConfig::slow(19306, 500)]).await;
+        let app = ctx.create_app().await;
+
+        let active = tokio::spawn(send_generate(app.clone(), "active"));
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let cancelled_waiter = tokio::spawn(send_generate(app.clone(), "cancelled waiter"));
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        cancelled_waiter.abort();
+        assert!(cancelled_waiter.await.unwrap_err().is_cancelled());
+
+        let replacement = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            send_generate(app, "replacement waiter"),
+        )
+        .await
+        .expect("replacement waiter should not hang");
+
+        assert_eq!(replacement, StatusCode::OK);
+        assert_eq!(active.await.unwrap(), StatusCode::OK);
         ctx.shutdown().await;
     }
 }

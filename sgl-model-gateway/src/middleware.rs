@@ -21,7 +21,7 @@ use http_body::Frame;
 use rand::Rng;
 use serde_json::json;
 use subtle::ConstantTimeEq;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tower::{Layer, Service};
 use tower_http::trace::{MakeSpan, OnRequest, OnResponse, TraceLayer};
 use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
@@ -455,8 +455,10 @@ impl QueueProcessor {
     pub async fn run(mut self) {
         debug!("Starting concurrency queue processor");
 
-        // Process requests in a single task to reduce overhead
-        while let Some(queued) = self.queue_rx.recv().await {
+        // Process requests serially to preserve FIFO admission. The queue-slot permit carried by
+        // each entry keeps the total number of waiting requests bounded even after recv() removes
+        // an entry from the mpsc channel.
+        while let Some(mut queued) = self.queue_rx.recv().await {
             // Check timeout immediately
             let elapsed = queued.queued_at.elapsed();
             if elapsed >= self.queue_timeout {
@@ -473,23 +475,23 @@ impl QueueProcessor {
                 debug!("Queue: acquired token immediately for queued request");
                 Self::grant_permit(self.token_bucket.clone(), queued.permit_tx);
             } else {
-                // Need to wait for token
+                // Need to wait for token or for the client to cancel. Avoid detached per-request
+                // waiter tasks: they would drain the bounded channel into an unbounded task set.
                 let token_bucket = self.token_bucket.clone();
-
-                // Spawn task only when we actually need to wait
-                tokio::spawn(async move {
-                    if token_bucket
-                        .acquire_timeout(1.0, remaining_timeout)
-                        .await
-                        .is_ok()
-                    {
+                tokio::select! {
+                    result = token_bucket.acquire_timeout(1.0, remaining_timeout) => {
+                        if result.is_ok() {
                         debug!("Queue: acquired token after waiting");
                         Self::grant_permit(token_bucket, queued.permit_tx);
-                    } else {
-                        warn!("Queue: request timed out waiting for token");
-                        let _ = queued.permit_tx.send(Err(StatusCode::REQUEST_TIMEOUT));
+                        } else {
+                            warn!("Queue: request timed out waiting for token");
+                            let _ = queued.permit_tx.send(Err(StatusCode::REQUEST_TIMEOUT));
+                        }
                     }
-                });
+                    _ = queued.permit_tx.closed() => {
+                        debug!("Queued request cancelled while waiting for limiter capacity");
+                    }
+                }
             }
         }
 
@@ -500,6 +502,7 @@ impl QueueProcessor {
 /// State for the concurrency limiter
 pub struct ConcurrencyLimiter {
     pub queue_tx: Option<mpsc::Sender<QueuedRequest>>,
+    pub queue_slots: Option<Arc<Semaphore>>,
 }
 
 impl ConcurrencyLimiter {
@@ -510,18 +513,31 @@ impl ConcurrencyLimiter {
         queue_timeout: Duration,
     ) -> (Self, Option<QueueProcessor>) {
         match (token_bucket, queue_size) {
-            (None, _) => (Self { queue_tx: None }, None),
+            (None, _) => (
+                Self {
+                    queue_tx: None,
+                    queue_slots: None,
+                },
+                None,
+            ),
             (Some(bucket), size) if size > 0 => {
                 let (queue_tx, queue_rx) = mpsc::channel(size);
                 let processor = QueueProcessor::new(bucket, queue_rx, queue_timeout);
                 (
                     Self {
                         queue_tx: Some(queue_tx),
+                        queue_slots: Some(Arc::new(Semaphore::new(size))),
                     },
                     Some(processor),
                 )
             }
-            (Some(_), _) => (Self { queue_tx: None }, None),
+            (Some(_), _) => (
+                Self {
+                    queue_tx: None,
+                    queue_slots: None,
+                },
+                None,
+            ),
         }
     }
 }
@@ -532,6 +548,14 @@ pub async fn concurrency_limit_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    if app_state.is_draining.load(Ordering::Acquire) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "router is draining"})),
+        )
+            .into_response();
+    }
+
     // Check mesh global rate limit first if mesh is enabled
     // If mesh is not enabled, this check is skipped and local rate limiting is used
     if let Some(sync_manager) = &app_state.mesh_sync_manager {
@@ -585,6 +609,26 @@ pub async fn concurrency_limit_middleware(
         if let Some(queue_tx) = &app_state.concurrency_queue_tx {
             debug!("No tokens available, attempting to queue request");
 
+            let queue_slot = match &app_state.concurrency_queue_slots {
+                Some(slots) => match slots.clone().try_acquire_owned() {
+                    Ok(slot) => slot,
+                    Err(_) => {
+                        warn!("Request queue is full, returning 429");
+                        Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
+                        return (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            Json(json!({"error": "request queue is full"})),
+                        )
+                            .into_response();
+                    }
+                },
+                None => {
+                    error!("Request queue sender configured without queue capacity tracker");
+                    Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+
             // Create a channel for the token response
             let (permit_tx, permit_rx) = oneshot::channel();
 
@@ -601,8 +645,12 @@ pub async fn concurrency_limit_middleware(
                         EMBEDDINGS_QUEUE_SIZE.fetch_add(1, Ordering::Relaxed);
                     }
 
-                    // Wait for token from queue processor
-                    match permit_rx.await {
+                    // Keep queue_slot in this request future for the complete wait. If the
+                    // client cancels before admission, dropping this future immediately frees
+                    // capacity even when the queue entry has not been received yet.
+                    let permit_result = permit_rx.await;
+                    drop(queue_slot);
+                    match permit_result {
                         Ok(Ok(token_lease)) => {
                             debug!("Acquired token from queue");
                             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
@@ -625,7 +673,8 @@ pub async fn concurrency_limit_middleware(
                             if is_embeddings {
                                 EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed);
                             }
-                            status.into_response()
+                            (status, Json(json!({"error": "request queue timeout"})))
+                                .into_response()
                         }
                         Err(_) => {
                             error!("Queue response channel closed");
@@ -641,13 +690,21 @@ pub async fn concurrency_limit_middleware(
                 Err(_) => {
                     warn!("Request queue is full, returning 429");
                     Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
-                    StatusCode::TOO_MANY_REQUESTS.into_response()
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        Json(json!({"error": "request queue is full"})),
+                    )
+                        .into_response()
                 }
             }
         } else {
             warn!("No tokens available and queuing is disabled, returning 429");
             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
-            StatusCode::TOO_MANY_REQUESTS.into_response()
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({"error": "request concurrency limit reached"})),
+            )
+                .into_response()
         }
     }
 }
@@ -1020,6 +1077,119 @@ pub async fn wasm_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn queue_slots_bound_all_waiting_requests() {
+        let token_bucket = Arc::new(TokenBucket::new(1, 0));
+        let (limiter, _processor) =
+            ConcurrencyLimiter::new(Some(token_bucket), 2, Duration::from_secs(1));
+        let slots = limiter
+            .queue_slots
+            .expect("non-zero queue size should create queue slots");
+
+        let first = slots
+            .clone()
+            .try_acquire_owned()
+            .expect("first waiting request should fit");
+        let second = slots
+            .clone()
+            .try_acquire_owned()
+            .expect("second waiting request should fit");
+        assert!(
+            slots.clone().try_acquire_owned().is_err(),
+            "a third waiting request must be rejected when queue_size is two"
+        );
+
+        drop(first);
+        let replacement = slots
+            .clone()
+            .try_acquire_owned()
+            .expect("dropping a waiter must release one queue slot");
+        drop((second, replacement));
+        assert_eq!(slots.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn queue_processor_grants_permits_in_fifo_order() {
+        let token_bucket = Arc::new(TokenBucket::new(1, 0));
+        token_bucket
+            .try_acquire(1.0)
+            .await
+            .expect("initial limiter capacity should be available");
+        let (queue_tx, queue_rx) = mpsc::channel(2);
+        let (first_tx, first_rx) = oneshot::channel();
+        let (second_tx, mut second_rx) = oneshot::channel();
+
+        queue_tx
+            .send(QueuedRequest {
+                queued_at: Instant::now(),
+                permit_tx: first_tx,
+            })
+            .await
+            .expect("queue processor receiver should be open");
+        queue_tx
+            .send(QueuedRequest {
+                queued_at: Instant::now(),
+                permit_tx: second_tx,
+            })
+            .await
+            .expect("queue processor receiver should be open");
+        drop(queue_tx);
+
+        let processor = tokio::spawn(
+            QueueProcessor::new(token_bucket.clone(), queue_rx, Duration::from_secs(1)).run(),
+        );
+        token_bucket.return_tokens_sync(1.0);
+
+        let first_lease = tokio::time::timeout(Duration::from_secs(1), first_rx)
+            .await
+            .expect("first queued request should receive capacity")
+            .expect("first queued request channel should remain open")
+            .expect("first queued request should be admitted");
+        assert!(
+            second_rx.try_recv().is_err(),
+            "second queued request must not overtake the first"
+        );
+
+        drop(first_lease);
+        let second_lease = tokio::time::timeout(Duration::from_secs(1), &mut second_rx)
+            .await
+            .expect("second queued request should receive returned capacity")
+            .expect("second queued request channel should remain open")
+            .expect("second queued request should be admitted");
+        drop(second_lease);
+        processor.await.expect("queue processor should not panic");
+    }
+
+    #[tokio::test]
+    async fn queue_processor_returns_request_timeout_after_queue_deadline() {
+        let token_bucket = Arc::new(TokenBucket::new(1, 0));
+        token_bucket
+            .try_acquire(1.0)
+            .await
+            .expect("initial limiter capacity should be available");
+        let (queue_tx, queue_rx) = mpsc::channel(1);
+        let (permit_tx, permit_rx) = oneshot::channel();
+        queue_tx
+            .send(QueuedRequest {
+                queued_at: Instant::now(),
+                permit_tx,
+            })
+            .await
+            .expect("queue processor receiver should be open");
+        drop(queue_tx);
+
+        QueueProcessor::new(token_bucket, queue_rx, Duration::from_millis(20))
+            .run()
+            .await;
+        match permit_rx
+            .await
+            .expect("timed-out request should receive a status")
+        {
+            Err(status) => assert_eq!(status, StatusCode::REQUEST_TIMEOUT),
+            Ok(_) => panic!("timed-out request must not receive a lease"),
+        }
+    }
 
     #[tokio::test]
     async fn queue_processor_returns_token_when_queued_request_is_cancelled() {

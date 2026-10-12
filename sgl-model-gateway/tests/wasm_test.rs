@@ -8,7 +8,10 @@
 
 mod common;
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{atomic::AtomicBool, Arc},
+    time::Duration,
+};
 
 use axum::{
     body::{to_bytes, Body},
@@ -178,6 +181,8 @@ async fn create_test_app_with_wasm() -> (axum::Router, Arc<AppContext>, TempDir)
         router,
         context: app_context.clone(),
         concurrency_queue_tx: None,
+        concurrency_queue_slots: None,
+        is_draining: Arc::new(AtomicBool::new(false)),
         router_manager: None,
         mesh_handler: None,
         mesh_sync_manager: None,

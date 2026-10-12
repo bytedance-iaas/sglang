@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{atomic::AtomicBool, Arc};
 
 use axum::{
     body::Body,
@@ -69,6 +69,8 @@ fn bench_wasm_middleware_buffering(c: &mut Criterion) {
         router: Arc::new(MockRouter),
         context: Arc::new(context),
         concurrency_queue_tx: None,
+        concurrency_queue_slots: None,
+        is_draining: Arc::new(AtomicBool::new(false)),
         router_manager: None,
         mesh_handler: None,
         mesh_sync_manager: None,

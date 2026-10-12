@@ -5,10 +5,15 @@ use axum::{
 };
 use serde_json::json;
 use smg::{config::RouterConfig, routers::RouterFactory};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tower::ServiceExt;
 
 use crate::common::{
     mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
+    test_app::create_test_app_with_context_and_draining,
     AppTestContext,
 };
 
@@ -73,6 +78,78 @@ mod health_tests {
         let resp = app.oneshot(req).await.unwrap();
         // With no workers, readiness should return SERVICE_UNAVAILABLE
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_draining_router_is_not_ready_and_rejects_new_inference() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18002,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 300,
+            fail_rate: 0.0,
+        }])
+        .await;
+        let is_draining = Arc::new(AtomicBool::new(false));
+        let app = create_test_app_with_context_and_draining(
+            Arc::clone(&ctx.router),
+            Arc::clone(&ctx.app_context),
+            Arc::clone(&is_draining),
+        );
+
+        let ready = Request::builder()
+            .method("GET")
+            .uri("/readiness")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(ready).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let accepted = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"text":"accepted before drain","stream":false}"#,
+            ))
+            .unwrap();
+        let accepted_app = app.clone();
+        let accepted_request =
+            tokio::spawn(async move { accepted_app.oneshot(accepted).await.unwrap().status() });
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        is_draining.store(true, Ordering::Release);
+
+        let not_ready = Request::builder()
+            .method("GET")
+            .uri("/readiness")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(not_ready).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        let inference = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"text":"new work","stream":false}"#))
+            .unwrap();
+        let response = app.oneshot(inference).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            json!({"error": "router is draining"})
+        );
+        assert_eq!(accepted_request.await.unwrap(), StatusCode::OK);
+
         ctx.shutdown().await;
     }
 

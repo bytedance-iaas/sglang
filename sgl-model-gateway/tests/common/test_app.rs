@@ -1,4 +1,4 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::{atomic::AtomicBool, Arc, OnceLock};
 
 use axum::Router;
 use data_connector::{
@@ -11,7 +11,7 @@ use smg::{
     core::{
         BasicWorkerBuilder, LoadMonitor, ModelCard, RuntimeType, Worker, WorkerRegistry, WorkerType,
     },
-    middleware::{AuthConfig, TokenBucket},
+    middleware::{AuthConfig, ConcurrencyLimiter, TokenBucket},
     policies::PolicyRegistry,
     routers::RouterTrait,
     server::{build_app, AppState},
@@ -32,8 +32,8 @@ pub fn create_test_app(
         n => {
             let rate_limit_tokens = router_config
                 .rate_limit_tokens_per_second
-                .filter(|&t| t > 0)
-                .unwrap_or(n);
+                .unwrap_or(n)
+                .max(0);
             Some(Arc::new(TokenBucket::new(
                 n as usize,
                 rate_limit_tokens as usize,
@@ -83,11 +83,22 @@ pub fn create_test_app(
             .unwrap(),
     );
 
+    let (limiter, processor) = ConcurrencyLimiter::new(
+        app_context.rate_limiter.clone(),
+        router_config.queue_size,
+        std::time::Duration::from_secs(router_config.queue_timeout_secs),
+    );
+    if let Some(processor) = processor {
+        tokio::spawn(processor.run());
+    }
+
     // Create AppState with the test router and context
     let app_state = Arc::new(AppState {
         router,
         context: app_context,
-        concurrency_queue_tx: None,
+        concurrency_queue_tx: limiter.queue_tx,
+        concurrency_queue_slots: limiter.queue_slots,
+        is_draining: Arc::new(AtomicBool::new(false)),
         router_manager: None,
         mesh_handler: None,
         mesh_sync_manager: None,
@@ -125,18 +136,36 @@ pub fn create_test_app_with_context(
     router: Arc<dyn RouterTrait>,
     app_context: Arc<AppContext>,
 ) -> Router {
+    create_test_app_with_context_and_draining(router, app_context, Arc::new(AtomicBool::new(false)))
+}
+
+#[allow(dead_code)]
+pub fn create_test_app_with_context_and_draining(
+    router: Arc<dyn RouterTrait>,
+    app_context: Arc<AppContext>,
+    is_draining: Arc<AtomicBool>,
+) -> Router {
+    let router_config = &app_context.router_config;
+    let (limiter, processor) = ConcurrencyLimiter::new(
+        app_context.rate_limiter.clone(),
+        router_config.queue_size,
+        std::time::Duration::from_secs(router_config.queue_timeout_secs),
+    );
+    if let Some(processor) = processor {
+        tokio::spawn(processor.run());
+    }
+
     // Create AppState with the test router and context
     let app_state = Arc::new(AppState {
         router,
         context: app_context.clone(),
-        concurrency_queue_tx: None,
+        concurrency_queue_tx: limiter.queue_tx,
+        concurrency_queue_slots: limiter.queue_slots,
+        is_draining,
         router_manager: None,
         mesh_handler: None,
         mesh_sync_manager: None,
     });
-
-    // Get config from the context
-    let router_config = &app_context.router_config;
 
     // Configure request ID headers (use defaults if not specified)
     let request_id_headers = router_config.request_id_headers.clone().unwrap_or_else(|| {

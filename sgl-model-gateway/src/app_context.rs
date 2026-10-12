@@ -537,9 +537,11 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_zero_refill_rate_is_preserved() {
-        let mut config = RouterConfig::default();
-        config.max_concurrent_requests = 1_000;
-        config.rate_limit_tokens_per_second = Some(0);
+        let config = RouterConfig {
+            max_concurrent_requests: 1_000,
+            rate_limit_tokens_per_second: Some(0),
+            ..RouterConfig::default()
+        };
 
         let limiter = AppContextBuilder::new()
             .maybe_rate_limiter(&config)
@@ -563,9 +565,11 @@ mod tests {
 
     #[tokio::test]
     async fn unchecked_negative_refill_rate_fails_closed() {
-        let mut config = RouterConfig::default();
-        config.max_concurrent_requests = 1;
-        config.rate_limit_tokens_per_second = Some(-1);
+        let config = RouterConfig {
+            max_concurrent_requests: 1,
+            rate_limit_tokens_per_second: Some(-1),
+            ..RouterConfig::default()
+        };
 
         let limiter = AppContextBuilder::new()
             .maybe_rate_limiter(&config)
