@@ -1745,29 +1745,25 @@ class EICNSATokenToKVPoolHost(EICMLATokenToKVPoolHost):
 class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
     """Native EIC shared-page adapter for DeepSeek V4 hybrid KV pools."""
 
-    # Pool names are matched by value, not by enum member: DSv4.1 adds
-    # low-ratio (C1/C2), FP4 indexer-scale and split-rope pools that this
-    # branch's PoolName enum does not define yet. PoolName is a str enum,
-    # so v4 members compare and hash equal to the same strings.
     _KV_SOURCED_POOLS = {
-        "deepseek_v4_c1",
-        "deepseek_v4_c1_indexer",
-        "deepseek_v4_c1_indexer_scale",
-        "deepseek_v4_c2",
-        "deepseek_v4_c2_indexer",
-        "deepseek_v4_c2_indexer_scale",
-        "deepseek_v4_c4",
-        "deepseek_v4_c4_indexer",
-        "deepseek_v4_c4_indexer_scale",
-        "deepseek_v4_c4_rope",
-        "deepseek_v4_c128",
-        "deepseek_v4_c128_rope",
+        PoolName.DEEPSEEK_V4_C1,
+        PoolName.DEEPSEEK_V4_C1_INDEXER,
+        PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE,
+        PoolName.DEEPSEEK_V4_C2,
+        PoolName.DEEPSEEK_V4_C2_INDEXER,
+        PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE,
+        PoolName.DEEPSEEK_V4_C4,
+        PoolName.DEEPSEEK_V4_C4_INDEXER,
+        PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
+        PoolName.DEEPSEEK_V4_C4_ROPE,
+        PoolName.DEEPSEEK_V4_C128,
+        PoolName.DEEPSEEK_V4_C128_ROPE,
     }
     _SWA_SOURCED_POOLS = {
-        "swa",
-        "deepseek_v4_c4_state",
-        "deepseek_v4_c4_indexer_state",
-        "deepseek_v4_c128_state",
+        PoolName.SWA,
+        PoolName.DEEPSEEK_V4_C4_STATE,
+        PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+        PoolName.DEEPSEEK_V4_C128_STATE,
     }
 
     def __init__(
@@ -1879,49 +1875,33 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
         seen = set()
 
         kv_pools = [
-            getattr(device_pool, "swa_kv_pool", None),
-            getattr(device_pool, "c4_kv_pool", None),
-            getattr(device_pool, "c128_kv_pool", None),
+            device_pool.swa_kv_pool,
+            device_pool.c4_kv_pool,
+            device_pool.c128_kv_pool,
         ]
-        extra_kv_pools = getattr(device_pool, "kv_pools", None)
-        if isinstance(extra_kv_pools, dict):
-            kv_pools.extend(extra_kv_pools.values())
         for pool in kv_pools:
             if pool is None or id(pool) in seen:
                 continue
             seen.add(id(pool))
-            buffers = getattr(pool, "kv_buffer", None)
-            if buffers:
-                page_bytes += len(buffers) * int(
-                    getattr(pool, "bytes_per_page_padded", 0) or 0
-                )
+            if pool.kv_buffer:
+                page_bytes += len(pool.kv_buffer) * int(pool.bytes_per_page_padded)
 
-        indexer_pools = [getattr(device_pool, "c4_indexer_kv_pool", None)]
-        extra_indexer_pools = getattr(device_pool, "index_pools", None)
-        if isinstance(extra_indexer_pools, dict):
-            indexer_pools.extend(extra_indexer_pools.values())
-        for pool in indexer_pools:
-            if pool is None or id(pool) in seen:
-                continue
-            seen.add(id(pool))
-            buffers = getattr(pool, "index_k_with_scale_buffer", None)
+        indexer_pool = device_pool.c4_indexer_kv_pool
+        if indexer_pool is not None and id(indexer_pool) not in seen:
+            buffers = indexer_pool.index_k_with_scale_buffer
             if buffers:
                 page_bytes += len(buffers) * (
                     buffers[0].shape[1] * buffers[0].element_size()
                 )
 
         for pools in (
-            getattr(device_pool, "compress_state_pools", None) or [],
-            getattr(device_pool, "indexer_compress_state_pools", None) or [],
+            device_pool.compress_state_pools,
+            device_pool.indexer_compress_state_pools,
         ):
             for pool in pools:
-                if pool is None or getattr(pool, "ratio", None) == 128:
+                if pool is None or pool.ratio == 128:
                     continue
-                state_tensor = getattr(
-                    getattr(pool, "kv_score_buffer", None), "kv_score", None
-                )
-                if state_tensor is None:
-                    continue
+                state_tensor = pool.kv_score_buffer.kv_score
                 page_bytes += int(pool.ring_size * state_tensor[0].nbytes)
         return page_bytes
 
@@ -1965,7 +1945,7 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
         self.deploy_key = f"{self.deploy_key}_pl{digest}"
 
     def _swa_indices(self, full_indices: torch.Tensor) -> torch.Tensor:
-        if getattr(self.device_pool, "swa_kv_pool", None) is None:
+        if self.device_pool.swa_kv_pool is None:
             # Unified-KV stages have no SWA pool and no SWA-sourced specs;
             # the SWA index stream is unused, so return a zero stream in
             # the shape callers expect instead of dereferencing None.

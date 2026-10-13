@@ -1836,17 +1836,17 @@ class TestEICHiCacheRegression(unittest.TestCase):
         host.host_pool_group = SimpleNamespace(
             entry_map={
                 PoolName.KV: entry(8),
-                "deepseek_v4_c1": entry(11),
-                "deepseek_v4_c1_indexer": entry(12),
-                "deepseek_v4_c1_indexer_scale": entry(13),
-                "deepseek_v4_c2": entry(14),
-                "deepseek_v4_c2_indexer": entry(15),
-                "deepseek_v4_c2_indexer_scale": entry(16),
+                PoolName.DEEPSEEK_V4_C1: entry(11),
+                PoolName.DEEPSEEK_V4_C1_INDEXER: entry(12),
+                PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE: entry(13),
+                PoolName.DEEPSEEK_V4_C2: entry(14),
+                PoolName.DEEPSEEK_V4_C2_INDEXER: entry(15),
+                PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE: entry(16),
                 PoolName.DEEPSEEK_V4_C4: entry(17),
-                "deepseek_v4_c4_indexer_scale": entry(18),
-                "deepseek_v4_c4_rope": entry(19),
-                "deepseek_v4_c128_rope": entry(20),
-                "deepseek_v4_c128_state": entry(21),
+                PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE: entry(18),
+                PoolName.DEEPSEEK_V4_C4_ROPE: entry(19),
+                PoolName.DEEPSEEK_V4_C128_ROPE: entry(20),
+                PoolName.DEEPSEEK_V4_C128_STATE: entry(21),
             }
         )
         specs = EICDeepSeekV4TokenToKVPoolHost._build_page_specs(host)
@@ -1865,9 +1865,7 @@ class TestEICHiCacheRegression(unittest.TestCase):
         self.assertEqual(by_name["deepseek_v4_c128_state"]["source"], PoolName.SWA)
         self.assertEqual(sum(spec["numel"] for spec in specs), 176)
 
-        host.host_pool_group = SimpleNamespace(
-            entry_map={"deepseek_v4_future_pool": entry(1)}
-        )
+        host.host_pool_group = SimpleNamespace(entry_map={PoolName.MAMBA: entry(1)})
         with self.assertRaisesRegex(ValueError, "Unsupported DeepSeek V4 EIC pool"):
             EICDeepSeekV4TokenToKVPoolHost._build_page_specs(host)
 
@@ -1884,8 +1882,16 @@ class TestEICHiCacheRegression(unittest.TestCase):
             swa_kv_pool=None,
             c4_kv_pool=None,
             c128_kv_pool=None,
-            c4_indexer_kv_pool=SimpleNamespace(),
-            compress_state_pools=[SimpleNamespace(ratio=2)],
+            c4_indexer_kv_pool=SimpleNamespace(index_k_with_scale_buffer=None),
+            compress_state_pools=[
+                SimpleNamespace(
+                    ratio=2,
+                    ring_size=0,
+                    kv_score_buffer=SimpleNamespace(
+                        kv_score=[torch.zeros(4, dtype=torch.uint8)]
+                    ),
+                )
+            ],
             indexer_compress_state_pools=[],
         )
         self.assertEqual(
