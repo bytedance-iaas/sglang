@@ -44,8 +44,10 @@ class TestEicEnvConfig(CustomTestCase):
 
     def test_u5_single_endpoint(self):
         endpoints, endpoint = parse_eic_remote_url(VALID_URL)
-        self.assertEqual(endpoints, ["http://1.2.3.4:12500"])
-        self.assertEqual(endpoint, "http://1.2.3.4:12500")
+        # The SDK endpoint string is the bare host:port form proven by
+        # the previous yaml path; an http scheme is input syntax only.
+        self.assertEqual(endpoints, ["1.2.3.4:12500"])
+        self.assertEqual(endpoint, "1.2.3.4:12500")
 
     def test_u6_multi_endpoint_with_spaces(self):
         endpoints, endpoint = parse_eic_remote_url(
@@ -54,9 +56,9 @@ class TestEicEnvConfig(CustomTestCase):
         self.assertEqual(
             endpoints,
             [
-                "http://1.2.3.4:12500",
-                "https://5.6.7.8:12501",
-                "http://9.10.11.12:12502",
+                "1.2.3.4:12500",
+                "5.6.7.8:12501",
+                "9.10.11.12:12502",
             ],
         )
         self.assertEqual(endpoint, ";".join(endpoints))
@@ -84,7 +86,7 @@ class TestEicEnvConfig(CustomTestCase):
         self.assertTrue(cfg.enabled)
         self.assertEqual(cfg.source, "env")
         self.assertEqual(cfg.instance_id, VALID_ID)
-        self.assertEqual(cfg.endpoints, ["http://1.2.3.4:12500"])
+        self.assertEqual(cfg.endpoints, ["1.2.3.4:12500"])
         self.assertEqual(cfg.fixed["eic_log_dir"], "/tmp/eic-client-log")
 
     def test_u11_enabled_without_url_fails(self):
@@ -147,6 +149,84 @@ class TestEicEnvConfig(CustomTestCase):
         self.assertEqual(cfg.endpoint, "192.168.30.90:12500;192.168.30.91:12500")
         self.assertEqual(cfg.fixed["eic_thread_num"], 2)
         self.assertEqual(cfg.fixed["eic_trans_type"], 2)
+
+    def test_u18_port_out_of_range_raises(self):
+        for raw in ("eic://1.2.3.4:0", "eic://1.2.3.4:99999"):
+            with self.assertRaisesRegex(ValueError, "1..65535"):
+                parse_eic_remote_url(raw)
+
+    def test_u19_whitespace_or_userinfo_endpoint_raises(self):
+        for raw in ("eic://1.2.3.4 :12500", "eic://user@1.2.3.4:12500"):
+            with self.assertRaises(ValueError):
+                parse_eic_remote_url(raw)
+
+    def test_u20_non_mapping_yaml_raises_clear_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "bad.yaml")
+            with open(path, "w") as fout:
+                fout.write("- a\n- b\n")
+            with self.assertRaisesRegex(ValueError, "must contain a mapping"):
+                load_eic_config(cli_enabled=True, environ={}, config_file=path)
+
+    def test_u21_instance_id_with_whitespace_raises(self):
+        env = {
+            "EnableEicCache": "True",
+            "EicRemoteUrl": VALID_URL,
+            "EicInstanceId": "eic x",
+        }
+        with self.assertRaisesRegex(ValueError, "must not contain whitespace"):
+            load_eic_config(environ=env, config_file="/nonexistent/eic.yaml")
+
+    def test_u22_yaml_null_counts_as_missing_for_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_yaml(
+                tmp,
+                {
+                    "remote_url": VALID_URL,
+                    "eic_instance_id": VALID_ID,
+                    "eic_trans_type": None,
+                },
+            )
+            cfg = load_eic_config(cli_enabled=True, environ={}, config_file=path)
+        self.assertEqual(cfg.fixed["eic_trans_type"], 3)
+
+    def test_u23_near_true_switch_warns_but_stays_disabled(self):
+        env = {"EnableEicCache": "true"}
+        with self.assertLogs(
+            "sglang.srt.mem_cache.storage.eic.eic_env_config", level="WARNING"
+        ):
+            cfg = load_eic_config(
+                cli_enabled=True, environ=env, config_file="/nonexistent/eic.yaml"
+            )
+        self.assertFalse(cfg.enabled)
+
+    def test_u24_empty_env_url_does_not_fall_back_to_yaml(self):
+        # A present-but-empty env value is an explicit injection error:
+        # falling back would silently connect to the yaml cluster.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_yaml(
+                tmp, {"remote_url": VALID_URL, "eic_instance_id": VALID_ID}
+            )
+            env = {
+                "EnableEicCache": "True",
+                "EicRemoteUrl": "",
+                "EicInstanceId": VALID_ID,
+            }
+            with self.assertRaisesRegex(ValueError, "EicRemoteUrl is required"):
+                load_eic_config(environ=env, config_file=path)
+
+    def test_u25_empty_env_id_does_not_fall_back_to_yaml(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_yaml(
+                tmp, {"remote_url": VALID_URL, "eic_instance_id": VALID_ID}
+            )
+            env = {
+                "EnableEicCache": "True",
+                "EicRemoteUrl": VALID_URL,
+                "EicInstanceId": "  ",
+            }
+            with self.assertRaisesRegex(ValueError, "EicInstanceId is required"):
+                load_eic_config(environ=env, config_file=path)
 
     def test_u15_env_explicit_off_overrides_cli(self):
         env = {"EnableEicCache": "False"}

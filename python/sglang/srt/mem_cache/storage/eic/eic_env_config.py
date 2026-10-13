@@ -62,9 +62,11 @@ def parse_eic_switch(raw) -> bool:
 def parse_eic_remote_url(raw) -> tuple[list, str]:
     """Parse an EicRemoteUrl value into (endpoint list, SDK endpoint string).
 
-    The SDK endpoint string is the ';'-joined endpoint list. Whether the
-    SDK accepts a multi-endpoint string is pending confirmation from the
-    EIC SDK team; the full list is always kept on the resolved config.
+    Both values are normalized to the bare host:port form that the
+    previous yaml path handed to the SDK verbatim, joined with ';' for
+    multiple endpoints. An http:// or https:// scheme on an endpoint is
+    accepted as input syntax and stripped, so every input form reaches
+    the SDK in the one shape already proven in production.
     """
     text = "" if raw is None else str(raw).strip()
     if not text:
@@ -72,23 +74,15 @@ def parse_eic_remote_url(raw) -> tuple[list, str]:
     if not text.startswith(EIC_URL_PREFIX):
         raise ValueError("EicRemoteUrl must start with eic://")
     body = text[len(EIC_URL_PREFIX) :]
-    endpoints = [part.strip() for part in body.split(";")]
-    endpoints = [part for part in endpoints if part]
-    if not endpoints:
+    parts = [part.strip() for part in body.split(";")]
+    parts = [part for part in parts if part]
+    if not parts:
         raise ValueError("no valid endpoint in EicRemoteUrl")
-    for endpoint in endpoints:
-        _validate_endpoint(endpoint)
-    if len(endpoints) > 1:
-        logger.warning(
-            "EicRemoteUrl carries %d endpoints; passing the ';'-joined "
-            "string to the EIC SDK, whose multi-endpoint support is not "
-            "yet confirmed",
-            len(endpoints),
-        )
+    endpoints = [_validate_endpoint(part) for part in parts]
     return endpoints, ";".join(endpoints)
 
 
-def _validate_endpoint(endpoint: str) -> None:
+def _validate_endpoint(endpoint: str) -> str:
     # Previous servingkit yaml writes bare host:port endpoints, e.g.
     # eic://192.168.30.90:12500;192.168.30.91:12500 -- that form must keep
     # working. http:// and https:// forms are also accepted; any other
@@ -105,12 +99,18 @@ def _validate_endpoint(endpoint: str) -> None:
             )
     else:
         host_port = endpoint
-    host, sep, port = host_port.rpartition(":")
-    if not sep or not host or not port.isdigit():
+    if any(ch.isspace() for ch in endpoint) or "@" in host_port or "/" in host_port:
         raise ValueError(
             f"invalid endpoint in EicRemoteUrl: {endpoint!r} "
-            "must be in host:port form"
+            "must be in host:port form without whitespace"
         )
+    host, sep, port = host_port.rpartition(":")
+    if not sep or not host or not port.isdigit() or not 1 <= int(port) <= 65535:
+        raise ValueError(
+            f"invalid endpoint in EicRemoteUrl: {endpoint!r} "
+            "must be in host:port form with a port in 1..65535"
+        )
+    return host_port
 
 
 def get_eic_config_file_path(environ: Optional[Mapping] = None) -> str:
@@ -130,16 +130,35 @@ def load_yaml_config(
     except ImportError:
         logger.warning("pyyaml is unavailable; ignoring EIC config %s", path)
         return {}
-    with open(path, "r") as fin:
-        return yaml.safe_load(fin) or {}
+    try:
+        with open(path, "r") as fin:
+            data = yaml.safe_load(fin)
+    except Exception as exc:
+        raise ValueError(f"failed to read EIC config file {path}: {exc}") from exc
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"EIC config file {path} must contain a mapping, "
+            f"got {type(data).__name__}"
+        )
+    return data
 
 
 def load_fixed_config(
     environ: Optional[Mapping] = None, config_file: Optional[str] = None
 ) -> dict:
-    """Fixed parameters: yaml values over the built-in defaults."""
+    """Fixed parameters: yaml values over the built-in defaults.
+
+    An explicit null in yaml counts as missing for a key that has a
+    built-in default, so generated templates that write null
+    placeholders do not turn into None values at client construction.
+    """
     fixed = dict(DEFAULT_FIXED_CONFIG)
     fixed.update(load_yaml_config(environ, config_file))
+    for key, default in DEFAULT_FIXED_CONFIG.items():
+        if fixed.get(key) is None and default is not None:
+            fixed[key] = default
     return fixed
 
 
@@ -166,33 +185,46 @@ def load_eic_config(
 
     if not enabled:
         source = "env" if switch_from_env else ("cli" if cli_enabled else "default")
+        if switch_from_env:
+            raw_switch = str(env.get(ENV_ENABLE_EIC_CACHE) or "").strip()
+            if raw_switch.lower() in ("true", "1", "yes", "on"):
+                logger.warning(
+                    "EnableEicCache=%r is treated as disabled: only the "
+                    "exact value 'True' enables EIC (case-sensitive)",
+                    raw_switch,
+                )
         resolved = EicResolvedConfig(enabled=False, source=source, fixed=fixed)
         logger.info("eic config resolved: enabled=False source=%s", source)
         return resolved
 
     yaml_config = load_yaml_config(env, config_file)
 
-    env_url = (env.get(ENV_EIC_REMOTE_URL) or "").strip()
+    # A present-but-empty env value is an explicit injection error, not
+    # an absence: parsing it raises instead of silently falling back to
+    # a yaml endpoint that may name a different cluster.
     yaml_url = str(yaml_config.get("remote_url") or "").strip()
-    if env_url:
-        endpoints, endpoint = parse_eic_remote_url(env_url)
+    if ENV_EIC_REMOTE_URL in env:
+        endpoints, endpoint = parse_eic_remote_url(env.get(ENV_EIC_REMOTE_URL))
+        url_source = "env"
     elif yaml_url:
         endpoints, endpoint = parse_eic_remote_url(yaml_url)
-        # Previous usage handed the yaml string to the SDK verbatim
-        # (remote_url without the eic:// prefix, separators untouched).
-        # Keep that byte-for-byte so existing ConfigMaps behave as before;
-        # the normalized form is only used for the env-var scheme.
-        endpoint = yaml_url[len(EIC_URL_PREFIX) :]
+        url_source = "yaml"
     else:
         raise ValueError("EicRemoteUrl is required when EnableEicCache=True")
 
-    env_id = (env.get(ENV_EIC_INSTANCE_ID) or "").strip()
     yaml_id = str(yaml_config.get("eic_instance_id") or "").strip()
-    instance_id = env_id or yaml_id
+    if ENV_EIC_INSTANCE_ID in env:
+        instance_id = (env.get(ENV_EIC_INSTANCE_ID) or "").strip()
+        id_source = "env"
+    else:
+        instance_id = yaml_id
+        id_source = "yaml"
     if not instance_id:
         raise ValueError("EicInstanceId is required when EnableEicCache=True")
+    if any(ch.isspace() for ch in instance_id):
+        raise ValueError("EicInstanceId must not contain whitespace")
 
-    source = "env" if (switch_from_env or env_url or env_id) else "yaml"
+    source = "env" if "env" in (url_source, id_source) else "yaml"
     resolved = EicResolvedConfig(
         enabled=True,
         instance_id=instance_id,
