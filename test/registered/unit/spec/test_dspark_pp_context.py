@@ -36,6 +36,7 @@ from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM  # noqa: E402
 from sglang.srt.models.deepseek_v4_dspark import (  # noqa: E402
     DeepseekV4ForCausalLMDSpark,
 )
+from sglang.srt.models.dspark import VanillaMarkov  # noqa: E402
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2  # noqa: E402
 from sglang.srt.speculative.dspark_components.dspark_config import (  # noqa: E402
     resolve_single_owner_pp_rank,
@@ -55,6 +56,107 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class TestDSparkPPContext(CustomTestCase):
+    @staticmethod
+    def _make_sampling_replay_worker():
+        class DraftModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.hc_mult = 2
+                self.base_head = torch.nn.Linear(4, 7, bias=False)
+                self.markov_head = VanillaMarkov(vocab_size=7, markov_rank=3)
+
+            def compute_base_logits(self, hidden):
+                return self.base_head(hidden.flatten(-2)), None
+
+        worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker.device = torch.device("cpu")
+        worker.gamma = 2
+        worker.draft_model = DraftModel()
+        worker._proposer = SimpleNamespace(_base_logits_context=lambda: nullcontext())
+        return worker
+
+    def test_pp_sampling_rebuilds_logits_from_relayed_hidden(self):
+        torch.manual_seed(1)
+        worker = self._make_sampling_replay_worker()
+        draft_hidden = torch.randn(2, worker.gamma, 4)
+        draft_block_ids = torch.tensor([[1, 6], [2, 6]])
+        draft_tokens = torch.tensor([[3, 4], [5, 1]])
+
+        actual = worker._rebuild_pp_draft_logits(
+            draft_block_ids=draft_block_ids,
+            draft_tokens=draft_tokens,
+            hidden_rows=[row.reshape(1, -1) for row in draft_hidden],
+            hidden_indices=[0, 1],
+        )
+
+        base_logits, _ = worker.draft_model.compute_base_logits(
+            draft_hidden.view(-1, worker.draft_model.hc_mult, 2)
+        )
+        previous_tokens = torch.stack(
+            [draft_block_ids[:, 0], draft_tokens[:, 0]], dim=1
+        )
+        expected = worker.draft_model.markov_head.apply_block_logits(
+            base_logits.view(2, worker.gamma, -1),
+            token_ids=previous_tokens,
+            hidden_states=draft_hidden,
+        )
+        torch.testing.assert_close(actual, expected)
+
+    def test_pp_sampling_bootstrap_uses_delta_proposal(self):
+        torch.manual_seed(2)
+        worker = self._make_sampling_replay_worker()
+        worker.draft_model.markov_head.to(torch.bfloat16)
+        draft_hidden = torch.randn(1, worker.gamma, 4)
+        draft_block_ids = torch.tensor([[4, 6], [2, 6]])
+        draft_tokens = torch.tensor([[4, 4], [5, 1]])
+
+        actual = worker._rebuild_pp_draft_logits(
+            draft_block_ids=draft_block_ids,
+            draft_tokens=draft_tokens,
+            hidden_rows=[draft_hidden[0]],
+            hidden_indices=[1],
+        )
+
+        self.assertEqual(actual.dtype, torch.float32)
+        self.assertTrue(torch.equal(actual[0, :, 4], torch.zeros(worker.gamma)))
+        bootstrap_other = actual[0].clone()
+        bootstrap_other[:, 4] = float("-inf")
+        self.assertTrue(torch.isneginf(bootstrap_other).all())
+
+        base_logits, _ = worker.draft_model.compute_base_logits(
+            draft_hidden.view(-1, worker.draft_model.hc_mult, 2)
+        )
+        expected = worker.draft_model.markov_head.apply_block_logits(
+            base_logits.view(1, worker.gamma, -1),
+            token_ids=torch.tensor([[2, 5]]),
+            hidden_states=draft_hidden,
+        )
+        torch.testing.assert_close(actual[1:], expected)
+
+    def test_pp_sampling_candidate_keeps_relayed_hidden(self):
+        class Request:
+            rid = "sample-request"
+            bootstrap_room = 7
+            retraction_count = 0
+            spec_verify_ct = 3
+
+        req = Request()
+        worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker.ps = SimpleNamespace(pp_size=1)
+        worker._pp_candidates = {}
+        hidden = torch.randn(2, 4)
+        payload = {
+            "identities": [(req.rid, (req.bootstrap_room, req.retraction_count), 4)],
+            "draft_block_ids": torch.tensor([[1, 6]]),
+            "draft_tokens": torch.tensor([[3, 4]]),
+            "draft_hidden": hidden.unsqueeze(0),
+        }
+
+        worker.install_pp_draft(SimpleNamespace(reqs=[req]), owner=0, payload=payload)
+
+        candidate = worker._pp_candidates[req]
+        torch.testing.assert_close(candidate.draft_hidden, hidden)
+
     def test_linear_accept_index_matches_flat_verify_rows(self):
         worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
         worker.verify_num_draft_tokens = 6

@@ -127,6 +127,30 @@ def resolve_greedy_mask(
     return (sampling_info.top_ks <= 1).view(-1)
 
 
+def replay_draft_block_logits(
+    *,
+    base_logits: torch.Tensor,
+    anchor_tokens: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    draft_hidden: torch.Tensor,
+    markov_head,
+) -> torch.Tensor:
+    """Rebuild the proposal distribution for an already sampled draft chain."""
+
+    def replay_token(_step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
+        return draft_tokens[:, step_idx]
+
+    _, corrected_logits = markov_head.sample_block(
+        base_logits,
+        first_prev_tokens=anchor_tokens,
+        hidden_states=draft_hidden,
+        sampler=replay_token,
+    )
+    if corrected_logits is None:
+        raise RuntimeError("DSpark sampling requires corrected draft logits.")
+    return corrected_logits
+
+
 def sample_draft_block(
     *,
     base_logits: torch.Tensor,

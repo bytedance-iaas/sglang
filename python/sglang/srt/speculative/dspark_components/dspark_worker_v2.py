@@ -54,6 +54,8 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockResult,
     DraftProposal,
     make_next_draft_input,
+    replay_draft_block_logits,
+    resolve_greedy_mask,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
     maybe_build_draft_sampler,
@@ -1025,14 +1027,6 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         target_model = self.target_worker.model_runner.model
         sampling_info = batch.sampling_info
-        if (
-            self._replicated_pp_decode
-            and sampling_info is not None
-            and not sampling_info.is_all_greedy
-        ):
-            raise ValueError(
-                "Replicated PP DSpark currently supports greedy sampling only."
-            )
         self._observers.begin_step()
         verify_window = alloc_verify_window(
             batch=batch,
@@ -1043,7 +1037,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             model_runner=self.model_runner,
         )
         if self._replicated_pp_decode:
-            proposal = self.consume_pp_draft(batch)
+            proposal = self.consume_pp_draft(batch, sampling_info)
         else:
             with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
                 proposal = self._proposer.propose(
@@ -1365,6 +1359,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                     )
             payload["draft_block_ids"] = proposal.draft_block_ids.clone()
             payload["draft_tokens"] = proposal.draft_block.draft_tokens.clone()
+            if not owned.sampling_info.is_all_greedy:
+                if proposal.draft_hidden is None:
+                    raise RuntimeError(
+                        "PP DSpark sampling proposal is missing draft hidden states."
+                    )
+                payload["draft_hidden"] = proposal.draft_hidden.clone()
             if confidence is not None:
                 payload["confidence"] = confidence.clone()
         elif self._pp_draft_dp_enabled:
@@ -1413,14 +1413,17 @@ class DSparkWorkerV2(BaseSpecWorker):
                 identity=expected[row],
                 draft_block_ids=payload["draft_block_ids"][row],
                 draft_tokens=payload["draft_tokens"][row],
+                draft_hidden=(
+                    payload["draft_hidden"][row] if "draft_hidden" in payload else None
+                ),
                 confidence=(
                     payload["confidence"][row] if "confidence" in payload else None
                 ),
             )
             row += 1
 
-    def consume_pp_draft(self, batch: ScheduleBatch) -> DraftProposal:
-        blocks, tokens, confidences = [], [], []
+    def consume_pp_draft(self, batch: ScheduleBatch, sampling_info) -> DraftProposal:
+        blocks, tokens, hidden_rows, hidden_indices, confidences = [], [], [], [], []
         stream = torch.get_device_module(self.device).current_stream()
         for i, req in enumerate(batch.reqs):
             candidate = self._pp_candidates.pop(req, None)
@@ -1438,18 +1441,45 @@ class DSparkWorkerV2(BaseSpecWorker):
             candidate.draft_tokens.record_stream(stream)
             blocks.append(candidate.draft_block_ids)
             tokens.append(candidate.draft_tokens)
+            if candidate.draft_hidden is not None:
+                candidate.draft_hidden.record_stream(stream)
+                hidden_rows.append(candidate.draft_hidden)
+                hidden_indices.append(i)
             if candidate.confidence is not None:
                 candidate.confidence.record_stream(stream)
                 confidences.append(candidate.confidence)
+        draft_block_ids = torch.stack(blocks)
+        draft_tokens = torch.stack(tokens)
+        rebuild_sampling_logits = (
+            sampling_info is not None
+            and not sampling_info.is_all_greedy
+            and self.ps.pp_rank == self.ps.pp_size - 1
+        )
+        corrected_logits = None
+        if rebuild_sampling_logits:
+            corrected_logits = self._rebuild_pp_draft_logits(
+                draft_block_ids=draft_block_ids,
+                draft_tokens=draft_tokens,
+                hidden_rows=hidden_rows,
+                hidden_indices=hidden_indices,
+            )
         return DraftProposal(
-            draft_block_ids=torch.stack(blocks),
+            draft_block_ids=draft_block_ids,
             draft_block=DraftBlockResult(
-                draft_tokens=torch.stack(tokens),
-                corrected_logits=None,
-                greedy_mask=torch.ones(
-                    len(batch.reqs), dtype=torch.bool, device=self.device
+                draft_tokens=draft_tokens,
+                corrected_logits=corrected_logits,
+                greedy_mask=resolve_greedy_mask(
+                    bs=len(batch.reqs),
+                    sampling_info=sampling_info,
+                    device=self.device,
                 ),
-                temperatures=torch.ones(len(batch.reqs), device=self.device),
+                temperatures=(
+                    torch.ones(len(batch.reqs), device=self.device)
+                    if sampling_info is None
+                    else sampling_info.temperatures.view(-1)
+                    .to(torch.float32)
+                    .clamp_min(1e-5)
+                ),
             ),
             draft_hidden=None,
             confidence=(
@@ -1458,6 +1488,98 @@ class DSparkWorkerV2(BaseSpecWorker):
                 else None
             ),
         )
+
+    def _rebuild_pp_draft_logits(
+        self,
+        *,
+        draft_block_ids: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        hidden_rows: list[torch.Tensor],
+        hidden_indices: list[int],
+    ) -> torch.Tensor:
+        bs = draft_tokens.shape[0]
+        markov_head = self.draft_model.markov_head
+        normalized_hidden_rows = []
+        for hidden in hidden_rows:
+            if hidden.numel() % self.gamma != 0:
+                raise RuntimeError(
+                    "PP DSpark draft hidden size must be divisible by gamma, got "
+                    f"shape={tuple(hidden.shape)}, gamma={self.gamma}."
+                )
+            normalized_hidden_rows.append(hidden.reshape(self.gamma, -1))
+        hidden_rows = normalized_hidden_rows
+        if len(hidden_rows) == bs:
+            draft_hidden = torch.stack(hidden_rows)
+            with self._proposer._base_logits_context():
+                base_logits, _ = self.draft_model.compute_base_logits(
+                    self._reshape_pp_hidden_for_projection(draft_hidden)
+                )
+            base_logits = base_logits.view(bs, self.gamma, -1)
+            return replay_draft_block_logits(
+                base_logits=base_logits,
+                anchor_tokens=draft_block_ids[:, 0],
+                draft_tokens=draft_tokens,
+                draft_hidden=draft_hidden,
+                markov_head=markov_head,
+            )
+
+        replayed_logits = None
+        if hidden_rows:
+            row_index = torch.tensor(
+                hidden_indices, dtype=torch.int64, device=self.device
+            )
+            draft_hidden = torch.stack(hidden_rows)
+            with self._proposer._base_logits_context():
+                base_logits, _ = self.draft_model.compute_base_logits(
+                    self._reshape_pp_hidden_for_projection(draft_hidden)
+                )
+            base_logits = base_logits.view(len(hidden_rows), self.gamma, -1)
+            replayed_logits = replay_draft_block_logits(
+                base_logits=base_logits,
+                anchor_tokens=draft_block_ids[row_index, 0],
+                draft_tokens=draft_tokens[row_index],
+                draft_hidden=draft_hidden,
+                markov_head=markov_head,
+            )
+
+        corrected_logits = torch.full(
+            (bs, self.gamma, int(markov_head.vocab_size)),
+            float("-inf"),
+            dtype=(
+                replayed_logits.dtype if replayed_logits is not None else torch.float32
+            ),
+            device=self.device,
+        )
+        if replayed_logits is not None:
+            corrected_logits[row_index] = replayed_logits
+
+        missing_mask = torch.ones(bs, dtype=torch.bool, device=self.device)
+        if hidden_indices:
+            missing_mask[hidden_indices] = False
+        missing_rows = torch.nonzero(missing_mask, as_tuple=False).view(-1)
+        if missing_rows.numel() > 0:
+            steps = torch.arange(self.gamma, device=self.device)
+            anchors = draft_block_ids[missing_rows, 0]
+            corrected_logits[
+                missing_rows[:, None],
+                steps[None, :],
+                anchors[:, None],
+            ] = 0
+        return corrected_logits
+
+    def _reshape_pp_hidden_for_projection(
+        self, draft_hidden: torch.Tensor
+    ) -> torch.Tensor:
+        hidden = draft_hidden.flatten(0, 1)
+        hc_mult = int(getattr(self.draft_model, "hc_mult", 1))
+        if hidden.shape[-1] % hc_mult != 0:
+            raise RuntimeError(
+                "PP DSpark draft hidden width must be divisible by hc_mult, got "
+                f"shape={tuple(hidden.shape)}, hc_mult={hc_mult}."
+            )
+        if hc_mult > 1:
+            hidden = hidden.view(hidden.shape[0], hc_mult, -1)
+        return hidden
 
     def _build_pp_commit_state(
         self, batch: ScheduleBatch, verify_window
