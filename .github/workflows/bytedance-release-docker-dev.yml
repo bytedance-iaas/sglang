@@ -316,9 +316,38 @@ jobs:
       concurrency_group: ${{ format('bytedance-kernel-build-{0}', github.run_id) }}
     secrets: inherit
 
-  build-dev:
+  warm-dev-build-cache:
     needs: [build-dev-kernel-wheel]
-    if: ${{ github.repository == 'bytedance-iaas/sglang' && !inputs.private_debug_base_only && inputs.private_debug_verify_image == '' && always() && (needs.build-dev-kernel-wheel.result == 'success' || needs.build-dev-kernel-wheel.result == 'skipped') }}
+    if: ${{ github.repository == 'bytedance-iaas/sglang' && !inputs.private_debug_base_only && inputs.private_debug_verify_image == '' && inputs.kernel_artifact_run_id == '' && (github.event_name == 'schedule' || inputs.compile_kernel) && always() && needs.build-dev-kernel-wheel.result == 'success' }}
+    uses: ./.github/workflows/_bytedance-docker-warm-cache.yml
+    with:
+      install_iaas_kernels: true
+      checkout_ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
+      cuda_key: cu130
+      cuda_version: 13.0.3
+      use_environment: prod
+      concurrency_group: ${{ format('bytedance-docker-cache-warm-{0}', github.run_id) }}
+      artifact_name: ${{ (inputs.kernel_artifact_run_id != '' || github.event_name == 'schedule' || inputs.compile_kernel) && 'sgl-kernel-x86-cu13' || '' }}
+      artifact_run_id: ${{ inputs.kernel_artifact_run_id }}
+      kernel_tos_uri: ${{ inputs.kernel_artifact_run_id == '' && needs.build-dev-kernel-wheel.outputs.kernel_tos_uri || '' }}
+      kernel_wheel_sha256: ${{ inputs.kernel_artifact_run_id == '' && needs.build-dev-kernel-wheel.outputs.kernel_wheel_sha256 || '' }}
+      extra_build_args: >-
+        --build-arg BRANCH_TYPE=local
+        --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
+        --build-arg INSTALL_LOCAL_SGL_KERNEL_WHEEL=${{ (inputs.kernel_artifact_run_id != '' || github.event_name == 'schedule' || inputs.compile_kernel) && '1' || '0' }}
+        --build-arg HTTP_PROXY=http://100.68.162.211:3128
+        --build-arg HTTPS_PROXY=http://100.68.162.211:3128
+        --build-arg ALL_PROXY=http://100.68.162.211:3128
+        --build-arg NO_PROXY=localhost,127.0.0.1,::1,archive.ubuntu.com,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,iaas-gpu-cn-beijing.cr.volces.com
+        --build-arg no_proxy=localhost,127.0.0.1,::1,archive.ubuntu.com,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,iaas-gpu-cn-beijing.cr.volces.com
+        --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com
+        --build-arg BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_APT_URL || 'http://mirrors.ivolces.com/extra-tools/ubuntu' }}
+        --build-arg BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL || 'https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system' }}
+    secrets: inherit
+
+  build-dev:
+    needs: [build-dev-kernel-wheel, warm-dev-build-cache]
+    if: ${{ github.repository == 'bytedance-iaas/sglang' && !inputs.private_debug_base_only && inputs.private_debug_verify_image == '' && always() && (needs.build-dev-kernel-wheel.result == 'success' || needs.build-dev-kernel-wheel.result == 'skipped') && (needs.warm-dev-build-cache.result == 'success' || needs.warm-dev-build-cache.result == 'skipped') }}
     strategy:
       fail-fast: false
       matrix:
@@ -351,6 +380,7 @@ jobs:
       # older run remains compatible with its GitHub artifact.
       kernel_tos_uri: ${{ inputs.kernel_artifact_run_id == '' && needs.build-dev-kernel-wheel.outputs.kernel_tos_uri || '' }}
       kernel_wheel_sha256: ${{ inputs.kernel_artifact_run_id == '' && needs.build-dev-kernel-wheel.outputs.kernel_wheel_sha256 || '' }}
+      build_cache_ref: ${{ needs.warm-dev-build-cache.outputs.cache_ref }}
       image_formats: ${{ github.event_name == 'schedule' && 'oci,zstd,nydus' || inputs.image_formats }}
       extra_build_args: >-
         --build-arg BRANCH_TYPE=local

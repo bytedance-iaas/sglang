@@ -106,6 +106,11 @@ on:
         required: false
         type: string
         default: ""
+      build_cache_ref:
+        description: "Optional registry BuildKit cache produced by a bounded prewarm job"
+        required: false
+        type: string
+        default: ""
       image_formats:
         description: "CSV of image formats to build and push. Default builds all three (oci,zstd,nydus); pass a subset to narrow."
         required: false
@@ -148,6 +153,7 @@ jobs:
       TAG_MODE: ${{ inputs.tag_mode }}
       TAG_VALUE: ${{ inputs.tag_value }}
       IMAGE_TAG_OVERRIDE: ${{ inputs.image_tag_override }}
+      BUILD_CACHE_REF: ${{ inputs.build_cache_ref }}
       VARIANT_SUFFIX: ${{ inputs.variant_suffix }}
       VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
       VOLCENGINE_CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
@@ -405,6 +411,9 @@ jobs:
           # The cache ref is keyed to the resolved primary tag (unique per
           # variant+cuda+run) to avoid collisions across concurrent matrix jobs.
           CACHE_ARGS=()
+          if [ -n "${BUILD_CACHE_REF}" ]; then
+            CACHE_ARGS+=(--cache-from "type=registry,ref=${BUILD_CACHE_REF}")
+          fi
           if printf '%s' "${IMAGE_FORMATS}" | tr ',' '\n' | grep -qx "zstd"; then
             PRIMARY_TAG=$(printf '%s\n' "${IMAGE_TAGS}" | grep -v '^[[:space:]]*$' | head -1 | tr -d '[:space:]')
             CACHE_REF="${IMAGE_REPO}:buildcache-${PRIMARY_TAG}"
