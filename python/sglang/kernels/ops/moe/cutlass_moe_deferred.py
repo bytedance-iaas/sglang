@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import os
 from functools import cache
 from pathlib import Path
 
 import torch
 
 _original_sm90_generator = None
+
+
+@cache
+def _use_tuned_dsv41_tp8_tactics() -> bool:
+    return os.environ.get("SGLANG_DSV41_SM90_MOE_TP8_8192_TACTICS", "0") == "1"
 
 
 def _cutlass_routing_map_to_token_major(
@@ -175,6 +181,23 @@ def cutlass_fused_moe_deferred(
     )
 
     install_sm90_deferred_overlay()
+    # FlashInfer 0.6.18 SM90 Humming: independently tuned W13 and W2.
+    # Keep the default heuristic for every unvalidated shape and explicit override.
+    if (
+        _use_tuned_dsv41_tp8_tactics()
+        and num_tokens == 8192
+        and hidden_size == 7168
+        and top_k == 6
+        and kwargs.get("tp_size") == 8
+        and kwargs.get("ep_size") == 1
+        and kwargs.get("use_wfp4afp8_humming", False)
+        and tuple(kwargs["fc2_expert_weights"].shape) == (384, 7168, 192)
+        and "profile_ids" not in kwargs
+    ):
+        import flashinfer
+
+        if flashinfer.__version__ == "0.6.18":
+            kwargs["profile_ids"] = [20, 160]
     expanded_rows = num_tokens * top_k
     gemm2_numel = expanded_rows * hidden_size
     # The C++ overlay writes int32 routing indices into this BF16 storage tail.
