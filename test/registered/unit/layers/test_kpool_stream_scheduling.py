@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from sglang.kernels.ops.attention.dsa import triton_kernel
 from sglang.srt.layers.attention.dsa import dsa_indexer_kpool as indexer_module
+from sglang.srt.layers.attention.dsa import kpool_fp8_index as kpool_index_module
 from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -386,6 +387,104 @@ class TestKPoolMqaLogitsRowChunks(CustomTestCase):
                 num_rows=_LARGE_ROWS, num_cols=_LARGE_COLS, budget_bytes=6 << 30
             )
         self.assertGreater(len(chunks), 1)
+
+
+class TestKPoolTopKV2Routing(unittest.TestCase):
+    def _inputs(self):
+        return dict(
+            logits=torch.empty((3, 16), dtype=torch.float32),
+            group_lengths=torch.tensor([0, 3, 16], dtype=torch.int32),
+            kpool=4,
+            topk=8,
+            page_table=None,
+            page_table_row_index=None,
+            topk_offsets=None,
+            seq_lens=torch.tensor([0, 14, 67], dtype=torch.int32),
+            row_starts=None,
+            out_rows=None,
+        )
+
+    def test_owned_plan_uses_planned_route(self):
+        expected = torch.full((3, 11), 7, dtype=torch.int32)
+        plan = torch.empty((4, 2), dtype=torch.int32)
+        with (
+            patch.object(
+                kpool_index_module, "_can_use_kpool_topk_v2", return_value=True
+            ),
+            patch.object(
+                kpool_index_module,
+                "_kpool_topk_v2",
+                return_value=expected,
+            ) as planned,
+            patch.object(kpool_index_module, "_kpool_topk_v2_ragged") as ragged,
+            patch.object(kpool_index_module, "_log_kpool_topk_v2_route") as log,
+        ):
+            actual = kpool_index_module._try_kpool_topk_v2(
+                **self._inputs(), topk_v2_plan=plan
+            )
+        self.assertIs(actual, expected)
+        self.assertIs(planned.call_args.kwargs["topk_v2_plan"], plan)
+        ragged.assert_not_called()
+        self.assertEqual(log.call_args.kwargs["route"], "planned")
+
+    def test_missing_or_mismatched_plan_uses_ragged_route(self):
+        expected = torch.full((3, 11), 9, dtype=torch.int32)
+        for plan in (None, torch.empty((3, 2), dtype=torch.int32)):
+            with (
+                self.subTest(plan=plan is not None),
+                patch.object(
+                    kpool_index_module, "_can_use_kpool_topk_v2", return_value=False
+                ),
+                patch.object(
+                    kpool_index_module, "_kpool_topk_v2_layout_ok", return_value=True
+                ),
+                patch.object(kpool_index_module, "_kpool_topk_v2") as planned,
+                patch.object(
+                    kpool_index_module,
+                    "_kpool_topk_v2_ragged",
+                    return_value=expected,
+                ) as ragged,
+                patch.object(kpool_index_module, "_log_kpool_topk_v2_route") as log,
+            ):
+                actual = kpool_index_module._try_kpool_topk_v2(
+                    **self._inputs(), topk_v2_plan=plan
+                )
+            self.assertIs(actual, expected)
+            planned.assert_not_called()
+            ragged.assert_called_once()
+            self.assertEqual(log.call_args.kwargs["route"], "ragged")
+
+    def test_ineligible_layout_preserves_legacy_fallback(self):
+        with (
+            patch.object(
+                kpool_index_module, "_can_use_kpool_topk_v2", return_value=False
+            ),
+            patch.object(
+                kpool_index_module, "_kpool_topk_v2_layout_ok", return_value=False
+            ),
+            patch.object(kpool_index_module, "_kpool_topk_v2") as planned,
+            patch.object(kpool_index_module, "_kpool_topk_v2_ragged") as ragged,
+        ):
+            actual = kpool_index_module._try_kpool_topk_v2(
+                **self._inputs(), topk_v2_plan=None
+            )
+        self.assertIsNone(actual)
+        planned.assert_not_called()
+        ragged.assert_not_called()
+
+    def test_plan_is_owned_only_by_matching_row_count(self):
+        plan = torch.empty((5, 2), dtype=torch.int32)
+        self.assertIs(
+            indexer_module._topk_v2_plan_for(
+                owned_plan=plan, pool_lens=torch.empty(4, dtype=torch.int32)
+            ),
+            plan,
+        )
+        self.assertIsNone(
+            indexer_module._topk_v2_plan_for(
+                owned_plan=plan, pool_lens=torch.empty(3, dtype=torch.int32)
+            )
+        )
 
 
 def _row_chunks(*, rows_per_chunk, num_rows, num_cols, device):

@@ -1,3 +1,4 @@
+import logging
 from typing import Optional, Tuple
 
 import torch
@@ -12,6 +13,9 @@ from sglang.srt.layers.attention.dsa.utils import (
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
+
+logger = logging.getLogger(__name__)
+_logged_kpool_topk_v2_routes: set[str] = set()
 
 BLOCK_SIZE_K = 64
 INDEX_HEAD_DIM = 128
@@ -643,6 +647,23 @@ def _alloc_kpool_topk_out(
     return logits.new_full((out_rows, out_cols), -1, dtype=torch.int32)
 
 
+def _log_kpool_topk_v2_route(
+    *, route: str, logits: torch.Tensor, pool_size: int, topk: int
+) -> None:
+    if route in _logged_kpool_topk_v2_routes:
+        return
+    logger.info(
+        "Activated DSA KPool top-k v2 route: route=%s rows=%d score_width=%d "
+        "pool_size=%d token_topk=%d",
+        route,
+        logits.shape[0],
+        logits.shape[1],
+        pool_size,
+        topk,
+    )
+    _logged_kpool_topk_v2_routes.add(route)
+
+
 def _kpool_topk_v2_ragged(
     *,
     logits: torch.Tensor,
@@ -734,6 +755,9 @@ def _try_kpool_topk_v2(
         row_starts=row_starts,
         page_table_row_index=page_table_row_index,
     ):
+        _log_kpool_topk_v2_route(
+            route="planned", logits=logits, pool_size=kpool, topk=topk
+        )
         return _kpool_topk_v2(
             logits=logits,
             group_lengths=group_lengths,
@@ -746,6 +770,9 @@ def _try_kpool_topk_v2(
             topk_v2_plan=topk_v2_plan,
         )
     if _kpool_topk_v2_layout_ok(logits=logits, pool_size=kpool):
+        _log_kpool_topk_v2_route(
+            route="ragged", logits=logits, pool_size=kpool, topk=topk
+        )
         return _kpool_topk_v2_ragged(
             logits=logits,
             group_lengths=group_lengths,
