@@ -1744,15 +1744,29 @@ class EICNSATokenToKVPoolHost(EICMLATokenToKVPoolHost):
 class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
     """Native EIC shared-page adapter for DeepSeek V4 hybrid KV pools."""
 
+    # Pool names are matched by value, not by enum member: DSv4.1 adds
+    # low-ratio (C1/C2), FP4 indexer-scale and split-rope pools that this
+    # branch's PoolName enum does not define yet. PoolName is a str enum,
+    # so v4 members compare and hash equal to the same strings.
     _KV_SOURCED_POOLS = {
-        PoolName.DEEPSEEK_V4_C4,
-        PoolName.DEEPSEEK_V4_C4_INDEXER,
-        PoolName.DEEPSEEK_V4_C128,
+        "deepseek_v4_c1",
+        "deepseek_v4_c1_indexer",
+        "deepseek_v4_c1_indexer_scale",
+        "deepseek_v4_c2",
+        "deepseek_v4_c2_indexer",
+        "deepseek_v4_c2_indexer_scale",
+        "deepseek_v4_c4",
+        "deepseek_v4_c4_indexer",
+        "deepseek_v4_c4_indexer_scale",
+        "deepseek_v4_c4_rope",
+        "deepseek_v4_c128",
+        "deepseek_v4_c128_rope",
     }
     _SWA_SOURCED_POOLS = {
-        PoolName.SWA,
-        PoolName.DEEPSEEK_V4_C4_STATE,
-        PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+        "swa",
+        "deepseek_v4_c4_state",
+        "deepseek_v4_c4_indexer_state",
+        "deepseek_v4_c128_state",
     }
 
     def __init__(
@@ -1815,6 +1829,7 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
                 self._estimated_page_bytes,
                 self.page_bytes,
             )
+        self._apply_page_layout_to_deploy_key()
 
         self.eic_chunk_bytes = self._resolve_eic_chunk_bytes()
         self.page_chunk_count = (
@@ -1854,33 +1869,58 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
         return "kernel"
 
     def _estimate_page_bytes(self, device_pool) -> int:
+        # Best-effort sizing hint only: the authoritative page size is the
+        # packed spec sum built in __init__. DSv4.1 stages may omit pools
+        # (unified KV has no SWA pool; a stage may have no C4/C128 layers)
+        # or use indexer/state layouts without the v4 attributes, so every
+        # access is guarded and a missing piece contributes 0.
         page_bytes = 0
-        if device_pool.swa_kv_pool.kv_buffer:
-            page_bytes += len(device_pool.swa_kv_pool.kv_buffer) * int(
-                device_pool.swa_kv_pool.bytes_per_page_padded
-            )
-        if device_pool.c4_kv_pool.kv_buffer:
-            page_bytes += len(device_pool.c4_kv_pool.kv_buffer) * int(
-                device_pool.c4_kv_pool.bytes_per_page_padded
-            )
-        c4_indexer_buffer = device_pool.c4_indexer_kv_pool.index_k_with_scale_buffer
-        if c4_indexer_buffer:
-            page_bytes += len(c4_indexer_buffer) * (
-                c4_indexer_buffer[0].shape[1] * c4_indexer_buffer[0].element_size()
-            )
-        if device_pool.c128_kv_pool.kv_buffer:
-            page_bytes += len(device_pool.c128_kv_pool.kv_buffer) * int(
-                device_pool.c128_kv_pool.bytes_per_page_padded
-            )
+        seen = set()
+
+        kv_pools = [
+            getattr(device_pool, "swa_kv_pool", None),
+            getattr(device_pool, "c4_kv_pool", None),
+            getattr(device_pool, "c128_kv_pool", None),
+        ]
+        extra_kv_pools = getattr(device_pool, "kv_pools", None)
+        if isinstance(extra_kv_pools, dict):
+            kv_pools.extend(extra_kv_pools.values())
+        for pool in kv_pools:
+            if pool is None or id(pool) in seen:
+                continue
+            seen.add(id(pool))
+            buffers = getattr(pool, "kv_buffer", None)
+            if buffers:
+                page_bytes += len(buffers) * int(
+                    getattr(pool, "bytes_per_page_padded", 0) or 0
+                )
+
+        indexer_pools = [getattr(device_pool, "c4_indexer_kv_pool", None)]
+        extra_indexer_pools = getattr(device_pool, "index_pools", None)
+        if isinstance(extra_indexer_pools, dict):
+            indexer_pools.extend(extra_indexer_pools.values())
+        for pool in indexer_pools:
+            if pool is None or id(pool) in seen:
+                continue
+            seen.add(id(pool))
+            buffers = getattr(pool, "index_k_with_scale_buffer", None)
+            if buffers:
+                page_bytes += len(buffers) * (
+                    buffers[0].shape[1] * buffers[0].element_size()
+                )
 
         for pools in (
-            device_pool.compress_state_pools,
-            device_pool.indexer_compress_state_pools,
+            getattr(device_pool, "compress_state_pools", None) or [],
+            getattr(device_pool, "indexer_compress_state_pools", None) or [],
         ):
             for pool in pools:
-                if pool is None or pool.ratio == 128:
+                if pool is None or getattr(pool, "ratio", None) == 128:
                     continue
-                state_tensor = pool.kv_score_buffer.kv_score
+                state_tensor = getattr(
+                    getattr(pool, "kv_score_buffer", None), "kv_score", None
+                )
+                if state_tensor is None:
+                    continue
                 page_bytes += int(pool.ring_size * state_tensor[0].nbytes)
         return page_bytes
 
@@ -1912,7 +1952,21 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
             )
         return specs
 
+    def _apply_page_layout_to_deploy_key(self) -> None:
+        # The base deploy key carries model path, page size and dtype only.
+        # A v4 and a v4.1 deployment of one checkpoint would otherwise share
+        # EIC keys while packing different page bytes. Append the packed
+        # page size so layout changes miss and rewrite instead of misreading.
+        self.deploy_key = f"{self.deploy_key}_pb{self.page_bytes}"
+
     def _swa_indices(self, full_indices: torch.Tensor) -> torch.Tensor:
+        if getattr(self.device_pool, "swa_kv_pool", None) is None:
+            # Unified-KV stages have no SWA pool and no SWA-sourced specs;
+            # the SWA index stream is unused, so return a zero stream in
+            # the shape callers expect instead of dereferencing None.
+            return torch.zeros(
+                full_indices.shape, dtype=torch.int64, device=full_indices.device
+            )
         return self.device_pool.translate_loc_from_full_to_swa(full_indices).to(
             torch.int64
         )
