@@ -219,6 +219,7 @@ ARG BUILD_TYPE
 ARG SGL_KERNEL_VERSION
 ARG GITHUB_ARTIFACTORY
 ARG INSTALL_LOCAL_SGL_KERNEL_WHEEL
+ARG INSTALL_IAAS_KERNELS
 
 WORKDIR /sgl-workspace
 
@@ -313,6 +314,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
        fi \
     && cd /sgl-workspace \
     && rm -rf /tmp/sglang_deps \
+    && if [ "$INSTALL_IAAS_KERNELS" = "1" ]; then \
+           test "$CUDA_VERSION" = "13.0.3" && test "$TARGETARCH" = "amd64" && \
+           python3 -m pip install --no-deps 'nvidia-nvshmem-cu13==3.4.5'; \
+       fi \
     && pip freeze | grep -v "^sglang==" > /sgl-workspace/constraints.txt
 
 # distro resolves to the apt python3-distro under /usr/lib/python3, which the runtime
@@ -371,8 +376,10 @@ ARG TARGETARCH
 ARG CUDA_VERSION
 
 COPY docker/iaas-kernels.lock.json /build/iaas-kernels.lock.json
-COPY scripts/ci/build_iaas_kernels_wheel.py scripts/ci/check_iaas_kernels_image.py /build/
-# Build only the host extension here; SM90 kernels are JIT compiled at runtime.
+COPY scripts/ci/build_iaas_kernels_wheel.py scripts/ci/check_iaas_kernels_image.py \
+     scripts/ci/build_iaas_kernels_lto.py scripts/ci/iaas_kernels_lto_link.cpp /build/
+# Build both host extensions and the device LTO runtime tools here. Shape-specific
+# SM90 kernels are JIT compiled at runtime; the CPU-only LTO probe needs no GPU.
 # The private repository token is a BuildKit secret, never a build argument.
 RUN --mount=type=secret,id=iaas_kernels_token \
     --mount=type=cache,target=/root/.cache/pip \
@@ -549,13 +556,16 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     fi && rm -rf /tmp/wheels/hpc-ops
 
 COPY --from=iaas_kernels_builder /wheels /tmp/wheels/iaas-kernels
+COPY docker/iaas-kernels-rdma-fp4.env /tmp/iaas-kernels-rdma-fp4.env
 RUN mkdir -p /opt/sglang/share/iaas-kernels && \
     if [ "$INSTALL_IAAS_KERNELS" = "1" ]; then \
         apt-get update && apt-get install -y --no-install-recommends libdw1t64 libelf1t64 && \
         rm -rf /var/lib/apt/lists/* && \
         python3 -m pip install --force-reinstall --no-deps /tmp/wheels/iaas-kernels/*.whl && \
-        cp /tmp/wheels/iaas-kernels/*.json /opt/sglang/share/iaas-kernels/; \
-    fi && rm -rf /tmp/wheels/iaas-kernels
+        cp /tmp/wheels/iaas-kernels/*.json /opt/sglang/share/iaas-kernels/ && \
+        cp -a /tmp/wheels/iaas-kernels/lto /opt/sglang/share/iaas-kernels/ && \
+        cp /tmp/iaas-kernels-rdma-fp4.env /opt/sglang/share/iaas-kernels/rdma-fp4.env; \
+    fi && rm -rf /tmp/wheels/iaas-kernels /tmp/iaas-kernels-rdma-fp4.env
 
 # Copy flashinfer cubin (always) and jit-cache (if installed) packages
 COPY --from=flashinfer_cache /flashinfer_jit_output/ /opt/sglang/lib/python3.12/site-packages/

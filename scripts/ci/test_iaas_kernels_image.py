@@ -1,5 +1,6 @@
 """CPU regressions for image provenance/ABI and plugin failures."""
 
+import hashlib
 import json
 import sys
 import tempfile
@@ -56,13 +57,119 @@ class TestIaasKernelsImage(unittest.TestCase):
             ("repository", "https://example.com/kernels.git"),
             ("platform", "linux/arm64"),
             ("cuda", "13.4"),
-            ("transport", "rdma"),
+            ("transports", ["nvlink"]),
         ]:
             with self.subTest(key=key), tempfile.TemporaryDirectory() as root:
                 lock_path = Path(root) / "lock.json"
                 lock_path.write_text(json.dumps(dict(self.lock, **{key: value})))
                 with self.assertRaises(RuntimeError):
                     checks.load_lock(lock_path)
+
+    def test_reject_unpinned_or_incompatible_nvshmem(self):
+        for key, value in [
+            ("api_version", 2),
+            ("nvshmem_version", "3.5.0"),
+            ("nvshmem_revision", "main"),
+            ("nvshmem_repository", "https://example.com/nvshmem.git"),
+        ]:
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as root:
+                path = Path(root) / "lock.json"
+                path.write_text(
+                    json.dumps(
+                        dict(self.lock, rdma=dict(self.lock["rdma"], **{key: value}))
+                    )
+                )
+                with self.assertRaisesRegex(RuntimeError, "RDMA requires"):
+                    checks.load_lock(path)
+
+    def test_rdma_must_match_single_node_wheel_and_api(self):
+        info = dict(self.info, source_tree_sha256="a" * 64)
+        rdma = dict(info, rdma_api_version=3, nvshmem="3.4.5", topology="runtime")
+        checks.check_rdma_info(self.lock, info, rdma)
+        for key, value in [
+            ("rdma_api_version", 2),
+            ("nvshmem", "3.5.0"),
+            ("topology", "fixed"),
+            ("source_tree_sha256", "b" * 64),
+            ("checkout", "f" * 40),
+            ("cxx11_abi", False),
+        ]:
+            with self.subTest(key=key), self.assertRaisesRegex(
+                RuntimeError, "RDMA wheel"
+            ):
+                checks.check_rdma_info(self.lock, info, dict(rdma, **{key: value}))
+
+    def test_lto_missing_corrupt_or_nonexecutable_artifacts_fail(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            files = {}
+            for name in (
+                "link_object",
+                "libnvshmem_device_lto.a",
+                "License.nvshmem.txt",
+            ):
+                path = root / name
+                path.write_bytes(name.encode())
+                path.chmod(0o755)
+                files[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+            manifest = dict(
+                files=files,
+                cuda="13.0",
+                cpu_link_probe="passed",
+                nvshmem_revision=self.lock["rdma"]["nvshmem_revision"],
+                nvshmem_version="3.4.5",
+            )
+            checks.check_lto(root, manifest, self.lock)
+            with self.assertRaisesRegex(RuntimeError, "LTO source/toolchain"):
+                checks.check_lto(root, dict(manifest, cuda="13.4"), self.lock)
+            with self.assertRaisesRegex(RuntimeError, "Invalid LTO artifact path"):
+                checks.check_lto(
+                    root,
+                    dict(manifest, files=dict(files, **{"../escape": "x"})),
+                    self.lock,
+                )
+            path = root / "link_object"
+            path.chmod(0o644)
+            with self.assertRaisesRegex(RuntimeError, "not executable"):
+                checks.check_lto(root, manifest, self.lock)
+            path.chmod(0o755)
+            path.write_bytes(b"corrupt")
+            with self.assertRaisesRegex(RuntimeError, "LTO hash mismatch"):
+                checks.check_lto(root, manifest, self.lock)
+            path.unlink()
+            with self.assertRaisesRegex(RuntimeError, "Missing LTO artifact"):
+                checks.check_lto(root, manifest, self.lock)
+
+    def test_nvshmem_headers_must_match_package(self):
+        with tempfile.TemporaryDirectory() as root:
+            home = Path(root)
+            header = home / "include/non_abi/nvshmem_version.h"
+            header.parent.mkdir(parents=True)
+            header.write_text(
+                "#define NVSHMEM_VENDOR_MAJOR_VERSION 3\n#define NVSHMEM_VENDOR_MINOR_VERSION 4\n#define NVSHMEM_VENDOR_PATCH_VERSION 5\n"
+            )
+            for name in (
+                "include/nvshmem.h",
+                "lib/libnvshmem_device.a",
+                "lib/libnvshmem_host.so.3",
+            ):
+                path = home / name
+                path.parent.mkdir(exist_ok=True)
+                path.touch()
+            dist = Mock(version="3.4.5", locate_file=Mock(return_value=home))
+            with patch.object(
+                checks.metadata, "distribution", return_value=dist
+            ), patch.dict(checks.os.environ, {}, clear=True):
+                self.assertEqual(checks.nvshmem_home(self.lock), home.resolve())
+                dist.version = "3.5.0"
+                with self.assertRaisesRegex(RuntimeError, "package mismatch"):
+                    checks.nvshmem_home(self.lock)
+                dist.version = "3.4.5"
+                header.write_text(
+                    header.read_text().replace("PATCH_VERSION 5", "PATCH_VERSION 4")
+                )
+                with self.assertRaisesRegex(RuntimeError, "headers mismatch"):
+                    checks.nvshmem_home(self.lock)
 
     def plugin_modules(self, *, registered=True, initialized=False):
         factory = Mock(__module__="iaas_kernels.integrations.sglang")
@@ -78,6 +185,9 @@ class TestIaasKernelsImage(unittest.TestCase):
                 fused_moe=fused_moe, load_plugins=Mock()
             ),
             "iaas_kernels": types.SimpleNamespace(
+                _native=types.SimpleNamespace(_module=None)
+            ),
+            "iaas_kernels.rdma": types.SimpleNamespace(
                 _native=types.SimpleNamespace(_module=None)
             ),
         }
