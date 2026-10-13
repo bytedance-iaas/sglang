@@ -69,6 +69,42 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         experts = SimpleNamespace(_mega_moe_native_fp8=True)
         self.assertEqual(mega_moe._mega_moe_mma_type(experts), "fp8xfp8")
 
+    def test_shared_fusion_is_opt_in_and_admits_native_fp8_on_megamoe(self):
+        flag = mega_moe.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS
+        self.assertFalse(flag.default)
+
+        moe = SimpleNamespace(
+            experts=SimpleNamespace(
+                _mega_moe_native_fp8=True,
+                _mega_moe_weights_built=True,
+            ),
+            shared_experts_is_fp8=True,
+            shared_experts_weight_block_size=[128, 128],
+        )
+        mega_backend = SimpleNamespace(is_megamoe=lambda: True)
+        other_backend = SimpleNamespace(is_megamoe=lambda: False)
+
+        with (
+            patch.object(flag, "get", return_value=True),
+            patch.object(mega_moe, "_device_sm", 103),
+            patch.object(mega_moe, "get_moe_a2a_backend", return_value=mega_backend),
+        ):
+            self.assertTrue(mega_moe.should_fuse_mega_moe_shared_experts(moe))
+
+        with (
+            patch.object(flag, "get", return_value=True),
+            patch.object(mega_moe, "_device_sm", 103),
+            patch.object(mega_moe, "get_moe_a2a_backend", return_value=other_backend),
+        ):
+            self.assertFalse(mega_moe.should_fuse_mega_moe_shared_experts(moe))
+
+        with (
+            patch.object(flag, "get", return_value=True),
+            patch.object(mega_moe, "_device_sm", 90),
+            patch.object(mega_moe, "get_moe_a2a_backend", return_value=mega_backend),
+        ):
+            self.assertFalse(mega_moe.should_fuse_mega_moe_shared_experts(moe))
+
     def test_fail_closed_rejects_missing_weights_and_token_overflow(self):
         backend = SimpleNamespace(is_megamoe=lambda: True)
         moe = SimpleNamespace(experts=SimpleNamespace(_mega_moe_weights_built=False))
@@ -163,9 +199,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         ):
             mega_moe.build_native_fp8_mega_moe_experts_weights(layer)
 
-        self.assertEqual(
-            fake_deep_gemm.transform_sf_into_required_layout.call_count, 2
-        )
+        self.assertEqual(fake_deep_gemm.transform_sf_into_required_layout.call_count, 2)
         self.assertTrue(layer._mega_moe_native_fp8)
         self.assertTrue(layer._mega_moe_weights_built)
         self.assertEqual(
@@ -213,6 +247,56 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             ["fp8xfp4", "mxf4xmxf4"],
         )
 
+    def test_buffer_cache_separates_shared_expert_capacity(self):
+        deep_gemm = ModuleType("deep_gemm")
+        expected_buffers = (object(), object())
+        deep_gemm.get_symm_buffer_for_mega_moe = MagicMock(side_effect=expected_buffers)
+        group = object()
+
+        with (
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch.object(mega_moe, "_mega_moe_mma_type", return_value="fp8xfp8"),
+        ):
+            without_shared = mega_moe._get_mega_moe_symm_buffer(
+                group,
+                num_experts=8,
+                num_max_tokens_per_rank=64,
+                num_topk=2,
+                hidden=128,
+                intermediate_hidden=256,
+                num_shared_experts=0,
+            )
+            with_shared = mega_moe._get_mega_moe_symm_buffer(
+                group,
+                num_experts=8,
+                num_max_tokens_per_rank=64,
+                num_topk=2,
+                hidden=128,
+                intermediate_hidden=256,
+                num_shared_experts=1,
+            )
+            cached_with_shared = mega_moe._get_mega_moe_symm_buffer(
+                group,
+                num_experts=8,
+                num_max_tokens_per_rank=64,
+                num_topk=2,
+                hidden=128,
+                intermediate_hidden=256,
+                num_shared_experts=1,
+            )
+
+        self.assertIs(without_shared, expected_buffers[0])
+        self.assertIs(with_shared, expected_buffers[1])
+        self.assertIs(cached_with_shared, expected_buffers[1])
+        self.assertEqual(deep_gemm.get_symm_buffer_for_mega_moe.call_count, 2)
+        self.assertEqual(
+            [
+                call.kwargs["num_shared_experts"]
+                for call in deep_gemm.get_symm_buffer_for_mega_moe.call_args_list
+            ],
+            [0, 1],
+        )
+
     def test_native_fp8_buffer_and_kernel_use_matching_mma_type(self):
         deep_gemm = ModuleType("deep_gemm")
         buffer = SimpleNamespace(
@@ -245,6 +329,8 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             num_fused_shared_experts=0,
             layer_id=0,
             routed_scaling_factor=1.0,
+            mega_shared_l1_weights=None,
+            mega_shared_l2_weights=None,
         )
 
         with (
@@ -280,6 +366,103 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         )
         self.assertTrue(pre_dispatch.called)
         self.assertTrue(deep_gemm.fp8_fp4_mega_moe.called)
+
+    def test_native_fp8_shared_tuples_and_routed_scaling_are_forwarded(self):
+        deep_gemm = ModuleType("deep_gemm")
+        deep_gemm.get_block_m_for_mega_moe = MagicMock(return_value=32)
+        deep_gemm.fp8_fp4_mega_moe = MagicMock()
+        shared_x_sf = object()
+        buffer = SimpleNamespace(
+            x=object(),
+            x_sf=object(),
+            topk_idx=object(),
+            topk_weights=object(),
+            shared_l1_acts_sf=shared_x_sf,
+            group=SimpleNamespace(size=MagicMock(return_value=8)),
+            num_experts=8,
+            num_max_tokens_per_rank=64,
+            num_topk=2,
+            mma_type="fp8xfp8",
+        )
+        routed_l1 = object()
+        routed_l2 = object()
+        shared_l1 = object()
+        shared_l2 = object()
+        experts = SimpleNamespace(
+            num_experts=8,
+            _mega_moe_native_fp8=True,
+            mega_l1_weights=routed_l1,
+            mega_l2_weights=routed_l2,
+            should_fuse_routed_scaling_factor_in_topk=False,
+        )
+        topk_output = SimpleNamespace(
+            topk_ids=torch.tensor([[0, 1]]),
+            topk_weights=torch.tensor([[0.6, 0.4]]),
+        )
+        moe = SimpleNamespace(
+            config=SimpleNamespace(
+                hidden_size=4,
+                num_experts_per_tok=2,
+                moe_intermediate_size=8,
+                swiglu_limit=None,
+            ),
+            experts=experts,
+            gate=MagicMock(return_value=torch.empty((1, 8))),
+            topk=MagicMock(return_value=topk_output),
+            is_hash=False,
+            n_shared_experts=1,
+            num_fused_shared_experts=0,
+            layer_id=0,
+            routed_scaling_factor=1.5,
+            mega_shared_l1_weights=shared_l1,
+            mega_shared_l2_weights=shared_l2,
+        )
+
+        with (
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch.object(mega_moe, "_device_sm", 103),
+            patch.object(mega_moe, "mega_moe_pre_dispatch") as pre_dispatch,
+            patch.object(
+                mega_moe,
+                "_get_mega_moe_symm_buffer",
+                return_value=buffer,
+            ) as get_buffer,
+            patch.object(
+                mega_moe,
+                "_configure_mega_moe_deep_gemm_num_sms",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                mega_moe.ExpertLocationDispatchInfo,
+                "init_new",
+                return_value=object(),
+            ),
+            patch(
+                "sglang.srt.distributed.parallel_state.get_moe_ep_group",
+                return_value=SimpleNamespace(device_group=object()),
+            ),
+        ):
+            actual = mega_moe._run_mega_routed(
+                moe,
+                torch.zeros((1, 4)),
+                forward_batch=None,
+                input_ids_global=None,
+                num_tokens=1,
+            )
+
+        self.assertEqual(actual.shape, (1, 4))
+        self.assertEqual(get_buffer.call_args.kwargs["num_shared_experts"], 1)
+        torch.testing.assert_close(
+            pre_dispatch.call_args.args[2],
+            topk_output.topk_weights.float() * moe.routed_scaling_factor,
+        )
+        self.assertIs(pre_dispatch.call_args.kwargs["shared_x_sf"], shared_x_sf)
+        self.assertEqual(pre_dispatch.call_args.kwargs["shared_block_m"], 32)
+        kernel_call = deep_gemm.fp8_fp4_mega_moe.call_args
+        self.assertIs(kernel_call.args[1], routed_l1)
+        self.assertIs(kernel_call.args[2], routed_l2)
+        self.assertIs(kernel_call.kwargs["shared_l1_weights"], shared_l1)
+        self.assertIs(kernel_call.kwargs["shared_l2_weights"], shared_l2)
 
     def test_mxf4_weight_transform_uses_matching_mma_type(self):
         from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod

@@ -179,8 +179,9 @@ def should_fuse_mega_moe_shared_experts(moe: DeepseekV2MoE) -> bool:
     mma_type = _mega_moe_mma_type(moe.experts)
     return (
         envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS.get()
+        and get_moe_a2a_backend().is_megamoe()
         and getattr(moe.experts, "_mega_moe_weights_built", False)
-        and _device_sm != 90
+        and _device_sm // 10 == 10
         and mma_type in ("fp8xfp4", "fp8xfp8")
         and moe.shared_experts_is_fp8
         and moe.shared_experts_weight_block_size == [128, 128]
@@ -526,9 +527,11 @@ def build_native_fp8_mega_moe_experts_weights(experts) -> None:
             scale_k32 = ceil_to_ue8m0(
                 blocks.abs().float().amax(dim=-1).clamp_min(1e-4) / 448.0
             )
-            weight.data = (blocks / scale_k32.unsqueeze(-1)).to(
-                torch.float8_e4m3fn
-            ).reshape_as(dequant)
+            weight.data = (
+                (blocks / scale_k32.unsqueeze(-1))
+                .to(torch.float8_e4m3fn)
+                .reshape_as(dequant)
+            )
             scale.data = deep_gemm.transform_sf_into_required_layout(
                 scale_k32,
                 mn=n,
@@ -542,9 +545,7 @@ def build_native_fp8_mega_moe_experts_weights(experts) -> None:
         (experts.w13_weight.data, experts.w13_weight_scale_inv.data), "fp8xfp8"
     )
     w13_sf_utccp = _transpose_mega_moe_sf_for_utccp(w13_sf_interleaved)
-    w2_sf_utccp = _transpose_mega_moe_sf_for_utccp(
-        experts.w2_weight_scale_inv.data
-    )
+    w2_sf_utccp = _transpose_mega_moe_sf_for_utccp(experts.w2_weight_scale_inv.data)
 
     # MegaMoE is fail-closed for this backend, so these parameters may use its
     # K32/interleaved representation. A non-MegaMoE server loads the checkpoint
