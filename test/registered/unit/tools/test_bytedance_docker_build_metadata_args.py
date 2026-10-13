@@ -13,6 +13,12 @@ DOCKERFILE_PATH = REPO_ROOT / "docker" / "Dockerfile"
 WORKFLOW_PATH = (
     REPO_ROOT / ".github" / "workflows" / "_bytedance-docker-build-and-publish.yml"
 )
+WARM_CACHE_WORKFLOW_PATH = (
+    REPO_ROOT / ".github" / "workflows" / "_bytedance-docker-warm-cache.yml"
+)
+DEV_WORKFLOW_PATH = (
+    REPO_ROOT / ".github" / "workflows" / "bytedance-release-docker-dev.yml"
+)
 
 
 def _load_module(name, path):
@@ -264,6 +270,33 @@ class TestDockerBuildMetadataArgs(unittest.TestCase):
         self.assertIn("mapfile -t METADATA_ARGS", workflow)
         self.assertIn('"${METADATA_ARGS[@]}"', workflow)
 
+    def test_dev_build_is_split_across_runner_lifetimes(self):
+        warm_workflow = WARM_CACHE_WORKFLOW_PATH.read_text()
+        publish_workflow = WORKFLOW_PATH.read_text()
+        dev_workflow = DEV_WORKFLOW_PATH.read_text()
+
+        self.assertIn("--target framework", warm_workflow)
+        self.assertIn("--output type=cacheonly", warm_workflow)
+        self.assertIn(
+            '--cache-to "type=registry,ref=${CACHE_REF},mode=max', warm_workflow
+        )
+        self.assertIn("KERNEL_ARTIFACT_TOS_URI", warm_workflow)
+        self.assertIn("KERNEL_WHEEL_SHA256", warm_workflow)
+
+        self.assertIn("build_cache_ref:", publish_workflow)
+        self.assertIn(
+            'CACHE_ARGS+=(--cache-from "type=registry,ref=${BUILD_CACHE_REF}")',
+            publish_workflow,
+        )
+
+        self.assertIn("warm-dev-build-cache:", dev_workflow)
+        self.assertIn(
+            "needs: [build-dev-kernel-wheel, warm-dev-build-cache]", dev_workflow
+        )
+        self.assertIn(
+            "build_cache_ref: ${{ needs.warm-dev-build-cache.outputs.cache_ref }}",
+            dev_workflow,
+        )
 
 if __name__ == "__main__":
     unittest.main()
