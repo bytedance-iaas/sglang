@@ -4,6 +4,9 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.kernels.ops.moe.cutlass_moe_deferred import (
+    _cutlass_routing_map_to_token_major,
+)
 from sglang.srt.layers import communicator_dsa_cp as dsa_cp
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -77,6 +80,32 @@ class TestDsv41CollectiveFusionGate(CustomTestCase):
 
     def test_tp1_shared_expert_falls_back(self):
         self.assertFalse(self._eligible(shared_tp1=True))
+
+    def test_cutlass_routing_map_is_converted_to_token_major(self):
+        topk_major = torch.tensor(
+            [
+                0,
+                10,
+                20,
+                1,
+                11,
+                21,
+            ],
+            dtype=torch.int32,
+        )
+
+        actual = _cutlass_routing_map_to_token_major(
+            topk_major,
+            num_tokens=3,
+            top_k=2,
+        )
+
+        torch.testing.assert_close(
+            actual,
+            torch.tensor([0, 1, 10, 11, 20, 21], dtype=torch.int32),
+            rtol=0,
+            atol=0,
+        )
 
 
 if __name__ == "__main__":
