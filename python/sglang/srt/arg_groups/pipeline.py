@@ -92,6 +92,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     handle_hicache_ratio_default(server_args)
+    # Before the dummy-model boundary, like the ratio default above: the
+    # env switch must apply (and invalid env config must fail) even for
+    # dummy-model launches and direct consumers that never reach the
+    # hicache handler below.
+    handle_eic_env(server_args)
     from sglang.srt.arg_groups.validation_hook import (
         validate_experimental_sgl_marlin,
         validate_prefill_decode_interval,
@@ -278,11 +283,9 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # _validate_prefill_only_disable_kv_cache_args().
     handle_prefill_only_disable_kv_cache(server_args)
 
-    # EIC environment variables win over CLI arguments and must be applied
-    # before hicache handling turns enable_eic_cache into hierarchical cache.
-    handle_eic_env(server_args)
-
-    # Handle Hicache settings.
+    # Handle Hicache settings. The EIC env switch was already applied
+    # before the dummy-model boundary above; this handler turns the
+    # resolved enable_eic_cache into hierarchical cache.
     handle_hicache(server_args)
 
     # Handle data parallelism.
