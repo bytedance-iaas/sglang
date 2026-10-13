@@ -39,14 +39,14 @@ struct TopKParams {
 };
 
 SGL_DEVICE uint8_t convert_to_uint8(float x) {
-  __half h = __float2half_rn(x);
+  __half h = __float2half_rn(x == 0.0f ? 0.0f : x);
   uint16_t bits = __half_as_ushort(h);
   uint16_t key = (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits | 0x8000);
   return static_cast<uint8_t>(key >> 8);
 }
 
 SGL_DEVICE uint32_t convert_to_uint32(float x) {
-  uint32_t bits = __float_as_uint(x);
+  uint32_t bits = __float_as_uint(x == 0.0f ? 0.0f : x);
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 
@@ -167,9 +167,9 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const 
     __syncthreads();
   }
 
-  // stage 2: refine with 8bit radix passes
-#pragma unroll 4
-  for (int round = 0; round < 4; ++round) {
+  // Refine by exact score, then by logical index (smaller wins).
+#pragma unroll 8
+  for (int round = 0; round < 8; ++round) {
     const auto r_idx = round % 2;
 
     // clip here to prevent overflow
@@ -190,8 +190,9 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const 
     if (remain_topk == 0) {
       for (uint32_t i = tx; i < num_input; i += BLOCK_SIZE) {
         const auto idx = s_input_idx[r_idx][i];
-        const auto offset = 24 - round * 8;
-        const auto bin = (convert_to_uint32(input[idx]) >> offset) & 0xFF;
+        const auto offset = 24 - (round % 4) * 8;
+        const auto key = round < 4 ? convert_to_uint32(input[idx]) : ~static_cast<uint32_t>(idx);
+        const auto bin = (key >> offset) & 0xFF;
         if (bin > threshold_bin) {
           const auto pos = ::atomicAdd(&s_counter, 1);
           output[pos] = idx;
@@ -208,13 +209,14 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const 
       for (uint32_t i = tx; i < num_input; i += BLOCK_SIZE) {
         const auto idx = s_input_idx[r_idx][i];
         const auto raw_input = input[idx];
-        const auto offset = 24 - round * 8;
-        const auto bin = (convert_to_uint32(raw_input) >> offset) & 0xFF;
+        const auto offset = 24 - (round % 4) * 8;
+        const auto key = round < 4 ? convert_to_uint32(raw_input) : ~static_cast<uint32_t>(idx);
+        const auto bin = (key >> offset) & 0xFF;
         if (bin > threshold_bin) {
           const auto pos = ::atomicAdd(&s_counter, 1);
           output[pos] = idx;
         } else if (bin == threshold_bin) {
-          if (round == 3) {
+          if (round == 7) {
             const auto pos = ::atomicAdd(&s_last_remain, -1);
             if (pos > 0) {
               output[topk - pos] = idx;
@@ -224,8 +226,9 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const 
             if (pos < SMEM_INPUT_SIZE) {
               /// NOTE: (dark) fuse the histogram computation here
               [[likely]] s_input_idx[r_idx ^ 1][pos] = idx;
-              const auto bin = convert_to_uint32(raw_input);
-              const auto sub_bin = (bin >> (offset - 8)) & 0xFF;
+              const auto next_key = round < 3 ? convert_to_uint32(raw_input) : ~static_cast<uint32_t>(idx);
+              const auto next_offset = round == 3 ? 24 : offset - 8;
+              const auto sub_bin = (next_key >> next_offset) & 0xFF;
               ::atomicAdd(&s_histogram[sub_bin], 1);
             }
           }
