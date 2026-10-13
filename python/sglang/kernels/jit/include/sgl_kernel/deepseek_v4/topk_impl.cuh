@@ -77,7 +77,7 @@ struct MaxSmem {
 // ---------------------------------------------------------------------------
 
 SGL_DEVICE uint32_t extract_exact_bin(float x) {
-  uint32_t bits = __float_as_uint(x);
+  uint32_t bits = __float_as_uint(x == 0.0f ? 0.0f : x);
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 
@@ -365,8 +365,8 @@ struct TopKConfig {
     uint32_t total_active = num_ties;
 
 #pragma unroll
-    for (int round = 0; round < 4; round++) {
-      const uint32_t shift = 24 - round * 8;
+    for (int round = 0; round < 8; round++) {
+      const uint32_t shift = 24 - (round % 4) * 8;
       const auto hist_idx = round % 2;
       const auto histogram = smem->histogram[hist_idx];
 
@@ -374,7 +374,7 @@ struct TopKConfig {
       for (uint32_t i = 0; i < kItems; ++i) {
         if (active[i]) atomicAdd(&histogram[(key[i] >> shift) & 0xFFu], 1);
       }
-      if (round < 3 && tx < kRadixSize) {
+      if (round < 7 && tx < kRadixSize) {
         smem->histogram[hist_idx ^ 1][tx] = 0;
       }
       __syncthreads();
@@ -399,7 +399,7 @@ struct TopKConfig {
       __syncthreads();
 
       const auto [threshold_bin, above_count, equal_count, __] = smem->match;
-      if (round < 3) total_active = equal_count;
+      if (round < 7) total_active = equal_count;
       topk_remain -= above_count;
 
       // 4. Scatter
@@ -412,13 +412,18 @@ struct TopKConfig {
           active[i] = false;
         } else if (bin < threshold_bin) {
           active[i] = false;
-        } else if (round == 3) {
+        } else if (round == 7) {
           write_pos[i] = topk - topk_remain + atomicAdd(&smem->counter_final, 1);
         }
-        // my_bin == thr && round < 3: stay active for next round
+        // my_bin == thr && round < 7: stay active for next round
       }
 
-      if (round == 3 || topk_remain == 0) break;
+      if (round == 3) {
+#pragma unroll
+        for (uint32_t i = 0; i < kItems; ++i)
+          key[i] = ~idx[i];
+      }
+      if (round == 7 || topk_remain == 0) break;
     }
 
 #pragma unroll
