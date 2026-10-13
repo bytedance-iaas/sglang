@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -1955,9 +1956,13 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
     def _apply_page_layout_to_deploy_key(self) -> None:
         # The base deploy key carries model path, page size and dtype only.
         # A v4 and a v4.1 deployment of one checkpoint would otherwise share
-        # EIC keys while packing different page bytes. Append the packed
-        # page size so layout changes miss and rewrite instead of misreading.
-        self.deploy_key = f"{self.deploy_key}_pb{self.page_bytes}"
+        # EIC keys while packing different layouts. Key on the layout itself
+        # (pool names and per-pool sizes in pack order), not the total byte
+        # count: two layouts with the same total but different composition
+        # must miss and rewrite instead of misreading each other's pages.
+        layout = ";".join(f"{spec['name']}:{spec['numel']}" for spec in self.page_specs)
+        digest = hashlib.sha256(layout.encode()).hexdigest()[:16]
+        self.deploy_key = f"{self.deploy_key}_pl{digest}"
 
     def _swa_indices(self, full_indices: torch.Tensor) -> torch.Tensor:
         if getattr(self.device_pool, "swa_kv_pool", None) is None:
