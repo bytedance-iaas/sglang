@@ -1,7 +1,6 @@
 import hashlib
 import heapq
 import logging
-import os
 import pickle
 import threading
 import time
@@ -9,7 +8,6 @@ from functools import partial
 from typing import List, Optional
 
 import torch
-import yaml
 
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.managers.eic_cache_controller import (
@@ -32,7 +30,6 @@ from sglang.srt.mem_cache.eic_memory_pool import (
     EICMLATokenToKVPoolHost,
     EICNSATokenToKVPoolHost,
     MemoryStateInt,
-    get_eic_config_file_path,
 )
 from sglang.srt.mem_cache.eic_pp_reconcile import eic_pp_unsupported_reason
 from sglang.srt.mem_cache.eic_stats import stats
@@ -42,6 +39,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.mem_cache.storage.eic.eic_env_config import load_fixed_config
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -313,11 +311,9 @@ class EICHiRadixCache(RadixCache):
         super().__init__(params)
 
         self.save_decode_cache = True
-        config_file = get_eic_config_file_path()
-        if os.path.exists(config_file):
-            with open(config_file, "r") as fin:
-                config = yaml.safe_load(fin)
-            self.init_hyper_params(config)
+        # Fixed parameters come from the unified module: yaml when present,
+        # built-in defaults when the yaml file is absent (env-var mode).
+        self.init_hyper_params(load_fixed_config())
 
     def get_extra_info(self, params: CacheInitParams, server_args: ServerArgs):
         # TODO update when sglang support pp

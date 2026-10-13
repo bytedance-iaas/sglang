@@ -86,6 +86,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     handle_return_hidden_states_mode(server_args)
     handle_media_url_security(server_args)
     from sglang.srt.arg_groups.hicache_hook import (
+        handle_eic_env,
         handle_hicache,
         handle_hicache_ratio_default,
     )
@@ -276,6 +277,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # the flag/precondition half runs earlier in
     # _validate_prefill_only_disable_kv_cache_args().
     handle_prefill_only_disable_kv_cache(server_args)
+
+    # EIC environment variables win over CLI arguments and must be applied
+    # before hicache handling turns enable_eic_cache into hierarchical cache.
+    handle_eic_env(server_args)
 
     # Handle Hicache settings.
     handle_hicache(server_args)

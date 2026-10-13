@@ -6,7 +6,6 @@ from typing import Any, List, Optional, Tuple
 
 import eic
 import torch
-import yaml
 
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
@@ -18,6 +17,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache
+from sglang.srt.mem_cache.storage.eic.eic_env_config import load_eic_config
 
 logger = logging.getLogger(__name__)
 
@@ -164,23 +164,20 @@ class EICStorage(HiCacheStorage):
         global G_EnableKVSetGPUDirect, G_EnableKVGetGPUDirect
         global GPUNicAffinity, CPUNicAffinity, G_EnableGPUNicAffinity
 
-        config_file = get_eic_config_file_path()
-        if os.path.exists(config_file) is False:
-            logger.error(f"config file {config_file} not exists")
-            raise RuntimeError(f"eic config file {config_file} not exists")
+        # This storage backend is only constructed when EIC is enabled, so
+        # the CLI side is treated as enabled; an explicit env switch of
+        # non-'True' raises here instead of silently starting without EIC.
+        resolved = load_eic_config(cli_enabled=True)
+        if not resolved.enabled:
+            raise RuntimeError(
+                "EIC storage constructed but EIC is disabled by "
+                "EnableEicCache environment variable"
+            )
+        config = resolved.fixed
+        endpoint = resolved.endpoint
+        logger.info(f"eic endpoint: {endpoint} source: {resolved.source}")
 
-        with open(config_file, "r") as fin:
-            config = yaml.safe_load(fin)
-
-        remote_url = config.get("remote_url", None)
-        if remote_url is None:
-            AssertionError("remote_url is None")
-
-        endpoint = remote_url[len("eic://") :]
-
-        logger.info(f"eic remote_url:" + remote_url + " endpoint: " + endpoint)
-
-        eic_instance_id = config.get("eic_instance_id", None)
+        eic_instance_id = resolved.instance_id
         logger.info(f"eic instance_id: {eic_instance_id}")
 
         eic_thread_num = config.get("eic_thread_num", 1)

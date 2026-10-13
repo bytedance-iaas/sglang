@@ -11,7 +11,6 @@ from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
 import torch
-import yaml
 
 from sglang.srt.mem_cache.eic_stats import stats
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
@@ -22,6 +21,10 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import synchronized
+from sglang.srt.mem_cache.storage.eic.eic_env_config import (
+    load_eic_config,
+    load_fixed_config,
+)
 from sglang.srt.runtime_context import get_parallel
 
 try:
@@ -229,23 +232,19 @@ class EICKVClient:
         global GPUNicAffinity, CPUNicAffinity, G_EnableGPUNicAffinity, G_KVSetTTLOption
         global G_GDRBounceBufferSize, G_GDRBounceTensorCount
 
-        config_file = get_eic_config_file_path()
-        if os.path.exists(config_file) is False:
-            logger.error(f"config file {config_file} not exists")
-            exit(1)
+        # Only constructed when EIC is enabled; an explicit env switch of
+        # non-'True' raises instead of silently starting without EIC.
+        resolved = load_eic_config(cli_enabled=True)
+        if not resolved.enabled:
+            raise RuntimeError(
+                "EICKVClient constructed but EIC is disabled by "
+                "EnableEicCache environment variable"
+            )
+        config = resolved.fixed
+        endpoint = resolved.endpoint
+        logger.info(f"eic endpoint: {endpoint} source: {resolved.source}")
 
-        with open(config_file, "r") as fin:
-            config = yaml.safe_load(fin)
-
-        remote_url = config.get("remote_url", None)
-        if remote_url is None:
-            raise RuntimeError("remote_url is None")
-
-        endpoint = remote_url[len("eic://") :]
-
-        logger.info(f"eic remote_url:" + remote_url + " endpoint: " + endpoint)
-
-        eic_instance_id = config.get("eic_instance_id", "")
+        eic_instance_id = resolved.instance_id
         logger.info(f"eic instance_id: {eic_instance_id}")
 
         eic_thread_num = config.get("eic_thread_num", 1)
@@ -1835,16 +1834,13 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
 
     def _resolve_eic_chunk_bytes(self) -> int:
         chunk_bytes = DEFAULT_DSV4_EIC_CHUNK_BYTES
-        config_file = get_eic_config_file_path()
-        if os.path.exists(config_file):
-            with open(config_file, "r") as fin:
-                config = yaml.safe_load(fin) or {}
-            chunk_bytes = int(
-                config.get(
-                    "dsv4_eic_chunk_bytes",
-                    config.get("eic_object_chunk_bytes", chunk_bytes),
-                )
+        config = load_fixed_config()
+        chunk_bytes = int(
+            config.get(
+                "dsv4_eic_chunk_bytes",
+                config.get("eic_object_chunk_bytes", chunk_bytes),
             )
+        )
         if chunk_bytes <= 0:
             chunk_bytes = self.page_bytes
         return max(1, min(chunk_bytes, self.page_bytes))
