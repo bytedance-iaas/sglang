@@ -95,9 +95,9 @@ def assert_equal(
         indices_our_set_i = set(indices_our_cpu[i])
         assert len(indices_our_cpu[i]) == k
         assert len(indices_our_set_i) == k, "top-k output indices must be distinct"
-        assert all(0 <= idx - offset < seq_len for idx in indices_our_cpu[i]), (
-            "top-k output index is outside the selected window"
-        )
+        assert all(
+            0 <= idx - offset < seq_len for idx in indices_our_cpu[i]
+        ), "top-k output index is outside the selected window"
         more = indices_our_set_i - indices_ref_set_i
         less = indices_ref_set_i - indices_our_set_i
         if len(more) > 0 or len(less) > 0:
@@ -465,9 +465,9 @@ def assert_exact(
             torch.topk(score[i, :seq_len], k).values, descending=True
         ).values
         got = torch.sort(score[i, :seq_len][indices[i].long()], descending=True).values
-        assert torch.equal(got, want), (
-            f"row {i}: {int((got != want).sum())}/{k} selected scores are not the top-{k}"
-        )
+        assert torch.equal(
+            got, want
+        ), f"row {i}: {int((got != want).sum())}/{k} selected scores are not the top-{k}"
 
 
 def assert_exact_rows(
@@ -486,9 +486,9 @@ def assert_exact_rows(
         row = score[i, start : start + length]
         want = torch.sort(torch.topk(row, k).values).values
         got = torch.sort(row[row_indices]).values
-        assert torch.equal(got, want), (
-            f"row {i}: {int((got != want).sum())}/{k} selected scores are not the top-{k}"
-        )
+        assert torch.equal(
+            got, want
+        ), f"row {i}: {int((got != want).sum())}/{k} selected scores are not the top-{k}"
 
 
 @pytest.mark.skipif(
