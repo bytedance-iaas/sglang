@@ -2686,18 +2686,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         self._hc_attn_tf32_parts = self._hc_ffn_tf32_parts = None
         self._hc_attn_bf16_parts = self._hc_ffn_bf16_parts = None
         if (
-            get_platform().is_sm90
-            and envs.SGLANG_OPT_DSV41_SM90_MHC_BF16X3.get()
-            and self.hc_attn_fn.shape == (24, 20480)
-            and getattr(self.config, "model_type", None) == "deepseek_v41"
-            and not is_batch_invariant_mode_enabled()
-        ):
-            from sglang.kernels.ops.layernorm.mhc import split_bf16_hc_weight
-
-            self._hc_attn_bf16_parts = split_bf16_hc_weight(self.hc_attn_fn.data)
-            self._hc_ffn_bf16_parts = split_bf16_hc_weight(self.hc_ffn_fn.data)
-
-        if (
             self.hc_pre_from_prev_sublayer
             and get_platform().is_sm100
             and self.hc_attn_fn.shape == (24, 20480)
@@ -2944,10 +2932,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 and x.is_cuda
                 and (
                     1 <= x.shape[0] <= 64
-                    or (
-                        envs.SGLANG_OPT_DSV41_SM90_MHC_BF16X3.get()
-                        and x.shape[0] <= 2048
-                    )
+                    or (envs.SGLANG_OPT_DSV41_SM90_MHC.get() and x.shape[0] <= 2048)
                 )
                 and x.shape[1] == 5120
                 and residual.shape == (x.shape[0], 4, 5120)
@@ -3253,62 +3238,30 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 
-        if (
+        use_sm90_mhc = (
             x.is_cuda
             and torch.version.cuda is not None
             and get_platform().is_sm90
-            and envs.SGLANG_OPT_DSV41_SM90_MHC_BF16X3.get()
+            and envs.SGLANG_OPT_DSV41_SM90_MHC.get()
             and x.dtype == torch.bfloat16
             and x_flat.is_contiguous()
+            and hc_fn.shape == (24, 20480)
+            and self.hc_mult == 4
+            and getattr(self.config, "model_type", None) == "deepseek_v41"
             and 0 < x.shape[0] <= 2048
             and not is_batch_invariant_mode_enabled()
-        ):
-            weight_parts = (
-                getattr(self, "_hc_attn_bf16_parts", None)
-                if hc_fn is self.hc_attn_fn
-                else (
-                    getattr(self, "_hc_ffn_bf16_parts", None)
-                    if hc_fn is self.hc_ffn_fn
-                    else None
-                )
-            )
-            if weight_parts is not None:
-                from sglang.kernels.ops.layernorm.mhc import (
-                    hc_mix_stats_sinkhorn_sm90_bf16x3,
-                )
-
-                main_stream = torch.cuda.current_stream()
-                if stats_stream is not None:
-                    x.record_stream(stats_stream)
-                with (
-                    torch.cuda.stream(stats_stream)
-                    if stats_stream is not None
-                    else nullcontext()
-                ):
-                    result = hc_mix_stats_sinkhorn_sm90_bf16x3(
-                        x_flat,
-                        weight_parts,
-                        hc_scale,
-                        hc_base,
-                        self.hc_sinkhorn_iters,
-                        self.rms_norm_eps,
-                        self.hc_eps,
-                    )
-                if stats_stream is not None:
-                    for coefficient in result:
-                        coefficient.record_stream(main_stream)
-                return result
+        )
 
         if (
             x.is_cuda
             and torch.version.cuda is not None
             and (
                 get_platform().is_blackwell
-                or (get_platform().is_sm90 and x.shape[0] == 1)
+                or (get_platform().is_sm90 and (x.shape[0] == 1 or use_sm90_mhc))
             )
             and x.dtype == torch.bfloat16
         ):
-            # Fusing the split-K reduction with sinkhorn keeps it batch-invariant.
+            # Keep the original projection; fuse its reduction with Sinkhorn.
             main_stream = torch.cuda.current_stream()
             if stats_stream is not None:
                 x.record_stream(stats_stream)
@@ -3373,6 +3326,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                         self.hc_sinkhorn_iters,
                         self.rms_norm_eps,
                         self.hc_eps,
+                        tree_reduce=use_sm90_mhc,
                     )
             if stats_stream is not None:
                 # Allocated on the side stream, read on the main stream after the join.

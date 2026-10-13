@@ -2307,7 +2307,6 @@ def _hc_mix_reduce_sinkhorn_tree_kernel(
     NUM_SLICES: tl.constexpr,
     ITERS: tl.constexpr,
     EPS: tl.constexpr,
-    part_mix_residual_ptr=None,
 ):
     """One CTA per row keeps the sinkhorn reductions two-dimensional."""
     row = tl.program_id(0)
@@ -2369,11 +2368,15 @@ def hc_mix_stats_sinkhorn(
     sinkhorn_iters: int,
     rms_eps: float,
     hc_eps: float,
+    *,
+    tree_reduce: bool = False,
 ):
     """Fuse the reduce and sinkhorn stages of hc_mix_stats followed by hc_split_sinkhorn.
 
-    The split-K kernel fixes the reduction order; sinkhorn uses the Triton port's
-    transcendental lowering, which differs from TileLang.
+    The projection always uses the original FP32 weights and split-K kernel.
+    Opt-in tree reduction changes only the partial-sum accumulation order.
+    Sinkhorn uses the Triton port's transcendental lowering, which differs from
+    TileLang; the formulas and iteration count are unchanged.
     """
     assert x_flat.dim() == 2 and hc_fn.dim() == 2
     assert x_flat.stride(1) == 1 and hc_fn.stride(1) == 1
@@ -2411,7 +2414,12 @@ def hc_mix_stats_sinkhorn(
         num_warps=_HC_MIX_NUM_WARPS,
         num_stages=_num_stages_for(m, k),
     )
-    _hc_mix_reduce_sinkhorn_kernel[(m,)](
+    reduce_kernel = (
+        _hc_mix_reduce_sinkhorn_tree_kernel
+        if tree_reduce
+        else _hc_mix_reduce_sinkhorn_kernel
+    )
+    reduce_kernel[(m,)](
         part_mix,
         part_sq,
         hc_scale.float().contiguous(),
@@ -2559,68 +2567,6 @@ def hc_mix_stats_sinkhorn_bf16x3(
         ITERS=sinkhorn_iters,
         EPS=hc_eps,
         num_warps=1,
-    )
-    return pre, post, comb
-
-
-def hc_mix_stats_sinkhorn_sm90_bf16x3(
-    x: torch.Tensor,
-    weight_parts,
-    scale: torch.Tensor,
-    base: torch.Tensor,
-    sinkhorn_iters: int,
-    rms_eps: float,
-    hc_eps: float,
-    hc_mult: int = 4,
-    reduce_warps: int = 1,
-):
-    m, k = x.shape
-    mix = (2 + hc_mult) * hc_mult
-    slices = _num_slices_for(k)
-    assert x.is_contiguous() and x.dtype == torch.bfloat16 and 0 < m <= 2048
-    assert k % (slices * _HC_MIX_BLOCK_K) == 0
-    assert len(weight_parts) == 3
-    assert all(
-        w.shape == (mix, k) and w.dtype == torch.bfloat16 and w.is_contiguous()
-        for w in weight_parts
-    )
-    part_mix = torch.empty((slices, m, mix), device=x.device, dtype=torch.float32)
-    sq = torch.empty((slices, m), device=x.device, dtype=torch.float32)
-    pre = torch.empty((m, hc_mult), device=x.device, dtype=torch.float32)
-    post = torch.empty_like(pre)
-    comb = torch.empty((m, hc_mult, hc_mult), device=x.device, dtype=torch.float32)
-    _hc_mix_stats_bf16x3_kernel[(triton.cdiv(m, 64), slices)](
-        x,
-        *weight_parts,
-        part_mix,
-        sq,
-        m,
-        K=k,
-        K_PER_SLICE=k // slices,
-        MIX_COLS=mix,
-        MIX_PAD=triton.next_power_of_2(mix),
-        BLOCK_K=_HC_MIX_BLOCK_K,
-        BLOCK_M=64,
-        num_warps=8,
-        num_stages=1,
-    )
-    _hc_mix_reduce_sinkhorn_tree_kernel[(m,)](
-        part_mix,
-        sq,
-        scale,
-        base,
-        pre,
-        post,
-        comb,
-        m,
-        1.0 / k,
-        rms_eps,
-        MIX=mix,
-        HC=hc_mult,
-        NUM_SLICES=slices,
-        ITERS=sinkhorn_iters,
-        EPS=hc_eps,
-        num_warps=reduce_warps,
     )
     return pre, post, comb
 

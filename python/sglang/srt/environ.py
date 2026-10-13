@@ -1506,7 +1506,8 @@ class Envs:
 
     # Kernels and indexer
     SGLANG_OPT_DSV41_SM90_PAIRED_INDEXER = EnvBool(False)
-    SGLANG_OPT_DSV41_SM90_MHC_BF16X3 = EnvBool(False)
+    # Fuse reduction/Sinkhorn and split post-mix, preserving the original projection.
+    SGLANG_OPT_DSV41_SM90_MHC = EnvBool(False)
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
