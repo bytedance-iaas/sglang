@@ -268,6 +268,11 @@ def test_kpool_topk_v2_ties_and_cuda_graph_dynamic_refresh() -> None:
                     POOL_SIZE
                 )
             )
+        # Production refreshes metadata before the score producer launches.
+        # Refresh this exact owned buffer outside the transform graph, then
+        # prove the capture consumes new contents without changing an address.
+        plan_topk_v2(pool_lens, out=plan)
+        torch.cuda.synchronize()
         graph.replay()
         torch.cuda.synchronize()
         assert pointers == tuple(
