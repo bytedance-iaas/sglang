@@ -144,9 +144,7 @@ class TestEicEnvConfig(CustomTestCase):
                 },
             )
             cfg = load_eic_config(cli_enabled=True, environ={}, config_file=path)
-        self.assertEqual(
-            cfg.endpoint, "192.168.30.90:12500;192.168.30.91:12500"
-        )
+        self.assertEqual(cfg.endpoint, "192.168.30.90:12500;192.168.30.91:12500")
         self.assertEqual(cfg.fixed["eic_thread_num"], 2)
         self.assertEqual(cfg.fixed["eic_trans_type"], 2)
 
