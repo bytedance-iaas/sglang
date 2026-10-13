@@ -111,6 +111,45 @@ class TestEicEnvConfig(CustomTestCase):
         cfg = load_eic_config(environ={}, config_file="/nonexistent/eic.yaml")
         self.assertFalse(cfg.enabled)
 
+    def test_u16_previous_bare_host_port_format(self):
+        # The servingkit ConfigMap in production writes bare host:port
+        # endpoints without an http scheme; that form must keep working.
+        endpoints, endpoint = parse_eic_remote_url(
+            "eic://192.168.30.90:12500;192.168.30.91:12500;192.168.30.92:12500"
+        )
+        self.assertEqual(
+            endpoints,
+            [
+                "192.168.30.90:12500",
+                "192.168.30.91:12500",
+                "192.168.30.92:12500",
+            ],
+        )
+        self.assertEqual(
+            endpoint,
+            "192.168.30.90:12500;192.168.30.91:12500;192.168.30.92:12500",
+        )
+
+    def test_u17_yaml_endpoint_verbatim_and_values_win(self):
+        # Previous scheme first: yaml values are handed to the SDK
+        # byte-for-byte and override the built-in defaults.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_yaml(
+                tmp,
+                {
+                    "remote_url": "eic://192.168.30.90:12500;192.168.30.91:12500",
+                    "eic_instance_id": VALID_ID,
+                    "eic_thread_num": 2,
+                    "eic_trans_type": 2,
+                },
+            )
+            cfg = load_eic_config(cli_enabled=True, environ={}, config_file=path)
+        self.assertEqual(
+            cfg.endpoint, "192.168.30.90:12500;192.168.30.91:12500"
+        )
+        self.assertEqual(cfg.fixed["eic_thread_num"], 2)
+        self.assertEqual(cfg.fixed["eic_trans_type"], 2)
+
     def test_u15_env_explicit_off_overrides_cli(self):
         env = {"EnableEicCache": "False"}
         cfg = load_eic_config(

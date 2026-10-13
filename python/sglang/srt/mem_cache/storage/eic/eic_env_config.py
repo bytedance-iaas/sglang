@@ -89,15 +89,22 @@ def parse_eic_remote_url(raw) -> tuple[list, str]:
 
 
 def _validate_endpoint(endpoint: str) -> None:
-    for scheme in ("http://", "https://"):
-        if endpoint.startswith(scheme):
-            host_port = endpoint[len(scheme) :]
-            break
+    # Previous servingkit yaml writes bare host:port endpoints, e.g.
+    # eic://192.168.30.90:12500;192.168.30.91:12500 -- that form must keep
+    # working. http:// and https:// forms are also accepted; any other
+    # scheme is rejected.
+    if "://" in endpoint:
+        for scheme in ("http://", "https://"):
+            if endpoint.startswith(scheme):
+                host_port = endpoint[len(scheme) :]
+                break
+        else:
+            raise ValueError(
+                f"invalid endpoint in EicRemoteUrl: {endpoint!r} "
+                "must start with http:// or https://"
+            )
     else:
-        raise ValueError(
-            f"invalid endpoint in EicRemoteUrl: {endpoint!r} "
-            "must start with http:// or https://"
-        )
+        host_port = endpoint
     host, sep, port = host_port.rpartition(":")
     if not sep or not host or not port.isdigit():
         raise ValueError(
@@ -171,6 +178,11 @@ def load_eic_config(
         endpoints, endpoint = parse_eic_remote_url(env_url)
     elif yaml_url:
         endpoints, endpoint = parse_eic_remote_url(yaml_url)
+        # Previous usage handed the yaml string to the SDK verbatim
+        # (remote_url without the eic:// prefix, separators untouched).
+        # Keep that byte-for-byte so existing ConfigMaps behave as before;
+        # the normalized form is only used for the env-var scheme.
+        endpoint = yaml_url[len(EIC_URL_PREFIX) :]
     else:
         raise ValueError("EicRemoteUrl is required when EnableEicCache=True")
 
