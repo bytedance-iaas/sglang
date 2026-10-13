@@ -11,6 +11,7 @@ from sglang.srt.layers.moe.utils import (
     install_shared_experts_fusion_decision,
     is_shared_experts_fusion_disabled,
 )
+from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 from sglang.srt.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
 from sglang.srt.runtime_context import get_context, get_exec, get_flags, get_parallel
@@ -199,7 +200,7 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
         self.assertEqual(loaded[0][1], "stages.0.mlp.experts.w13_weight")
         self.assertEqual(loaded[0][2:], ("w1", config.n_routed_experts))
 
-    def test_precompile_builds_and_reports_eligible_shared_tuples(self):
+    def test_common_precompile_builds_and_reports_eligible_shared_tuples(self):
         class FakeMoE:
             def __init__(self, name):
                 self.shared_experts = name
@@ -213,7 +214,7 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
 
         with (
             patch(
-                "sglang.srt.models.deepseek_v4.deepseek_v2.DeepseekV2MoE",
+                "sglang.srt.models.deepseek_v2.DeepseekV2MoE",
                 FakeMoE,
             ),
             patch.object(
@@ -226,16 +227,27 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
                 "build_mega_moe_shared_weights",
                 return_value=(l1, l2),
             ) as build,
-            self.assertLogs("sglang.srt.models.deepseek_v4", level="INFO") as logs,
+            self.assertLogs("sglang.srt.layers.moe.mega_moe", level="INFO") as logs,
         ):
-            DeepseekV4ForCausalLM.precompile_kernels_after_loading(model)
+            count = mega_moe.prepare_mega_moe_shared_experts(model)
 
+        self.assertEqual(count, 1)
         build.assert_called_once_with("eligible")
         self.assertIs(eligible.mega_shared_l1_weights, l1)
         self.assertIs(eligible.mega_shared_l2_weights, l2)
         self.assertIsNone(ineligible.mega_shared_l1_weights)
         self.assertIsNone(ineligible.mega_shared_l2_weights)
         self.assertTrue(any("1 layer(s)" in message for message in logs.output))
+
+    def test_v2_and_v4_precompile_delegate_to_common_helper(self):
+        model = object()
+        with patch.object(mega_moe, "prepare_mega_moe_shared_experts") as prepare:
+            DeepseekV2ForCausalLM.precompile_kernels_after_loading(model)
+            DeepseekV4ForCausalLM.precompile_kernels_after_loading(model)
+
+        self.assertEqual(
+            [entry.args for entry in prepare.call_args_list], [(model,), (model,)]
+        )
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Optional
 
@@ -43,6 +44,7 @@ if TYPE_CHECKING:
 
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
+logger = logging.getLogger(__name__)
 
 
 def _mega_moe_mma_type(experts=None) -> str:
@@ -574,6 +576,28 @@ def build_mega_moe_shared_weights(
         (gate_up_proj.weight.data, _transform_mega_moe_shared_sf(gate_up_proj)),
         (down_proj.weight.data, _transform_mega_moe_shared_sf(down_proj)),
     )
+
+
+def prepare_mega_moe_shared_experts(model) -> int:
+    """Build independent shared-expert tuples for every eligible MoE layer."""
+    from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
+
+    fused_layer_count = 0
+    for module in model.modules():
+        if isinstance(module, DeepseekV2MoE) and should_fuse_mega_moe_shared_experts(
+            module
+        ):
+            module.mega_shared_l1_weights, module.mega_shared_l2_weights = (
+                build_mega_moe_shared_weights(module.shared_experts)
+            )
+            fused_layer_count += 1
+
+    if fused_layer_count:
+        logger.info(
+            "Prepared MegaMoE in-kernel shared expert tuples for %d layer(s).",
+            fused_layer_count,
+        )
+    return fused_layer_count
 
 
 def _transform_mega_moe_shared_sf(linear) -> torch.Tensor:
