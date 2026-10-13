@@ -118,7 +118,7 @@ on:
         default: true
 
       install_iaas_kernels:
-        description: "Preinstall the pinned SM90 NVLink wheel (amd64/cu130, local source only)"
+        description: "Preinstall the pinned SM90 NVLink/RDMA wheel and FP4 LTO tools (amd64/cu130, local source only)"
         required: false
         type: boolean
         default: false
@@ -137,6 +137,7 @@ jobs:
       group: ${{ inputs.concurrency_group }}
       cancel-in-progress: false
     env:
+      SGL_IMAGE_BUILDER: builder-sgl-image-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.cuda_key }}-${{ inputs.variant_suffix || 'base' }}
       CUDA_KEY: ${{ inputs.cuda_key }}
       CUDA_SUFFIX: ${{ inputs.cuda_suffix }}
       IMAGE_FORMATS: ${{ inputs.image_formats }}
@@ -169,7 +170,7 @@ jobs:
           # BRANCH_TYPE=local copies Git metadata into the image for versioning.
           persist-credentials: false
 
-      - name: Configure iaas-kernels NVLink image
+      - name: Configure iaas-kernels NVLink/RDMA image
         env:
           INSTALL_IAAS_KERNELS: ${{ inputs.install_iaas_kernels }}
           IAAS_KERNELS_READ_TOKEN: ${{ secrets.IAAS_KERNELS_READ_TOKEN }}
@@ -358,9 +359,11 @@ jobs:
       - name: Set up Docker Buildx with local Docker Hub mirror
         uses: docker/setup-buildx-action@v3
         with:
-          name: sgl-private-image-builder
-          keep-state: true
-          cleanup: false
+          # A persistent named builder can retain a broken worker across runs.
+          # OCI and zstd still share this builder within the current job.
+          name: ${{ env.SGL_IMAGE_BUILDER }}
+          keep-state: false
+          cleanup: true
           driver-opts: |
             network=host
           buildkitd-config-inline: |
@@ -371,6 +374,9 @@ jobs:
               reservedSpace = "10GB"
               maxUsedSpace = "100GB"
               minFreeSpace = "150GB"
+
+      - name: Verify BuildKit connection
+        run: docker buildx du --builder "${SGL_IMAGE_BUILDER}"
 
       - name: Login to Volcengine CR
         run: |
@@ -407,7 +413,7 @@ jobs:
           fi
 
           docker buildx build \
-            --builder sgl-private-image-builder \
+            --builder "${SGL_IMAGE_BUILDER}" \
             --target ${{ inputs.docker_target }} \
             --platform linux/amd64 \
             --output type=image,name=${IMAGE_REPO},push-by-digest=true,name-canonical=true,push=true \
@@ -531,7 +537,7 @@ jobs:
           fi
 
           docker buildx build \
-            --builder sgl-private-image-builder \
+            --builder "${SGL_IMAGE_BUILDER}" \
             --target ${{ inputs.docker_target }} \
             --platform linux/amd64 \
             --output type=image,name=${IMAGE_REPO},push-by-digest=true,name-canonical=true,push=true,compression=zstd,compression-level=3,force-compression=true,oci-mediatypes=true \
