@@ -376,7 +376,7 @@ class TestNixlKVSenderChunkPolicy(CustomTestCase):
         sender.bootstrap_room = 17
         sender.chunk_id = 3
         sender.kv_mgr = SimpleNamespace(
-            kv_args=SimpleNamespace(engine_rank=2),
+            kv_args=SimpleNamespace(system_dp_rank=1, engine_rank=2),
             _staging_outstanding={},
             check_status=lambda _room: KVPoll.Success,
         )
@@ -386,7 +386,7 @@ class TestNixlKVSenderChunkPolicy(CustomTestCase):
         self.assertEqual(sender._transfer_metric.transfer_latency_s, 2.0)
         self.assertTrue(sender._ready_diag_logged)
         log_info.assert_called_once()
-        self.assertEqual(log_info.call_args.args[1:4], (17, 2, 3))
+        self.assertEqual(log_info.call_args.args[1:5], (17, 1, 2, 3))
 
 
 class TestNixlAbortHandling(CustomTestCase):
@@ -843,6 +843,7 @@ class TestNixlReceiverPoll(CustomTestCase):
         receiver, mgr = self._make_receiver(status=KVPoll.WaitingForInput)
         receiver.started_transfer = True
         receiver.init_time = 10.0
+        mgr.kv_args.system_dp_rank = 3
         mgr.kv_args.engine_rank = 4
         status = TransferStatus(
             received_aux=True,

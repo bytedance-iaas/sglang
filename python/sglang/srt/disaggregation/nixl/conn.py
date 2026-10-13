@@ -2938,10 +2938,12 @@ class NixlKVSender(CommonKVSender):
                 else -1.0
             )
             logger.info(
-                "PD_READY_DIAG role=prefill_transfer room=%s rank=%s "
+                "PD_READY_DIAG role=prefill_transfer room=%s dp_rank=%s "
+                "engine_rank=%s "
                 "chunks=%s first_submit_to_done_ms=%.3f "
                 "last_submit_to_done_ms=%.3f total_bytes=%s",
                 self.bootstrap_room,
+                self.kv_mgr.kv_args.system_dp_rank,
                 self.kv_mgr.kv_args.engine_rank,
                 self.chunk_id,
                 first_ms,
@@ -3114,10 +3116,12 @@ class NixlKVReceiver(CommonKVReceiver):
                     else "unknown"
                 )
                 logger.info(
-                    "PD_READY_DIAG role=decode_transfer room=%s rank=%s "
+                    "PD_READY_DIAG role=decode_transfer room=%s dp_rank=%s "
+                    "engine_rank=%s "
                     "kv_ms=%.3f aux_ms=%.3f state_ms=%.3f all_ms=%.3f "
                     "winner=%s kv_chunks=%s state_pp=%s",
                     self.bootstrap_room,
+                    self.kv_mgr.kv_args.system_dp_rank,
                     self.kv_mgr.kv_args.engine_rank,
                     (
                         (transfer_status.diag_kv_ready_at - started) * 1000

@@ -86,11 +86,13 @@ def _maybe_log_pd_ready_first_decode(req: Req, was_first_decode: bool) -> None:
         return
     stats = req.time_stats
     logger.info(
-        "PD_READY_DIAG role=decode_first rid=%s room=%s rank=%s "
+        "PD_READY_DIAG role=decode_first rid=%s room=%s dp_rank=%s "
+        "attn_tp_rank=%s "
         "transfer_ms=%.3f ready_to_schedule_ms=%.3f "
         "schedule_to_finish_ms=%.3f ready_to_finish_ms=%.3f",
         req.rid,
         req.bootstrap_room,
+        get_parallel().attn_dp_rank,
         get_parallel().attn_tp_rank,
         (stats.wait_queue_entry_time - stats.decode_transfer_queue_entry_time) * 1000,
         (stats.last_decode_scheduled_time - stats.wait_queue_entry_time) * 1000,

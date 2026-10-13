@@ -46,7 +46,7 @@ class TestPdReadyDiag(CustomTestCase):
     )
     @patch(
         "sglang.srt.managers.scheduler_components.batch_result_processor.get_parallel",
-        return_value=SimpleNamespace(attn_tp_rank=3),
+        return_value=SimpleNamespace(attn_dp_rank=2, attn_tp_rank=3),
     )
     @patch(
         "sglang.srt.managers.scheduler_components.batch_result_processor.logger.info"
@@ -64,8 +64,8 @@ class TestPdReadyDiag(CustomTestCase):
         _maybe_log_pd_ready_first_decode(req, was_first_decode=True)
 
         log_info.assert_called_once()
-        self.assertEqual(log_info.call_args.args[1:4], ("rid-1", 42, 3))
-        self.assertEqual(log_info.call_args.args[4:], (1000.0, 250.0, 250.0, 500.0))
+        self.assertEqual(log_info.call_args.args[1:5], ("rid-1", 42, 2, 3))
+        self.assertEqual(log_info.call_args.args[5:], (1000.0, 250.0, 250.0, 500.0))
 
     @patch(
         "sglang.srt.managers.scheduler_components.batch_result_processor._PD_READY_DIAG",
