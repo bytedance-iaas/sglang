@@ -390,6 +390,105 @@ class TestKPoolMqaLogitsRowChunks(CustomTestCase):
         self.assertGreater(len(chunks), 1)
 
 
+class TestKPoolIndexerRowSplitPolicy(CustomTestCase):
+    def test_work_is_summed_per_request_not_against_the_batch_maximum(self):
+        batch = SimpleNamespace(
+            extend_seq_lens_cpu=[256, 8],
+            seq_lens_cpu=torch.tensor([65_536, 1_024]),
+        )
+        self.assertEqual(
+            indexer_module._extend_logits_elems(batch, 4),
+            256 * 16_384 + 8 * 256,
+        )
+
+    def test_tensor_and_list_mirrors_are_equivalent(self):
+        tensor_batch = SimpleNamespace(
+            extend_seq_lens_cpu=torch.tensor([8_192]),
+            seq_lens_cpu=torch.tensor([65_536]),
+        )
+        list_batch = SimpleNamespace(extend_seq_lens_cpu=[8_192], seq_lens_cpu=[65_536])
+        expected = 8_192 * 16_384
+        self.assertEqual(indexer_module._extend_logits_elems(tensor_batch, 4), expected)
+        self.assertEqual(indexer_module._extend_logits_elems(list_batch, 4), expected)
+
+    def test_missing_or_misaligned_host_mirrors_fail_closed(self):
+        for batch, kpool in (
+            (SimpleNamespace(seq_lens_cpu=None, extend_seq_lens_cpu=[1]), 4),
+            (SimpleNamespace(seq_lens_cpu=[8], extend_seq_lens_cpu=None), 4),
+            (SimpleNamespace(seq_lens_cpu=[8, 9], extend_seq_lens_cpu=[1]), 4),
+            (SimpleNamespace(seq_lens_cpu=[8], extend_seq_lens_cpu=[1]), 0),
+            (SimpleNamespace(), 4),
+        ):
+            with self.subTest(batch=batch, kpool=kpool):
+                self.assertEqual(indexer_module._extend_logits_elems(batch, kpool), 0)
+
+    def test_real_workload_threshold_boundary(self):
+        threshold = envs.SGLANG_DSA_INDEXER_ROW_SPLIT_MIN_ELEMS
+        parallel = SimpleNamespace(
+            attn_cp_size=1,
+            attn_tp_group=SimpleNamespace(world_size=4, rank_in_group=0),
+        )
+
+        def choose(rows, elems):
+            with (
+                threshold.override(134_217_728),
+                patch.object(indexer_module, "get_parallel", return_value=parallel),
+                patch.object(indexer_module.capture_mode, "is_capture_mode", False),
+                patch.object(
+                    torch.cuda, "is_current_stream_capturing", return_value=False
+                ),
+                patch.object(
+                    indexer_module, "is_in_breakable_cuda_graph", return_value=False
+                ),
+            ):
+                return indexer_module._indexer_row_split_group(
+                    num_rows=rows, logits_elems=elems
+                )
+
+        self.assertIsNone(choose(256, 256 * 16_320))
+        self.assertIsNone(choose(8_192, 134_217_727))
+        self.assertIs(choose(8_192, 134_217_728), parallel.attn_tp_group)
+
+    def test_policy_rejects_small_rows_graph_cp_and_tp1(self):
+        threshold = envs.SGLANG_DSA_INDEXER_ROW_SPLIT_MIN_ELEMS
+        for world, rows, capture, breakable, cp in (
+            (4, 15, False, False, 1),
+            (4, 16, True, False, 1),
+            (4, 16, False, True, 1),
+            (4, 16, False, False, 2),
+            (1, 16, False, False, 1),
+        ):
+            parallel = SimpleNamespace(
+                attn_cp_size=cp,
+                attn_tp_group=SimpleNamespace(world_size=world, rank_in_group=0),
+            )
+            with (
+                self.subTest(
+                    world=world,
+                    rows=rows,
+                    capture=capture,
+                    breakable=breakable,
+                    cp=cp,
+                ),
+                threshold.override(1),
+                patch.object(indexer_module, "get_parallel", return_value=parallel),
+                patch.object(indexer_module.capture_mode, "is_capture_mode", capture),
+                patch.object(
+                    torch.cuda, "is_current_stream_capturing", return_value=False
+                ),
+                patch.object(
+                    indexer_module,
+                    "is_in_breakable_cuda_graph",
+                    return_value=breakable,
+                ),
+            ):
+                self.assertIsNone(
+                    indexer_module._indexer_row_split_group(
+                        num_rows=rows, logits_elems=1
+                    )
+                )
+
+
 class TestKPoolTopKV2Routing(unittest.TestCase):
     def _inputs(self):
         return dict(
@@ -583,6 +682,7 @@ def _chunk_backend(*, topk, index_topk=4, index_kpool=4):
     backend._kpool_topk_by_row_chunks = MethodType(
         IndexerKPool._kpool_topk_by_row_chunks, backend
     )
+    backend._kpool_topk_rows = MethodType(IndexerKPool._kpool_topk_rows, backend)
     return backend
 
 
