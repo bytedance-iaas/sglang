@@ -1815,6 +1815,127 @@ class TestEICHiCacheRegression(unittest.TestCase):
                 self.assertTrue(callable(getattr(cls, hook, None)), f"{name}.{hook}")
         self.assertIn(eic_hiradix_cache.EICHiRadixCache.__name__, names)
 
+    def test_dsv41_page_specs_accept_new_pools(self):
+        # DSv4.1 host stacks carry low-ratio (C1/C2), FP4-indexer-scale and
+        # split-rope pools that the v4 adapter rejects as unsupported. Names
+        # arrive as PoolName members on v4.1 and plain values must also work.
+        from sglang.srt.mem_cache.eic_memory_pool import (
+            EICDeepSeekV4TokenToKVPoolHost,
+        )
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+
+        def entry(numel):
+            host_pool = SimpleNamespace(
+                get_dummy_flat_data_page=lambda n=numel: torch.zeros(
+                    n, dtype=torch.uint8
+                )
+            )
+            return SimpleNamespace(host_pool=host_pool)
+
+        host = object.__new__(EICDeepSeekV4TokenToKVPoolHost)
+        host.host_pool_group = SimpleNamespace(
+            entry_map={
+                PoolName.KV: entry(8),
+                "deepseek_v4_c1": entry(11),
+                "deepseek_v4_c1_indexer": entry(12),
+                "deepseek_v4_c1_indexer_scale": entry(13),
+                "deepseek_v4_c2": entry(14),
+                "deepseek_v4_c2_indexer": entry(15),
+                "deepseek_v4_c2_indexer_scale": entry(16),
+                PoolName.DEEPSEEK_V4_C4: entry(17),
+                "deepseek_v4_c4_indexer_scale": entry(18),
+                "deepseek_v4_c4_rope": entry(19),
+                "deepseek_v4_c128_rope": entry(20),
+                "deepseek_v4_c128_state": entry(21),
+            }
+        )
+        specs = EICDeepSeekV4TokenToKVPoolHost._build_page_specs(host)
+        by_name = {str(spec["name"]): spec for spec in specs}
+        self.assertNotIn("kv", by_name)
+        for name in (
+            "deepseek_v4_c1",
+            "deepseek_v4_c1_indexer_scale",
+            "deepseek_v4_c2",
+            "deepseek_v4_c4_indexer_scale",
+            "deepseek_v4_c4_rope",
+            "deepseek_v4_c128_rope",
+            "deepseek_v4_c4",
+        ):
+            self.assertEqual(by_name[name]["source"], PoolName.KV, name)
+        self.assertEqual(by_name["deepseek_v4_c128_state"]["source"], PoolName.SWA)
+        self.assertEqual(sum(spec["numel"] for spec in specs), 176)
+
+        host.host_pool_group = SimpleNamespace(
+            entry_map={"deepseek_v4_future_pool": entry(1)}
+        )
+        with self.assertRaisesRegex(ValueError, "Unsupported DeepSeek V4 EIC pool"):
+            EICDeepSeekV4TokenToKVPoolHost._build_page_specs(host)
+
+    def test_dsv41_estimate_page_bytes_tolerates_missing_pools(self):
+        # DSv4.1 stages may have no SWA pool (unified KV), no C4/C128 pool,
+        # an indexer pool without index_k_with_scale_buffer, and pair state
+        # pools without kv_score_buffer. The estimate must not crash.
+        from sglang.srt.mem_cache.eic_memory_pool import (
+            EICDeepSeekV4TokenToKVPoolHost,
+        )
+
+        host = object.__new__(EICDeepSeekV4TokenToKVPoolHost)
+        device_pool = SimpleNamespace(
+            swa_kv_pool=None,
+            c4_kv_pool=None,
+            c128_kv_pool=None,
+            c4_indexer_kv_pool=SimpleNamespace(),
+            compress_state_pools=[SimpleNamespace(ratio=2)],
+            indexer_compress_state_pools=[],
+        )
+        self.assertEqual(
+            EICDeepSeekV4TokenToKVPoolHost._estimate_page_bytes(host, device_pool), 0
+        )
+
+        v4_pool = SimpleNamespace(
+            swa_kv_pool=SimpleNamespace(
+                kv_buffer=[torch.zeros(1), torch.zeros(1)], bytes_per_page_padded=100
+            ),
+            c4_kv_pool=SimpleNamespace(
+                kv_buffer=[torch.zeros(1)], bytes_per_page_padded=200
+            ),
+            c128_kv_pool=SimpleNamespace(kv_buffer=[], bytes_per_page_padded=300),
+            c4_indexer_kv_pool=SimpleNamespace(
+                index_k_with_scale_buffer=[
+                    torch.zeros(4, 50, dtype=torch.uint8),
+                    torch.zeros(4, 50, dtype=torch.uint8),
+                ]
+            ),
+            compress_state_pools=[],
+            indexer_compress_state_pools=[],
+        )
+        # 2*100 (SWA) + 200 (C4) + 2*50 (indexer page row bytes) = 500.
+        self.assertEqual(
+            EICDeepSeekV4TokenToKVPoolHost._estimate_page_bytes(host, v4_pool), 500
+        )
+
+    def test_dsv41_swa_indices_without_swa_pool(self):
+        from sglang.srt.mem_cache.eic_memory_pool import (
+            EICDeepSeekV4TokenToKVPoolHost,
+        )
+
+        host = object.__new__(EICDeepSeekV4TokenToKVPoolHost)
+        host.device_pool = SimpleNamespace(swa_kv_pool=None)
+        out = EICDeepSeekV4TokenToKVPoolHost._swa_indices(host, torch.tensor([5, 6, 7]))
+        self.assertEqual(out.dtype, torch.int64)
+        self.assertEqual(out.tolist(), [0, 0, 0])
+
+    def test_dsv41_deploy_key_carries_page_bytes(self):
+        from sglang.srt.mem_cache.eic_memory_pool import (
+            EICDeepSeekV4TokenToKVPoolHost,
+        )
+
+        host = object.__new__(EICDeepSeekV4TokenToKVPoolHost)
+        host.deploy_key = "model_1_0_512_torch.uint8@sglang"
+        host.page_bytes = 9158208
+        EICDeepSeekV4TokenToKVPoolHost._apply_page_layout_to_deploy_key(host)
+        self.assertTrue(host.deploy_key.endswith("_pb9158208"))
+
 
 if __name__ == "__main__":
     unittest.main()
