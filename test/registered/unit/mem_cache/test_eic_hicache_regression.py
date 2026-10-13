@@ -1925,16 +1925,29 @@ class TestEICHiCacheRegression(unittest.TestCase):
         self.assertEqual(out.dtype, torch.int64)
         self.assertEqual(out.tolist(), [0, 0, 0])
 
-    def test_dsv41_deploy_key_carries_page_bytes(self):
+    def test_dsv41_deploy_key_carries_layout_hash(self):
         from sglang.srt.mem_cache.eic_memory_pool import (
             EICDeepSeekV4TokenToKVPoolHost,
         )
 
-        host = object.__new__(EICDeepSeekV4TokenToKVPoolHost)
-        host.deploy_key = "model_1_0_512_torch.uint8@sglang"
-        host.page_bytes = 9158208
-        EICDeepSeekV4TokenToKVPoolHost._apply_page_layout_to_deploy_key(host)
-        self.assertTrue(host.deploy_key.endswith("_pb9158208"))
+        def key_for(specs):
+            host = object.__new__(EICDeepSeekV4TokenToKVPoolHost)
+            host.deploy_key = "model_1_0_512_torch.uint8@sglang"
+            host.page_specs = specs
+            EICDeepSeekV4TokenToKVPoolHost._apply_page_layout_to_deploy_key(host)
+            return host.deploy_key
+
+        specs = [
+            {"name": "deepseek_v4_c4", "numel": 100},
+            {"name": "deepseek_v4_c128", "numel": 28},
+        ]
+        key = key_for(specs)
+        self.assertTrue(key.startswith("model_1_0_512_torch.uint8@sglang_pl"))
+        # Same total bytes, different composition or order: different key.
+        self.assertNotEqual(key, key_for([{"name": "deepseek_v4_c4", "numel": 128}]))
+        self.assertNotEqual(key, key_for(list(reversed(specs))))
+        # Same layout: stable key.
+        self.assertEqual(key, key_for(specs))
 
 
 if __name__ == "__main__":
