@@ -1,4 +1,4 @@
-"""Interleaved legacy / mapped / automatic indexer A/B on Hopper.
+"""Interleaved default / mapped / prefix indexer A/B on Hopper.
 
 SM90_PREFIX_BENCH_CASES: rows:capacity:visible:ratio:role, comma separated.
 Uses production candidate settings (2048 blocks x 8 positions). Timings include
@@ -13,6 +13,7 @@ import torch
 from bench_sm90_fp4_grouped_indexer import interleaved_times
 from test_sm90_length_aware_indexer import TestSm90LengthAwareIndexer
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.candidate_indexer import select_candidate_blocks
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -65,11 +66,10 @@ def benchmark():
             mask = None
 
         def run(stage):
-            if stage == 0:
-                case.run(group_size=1)
-            elif stage == 1:
-                case.run_mapped()
-            else:
+            with (
+                envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER.override(stage >= 1),
+                envs.SGLANG_OPT_DSV41_SM90_LENGTH_AWARE_INDEXER.override(stage == 2),
+            ):
                 case.run()
 
         for stage in range(3):
@@ -77,9 +77,9 @@ def benchmark():
             check.check_outputs(x, case, role, mask)
         times = interleaved_times(
             {
-                "legacy": lambda: run(0),
+                "default": lambda: run(0),
                 "mapped": lambda: run(1),
-                "automatic": lambda: run(2),
+                "prefix": lambda: run(2),
             },
             rounds,
             target_ms,

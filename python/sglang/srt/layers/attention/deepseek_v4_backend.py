@@ -162,22 +162,6 @@ def _is_sm90() -> bool:
     return torch.cuda.get_device_capability()[0] == 9
 
 
-def _supports_sm90_length_aware_indexer(q: torch.Tensor, indexer) -> bool:
-    # Called only after the grouped SM90 layout checks. TopK and candidate
-    # selection have narrower shape limits than grouped scoring itself.
-    return (
-        q.shape[1] == 32
-        and 0 < indexer.index_topk <= 2048
-        and (
-            not indexer.is_candidate_source
-            or (
-                0 < indexer.candidate_topk_blocks <= 2048
-                and indexer.candidate_block_size in (1, 2, 4, 8, 16, 32, 64, 128)
-            )
-        )
-    )
-
-
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
     # IDLE is a real per-DP-rank mode. Do not let a stale _original_forward_mode
     # from a reused/padded ForwardBatch turn an empty rank into TARGET_VERIFY.
@@ -3289,7 +3273,8 @@ class DeepseekV4AttnBackend(
             else:
                 group_size = 1
                 if (
-                    forward_batch.forward_mode.is_target_verify()
+                    envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER.get()
+                    and forward_batch.forward_mode.is_target_verify()
                     and not self.is_dspark_draft
                     and read_ragged_verify_mode() is RaggedVerifyMode.STATIC
                     and self.forward_metadata.late_layer_tail is None
@@ -3777,8 +3762,8 @@ class DeepseekV4AttnBackend(
         # TODO(dark): add bf16 topk
         topk_transform_paged_from_metadata(logits, metadata, page_indices, raw_indices)
 
-    # TODO(candidate): Move Hopper's compact-candidate and mask fallback paths
-    # into the candidate indexer alongside the prefill paths.
+    # TODO(candidate): Hopper decode still publishes / consumes masks inline (torch
+    # top-k); move into the candidate indexer with the prefill paths.
     def _low_ratio_index_topk_sm90_decode(
         self, layer, x, q_lora, req, pos, *, group_size=1
     ) -> None:
@@ -3812,7 +3797,8 @@ class DeepseekV4AttnBackend(
         weights = indexer.head_weights(x)
         table = pool.get_index_k_with_scale_buffer(layer.layer_id)
         use_grouped = (
-            group_size > 1
+            envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER.get()
+            and group_size > 1
             and ratio in (1, 2)
             and q.is_cuda
             and torch.version.cuda is not None
@@ -3827,9 +3813,23 @@ class DeepseekV4AttnBackend(
             and table.dim() == 2
             and table.stride(1) == 1
         )
-        if use_grouped and _supports_sm90_length_aware_indexer(q, indexer):
+        use_length_aware = (
+            use_grouped
+            and envs.SGLANG_OPT_DSV41_SM90_LENGTH_AWARE_INDEXER.get()
+            and q.shape[1] == 32
+            and 0 < indexer.index_topk <= 2048
+            and (
+                not indexer.is_candidate_source
+                or (
+                    0 < indexer.candidate_topk_blocks <= 2048
+                    and indexer.candidate_block_size in (1, 2, 4, 8, 16, 32, 64, 128)
+                )
+            )
+        )
+        if use_length_aware:
             from sglang.kernels.ops.attention.dsv4.sm90_length_aware_indexer import (
                 candidate_blocks,
+                candidate_mask,
                 prefix_logits,
                 prepare_candidate_lengths,
                 publish_topk,
@@ -3838,10 +3838,16 @@ class DeepseekV4AttnBackend(
 
             request = req.to(torch.int64).contiguous()
             consumer = indexer.uses_candidates and not indexer.is_candidate_source
-            candidate_layer = indexer.is_candidate_source or consumer
+            compact = envs.SGLANG_OPT_DSV41_SM90_COMPACT_CANDIDATES.get() and (
+                indexer.is_candidate_source or consumer
+            )
             candidates = self.forward_metadata.candidate_metadata if consumer else None
-            candidates = candidates if isinstance(candidates, CandidateBlocks) else None
-            if candidate_layer:
+            candidates = (
+                candidates
+                if compact and isinstance(candidates, CandidateBlocks)
+                else None
+            )
+            if compact:
                 visible, score_lens = prepare_candidate_lengths(
                     pos, ratio, lmax, candidates
                 )
@@ -3877,12 +3883,16 @@ class DeepseekV4AttnBackend(
                 group_size=group_size,
             )
             if indexer.is_candidate_source:
-                self.forward_metadata.candidate_metadata = candidate_blocks(
+                publish = candidate_blocks if compact else candidate_mask
+                published = publish(
                     s,
                     visible,
                     lmax,
                     indexer.candidate_topk_blocks,
                     indexer.candidate_block_size,
+                )
+                self.forward_metadata.candidate_metadata = (
+                    published if compact else CandidateMasks(mask=published)
                 )
             idx = select_prefix_topk(
                 s, score_lens, min(indexer.index_topk, score_width)
@@ -3962,7 +3972,7 @@ class DeepseekV4AttnBackend(
         idx = idx.sort(dim=-1).values
         reach = idx < lens[:, None]
         if slots is None:
-            # Map only the selected positions; the grouped logits path does not
+            # Map only the selected positions; the opt-in logits path does not
             # materialize a rows x lmax slots matrix. Candidate-masked indices
             # may equal lmax and are clamped before the masked result is stored.
             selected_slots = (

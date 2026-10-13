@@ -2,6 +2,8 @@
 
 import os
 import unittest
+from contextlib import ExitStack
+from itertools import product
 from unittest.mock import patch
 
 import test_sm90_fp4_grouped_indexer as fixtures
@@ -12,6 +14,7 @@ from sglang.kernels.ops.attention.dsv4.sm90_length_aware_indexer import (
     prefix_logits,
     select_prefix_topk,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     CandidateBlocks,
     CandidateMasks,
@@ -32,43 +35,72 @@ class TestSm90LengthAwareIndexer(CustomTestCase):
         self.fixture = fixtures.TestSm90Fp4GroupedIndexer("test_matches_triton")
 
     def run_case(self, case):
-        case.run()
+        with (
+            envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER.override(True),
+            envs.SGLANG_OPT_DSV41_SM90_LENGTH_AWARE_INDEXER.override(True),
+        ):
+            case.run()
 
-    def test_zero_config_verify_dispatch(self):
+    def test_existing_flags_control_verify_optimizations(self):
         from sglang.kernels.ops.attention.dsv4 import (
             sm90_length_aware_indexer as prefix,
         )
         from sglang.kernels.ops.attention.dsv4 import sm90_paired_indexer as paired
 
+        names = (
+            "SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER",
+            "SGLANG_OPT_DSV41_SM90_LENGTH_AWARE_INDEXER",
+            "SGLANG_OPT_DSV41_SM90_COMPACT_CANDIDATES",
+        )
+        # Exercise normal static VERIFY dispatch with defaults and every legacy
+        # flag combination. Paired scoring adds no configuration of its own.
         for group in (4, 6):
-            with self.subTest(group=group), patch.dict(os.environ):
-                os.environ.pop("SGLANG_RAGGED_VERIFY_MODE", None)
-                x = self.fixture.make_inputs(
-                    rows=12, width=32769, heads=32, group=group
-                )
-                source = self.fixture.make_backend_case(x, "source", 512)
-                consumer = self.fixture.make_backend_case(x, "consumer", 512)
-                with (
-                    patch.object(
-                        paired,
-                        "paired_prefix_logits",
-                        wraps=paired.paired_prefix_logits,
-                    ) as score,
-                    patch.object(
-                        prefix, "select_prefix_topk", wraps=prefix.select_prefix_topk
-                    ) as topk,
-                ):
-                    source.run_verify()
-                    candidates = source.state.forward_metadata.candidate_metadata
-                    self.assertIsInstance(candidates, CandidateBlocks)
-                    consumer.state.forward_metadata.candidate_metadata = candidates
-                    consumer.run_verify()
-                self.assertEqual(score.call_count, 2)
-                self.assertGreaterEqual(topk.call_count, 2)
-                self.check_outputs(x, source, "source")
-                self.check_outputs(
-                    x, consumer, "consumer", published_masks(candidates).mask
-                )
+            for flags in (None, *product((False, True), repeat=3)):
+                with self.subTest(group=group, flags=flags), ExitStack() as stack:
+                    stack.enter_context(patch.dict(os.environ))
+                    for name in (*names, "SGLANG_RAGGED_VERIFY_MODE"):
+                        os.environ.pop(name, None)
+                    if flags is not None:
+                        for name, enabled in zip(names, flags):
+                            stack.enter_context(getattr(envs, name).override(enabled))
+                    grouped, length_aware, compact = flags or (False, False, False)
+                    use_prefix = grouped and length_aware
+                    x = self.fixture.make_inputs(
+                        rows=12, width=8192, heads=32, group=group
+                    )
+                    source = self.fixture.make_backend_case(x, "source", 512)
+                    consumer = self.fixture.make_backend_case(x, "consumer", 512)
+                    with (
+                        patch.object(
+                            paired,
+                            "paired_prefix_logits",
+                            wraps=paired.paired_prefix_logits,
+                        ) as score,
+                        patch.object(
+                            prefix,
+                            "select_prefix_topk",
+                            wraps=prefix.select_prefix_topk,
+                        ) as topk,
+                    ):
+                        source.run_verify()
+                        candidates = source.state.forward_metadata.candidate_metadata
+                        expected_type = (
+                            CandidateBlocks
+                            if use_prefix and compact
+                            else CandidateMasks
+                        )
+                        self.assertIsInstance(candidates, expected_type)
+                        consumer.state.forward_metadata.candidate_metadata = candidates
+                        consumer.run_verify()
+                    self.assertEqual(score.call_count, 2 if use_prefix else 0)
+                    if use_prefix:
+                        self.assertGreaterEqual(topk.call_count, 2)
+                    else:
+                        self.assertEqual(topk.call_count, 0)
+                    self.check_outputs(x, source, "source")
+                    self.check_outputs(
+                        x, consumer, "consumer", published_masks(candidates).mask
+                    )
 
     def check_outputs(self, x, case, role="none", input_mask=None, k=512, has_raw=True):
         scores = self.fixture.reference(x)
@@ -221,7 +253,11 @@ class TestSm90LengthAwareIndexer(CustomTestCase):
             x = self.fixture.make_inputs(rows=12, width=4096, heads=heads, group=group)
             case = self.fixture.make_backend_case(x, "source", k)
             case.layer.indexer.candidate_block_size = block_size
-            case.run_mapped()
+            with (
+                envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER.override(True),
+                envs.SGLANG_OPT_DSV41_SM90_LENGTH_AWARE_INDEXER.override(False),
+            ):
+                case.run()
             pages, raw = case.pages.clone(), case.raw.clone()
             with patch.object(
                 sm90_length_aware_indexer,
@@ -239,14 +275,18 @@ class TestSm90LengthAwareIndexer(CustomTestCase):
         source.layer.indexer.candidate_block_size = 8
         source.layer.indexer.candidate_topk_blocks = 2048
         self.run_case(source)
-        mask = published_masks(source.state.forward_metadata.candidate_metadata).mask
-        # At 8K all reachable blocks fit the budget. Mask materialization also
-        # permits a subsequent layer to fall back to the mapped path.
+        mask = source.state.forward_metadata.candidate_metadata.mask
+        # At 8K all reachable blocks fit the budget. Full-width mask publication
+        # also permits a subsequent layer to fall back to the mapped path.
         self.check_outputs(x, source, "source")
         for optimized in (False, True):
             consumer = self.fixture.make_backend_case(x, "consumer", 512)
             consumer.state.forward_metadata.candidate_metadata.mask = mask
-            (consumer.run if optimized else consumer.run_mapped)()
+            with (
+                envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER.override(True),
+                envs.SGLANG_OPT_DSV41_SM90_LENGTH_AWARE_INDEXER.override(optimized),
+            ):
+                consumer.run()
             self.check_outputs(x, consumer, "consumer", mask)
 
     def test_graph_replay_grow_shrink_and_candidates(self):
@@ -288,17 +328,21 @@ class TestSm90LengthAwareIndexer(CustomTestCase):
             source = self.fixture.make_backend_case(x, "source", 512)
             source.layer.indexer.candidate_block_size = 8
             source.layer.indexer.candidate_topk_blocks = 2048
-            self.run_case(source)
+            with envs.SGLANG_OPT_DSV41_SM90_COMPACT_CANDIDATES.override(True):
+                self.run_case(source)
             candidates = source.state.forward_metadata.candidate_metadata
             self.assertIsInstance(candidates, CandidateBlocks)
             mask = published_masks(candidates).mask
             self.check_outputs(x, source, "source")
-            for mode in ("compact", "mask", "mapped"):
+            for optimized, compact in ((True, True), (True, False), (False, False)):
                 consumer = self.fixture.make_backend_case(x, "consumer", 512)
-                consumer.state.forward_metadata.candidate_metadata = (
-                    CandidateMasks(mask=mask) if mode == "mask" else candidates
-                )
-                (consumer.run_mapped if mode == "mapped" else consumer.run)()
+                consumer.state.forward_metadata.candidate_metadata = candidates
+                with (
+                    envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER.override(True),
+                    envs.SGLANG_OPT_DSV41_SM90_LENGTH_AWARE_INDEXER.override(optimized),
+                    envs.SGLANG_OPT_DSV41_SM90_COMPACT_CANDIDATES.override(compact),
+                ):
+                    consumer.run()
                 self.check_outputs(x, consumer, "consumer", mask)
 
     def test_compact_blocks_partial_and_sparse(self):
@@ -349,14 +393,14 @@ class TestSm90LengthAwareIndexer(CustomTestCase):
             case.pos.copy_(x.lens * x.ratio - 1)
 
         def run():
-            self.run_case(source)
-            candidates = source.state.forward_metadata.candidate_metadata
-            consumer.state.forward_metadata.candidate_metadata = candidates
-            fallback.state.forward_metadata.candidate_metadata = published_masks(
-                candidates
-            )
-            self.run_case(consumer)
-            self.run_case(fallback)
+            with envs.SGLANG_OPT_DSV41_SM90_COMPACT_CANDIDATES.override(True):
+                self.run_case(source)
+                candidates = source.state.forward_metadata.candidate_metadata
+                consumer.state.forward_metadata.candidate_metadata = candidates
+                fallback.state.forward_metadata.candidate_metadata = candidates
+                self.run_case(consumer)
+            with envs.SGLANG_OPT_DSV41_SM90_COMPACT_CANDIDATES.override(False):
+                self.run_case(fallback)
 
         for _ in range(3):
             run()
@@ -409,7 +453,8 @@ class TestSm90LengthAwareIndexer(CustomTestCase):
         case = self.fixture.make_backend_case(x, "consumer", 31)
         case.state.forward_metadata.candidate_metadata = candidates
         case.state.forward_metadata.core_metadata.sparse_raw_indices = lambda _: None
-        self.run_case(case)
+        with envs.SGLANG_OPT_DSV41_SM90_COMPACT_CANDIDATES.override(True):
+            self.run_case(case)
         self.check_outputs(x, case, "consumer", mask, k=31, has_raw=False)
 
 

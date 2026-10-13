@@ -383,20 +383,22 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
         from sglang.srt.layers.attention import deepseek_v4_backend as backend
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
+        option = envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER
         with patch.dict(os.environ):
-            os.environ.pop("SGLANG_RAGGED_VERIFY_MODE", None)
-            self.assertEqual(envs.SGLANG_RAGGED_VERIFY_MODE.get(), "static")
-        for mode, ragged, draft, tail, rows, spec_tokens, expected in (
-            (ForwardMode.TARGET_VERIFY, "static", False, None, 12, 6, 6),
-            (ForwardMode.DECODE, "static", False, None, 2, 6, 1),
-            (ForwardMode.TARGET_VERIFY, "compact", False, None, 12, 6, 1),
-            (ForwardMode.TARGET_VERIFY, "cap-accept", False, None, 12, 6, 1),
-            (ForwardMode.TARGET_VERIFY, "static", True, None, 12, 6, 1),
-            (ForwardMode.TARGET_VERIFY, "static", False, object(), 12, 6, 1),
-            (ForwardMode.TARGET_VERIFY, "static", False, None, 11, 6, 1),
-            (ForwardMode.TARGET_VERIFY, "static", False, None, 12, 5, 1),
+            os.environ.pop("SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER", None)
+            self.assertFalse(option.get())
+        for enabled, mode, ragged, draft, tail, rows, spec_tokens, expected in (
+            (False, ForwardMode.TARGET_VERIFY, "static", False, None, 12, 6, 1),
+            (True, ForwardMode.TARGET_VERIFY, "static", False, None, 12, 6, 6),
+            (True, ForwardMode.DECODE, "static", False, None, 2, 6, 1),
+            (True, ForwardMode.TARGET_VERIFY, "compact", False, None, 12, 6, 1),
+            (True, ForwardMode.TARGET_VERIFY, "cap-accept", False, None, 12, 6, 1),
+            (True, ForwardMode.TARGET_VERIFY, "static", True, None, 12, 6, 1),
+            (True, ForwardMode.TARGET_VERIFY, "static", False, object(), 12, 6, 1),
+            (True, ForwardMode.TARGET_VERIFY, "static", False, None, 11, 6, 1),
+            (True, ForwardMode.TARGET_VERIFY, "static", False, None, 12, 5, 1),
         ):
-            with self.subTest(mode=mode, ragged=ragged, rows=rows):
+            with self.subTest(enabled=enabled, mode=mode, ragged=ragged, rows=rows):
                 state = SimpleNamespace(
                     is_dspark_draft=draft,
                     speculative_num_draft_tokens=6,
@@ -410,6 +412,7 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
                 )
                 tensor = torch.empty(rows)
                 with (
+                    option.override(enabled),
                     envs.SGLANG_RAGGED_VERIFY_MODE.override(ragged),
                     patch.object(backend, "_is_sm100_or_newer", return_value=False),
                 ):
@@ -468,13 +471,6 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
                 state, layer, x.weights, x.q, x.req, pos, group_size=group_size
             )
 
-        def run_mapped():
-            # Exercise the grouped fallback independently of prefix TopK.
-            with patch.object(
-                backend, "_supports_sm90_length_aware_indexer", return_value=False
-            ):
-                run()
-
         def run_verify():
             from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -495,7 +491,6 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
 
         return SimpleNamespace(
             run=run,
-            run_mapped=run_mapped,
             run_verify=run_verify,
             state=state,
             pages=pages,
@@ -504,59 +499,13 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
             layer=layer,
         )
 
-    def test_sm100_keeps_existing_dispatch(self):
-        from sglang.srt.layers.attention import deepseek_v4_backend as backend
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
-
-        for mode in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY):
-            state = SimpleNamespace(
-                _low_ratio_index_topk_decode=Mock(),
-                _low_ratio_index_topk_sm90_decode=Mock(),
-            )
-            tensor = torch.empty(12)
-            with patch.object(backend, "_is_sm100_or_newer", return_value=True):
-                backend.DeepseekV4AttnBackend._low_ratio_index_topk(
-                    state,
-                    None,
-                    tensor,
-                    tensor,
-                    tensor,
-                    tensor,
-                    SimpleNamespace(forward_mode=mode),
-                )
-            state._low_ratio_index_topk_decode.assert_called_once()
-            self.assertIs(
-                state._low_ratio_index_topk_decode.call_args.args[-1],
-                None if mode.is_decode() else tensor,
-            )
-            state._low_ratio_index_topk_sm90_decode.assert_not_called()
-
-    def test_non_sm90_keeps_legacy_scoring(self):
-        from sglang.kernels.ops.attention.dsv4 import (
-            sm90_fp4_grouped_indexer as grouped,
-        )
-
-        x = self.make_inputs(rows=12, width=512)
-        case = self.make_backend_case(x)
-        case.run(group_size=1)
-        pages, raw = case.pages.clone(), case.raw.clone()
-        with (
-            patch.object(torch.cuda, "get_device_capability", return_value=(8, 0)),
-            patch.object(
-                grouped,
-                "fp4_index_logits_grouped_sm90",
-                side_effect=AssertionError("non-SM90 entered grouped scoring"),
-            ),
-        ):
-            case.run()
-        torch.testing.assert_close(case.pages, pages, atol=0, rtol=0)
-        torch.testing.assert_close(case.raw, raw, atol=0, rtol=0)
-
     def test_backend_topk_and_candidate_masks(self):
         from sglang.kernels.ops.attention.dsv4 import (
             sm90_fp4_grouped_indexer as grouped,
         )
+        from sglang.srt.environ import envs
 
+        option = envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER
         for width in (512, 4096):
             for ratio in (1, 2):
                 for role in ("none", "source", "consumer"):
@@ -564,12 +513,14 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
                         x = self.make_inputs(rows=12, width=width, ratio=ratio)
                         x.lens[0] = 0
                         case = self.make_backend_case(x, role)
-                        case.run(group_size=1)
+                        with option.override(False):
+                            case.run()
                         pages, raw = case.pages.clone(), case.raw.clone()
                         mask = (
                             case.state.forward_metadata.candidate_metadata.mask.clone()
                         )
                         with (
+                            option.override(True),
                             patch.object(
                                 grouped,
                                 "fp4_index_logits_grouped_sm90",
@@ -588,6 +539,7 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
         from sglang.kernels.ops.attention.dsv4 import (
             sm90_fp4_grouped_indexer as grouped,
         )
+        from sglang.srt.environ import envs
 
         for heads, group_size in ((16, 6), (32, 1), (64, 1)):
             with self.subTest(heads=heads, group_size=group_size):
@@ -595,9 +547,11 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
                 x.q = x.q[:, :heads].contiguous()
                 x.weights = x.weights[:, :heads].contiguous()
                 case = self.make_backend_case(x)
-                case.run(group_size=1)
+                with envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER.override(False):
+                    case.run(group_size)
                 pages, raw = case.pages.clone(), case.raw.clone()
                 with (
+                    envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER.override(True),
                     patch.object(
                         grouped,
                         "fp4_index_logits_grouped_sm90",
@@ -615,7 +569,9 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
         from sglang.kernels.ops.attention.dsv4 import (
             sm90_fp4_topk,
         )
+        from sglang.srt.environ import envs
 
+        option = envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER
         for ratio, role, topk, has_raw in (
             (1, "none", 512, True),
             (2, "source", 512, True),
@@ -631,11 +587,13 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
                     case.state.forward_metadata.core_metadata.sparse_raw_indices = (
                         lambda _: None
                     )
-                case.run(group_size=1)
+                with option.override(False):
+                    case.run()
                 pages = case.pages.clone()
                 raw = case.raw.clone() if has_raw else None
                 mask = case.state.forward_metadata.candidate_metadata.mask.clone()
                 with (
+                    option.override(True),
                     patch.object(
                         grouped,
                         "_sm90_fp4_grouped_indexer_op",
@@ -652,7 +610,7 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
                         wraps=sm90_fp4_topk.sort_map_topk,
                     ) as epilogue,
                 ):
-                    case.run_mapped()
+                    case.run()
                     score.assert_called_once()
                     self.assertEqual(epilogue.call_count, int(topk <= 1024))
                 torch.testing.assert_close(case.pages, pages, atol=0, rtol=0)
@@ -663,19 +621,25 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
                 )
 
     def test_backend_int32_metadata(self):
+        from sglang.srt.environ import envs
+
         for width in (512, 4096):
             with self.subTest(width=width):
                 x = self.make_inputs(rows=12, width=width)
                 x.req = x.req.to(torch.int32)
                 x.lens = x.lens.to(torch.int32)
                 case = self.make_backend_case(x, topk=512)
-                case.run(group_size=1)
+                with envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER.override(False):
+                    case.run()
                 pages, raw = case.pages.clone(), case.raw.clone()
-                case.run()
+                with envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER.override(True):
+                    case.run()
                 torch.testing.assert_close(case.pages, pages, atol=0, rtol=0)
                 torch.testing.assert_close(case.raw, raw, atol=0, rtol=0)
 
     def test_backend_strided_request_metadata(self):
+        from sglang.srt.environ import envs
+
         for dtype in (torch.int32, torch.int64):
             with self.subTest(dtype=dtype):
                 x = self.make_inputs(rows=12, width=4096)
@@ -683,9 +647,11 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
                 storage[::2].copy_(x.req)
                 x.req = storage[::2]
                 case = self.make_backend_case(x, topk=513)
-                case.run(group_size=1)
+                with envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER.override(False):
+                    case.run()
                 pages, raw = case.pages.clone(), case.raw.clone()
-                case.run()
+                with envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER.override(True):
+                    case.run()
                 torch.testing.assert_close(case.pages, pages, atol=0, rtol=0)
                 torch.testing.assert_close(case.raw, raw, atol=0, rtol=0)
 
@@ -693,6 +659,8 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
         self.check_backend_graph_replay(4096)
 
     def test_backend_topk_sizes_and_optional_raw(self):
+        from sglang.srt.environ import envs
+
         for topk in (1, 31, 513, 1024, 1025):
             for has_raw in (False, True):
                 with self.subTest(topk=topk, has_raw=has_raw):
@@ -703,10 +671,12 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
                         case.state.forward_metadata.core_metadata.sparse_raw_indices = (
                             lambda _: None
                         )
-                    case.run(group_size=1)
+                    with envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER.override(False):
+                        case.run()
                     pages = case.pages.clone()
                     raw = case.raw.clone() if has_raw else None
-                    case.run()
+                    with envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER.override(True):
+                        case.run()
                     torch.testing.assert_close(case.pages, pages, atol=0, rtol=0)
                     if has_raw:
                         torch.testing.assert_close(case.raw, raw, atol=0, rtol=0)
@@ -718,14 +688,18 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
         self.check_backend_graph_replay(131072, heads=32)
 
     def check_backend_graph_replay(self, width, heads=64):
+        from sglang.srt.environ import envs
+
+        option = envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER
         x = self.make_inputs(rows=12, width=width, heads=heads)
         case = self.make_backend_case(x, topk=512)
-        for _ in range(3):
-            case.run_mapped()
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            case.run_mapped()
+        with option.override(True):
+            for _ in range(3):
+                case.run()
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                case.run()
         try:
             for fraction in (1, 0.125, 0, 0.5, 1):
                 x.lens.copy_(
@@ -735,7 +709,8 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
                 )
                 case.pos.copy_(x.lens * x.ratio - 1)
                 x.mapping[:, :: x.ratio].copy_(x.mapping[:, :: x.ratio].roll(3, dims=1))
-                case.run(group_size=1)
+                with option.override(False):
+                    case.run()
                 pages, raw = case.pages.clone(), case.raw.clone()
                 case.pages.fill_(123)
                 case.raw.fill_(123)

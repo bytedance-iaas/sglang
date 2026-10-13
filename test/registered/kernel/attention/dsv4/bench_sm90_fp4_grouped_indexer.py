@@ -1,4 +1,4 @@
-"""Interleaved A/B for the grouped SM90 indexer, including preparation costs.
+"""Interleaved A/B for the opt-in SM90 indexer, including preparation costs.
 
 Inputs are synthetic fake-FP4 queries and packed FP4 cache pages. Logits timing
 includes dense slot construction on the default path and Q packing on CUDA.
@@ -10,9 +10,8 @@ Optional environment variables: SM90_INDEXER_BENCH_CASES (comma-separated
 rows:width:visible_fraction), SM90_INDEXER_BENCH_SEED, SM90_INDEXER_BENCH_ROUNDS,
 SM90_INDEXER_BENCH_MS, SM90_INDEXER_BENCH_HEADS (32 or 64, default 64),
 SM90_INDEXER_BENCH_RATIO (1 or 2, default 2), and SM90_INDEXER_BENCH_OUTPUT
-(a new JSON filename). Set HEADS=32 for the Flash workload. This benchmark
-isolates the mapped/grouped fallback; the prefix benchmark covers automatic
-32-head dispatch, including paired scoring and length-aware TopK.
+(a new JSON filename). Set HEADS=32 for the Flash workload; its opt-in path
+uses mapped Triton, not the 64-head grouped CUDA kernel.
 """
 
 import json
@@ -27,6 +26,7 @@ from test_sm90_fp4_grouped_indexer import TestSm90Fp4GroupedIndexer
 
 from sglang.kernels.jit.benchmark.utils import get_benchmark_range
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import fp4_index_logits_decode
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
@@ -142,10 +142,8 @@ def benchmark():
             )
 
         def backend(enabled):
-            if enabled:
-                case.run_mapped()
-            else:
-                case.run(group_size=1)
+            with envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER.override(enabled):
+                case.run()
 
         torch.testing.assert_close(
             fixture.run_public(x), default_logits(), atol=0, rtol=0, equal_nan=False
@@ -157,10 +155,10 @@ def benchmark():
         torch.testing.assert_close(case.raw, raw, atol=0, rtol=0)
         times = interleaved_times(
             {
-                "legacy_logits": default_logits,
-                "grouped_logits": lambda: fixture.run_public(x),
-                "legacy_backend": lambda: backend(False),
-                "grouped_backend": lambda: backend(True),
+                "default_logits": default_logits,
+                "opt_in_logits": lambda: fixture.run_public(x),
+                "default_backend": lambda: backend(False),
+                "opt_in_backend": lambda: backend(True),
             },
             rounds,
             target_ms,

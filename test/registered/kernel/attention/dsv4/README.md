@@ -1,20 +1,36 @@
-# SM90 FP4 Indexer/TopK
+# Opt-in SM90 FP4 grouped indexer
 
-Supported DeepSeek-V4.1 static target verification on Hopper automatically uses
-grouped scoring, length-aware TopK, paired 32-head queries and compact candidates.
-No optimization environment variables are required. Static verification is
-already the default; the grouped, length-aware and compact switches were removed.
-32-head indexers use prefix scoring, including paired WGMMA for groups of four
-or six queries. 64-head indexers use mapped Triton or request-grouped CUDA.
+Enable before server startup / CUDA Graph capture:
+
+```bash
+export SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER=1
+```
+
+The default is **off**. This adds fused-mapping logits to DeepSeek-V4.1 static
+target verification on Hopper. 32-head indexers use mapped Triton at every
+capacity; 64-head indexers also use request-grouped CUDA where profitable.
 It does not change ordinary decode, prefill, SM100+, DSpark draft execution,
 ragged verification, or late-layer-tail execution. Unsupported layouts keep
-the existing path. Automatic dispatch is not a promise of a speedup on every
+the existing path. Enabling the flag is not a promise of a speedup on every
 Hopper configuration.
 
-The 32-head path is described under **Length-aware 32-head indexer** below.
-The original grouped/mapped path's full-width logits and PyTorch TopK contracts
-apply when the length-aware shape checks fail. Performance tables below are
-historical measurements; their flag-on/off labels describe those older revisions.
+An additional, separately gated 32-head optimization is described under
+**Length-aware 32-head indexer** below. The original grouped/mapped path's
+full-width logits and PyTorch TopK contracts apply when that second flag is off.
+
+## Existing configuration and automatic kernel selection
+
+The existing `GROUPED_INDEXER`, `LENGTH_AWARE_INDEXER`, and `COMPACT_CANDIDATES`
+settings (all prefixed with `SGLANG_OPT_DSV41_SM90_`) retain their original
+names, default-off values, and dependencies. Enable the existing settings
+before server startup / CUDA Graph capture as described below.
+
+Paired scoring is selected automatically for supported groups within the
+existing length-aware path; it has no additional environment switch. Turning
+off the existing grouped or length-aware setting prevents entry to paired
+scoring. Turning off compact candidates retains mask publication/consumption.
+The supported SM90 mHC optimization is selected independently without adding
+an mHC environment switch. Its original projection arithmetic is retained.
 
 ## Supported contract
 
@@ -34,7 +50,7 @@ against its fixed `56ad1a2` snapshot and then integrated into `dsv4.1`.
 
 ## Selected implementation
 
-1. Use mapped Triton for fallback 32-head and short 64-head shapes; it avoids Q
+1. Use mapped Triton for all 32-head and short 64-head shapes; it avoids Q
    packing and dense slots. Fully invisible tiles only write `-inf`, skipping
    mapping/Q/K loads, dequantization, dot products and reduction.
 2. Use an 8-head/CTA Q pack for the CUDA branch, matching fake quant's scale floor.
@@ -48,10 +64,10 @@ against its fixed `56ad1a2` snapshot and then integrated into `dsv4.1`.
 6. Keep the conservative E5M2 safe domain, BF16 fallback, explicit rounding and
    reduction order, `--ftz=false`, and required generic-to-async proxy fences.
 
-The backend maps only selected TopK positions to physical slots on the grouped
+The backend maps only selected TopK positions to physical slots on the opt-in
 path. For K <= 1024, one Triton epilogue sorts the selected positions, applies
 visibility, maps slots and publishes both outputs. TopK selection/tie-breaking
-remains in PyTorch; larger K retains the torch epilogue. The grouped path does not
+remains in PyTorch; larger K retains the torch epilogue. The opt-in path does not
 materialize a dense `[rows, width]` slot matrix.
 
 Both score implementations still produce capacity-width FP32 logits, and
@@ -89,8 +105,8 @@ PYTHONPATH=python SM90_INDEXER_BENCH_HEADS=32 SM90_INDEXER_BENCH_RATIO=2 \
 filenames. These microbenchmarks include preparation and TopK/epilogue but do
 not include candidate source/consumer selection or serving overhead. For the
 serving A/B, keep context limit, GSP seed/data, 256 requests, concurrency 64,
-output length and speculative settings fixed; compare isolated baseline and PR
-checkouts with separate server startups/graph captures. Record throughput, TPOT and
+output length and speculative settings fixed; toggle only the indexer flag
+before separate server startups/graph captures. Record throughput, TPOT and
 acceptance length without profiling; use a separate short trace to verify
 removal of dense slots preparation and presence of `_sort_map_topk`.
 
@@ -132,7 +148,14 @@ complete independence from the maximum context length.
 
 ## Length-aware 32-head indexer
 
-This path is selected automatically. It supports the grouped path's 32-head,
+Enable both flags before server startup / CUDA Graph capture:
+
+```bash
+export SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER=1
+export SGLANG_OPT_DSV41_SM90_LENGTH_AWARE_INDEXER=1
+```
+
+The second flag defaults to **off**. It supports the mapped path's 32-head,
 static-verification layouts, TopK 1..2048, and ratio 1 or 2. Candidate sources
 additionally require 1..2048 selected blocks and a power-of-two block size from
 1 through 128. Unsupported cases retain the original path.
@@ -154,9 +177,9 @@ All graph shapes stay fixed; lengths and request mappings can grow or shrink
 between replays without host synchronization. FP32 score buffers retain their
 capacity-sized allocation, but only visible tiles and boundary padding are
 initialized. Every reader of these private buffers must use the device lengths.
-Candidate sources publish compact blocks as described below. A full-width bool
-mask is materialized only when a fallback consumer needs it. Source scoring
-still has capacity-dependent allocations.
+Candidate sources still zero a full-width bool mask to support subsequent
+fallback consumers. This optimization does **not** eliminate capacity-dependent
+allocation or that remaining mask write.
 
 Valid scores match the existing Triton implementation exactly. TopK is exact
 by selected score, but cutoff ties may select different positions from PyTorch.
@@ -215,8 +238,8 @@ PYTHONPATH=python SM90_PREFIX_BENCH_SEED=11 \
 Repeat with seed 23 and a new filename. The benchmark checks all three paths
 before randomized interleaved timing. For a serving comparison, keep the model
 maximum context, dataset/cache, concurrency, output length, speculative setup
-and warmup policy fixed; compare isolated baseline and PR checkouts across
-separate server startups. The microbenchmark calls reference paths directly.
+and warmup policy fixed; keep the grouped flag on in both runs and toggle only
+the length-aware flag across separate server startups.
 
 ### Matched serving check
 
@@ -259,8 +282,13 @@ context and KV capacity were checked against the running services.
 
 This selectively adopts the compact-candidate idea from iaas PR #796 while
 retaining persistent prefix scoring and the H20-safe non-cluster ragged TopK.
-Compact blocks are the default representation for supported candidate-source
-layers; no environment variable is required.
+Enable the additional, default-off switch before graph capture:
+
+```bash
+export SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER=1
+export SGLANG_OPT_DSV41_SM90_LENGTH_AWARE_INDEXER=1
+export SGLANG_OPT_DSV41_SM90_COMPACT_CANDIDATES=1
+```
 
 Sources reuse their prefix scores for both block selection and final token
 TopK. They publish sorted int32 block IDs instead of a capacity-width bool
@@ -389,10 +417,8 @@ PYTHONPATH=python SM90_INDEXER_BENCH_SEED=11 \
   python3 test/registered/kernel/attention/dsv4/bench_sm90_fp4_grouped_indexer.py
 ```
 
-The benchmark directly compares legacy and grouped fallback calls during
-separate graph captures. The prefix benchmark also measures automatic dispatch,
-and the compact benchmark compares mask and compact representations. No runtime
-optimization switch is used. Use a new
+The benchmark toggles the opt-in flag during separate graph captures; it does
+not require the environment switch to be enabled outside the script. Use a new
 output filename for every run. Seed 23 repeats the same shape matrix. Optional
 `SM90_INDEXER_BENCH_CASES` accepts comma-separated `rows:width:visible_fraction`
 triples; backend rows must be complete groups of six. The benchmark's docstring
@@ -400,10 +426,10 @@ lists timing overrides. CI uses a smaller shape subset.
 
 The registered test file covers both logits branches; multiple page sizes,
 ratios, groups and tail groups; scale/weight boundaries; unaligned cache views;
-poisoned invisible mappings; varying-length replay; automatic and unsupported
+poisoned invisible mappings; varying-length replay; default-off and unsupported
 backend dispatch; int32 metadata; candidate source/consumer masks; and TopK /
 physical-index equality, strided request metadata, non-power-of-two TopK sizes,
-optional raw-index output and the large-K fallback. It
+optional raw-index output and the large-K fallback. It contains 21 methods and
 uses the existing Triton implementation as its numerical-contract reference,
 plus an exact simple-score case. Tuning also used an independent FP64 reference
 for ordinary finite inputs.
