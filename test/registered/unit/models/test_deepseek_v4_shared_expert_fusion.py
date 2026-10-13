@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.layers.moe import mega_moe
 from sglang.srt.layers.moe.utils import (
     install_shared_experts_fusion_decision,
     is_shared_experts_fusion_disabled,
@@ -197,6 +198,44 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
         self.assertIs(loaded[0][0], weight)
         self.assertEqual(loaded[0][1], "stages.0.mlp.experts.w13_weight")
         self.assertEqual(loaded[0][2:], ("w1", config.n_routed_experts))
+
+    def test_precompile_builds_and_reports_eligible_shared_tuples(self):
+        class FakeMoE:
+            def __init__(self, name):
+                self.shared_experts = name
+                self.mega_shared_l1_weights = None
+                self.mega_shared_l2_weights = None
+
+        eligible = FakeMoE("eligible")
+        ineligible = FakeMoE("ineligible")
+        model = SimpleNamespace(modules=lambda: [eligible, ineligible])
+        l1, l2 = object(), object()
+
+        with (
+            patch(
+                "sglang.srt.models.deepseek_v4.deepseek_v2.DeepseekV2MoE",
+                FakeMoE,
+            ),
+            patch.object(
+                mega_moe,
+                "should_fuse_mega_moe_shared_experts",
+                side_effect=[True, False],
+            ),
+            patch.object(
+                mega_moe,
+                "build_mega_moe_shared_weights",
+                return_value=(l1, l2),
+            ) as build,
+            self.assertLogs("sglang.srt.models.deepseek_v4", level="INFO") as logs,
+        ):
+            DeepseekV4ForCausalLM.precompile_kernels_after_loading(model)
+
+        build.assert_called_once_with("eligible")
+        self.assertIs(eligible.mega_shared_l1_weights, l1)
+        self.assertIs(eligible.mega_shared_l2_weights, l2)
+        self.assertIsNone(ineligible.mega_shared_l1_weights)
+        self.assertIsNone(ineligible.mega_shared_l2_weights)
+        self.assertTrue(any("1 layer(s)" in message for message in logs.output))
 
 
 if __name__ == "__main__":

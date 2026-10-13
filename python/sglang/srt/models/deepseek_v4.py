@@ -3431,6 +3431,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             should_fuse_mega_moe_shared_experts,
         )
 
+        fused_layer_count = 0
         for module in self.modules():
             if isinstance(
                 module, deepseek_v2.DeepseekV2MoE
@@ -3438,6 +3439,13 @@ class DeepseekV4ForCausalLM(nn.Module):
                 module.mega_shared_l1_weights, module.mega_shared_l2_weights = (
                     build_mega_moe_shared_weights(module.shared_experts)
                 )
+                fused_layer_count += 1
+
+        if fused_layer_count:
+            logger.info(
+                "Prepared MegaMoE in-kernel shared expert tuples for %d layer(s).",
+                fused_layer_count,
+            )
 
     @staticmethod
     def remap_weight_name_to_dpsk_hf_format(
