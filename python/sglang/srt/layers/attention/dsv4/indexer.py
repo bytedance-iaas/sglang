@@ -852,6 +852,9 @@ class C4IndexerBackendMixin:
         elif core_metadata.c4_sparse_raw_indices is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
 
+        use_logical_topk_v2 = (
+            self.dsa_topk_backend.should_use_topk_v2() and raw_indices is None
+        )
         if self.dsa_topk_backend.is_torch():
             topk_transform_512_pytorch_vectorized(
                 logits,
@@ -870,14 +873,28 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )
-        elif self.dsa_topk_backend.should_use_topk_v2() and raw_indices is None:
+        elif use_logical_topk_v2:
             topk_transform_512_v2(
                 logits,
                 c4_seq_lens,
-                page_table,
+                None,
                 c4_sparse_page_indices,
                 indexer_metadata.c4_page_size,
                 indexer_metadata.topk_metadata,
+            )
+            logical_indices = c4_sparse_page_indices.sort(
+                dim=-1, descending=True
+            ).values
+            page_size = indexer_metadata.c4_page_size
+            page_ids = torch.gather(
+                page_table, -1, (logical_indices.clamp_min(0) // page_size).long()
+            )
+            c4_sparse_page_indices.copy_(
+                torch.where(
+                    logical_indices >= 0,
+                    page_ids * page_size + logical_indices % page_size,
+                    -1,
+                )
             )
         else:
             topk_transform_512(
@@ -888,6 +905,17 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )
+        if not use_logical_topk_v2:
+            if raw_indices is None:
+                c4_sparse_page_indices.copy_(
+                    c4_sparse_page_indices.sort(dim=-1, descending=True).values
+                )
+            else:
+                sorted_raw, permutation = raw_indices.sort(dim=-1, descending=True)
+                raw_indices.copy_(sorted_raw)
+                c4_sparse_page_indices.copy_(
+                    torch.gather(c4_sparse_page_indices, -1, permutation)
+                )
         if hisparse_coordinator is not None:
             if hisparse_decode:
                 compress_layer_id = token_to_kv_pool.layer_mapping[
