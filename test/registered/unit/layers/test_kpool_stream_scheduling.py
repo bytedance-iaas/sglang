@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.attention.dsa import triton_kernel
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa import dsa_indexer_kpool as indexer_module
 from sglang.srt.layers.attention.dsa import kpool_fp8_index as kpool_index_module
 from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
@@ -485,6 +486,22 @@ class TestKPoolTopKV2Routing(unittest.TestCase):
                 owned_plan=plan, pool_lens=torch.empty(3, dtype=torch.int32)
             )
         )
+
+    def test_kpool_gate_is_independent_from_generic_topk_v2(self):
+        with patch.object(kpool_index_module, "_is_cuda", True):
+            for generic, kpool, expected in (
+                (True, False, False),
+                (False, True, False),
+                (True, True, True),
+            ):
+                with (
+                    self.subTest(generic=generic, kpool=kpool),
+                    envs.SGLANG_OPT_USE_TOPK_V2.override(generic),
+                    envs.SGLANG_EXPERIMENTAL_DSA_KPOOL_TOPK_V2.override(kpool),
+                ):
+                    self.assertEqual(
+                        kpool_index_module._kpool_topk_v2_enabled(), expected
+                    )
 
 
 def _row_chunks(*, rows_per_chunk, num_rows, num_cols, device):

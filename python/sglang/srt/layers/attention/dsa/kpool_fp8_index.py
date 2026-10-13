@@ -595,7 +595,11 @@ def _append_kpool_tail_to_topk_kernel(
 
 
 def _kpool_topk_v2_enabled() -> bool:
-    return _is_cuda and envs.SGLANG_OPT_USE_TOPK_V2.get()
+    return (
+        _is_cuda
+        and envs.SGLANG_OPT_USE_TOPK_V2.get()
+        and envs.SGLANG_EXPERIMENTAL_DSA_KPOOL_TOPK_V2.get()
+    )
 
 
 def build_kpool_topk_v2_plan(pool_lens: torch.Tensor) -> Optional[torch.Tensor]:

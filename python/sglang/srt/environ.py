@@ -1326,6 +1326,10 @@ class Envs:
     # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
+    # Opt-in GLM KPool extension for the generic DSA top-k v2 kernel.  Keep it
+    # separate so same-source service A/B does not disable the already-enabled
+    # non-KPool v2 routes in the control arm.
+    SGLANG_EXPERIMENTAL_DSA_KPOOL_TOPK_V2 = EnvBool(False)
     # Experimental H20/SM90 path: keep GLM's 528-byte group-scaled FP8 NoPE
     # KPool rows native and let FlashMLA consume the tail-extended sparse table.
     # V3.2 does not support dynamic topk_length, so the consumer pads the fixed

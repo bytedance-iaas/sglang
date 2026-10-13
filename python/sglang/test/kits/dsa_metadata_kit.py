@@ -59,7 +59,10 @@ def make_backend(mode, seq, req, *, fusion=True):
     }
     with envs.SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION.override(fusion):
         backend._init_kpool_metadata_fusion()
-    with envs.SGLANG_OPT_USE_TOPK_V2.override(True):
+    with (
+        envs.SGLANG_OPT_USE_TOPK_V2.override(True),
+        envs.SGLANG_EXPERIMENTAL_DSA_KPOOL_TOPK_V2.override(True),
+    ):
         apply_metadata(backend, mode, seq, req)
     apply_metadata(backend, mode, seq, req)
     return backend
