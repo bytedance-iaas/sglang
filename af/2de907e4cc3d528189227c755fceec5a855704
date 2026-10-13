@@ -1,0 +1,21 @@
+python/sglang/srt/mem_cache/memory_pool.py
+  s_e438893c037c2d::t_880aa87cdb48b9 2660-2662,2664,2668
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "af2de907e4cc3d528189227c755fceec5a855704",
+  "prompts": {},
+  "sessions": {
+    "s_e438893c037c2d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9b1e60f1-9671-41cd-88bf-1c13d90a440e",
+        "model": "unknown"
+      },
+      "human_author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

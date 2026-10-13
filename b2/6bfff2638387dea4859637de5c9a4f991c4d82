@@ -1,0 +1,25 @@
+python/sglang/srt/managers/tokenizer_manager.py
+  s_3af354177588a3::t_0f9692ee9d17f7 1355,1357,1359
+test/manual/dsv4/bench_dcp_fixed_batch_decode.py
+  s_3af354177588a3::t_050fecf2d85ebd 151
+test/registered/unit/managers/test_tokenizer_manager_batch_routing.py
+  s_3af354177588a3::t_2ea4c1f08ad67b 1-90
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b26bfff2638387dea4859637de5c9a4f991c4d82",
+  "prompts": {},
+  "sessions": {
+    "s_3af354177588a3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f40eb-f26a-72d1-832b-54050e70467a",
+        "model": "unknown"
+      },
+      "human_author": "shiyu7 <shiyu_1995@163.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

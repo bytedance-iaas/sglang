@@ -1,0 +1,39 @@
+KVRoadMap.md
+  bc724571dc077ef2 35-219,449-450,460-473,525
+python/sglang/srt/server_args.py
+  bc724571dc077ef2 316-352,407-411,2436-2440,3528-3884,4750-4778,5996-6003,6615-6619,6767,7852-7913
+python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+  bc724571dc077ef2 88-99,338-364,379-450,617-643,740-773
+python/sglang/srt/mem_cache/rotated_quant_memory_pool.py
+  bc724571dc077ef2 419-448
+scripts/build_rotated_kv_calib.py
+  bc724571dc077ef2 1-699
+test/manual/quant/test_rotated_kv_quant_e2e.py
+  bc724571dc077ef2 1-581
+python/sglang/srt/layers/quantization/rotated_kv_quant.py
+  bc724571dc077ef2 1-420
+.gitignore
+  s_a43a7a56d77e55::t_04e81ba43cd4e6 283
+  s_071d0bf34ab4c4::t_797b7dd34b5058 282
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "f9b826a92b528e5ea27f7932e3c7202f7c816ad0",
+  "prompts": {
+    "bc724571dc077ef2": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a1ff1998acd8a2c99d7e3ea",
+        "model": "openrouter-2o__dev"
+      },
+      "human_author": "wangyuzhan <wangyuzhan@bytedance.com>",
+      "total_additions": 729,
+      "total_deletions": 16,
+      "accepted_lines": 2613,
+      "overriden_lines": 0
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

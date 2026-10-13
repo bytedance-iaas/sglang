@@ -1,0 +1,66 @@
+python/sglang/srt/layers/moe/cutlass_w4a8_moe.py
+  s_bbac2dc1f8d0f2::t_2d049f8a89c3f7 218,226 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a54b26de127d6363e6fc928","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Single":218},{"Single":226}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3cb30720851049bcf28594cd33382d6d689a3626",
+  "prompts": {},
+  "sessions": {
+    "s_bbac2dc1f8d0f2": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a3d26127cb3eaebe2eba1d4",
+        "model": "openrouter-2o__dev"
+      },
+      "human_author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {
+    "python/sglang/srt/layers/moe/cutlass_w4a8_moe.py": [
+      {
+        "hash": "s_bbac2dc1f8d0f2::t_2d049f8a89c3f7",
+        "line_ranges": [
+          {
+            "Single": 218
+          },
+          {
+            "Single": 226
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a54b26de127d6363e6fc928",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Single": 218
+              },
+              {
+                "Single": 226
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "s_bbac2dc1f8d0f2": {
+      "tool": "trae",
+      "conversation_id": "6a3d26127cb3eaebe2eba1d4",
+      "session_id": "6a3d26127cb3eaebe2eba1d4",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_bbac2dc1f8d0f2::t_2d049f8a89c3f7": {
+      "tool": "trae",
+      "conversation_id": "6a3d26127cb3eaebe2eba1d4",
+      "session_id": "6a3d26127cb3eaebe2eba1d4",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}

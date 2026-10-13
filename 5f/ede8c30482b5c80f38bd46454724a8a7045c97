@@ -1,0 +1,78 @@
+python/sglang/srt/disaggregation/prefill.py
+  s_6ab00bf1e68681::t_4e27bafd895c47 909-912,1022-1038 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a5885b91456988efbe27a59","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Range":[909,912]},{"Range":[1022,1038]}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5fede8c30482b5c80f38bd46454724a8a7045c97",
+  "prompts": {},
+  "sessions": {
+    "s_6ab00bf1e68681": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a56edf31456988efbe220a0",
+        "model": "gpt-5.5__dev"
+      },
+      "human_author": "zhangxiaolei <zhangxiaolei.666@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {
+    "python/sglang/srt/disaggregation/prefill.py": [
+      {
+        "hash": "s_6ab00bf1e68681::t_4e27bafd895c47",
+        "line_ranges": [
+          {
+            "Range": [
+              909,
+              912
+            ]
+          },
+          {
+            "Range": [
+              1022,
+              1038
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a5885b91456988efbe27a59",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Range": [
+                  909,
+                  912
+                ]
+              },
+              {
+                "Range": [
+                  1022,
+                  1038
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "s_6ab00bf1e68681": {
+      "tool": "trae",
+      "conversation_id": "6a56edf31456988efbe220a0",
+      "session_id": "6a56edf31456988efbe220a0",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_6ab00bf1e68681::t_4e27bafd895c47": {
+      "tool": "trae",
+      "conversation_id": "6a56edf31456988efbe220a0",
+      "session_id": "6a56edf31456988efbe220a0",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}

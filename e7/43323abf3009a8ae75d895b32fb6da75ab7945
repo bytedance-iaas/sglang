@@ -1,0 +1,16 @@
+python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py
+  h_11d5c68ede7790 156-158,230
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e743323abf3009a8ae75d895b32fb6da75ab7945",
+  "prompts": {},
+  "humans": {
+    "h_11d5c68ede7790": {
+      "author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

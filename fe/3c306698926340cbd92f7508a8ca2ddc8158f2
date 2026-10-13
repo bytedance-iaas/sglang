@@ -1,0 +1,188 @@
+python/sglang/srt/layers/quantization/mxfp4.py
+  s_eca38f4b0c1c42::t_e5284f0dfc45c1 304,316-322,324-333,337-338,347-351,353-356 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a69b6ae5bf76e1ac79e254d","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Single":304},{"Range":[316,322]},{"Range":[324,333]},{"Range":[337,338]},{"Range":[347,351]},{"Range":[353,356]}]}]}
+python/sglang/srt/models/glm4_moe.py
+  s_eca38f4b0c1c42::t_65ab54c3cc8b83 131 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a69b6c45bf76e1ac79e2587","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Single":131}]}]}
+  s_eca38f4b0c1c42::t_3e8d55167c0ded 153 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a69b6e95bf76e1ac79e25fe","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Single":153}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fe3c306698926340cbd92f7508a8ca2ddc8158f2",
+  "prompts": {},
+  "sessions": {
+    "s_eca38f4b0c1c42": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a66c9b95bf76e1ac79e1270",
+        "model": "gpt-5.4__dev"
+      },
+      "human_author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {
+    "python/sglang/srt/layers/quantization/mxfp4.py": [
+      {
+        "hash": "s_eca38f4b0c1c42::t_e5284f0dfc45c1",
+        "line_ranges": [
+          {
+            "Single": 304
+          },
+          {
+            "Range": [
+              316,
+              322
+            ]
+          },
+          {
+            "Range": [
+              324,
+              333
+            ]
+          },
+          {
+            "Range": [
+              337,
+              338
+            ]
+          },
+          {
+            "Range": [
+              347,
+              351
+            ]
+          },
+          {
+            "Range": [
+              353,
+              356
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a69b6ae5bf76e1ac79e254d",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Single": 304
+              },
+              {
+                "Range": [
+                  316,
+                  322
+                ]
+              },
+              {
+                "Range": [
+                  324,
+                  333
+                ]
+              },
+              {
+                "Range": [
+                  337,
+                  338
+                ]
+              },
+              {
+                "Range": [
+                  347,
+                  351
+                ]
+              },
+              {
+                "Range": [
+                  353,
+                  356
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "python/sglang/srt/models/glm4_moe.py": [
+      {
+        "hash": "s_eca38f4b0c1c42::t_65ab54c3cc8b83",
+        "line_ranges": [
+          {
+            "Single": 131
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a69b6c45bf76e1ac79e2587",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Single": 131
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "hash": "s_eca38f4b0c1c42::t_3e8d55167c0ded",
+        "line_ranges": [
+          {
+            "Single": 153
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a69b6e95bf76e1ac79e25fe",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Single": 153
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "s_eca38f4b0c1c42": {
+      "tool": "trae",
+      "conversation_id": "6a66c9b95bf76e1ac79e1270",
+      "session_id": "6a66c9b95bf76e1ac79e1270",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_eca38f4b0c1c42::t_3e8d55167c0ded": {
+      "tool": "trae",
+      "conversation_id": "6a66c9b95bf76e1ac79e1270",
+      "session_id": "6a66c9b95bf76e1ac79e1270",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_eca38f4b0c1c42::t_65ab54c3cc8b83": {
+      "tool": "trae",
+      "conversation_id": "6a66c9b95bf76e1ac79e1270",
+      "session_id": "6a66c9b95bf76e1ac79e1270",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_eca38f4b0c1c42::t_a3a774ec3a0086": {
+      "tool": "trae",
+      "conversation_id": "6a66c9b95bf76e1ac79e1270",
+      "session_id": "6a66c9b95bf76e1ac79e1270",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_eca38f4b0c1c42::t_e5284f0dfc45c1": {
+      "tool": "trae",
+      "conversation_id": "6a66c9b95bf76e1ac79e1270",
+      "session_id": "6a66c9b95bf76e1ac79e1270",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}

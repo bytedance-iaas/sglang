@@ -1,0 +1,23 @@
+python/sglang/srt/managers/tokenizer_manager.py
+  s_3af354177588a3::t_7ef6e90a65db4a 3297-3298
+test/registered/unit/managers/test_tokenizer_manager_batch_routing.py
+  s_3af354177588a3::t_feb42f1e8dc689 75-78
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "47537220244267744dd71a1392e8710a30fc1794",
+  "prompts": {},
+  "sessions": {
+    "s_3af354177588a3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f40eb-f26a-72d1-832b-54050e70467a",
+        "model": "unknown"
+      },
+      "human_author": "shiyu7 <shiyu_1995@163.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

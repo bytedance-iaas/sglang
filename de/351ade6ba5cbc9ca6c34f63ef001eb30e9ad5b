@@ -1,0 +1,60 @@
+python/sglang/srt/disaggregation/mooncake/conn.py
+  s_874079b5a852ec::t_3a512b85908c89 18 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a5af86da9cf4e03972ddba7","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Single":18}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "de351ade6ba5cbc9ca6c34f63ef001eb30e9ad5b",
+  "prompts": {},
+  "sessions": {
+    "s_874079b5a852ec": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a5a459ba9cf4e03972db15f",
+        "model": "gpt-5.6-terra__max"
+      },
+      "human_author": "zhangxiaolei <zhangxiaolei.666@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {
+    "python/sglang/srt/disaggregation/mooncake/conn.py": [
+      {
+        "hash": "s_874079b5a852ec::t_3a512b85908c89",
+        "line_ranges": [
+          {
+            "Single": 18
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a5af86da9cf4e03972ddba7",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Single": 18
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "s_874079b5a852ec": {
+      "tool": "trae",
+      "conversation_id": "6a5a459ba9cf4e03972db15f",
+      "session_id": "6a5a459ba9cf4e03972db15f",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_874079b5a852ec::t_3a512b85908c89": {
+      "tool": "trae",
+      "conversation_id": "6a5a459ba9cf4e03972db15f",
+      "session_id": "6a5a459ba9cf4e03972db15f",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}

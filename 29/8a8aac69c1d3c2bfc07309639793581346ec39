@@ -1,0 +1,21 @@
+python/sglang/srt/layers/attention/deepseek_v4_backend.py
+  s_16dfd85b073934::t_771768bc423ccc 1768-1781,1785
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "298a8aac69c1d3c2bfc07309639793581346ec39",
+  "prompts": {},
+  "sessions": {
+    "s_16dfd85b073934": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cb2e419d-3273-4708-9da4-35c52f383074",
+        "model": "unknown"
+      },
+      "human_author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

@@ -1,0 +1,23 @@
+python/sglang/srt/layers/attention/dsv4/metadata.py
+  s_3af354177588a3::t_7bd285eeb7de92 135,138,165-191,367-370
+test/registered/unit/layers/test_dsv4_nonpaged_indexer.py
+  s_3af354177588a3::t_e8ab39d0050466 10-13,24-78
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2b2bd2c2f1b9eca03c6f4297a27cdb2882062f64",
+  "prompts": {},
+  "sessions": {
+    "s_3af354177588a3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f40eb-f26a-72d1-832b-54050e70467a",
+        "model": "unknown"
+      },
+      "human_author": "shiyu7 <shiyu_1995@163.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

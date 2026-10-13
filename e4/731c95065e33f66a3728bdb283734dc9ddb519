@@ -1,0 +1,25 @@
+python/sglang/srt/disaggregation/prefill.py
+  s_421cac7749974e::t_69e39327c3bdbd 345-346,357-358,413-417,435-438,441-461,767,770,772-773
+python/sglang/srt/models/deepseek_v4.py
+  s_421cac7749974e::t_69e39327c3bdbd 2295-2299
+python/sglang/srt/disaggregation/decode.py
+  s_421cac7749974e::t_69e39327c3bdbd 63-65,264-265,1048-1049,1076-1137,1140,1157-1169,1173-1175,1184-1185,1315-1319,1322-1323,1333,1346-1361,1818,1820,1824-1828,1830-1831,1946,1950-1965,1967
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e4731c95065e33f66a3728bdb283734dc9ddb519",
+  "prompts": {},
+  "sessions": {
+    "s_421cac7749974e": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a54516b1456988efbe1cb66",
+        "model": "gpt-5.5__dev"
+      },
+      "human_author": "zhangxiaolei <zhangxiaolei.666@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

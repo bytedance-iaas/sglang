@@ -1,0 +1,21 @@
+sgl-kernel/csrc/flashmla_extension.cc
+  s_16dfd85b073934::t_fc68d23922522e 36-53,66-78,228-233
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "175cd6efe5740e7ef8a98f53fbbac321e7bd4b86",
+  "prompts": {},
+  "sessions": {
+    "s_16dfd85b073934": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cb2e419d-3273-4708-9da4-35c52f383074",
+        "model": "unknown"
+      },
+      "human_author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

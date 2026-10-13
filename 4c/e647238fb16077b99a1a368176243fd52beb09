@@ -1,0 +1,31 @@
+python/sglang/srt/disaggregation/prefill.py
+  s_421cac7749974e::t_69e39327c3bdbd 91-93,107-111,227,305-310,323-419,489-490,613-616,708-749,789,823,825-826,1038-1040,1084-1088,1294-1306,1326
+python/sglang/srt/managers/scheduler.py
+  s_421cac7749974e::t_69e39327c3bdbd 1131-1170,1178,1180-1183,1187,1189-1190,1196-1197,1199-1210,1213,1216,1246
+python/sglang/srt/speculative/spec_info.py
+  s_421cac7749974e::t_69e39327c3bdbd 240
+python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
+  s_421cac7749974e::t_69e39327c3bdbd 721-722,724-732
+python/sglang/srt/disaggregation/decode.py
+  s_421cac7749974e::t_69e39327c3bdbd 265-266,468-470,1047-1099,1106-1107,1235-1240,1243-1267,1279,1718-1726,1775,1795,1840-1855,1861,1863
+python/sglang/srt/speculative/draft_worker_common.py
+  s_421cac7749974e::t_69e39327c3bdbd 129,142
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4ce647238fb16077b99a1a368176243fd52beb09",
+  "prompts": {},
+  "sessions": {
+    "s_421cac7749974e": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a54516b1456988efbe1cb66",
+        "model": "gpt-5.5__dev"
+      },
+      "human_author": "zhangxiaolei <zhangxiaolei.666@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

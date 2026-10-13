@@ -1,0 +1,23 @@
+python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
+  h_11d5c68ede7790 47,310-313,315-319,370-394,749-755
+python/sglang/srt/models/minimax_m3_vl.py
+  s_25f30d39e75a32::t_d8d5f3f6ced389 157-174
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "a19f5af105eeba1ec734ec11f36dc39784a70046",
+  "prompts": {},
+  "sessions": {
+    "s_25f30d39e75a32": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a3290da7cb3eaebe2eb9adc",
+        "model": "openrouter-2o__dev"
+      },
+      "human_author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

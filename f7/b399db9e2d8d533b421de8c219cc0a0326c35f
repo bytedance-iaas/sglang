@@ -1,0 +1,16 @@
+python/sglang/srt/layers/moe/cutlass_w4a8_moe.py
+  h_11d5c68ede7790 29
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f7b399db9e2d8d533b421de8c219cc0a0326c35f",
+  "prompts": {},
+  "humans": {
+    "h_11d5c68ede7790": {
+      "author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

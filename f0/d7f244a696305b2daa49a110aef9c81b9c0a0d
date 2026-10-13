@@ -1,0 +1,18 @@
+python/sglang/srt/layers/moe/cutlass_w4a8_moe.py
+  h_11d5c68ede7790 25-26,28
+python/sglang/srt/models/deepseek_v4.py
+  h_11d5c68ede7790 117,121
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f0d7f244a696305b2daa49a110aef9c81b9c0a0d",
+  "prompts": {},
+  "humans": {
+    "h_11d5c68ede7790": {
+      "author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

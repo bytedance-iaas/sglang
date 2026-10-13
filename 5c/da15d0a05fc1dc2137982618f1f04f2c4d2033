@@ -1,0 +1,21 @@
+python/sglang/srt/disaggregation/decode.py
+  s_421cac7749974e::t_69e39327c3bdbd 266-268,287-327,1094-1095,1183-1184,1186-1218,1221-1223,1226-1235,1237,1240,1250-1252,1269-1279,1912-1917,1921-1923,1925-1932,1936-1938,2080-2082
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5cda15d0a05fc1dc2137982618f1f04f2c4d2033",
+  "prompts": {},
+  "sessions": {
+    "s_421cac7749974e": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a54516b1456988efbe1cb66",
+        "model": "gpt-5.5__dev"
+      },
+      "human_author": "zhangxiaolei <zhangxiaolei.666@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

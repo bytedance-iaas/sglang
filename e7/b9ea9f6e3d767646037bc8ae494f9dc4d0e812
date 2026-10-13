@@ -1,0 +1,88 @@
+python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
+  s_421cac7749974e::t_69e39327c3bdbd 2,8-12,298,300-305,517-519 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a5452a91456988efbe1cb99","tool_type":"agent","tool_id":"exec_command","line_ranges":[{"Single":2},{"Range":[8,12]},{"Single":298},{"Range":[300,305]},{"Range":[517,519]}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e7b9ea9f6e3d767646037bc8ae494f9dc4d0e812",
+  "prompts": {},
+  "sessions": {
+    "s_421cac7749974e": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a54516b1456988efbe1cb66",
+        "model": "gpt-5.5__dev",
+        "display_model_name": "GPT-5.5"
+      },
+      "human_author": "zhangxiaolei <zhangxiaolei.666@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {
+    "python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py": [
+      {
+        "hash": "s_421cac7749974e::t_69e39327c3bdbd",
+        "line_ranges": [
+          {
+            "Single": 2
+          },
+          {
+            "Range": [
+              8,
+              12
+            ]
+          },
+          {
+            "Single": 298
+          },
+          {
+            "Range": [
+              300,
+              305
+            ]
+          },
+          {
+            "Range": [
+              517,
+              519
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a5452a91456988efbe1cb99",
+            "tool_type": "agent",
+            "tool_id": "exec_command",
+            "line_ranges": [
+              {
+                "Single": 2
+              },
+              {
+                "Range": [
+                  8,
+                  12
+                ]
+              },
+              {
+                "Single": 298
+              },
+              {
+                "Range": [
+                  300,
+                  305
+                ]
+              },
+              {
+                "Range": [
+                  517,
+                  519
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {}
+}

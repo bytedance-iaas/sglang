@@ -1,0 +1,35 @@
+python/sglang/srt/hardware_backend/mlx/model_runner_stub.py
+  s_ad2f633ba377a9::t_715a0e305de0b1 137,154
+python/sglang/srt/hardware_backend/npu/dsv4/dsv4_memory_pool.py
+  s_ad2f633ba377a9::t_c0c317de7bf632 10
+python/sglang/srt/hardware_backend/npu/dsv4/dsv4_req_to_token_pool.py
+  s_ad2f633ba377a9::t_dce47010a44425 46
+python/sglang/srt/mem_cache/kv_cache_configurator.py
+  s_ad2f633ba377a9::t_8d29d29ca180c7 831-857,866-900,990-1035
+python/sglang/srt/model_executor/pool_configurator.py
+  s_ad2f633ba377a9::t_a71f28b94c7188 847-848,917-989,1005-1012
+python/sglang/srt/server_args.py
+  s_ad2f633ba377a9::t_9aec11aeb438cf 7318
+test/registered/dcp/test_dsv31_dcp8_gsm8k.py
+  s_ad2f633ba377a9::t_9a788bd7dca517 111
+test/registered/unit/hardware_backend/mlx/test_mlx_runner_pool_contract.py
+  s_ad2f633ba377a9::t_e5b3643adccda4 3-4,44
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ace4bd4952774ea6578cdbb0d6d0887dc02d2c54",
+  "prompts": {},
+  "sessions": {
+    "s_ad2f633ba377a9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "63b9d051-085a-4f60-9710-44bcb032c157",
+        "model": "unknown"
+      },
+      "human_author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

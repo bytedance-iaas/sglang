@@ -1,0 +1,23 @@
+python/sglang/srt/disaggregation/decode.py
+  s_421cac7749974e::t_69e39327c3bdbd 47,1518,1521,1576-1578
+python/sglang/srt/disaggregation/prefill.py
+  s_421cac7749974e::t_69e39327c3bdbd 36
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "df06bd791ed1f27241130eb59dc425a7c0e044c1",
+  "prompts": {},
+  "sessions": {
+    "s_421cac7749974e": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a54516b1456988efbe1cb66",
+        "model": "gpt-5.5__dev"
+      },
+      "human_author": "zhangxiaolei <zhangxiaolei.666@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

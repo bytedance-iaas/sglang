@@ -1,0 +1,16 @@
+python/sglang/jit_kernel/csrc/gemm/per_tensor_quant_fp8.cuh
+  h_11d5c68ede7790 157
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f8fe66f1b77bb45dea4f84ee2541ef9faf2159b7",
+  "prompts": {},
+  "humans": {
+    "h_11d5c68ede7790": {
+      "author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

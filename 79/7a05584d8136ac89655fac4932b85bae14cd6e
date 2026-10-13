@@ -1,0 +1,25 @@
+python/sglang/srt/model_executor/model_runner.py
+  s_421cac7749974e::t_69e39327c3bdbd 511-512,526-537
+python/sglang/srt/managers/scheduler.py
+  s_421cac7749974e::t_69e39327c3bdbd 1151-1154,1156,1206
+python/sglang/srt/disaggregation/decode.py
+  s_421cac7749974e::t_69e39327c3bdbd 1174-1185,1188,1966,1980
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "797a05584d8136ac89655fac4932b85bae14cd6e",
+  "prompts": {},
+  "sessions": {
+    "s_421cac7749974e": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a54516b1456988efbe1cb66",
+        "model": "gpt-5.5__dev"
+      },
+      "human_author": "zhangxiaolei <zhangxiaolei.666@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

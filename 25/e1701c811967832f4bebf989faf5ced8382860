@@ -1,0 +1,269 @@
+python/sglang/srt/layers/quantization/compressed_tensors/utils.py
+  s_eca38f4b0c1c42::t_3cf123e0ebbf2e 12-13,21 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a69c2c35bf76e1ac79e2897","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Range":[12,13]},{"Single":21}]}]}
+python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
+  s_eca38f4b0c1c42::t_1b023f87d6c1ec 47,63,150-165,512-541,754-760 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a69c32d5bf76e1ac79e295d","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Single":47},{"Single":63},{"Range":[150,165]},{"Range":[512,541]},{"Range":[754,760]}]}]}
+python/sglang/srt/layers/quantization/compressed_tensors/schemes/__init__.py
+  s_eca38f4b0c1c42::t_6a41fbf1dc4e92 11,43 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a69c31f5bf76e1ac79e2920","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Single":11},{"Single":43}]}]}
+python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_wmxfp4_afp8_moe.py
+  s_eca38f4b0c1c42::t_dad8db193034af 19-20 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a69c3765bf76e1ac79e29a7","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Range":[19,20]}]}]}
+  s_eca38f4b0c1c42::t_3e192b51636d3f 1-18,21-171 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a69c2fc5bf76e1ac79e28d8","tool_type":"agent","tool_id":"apply_patch","line_ranges":[{"Range":[1,18]},{"Range":[21,171]}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "25e1701c811967832f4bebf989faf5ced8382860",
+  "prompts": {},
+  "sessions": {
+    "s_eca38f4b0c1c42": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a66c9b95bf76e1ac79e1270",
+        "model": "gpt-5.4__dev"
+      },
+      "human_author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {
+    "python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py": [
+      {
+        "hash": "s_eca38f4b0c1c42::t_1b023f87d6c1ec",
+        "line_ranges": [
+          {
+            "Single": 47
+          },
+          {
+            "Single": 63
+          },
+          {
+            "Range": [
+              150,
+              165
+            ]
+          },
+          {
+            "Range": [
+              512,
+              541
+            ]
+          },
+          {
+            "Range": [
+              754,
+              760
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a69c32d5bf76e1ac79e295d",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Single": 47
+              },
+              {
+                "Single": 63
+              },
+              {
+                "Range": [
+                  150,
+                  165
+                ]
+              },
+              {
+                "Range": [
+                  512,
+                  541
+                ]
+              },
+              {
+                "Range": [
+                  754,
+                  760
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "python/sglang/srt/layers/quantization/compressed_tensors/schemes/__init__.py": [
+      {
+        "hash": "s_eca38f4b0c1c42::t_6a41fbf1dc4e92",
+        "line_ranges": [
+          {
+            "Single": 11
+          },
+          {
+            "Single": 43
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a69c31f5bf76e1ac79e2920",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Single": 11
+              },
+              {
+                "Single": 43
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_wmxfp4_afp8_moe.py": [
+      {
+        "hash": "s_eca38f4b0c1c42::t_dad8db193034af",
+        "line_ranges": [
+          {
+            "Range": [
+              19,
+              20
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a69c3765bf76e1ac79e29a7",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Range": [
+                  19,
+                  20
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "hash": "s_eca38f4b0c1c42::t_3e192b51636d3f",
+        "line_ranges": [
+          {
+            "Range": [
+              1,
+              18
+            ]
+          },
+          {
+            "Range": [
+              21,
+              171
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a69c2fc5bf76e1ac79e28d8",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Range": [
+                  1,
+                  18
+                ]
+              },
+              {
+                "Range": [
+                  21,
+                  171
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "python/sglang/srt/layers/quantization/compressed_tensors/utils.py": [
+      {
+        "hash": "s_eca38f4b0c1c42::t_3cf123e0ebbf2e",
+        "line_ranges": [
+          {
+            "Range": [
+              12,
+              13
+            ]
+          },
+          {
+            "Single": 21
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a69c2c35bf76e1ac79e2897",
+            "tool_type": "agent",
+            "tool_id": "apply_patch",
+            "line_ranges": [
+              {
+                "Range": [
+                  12,
+                  13
+                ]
+              },
+              {
+                "Single": 21
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "s_eca38f4b0c1c42": {
+      "tool": "trae",
+      "conversation_id": "6a66c9b95bf76e1ac79e1270",
+      "session_id": "6a66c9b95bf76e1ac79e1270",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_eca38f4b0c1c42::t_1b023f87d6c1ec": {
+      "tool": "trae",
+      "conversation_id": "6a66c9b95bf76e1ac79e1270",
+      "session_id": "6a66c9b95bf76e1ac79e1270",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_eca38f4b0c1c42::t_3cf123e0ebbf2e": {
+      "tool": "trae",
+      "conversation_id": "6a66c9b95bf76e1ac79e1270",
+      "session_id": "6a66c9b95bf76e1ac79e1270",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_eca38f4b0c1c42::t_3e192b51636d3f": {
+      "tool": "trae",
+      "conversation_id": "6a66c9b95bf76e1ac79e1270",
+      "session_id": "6a66c9b95bf76e1ac79e1270",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_eca38f4b0c1c42::t_6a41fbf1dc4e92": {
+      "tool": "trae",
+      "conversation_id": "6a66c9b95bf76e1ac79e1270",
+      "session_id": "6a66c9b95bf76e1ac79e1270",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_eca38f4b0c1c42::t_dad8db193034af": {
+      "tool": "trae",
+      "conversation_id": "6a66c9b95bf76e1ac79e1270",
+      "session_id": "6a66c9b95bf76e1ac79e1270",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}

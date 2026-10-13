@@ -1,0 +1,519 @@
+python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_wmxfp4_afp8_moe.py
+  s_3e6011b7a7f208::t_9b334e20ea57c8 4
+  s_3e6011b7a7f208::t_a172d24f92b44d 1-3
+  s_3e6011b7a7f208::t_0cc4271ee9e281 5-7
+  s_3e6011b7a7f208::t_7c8b4433759329 31-33
+  s_3e6011b7a7f208::t_78a5d2cc99f6f1 231-234
+  s_3e6011b7a7f208::t_66b566da140f55 240,243,254,257
+  s_3e6011b7a7f208::t_aef40841e28590 159,163-168,176-177,188-196,205-222,225-228
+  s_3e6011b7a7f208::t_4699ceac7c0a24 290-298,306-307
+  s_3e6011b7a7f208::t_28698ebe27d94e 247-252,259-268
+  s_3e6011b7a7f208::t_a70067fd5c6428 25-30,34-158,160-162,169-175,178-187,197-204,223-224,229-230,235-239,241-242,244-246,253,255-256,258,269-283 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a573915e127d6363e6fdb30","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[25,283]}]}]}
+python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
+  s_3e6011b7a7f208::t_2f5c54f7408207 495-530
+  s_3e6011b7a7f208::t_bd11891f78f65e 743
+  s_3e6011b7a7f208::t_8eeb6bece24edf 744-745 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a57394ce127d6363e6fdb54","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[744,745]}]}]}
+  s_3e6011b7a7f208::t_6a9062f7553d5b 54 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a573949e127d6363e6fdb51","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Single":54}]}]}
+python/sglang/srt/layers/quantization/compressed_tensors/utils.py
+  s_3e6011b7a7f208::t_ee3b2a9c3a6e8e 13-15,22 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a55ee5de127d6363e6fcea8","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[13,15]},{"Single":22}]}]}
+python/sglang/srt/layers/deep_gemm_wrapper/compile_utils.py
+  s_3e6011b7a7f208::t_457c9982f135cb 419-423,425-426 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a55fe95e127d6363e6fd0e9","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[419,423]},{"Range":[425,426]}]}]}
+python/sglang/srt/layers/moe/ep_moe/layer.py
+  s_3e6011b7a7f208::t_a728a836722b22 105-107
+  s_3e6011b7a7f208::t_1abc010fdf2328 48-51,53-55,57-58
+  s_3e6011b7a7f208::t_e870df762b7ef3 104 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a573951e127d6363e6fdb5a","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Single":104}]}]}
+  s_3e6011b7a7f208::t_41141de85b315b 47,52,56 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a57394ee127d6363e6fdb57","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[47,56]}]}]}
+python/sglang/srt/layers/deep_gemm_wrapper/configurer.py
+  s_3e6011b7a7f208::t_d09ffd49d61c9a 42 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a560a2fe127d6363e6fd244","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Single":42}]}]}
+python/sglang/srt/layers/moe/moe_runner/deep_gemm.py
+  s_3e6011b7a7f208::t_4a3f83b47bf8e7 1012,1034-1041,1044 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a561122e127d6363e6fd290","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Single":1012},{"Range":[1034,1041]},{"Single":1044}]}]}
+python/sglang/srt/models/deepseek_v4_nextn.py
+  s_3e6011b7a7f208::t_40d46209265857 52-68,70-75,107-108,113,120
+  s_3e6011b7a7f208::t_d9f31ee9a65741 2
+  s_3e6011b7a7f208::t_38c96819cb48e0 69
+  s_3e6011b7a7f208::t_603b9d16412cd3 126-132,136 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a562a58e127d6363e6fd4c8","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[126,132]},{"Single":136}]}]}
+python/sglang/srt/layers/moe/ep_moe/kernels.py
+  s_3e6011b7a7f208::t_9df94092a4efb9 1199-1210 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a561f77e127d6363e6fd3ce","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[1199,1210]}]}]}
+python/sglang/srt/models/deepseek_v4.py
+  s_3e6011b7a7f208::t_0b10e2f99f5c1b 5
+python/sglang/srt/layers/quantization/compressed_tensors/schemes/__init__.py
+  s_3e6011b7a7f208::t_a04f32ad3f32c0 43 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a573924e127d6363e6fdb3f","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Single":43}]}]}
+  s_3e6011b7a7f208::t_8acaacc703cf43 25 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a573921e127d6363e6fdb3c","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Single":25}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1d370604902704f2b8653cc22b194e2594d5e767",
+  "prompts": {},
+  "sessions": {
+    "s_3e6011b7a7f208": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a55e1d4e127d6363e6fcd59",
+        "model": "openrouter-2o__dev"
+      },
+      "human_author": "wangyuzhan <wangyuzhan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {
+    "python/sglang/srt/layers/deep_gemm_wrapper/compile_utils.py": [
+      {
+        "hash": "s_3e6011b7a7f208::t_457c9982f135cb",
+        "line_ranges": [
+          {
+            "Range": [
+              419,
+              423
+            ]
+          },
+          {
+            "Range": [
+              425,
+              426
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a55fe95e127d6363e6fd0e9",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  419,
+                  423
+                ]
+              },
+              {
+                "Range": [
+                  425,
+                  426
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "python/sglang/srt/layers/deep_gemm_wrapper/configurer.py": [
+      {
+        "hash": "s_3e6011b7a7f208::t_d09ffd49d61c9a",
+        "line_ranges": [
+          {
+            "Single": 42
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a560a2fe127d6363e6fd244",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Single": 42
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "python/sglang/srt/layers/moe/ep_moe/kernels.py": [
+      {
+        "hash": "s_3e6011b7a7f208::t_9df94092a4efb9",
+        "line_ranges": [
+          {
+            "Range": [
+              1199,
+              1210
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a561f77e127d6363e6fd3ce",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  1199,
+                  1210
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "python/sglang/srt/layers/moe/ep_moe/layer.py": [
+      {
+        "hash": "s_3e6011b7a7f208::t_e870df762b7ef3",
+        "line_ranges": [
+          {
+            "Single": 104
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a573951e127d6363e6fdb5a",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Single": 104
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "hash": "s_3e6011b7a7f208::t_41141de85b315b",
+        "line_ranges": [
+          {
+            "Single": 47
+          },
+          {
+            "Single": 52
+          },
+          {
+            "Single": 56
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a57394ee127d6363e6fdb57",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  47,
+                  56
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "python/sglang/srt/layers/moe/moe_runner/deep_gemm.py": [
+      {
+        "hash": "s_3e6011b7a7f208::t_4a3f83b47bf8e7",
+        "line_ranges": [
+          {
+            "Single": 1012
+          },
+          {
+            "Range": [
+              1034,
+              1041
+            ]
+          },
+          {
+            "Single": 1044
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a561122e127d6363e6fd290",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Single": 1012
+              },
+              {
+                "Range": [
+                  1034,
+                  1041
+                ]
+              },
+              {
+                "Single": 1044
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py": [
+      {
+        "hash": "s_3e6011b7a7f208::t_8eeb6bece24edf",
+        "line_ranges": [
+          {
+            "Range": [
+              744,
+              745
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a57394ce127d6363e6fdb54",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  744,
+                  745
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "hash": "s_3e6011b7a7f208::t_6a9062f7553d5b",
+        "line_ranges": [
+          {
+            "Single": 54
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a573949e127d6363e6fdb51",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Single": 54
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "python/sglang/srt/layers/quantization/compressed_tensors/schemes/__init__.py": [
+      {
+        "hash": "s_3e6011b7a7f208::t_a04f32ad3f32c0",
+        "line_ranges": [
+          {
+            "Single": 43
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a573924e127d6363e6fdb3f",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Single": 43
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "hash": "s_3e6011b7a7f208::t_8acaacc703cf43",
+        "line_ranges": [
+          {
+            "Single": 25
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a573921e127d6363e6fdb3c",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Single": 25
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_wmxfp4_afp8_moe.py": [
+      {
+        "hash": "s_3e6011b7a7f208::t_a70067fd5c6428",
+        "line_ranges": [
+          {
+            "Range": [
+              25,
+              30
+            ]
+          },
+          {
+            "Range": [
+              34,
+              158
+            ]
+          },
+          {
+            "Range": [
+              160,
+              162
+            ]
+          },
+          {
+            "Range": [
+              169,
+              175
+            ]
+          },
+          {
+            "Range": [
+              178,
+              187
+            ]
+          },
+          {
+            "Range": [
+              197,
+              204
+            ]
+          },
+          {
+            "Range": [
+              223,
+              224
+            ]
+          },
+          {
+            "Range": [
+              229,
+              230
+            ]
+          },
+          {
+            "Range": [
+              235,
+              239
+            ]
+          },
+          {
+            "Range": [
+              241,
+              242
+            ]
+          },
+          {
+            "Range": [
+              244,
+              246
+            ]
+          },
+          {
+            "Single": 253
+          },
+          {
+            "Range": [
+              255,
+              256
+            ]
+          },
+          {
+            "Single": 258
+          },
+          {
+            "Range": [
+              269,
+              283
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a573915e127d6363e6fdb30",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  25,
+                  283
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "python/sglang/srt/layers/quantization/compressed_tensors/utils.py": [
+      {
+        "hash": "s_3e6011b7a7f208::t_ee3b2a9c3a6e8e",
+        "line_ranges": [
+          {
+            "Range": [
+              13,
+              15
+            ]
+          },
+          {
+            "Single": 22
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a55ee5de127d6363e6fcea8",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  13,
+                  15
+                ]
+              },
+              {
+                "Single": 22
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "python/sglang/srt/models/deepseek_v4_nextn.py": [
+      {
+        "hash": "s_3e6011b7a7f208::t_603b9d16412cd3",
+        "line_ranges": [
+          {
+            "Range": [
+              126,
+              132
+            ]
+          },
+          {
+            "Single": 136
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a562a58e127d6363e6fd4c8",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  126,
+                  132
+                ]
+              },
+              {
+                "Single": 136
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {}
+}
