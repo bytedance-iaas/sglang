@@ -58,13 +58,49 @@ def _make_controller(num_dp_ranks: int) -> DataParallelController:
     return ctl
 
 
-def _req(routed_dp_rank=None, bootstrap_room=None, input_ids=None):
+def _req(
+    routed_dp_rank=None,
+    bootstrap_room=None,
+    input_ids=None,
+    *,
+    routing_key=None,
+    session_id=None,
+    session_params=None,
+):
     """Req stand-in; SimpleNamespace avoids pinning to the Req dataclass schema."""
     return SimpleNamespace(
         routed_dp_rank=routed_dp_rank,
         bootstrap_room=bootstrap_room,
         input_ids=input_ids or [],
+        routing_key=routing_key,
+        session_id=session_id,
+        session_params=session_params,
     )
+
+
+def _make_affinity_controller(
+    num_dp_ranks: int,
+    *,
+    fallback: str = "total_tokens",
+    max_load_skew: float = 1.5,
+    hash_tokens: int = 4096,
+    disable_token_fallback: bool = False,
+) -> DataParallelController:
+    ctl = _make_controller(num_dp_ranks)
+    ctl.load_balance_method = LoadBalanceMethod.PREFIX_AFFINITY
+    ctl._affinity_fallback = LoadBalanceMethod.from_str(fallback)
+    ctl._affinity_max_load_skew = max_load_skew
+    ctl._affinity_hash_tokens = hash_tokens
+    ctl._affinity_disable_token_fallback = disable_token_fallback
+    ctl._incremental_session_owners = {}
+    ctl._open_incremental_sessions = set()
+    return ctl
+
+
+def _dispatched_rank(ctl: DataParallelController) -> int:
+    called = [i for i, worker in enumerate(ctl.workers) if worker.send_pyobj.called]
+    assert len(called) == 1, called
+    return called[0]
 
 
 class TestLocalKvEventSources(CustomTestCase):
@@ -357,21 +393,194 @@ class TestTotalRequestsScheduler(CustomTestCase):
         )
 
 
-class TestStatusAwarenessInconsistency(CustomTestCase):
-    """Document a divergence: ``round_robin_scheduler`` skips workers whose
-    ``status`` is False, but ``total_requests_scheduler`` /
-    ``total_tokens_scheduler`` route purely by DPBudget — they do NOT
-    consult ``self.status``. If a future change unifies this behaviour,
-    this test will fail and force a reviewer to confirm intent."""
-
-    def test_total_requests_ignores_status(self):
+class TestStatusAwareLoadBalancing(CustomTestCase):
+    def test_total_requests_skips_inactive_rank(self):
         ctl = _make_controller(num_dp_ranks=4)
-        # Worker 2 is the global minimum AND marked inactive.
         ctl.dp_budget.total_requests = [5, 3, 1, 4]
         ctl.status[2] = False
+        ctl._active_workers = [0, 1, 3]
         ctl.total_requests_scheduler(_req())
-        # Current behaviour: still dispatches to the inactive worker.
+        ctl.workers[1].send_pyobj.assert_called_once()
+        ctl.workers[2].send_pyobj.assert_not_called()
+
+    def test_total_tokens_skips_inactive_rank(self):
+        ctl = _make_controller(num_dp_ranks=4)
+        ctl.dp_budget.total_tokens = [50, 30, 10, 40]
+        ctl.status[2] = False
+        ctl._active_workers = [0, 1, 3]
+        ctl.total_tokens_scheduler(_req(input_ids=[1, 2]))
+        ctl.workers[1].send_pyobj.assert_called_once()
+        ctl.workers[2].send_pyobj.assert_not_called()
+
+
+class TestPrefixAffinity(CustomTestCase):
+    @staticmethod
+    def _mark_open(ctl: DataParallelController, session_id: str) -> None:
+        ctl._open_incremental_sessions.add(session_id)
+
+    def test_routed_dp_rank_remains_authoritative_for_full_prompt(self):
+        ctl = _make_affinity_controller(4)
+        ctl.prefix_affinity_scheduler(
+            _req(routed_dp_rank=2, routing_key="session-a", input_ids=[1, 2])
+        )
         ctl.workers[2].send_pyobj.assert_called_once()
+        self.assertEqual(ctl.dp_budget.total_requests, [0, 0, 0, 0])
+
+    def test_top_level_session_id_is_deterministic(self):
+        ranks = set()
+        for _ in range(8):
+            ctl = _make_affinity_controller(8)
+            ctl.prefix_affinity_scheduler(
+                _req(session_id="session-a", input_ids=[1, 2, 3])
+            )
+            ranks.add(_dispatched_rank(ctl))
+        self.assertEqual(len(ranks), 1)
+
+    def test_routing_key_has_priority_over_top_level_session_id(self):
+        ctl = _make_affinity_controller(8)
+        ctl.prefix_affinity_scheduler(
+            _req(routing_key="project-a", session_id="session-a", input_ids=[1])
+        )
+        expected = ctl._rendezvous_ranked("project-a", list(range(8)))[0]
+        self.assertEqual(_dispatched_rank(ctl), expected)
+
+    def test_full_prompt_spills_from_overloaded_preferred_rank(self):
+        ctl = _make_affinity_controller(4, max_load_skew=1.5)
+        preferred = ctl._rendezvous_ranked("session:session-a", list(range(4)))[0]
+        ctl.dp_budget.total_requests[preferred] = 100
+
+        ctl.prefix_affinity_scheduler(_req(session_id="session-a", input_ids=[1, 2, 3]))
+
+        self.assertNotEqual(_dispatched_rank(ctl), preferred)
+
+    def test_huge_resident_prefix_is_not_an_overload_signal(self):
+        ctl = _make_affinity_controller(4)
+        preferred = ctl._rendezvous_ranked("session:session-a", list(range(4)))[0]
+        ctl.dp_budget.total_tokens[preferred] = 800_000
+
+        ctl.prefix_affinity_scheduler(_req(session_id="session-a", input_ids=[1, 2, 3]))
+
+        self.assertEqual(_dispatched_rank(ctl), preferred)
+
+    def test_incremental_session_stays_on_owner_despite_overload(self):
+        ctl = _make_affinity_controller(4)
+        params = SimpleNamespace(id="incremental-a")
+        self._mark_open(ctl, params.id)
+        ctl.prefix_affinity_scheduler(_req(session_params=params, input_ids=[1]))
+        owner = ctl._incremental_session_owners["incremental-a"]
+        for worker in ctl.workers:
+            worker.reset_mock()
+        ctl.dp_budget.total_requests[owner] = 100
+
+        ctl.prefix_affinity_scheduler(_req(session_params=params, input_ids=[2]))
+
+        self.assertEqual(_dispatched_rank(ctl), owner)
+
+    def test_incremental_session_explicit_rank_sets_owner(self):
+        ctl = _make_affinity_controller(4)
+        params = SimpleNamespace(id="incremental-a")
+        self._mark_open(ctl, params.id)
+        ctl.prefix_affinity_scheduler(
+            _req(routed_dp_rank=3, session_params=params, input_ids=[1])
+        )
+        self.assertEqual(ctl._incremental_session_owners["incremental-a"], 3)
+        ctl.workers[3].send_pyobj.assert_called_once()
+
+    def test_incremental_session_rejects_explicit_rank_change(self):
+        ctl = _make_affinity_controller(4)
+        params = SimpleNamespace(id="incremental-a")
+        self._mark_open(ctl, params.id)
+        ctl.prefix_affinity_scheduler(
+            _req(routed_dp_rank=1, session_params=params, input_ids=[1])
+        )
+        for worker in ctl.workers:
+            worker.reset_mock()
+        req = _req(routed_dp_rank=2, session_params=params, input_ids=[2])
+
+        ctl.prefix_affinity_scheduler(req)
+
+        ctl.workers[0].send_pyobj.assert_called_once()
+        self.assertIs(ctl.workers[0].send_pyobj.call_args.args[0], req)
+        self.assertIn(
+            "Scheduler-local history migration is unsupported",
+            req.dp_routing_error,
+        )
+
+    def test_incremental_session_owner_inactive_fails_closed(self):
+        ctl = _make_affinity_controller(4)
+        params = SimpleNamespace(id="incremental-a")
+        self._mark_open(ctl, params.id)
+        ctl.prefix_affinity_scheduler(_req(session_params=params, input_ids=[1]))
+        owner = ctl._incremental_session_owners["incremental-a"]
+        ctl._active_workers.remove(owner)
+        for worker in ctl.workers:
+            worker.reset_mock()
+        req = _req(session_params=params, input_ids=[2])
+
+        ctl.prefix_affinity_scheduler(req)
+
+        fallback_rank = ctl._active_workers[0]
+        ctl.workers[fallback_rank].send_pyobj.assert_called_once()
+        self.assertIs(ctl.workers[fallback_rank].send_pyobj.call_args.args[0], req)
+        self.assertIn("owner DP rank", req.dp_routing_error)
+
+    def test_close_invalidates_incremental_owner(self):
+        ctl = _make_affinity_controller(4)
+        ctl.send_control_message = MagicMock()
+        params = SimpleNamespace(id="incremental-a")
+        self._mark_open(ctl, params.id)
+        ctl.prefix_affinity_scheduler(_req(session_params=params, input_ids=[1]))
+
+        ctl.close_session(SimpleNamespace(session_id="incremental-a"))
+
+        self.assertNotIn("incremental-a", ctl._incremental_session_owners)
+        self.assertNotIn("incremental-a", ctl._open_incremental_sessions)
+        ctl.send_control_message.assert_called_once()
+
+    def test_duplicate_open_preserves_existing_incremental_owner(self):
+        ctl = _make_affinity_controller(4)
+        ctl.send_control_message = MagicMock()
+        ctl._incremental_session_owners["incremental-a"] = 2
+
+        ctl.open_session(SimpleNamespace(session_id="incremental-a"))
+
+        self.assertEqual(ctl._incremental_session_owners["incremental-a"], 2)
+        self.assertIn("incremental-a", ctl._open_incremental_sessions)
+        ctl.send_control_message.assert_called_once()
+
+    def test_first_incremental_request_only_dispatches_to_owner(self):
+        ctl = _make_affinity_controller(4)
+        params = SimpleNamespace(id="incremental-a")
+        self._mark_open(ctl, params.id)
+
+        ctl.prefix_affinity_scheduler(_req(session_params=params, input_ids=[1]))
+
+        owner = ctl._incremental_session_owners[params.id]
+        for rank, worker in enumerate(ctl.workers):
+            if rank == owner:
+                self.assertEqual(worker.send_pyobj.call_count, 1)
+            else:
+                worker.send_pyobj.assert_not_called()
+
+    def test_unopened_incremental_session_is_rejected_without_owner_guess(self):
+        ctl = _make_affinity_controller(4)
+        req = _req(session_params=SimpleNamespace(id="incremental-a"), input_ids=[1])
+
+        ctl.prefix_affinity_scheduler(req)
+
+        self.assertNotIn("incremental-a", ctl._incremental_session_owners)
+        self.assertIn("call /open_session first", req.dp_routing_error)
+
+    def test_inactive_rank_only_remaps_keys_owned_by_that_rank(self):
+        ctl = _make_affinity_controller(4)
+        keys = [f"session-{i}" for i in range(256)]
+        before = {key: ctl._rendezvous_ranked(key, [0, 1, 2, 3])[0] for key in keys}
+        after = {key: ctl._rendezvous_ranked(key, [0, 1, 3])[0] for key in keys}
+        for key in keys:
+            if before[key] == 2:
+                self.assertNotEqual(after[key], 2)
+            else:
+                self.assertEqual(after[key], before[key])
 
 
 class TestRefreshLoadBudgetThrottle(CustomTestCase):

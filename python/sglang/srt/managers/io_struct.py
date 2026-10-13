@@ -1151,6 +1151,11 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Shape of output_token_sampling_logprobs for each output token. This is a
     # defaulted tail field so older IPC senders decode as selected mode.
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
+    # Internal DP-controller rejection. The controller sends the request to a
+    # live scheduler only so the normal output path can return a per-request
+    # abort instead of crashing the controller or migrating scheduler-local
+    # session history. Keep IPC tail fields append-only.
+    dp_routing_error: Optional[str] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)

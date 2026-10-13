@@ -1127,6 +1127,40 @@ class TestLoadBalanceMethod(unittest.TestCase):
             resolution_result(server_args, "load_balance_method"), "round_robin"
         )
 
+    def test_prefix_affinity_is_explicit_and_preserved(self):
+        server_args = self._load_balance_args(
+            disaggregation_mode="decode",
+            load_balance_method="prefix_affinity",
+            prefix_affinity_fallback="total_requests",
+            prefix_affinity_max_load_skew=2.0,
+            prefix_affinity_hash_tokens=2048,
+        )
+        self.assertEqual(server_args.load_balance_method, "prefix_affinity")
+        self.assertEqual(server_args.prefix_affinity_fallback, "total_requests")
+        self.assertEqual(server_args.prefix_affinity_max_load_skew, 2.0)
+        self.assertEqual(server_args.prefix_affinity_hash_tokens, 2048)
+
+    def test_prefix_affinity_rejects_invalid_skew(self):
+        with self.assertRaisesRegex(ValueError, "max-load-skew must be >= 1.0"):
+            self._load_balance_args(
+                load_balance_method="prefix_affinity",
+                prefix_affinity_max_load_skew=0.99,
+            )
+
+    def test_prefix_affinity_rejects_negative_hash_tokens(self):
+        with self.assertRaisesRegex(ValueError, "hash-tokens must be >= 0"):
+            self._load_balance_args(
+                load_balance_method="prefix_affinity",
+                prefix_affinity_hash_tokens=-1,
+            )
+
+    def test_prefix_affinity_rejects_pd_prefill(self):
+        with self.assertRaisesRegex(ValueError, "follow_bootstrap_room"):
+            self._load_balance_args(
+                disaggregation_mode="prefill",
+                load_balance_method="prefix_affinity",
+            )
+
     def test_pd_prefill_dcp_warns_about_performance(self):
         server_args = ServerArgs(
             model_path="dummy",

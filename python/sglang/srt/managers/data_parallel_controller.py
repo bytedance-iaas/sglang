@@ -14,6 +14,7 @@
 """A controller that dispatches requests to multiple data parallel workers."""
 
 import faulthandler
+import hashlib
 import logging
 import multiprocessing as mp
 import signal
@@ -33,7 +34,9 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
+    CloseSessionReqInput,
     ElasticScaleUpdateReq,
+    OpenSessionReqInput,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -42,7 +45,10 @@ from sglang.srt.managers.io_struct import (
     unwrap_from_pickle,
     wrap_as_pickle,
 )
-from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
+from sglang.srt.managers.load_snapshot import (
+    create_load_snapshot_reader,
+    is_load_aware_method,
+)
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
@@ -92,6 +98,7 @@ class LoadBalanceMethod(Enum):
     FOLLOW_BOOTSTRAP_ROOM = auto()
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
+    PREFIX_AFFINITY = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -120,13 +127,23 @@ class DPBudget:
             )
             self.total_tokens[load.dp_rank] = load.num_total_tokens
 
-    def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
+    def dispatch(
+        self,
+        method: LoadBalanceMethod,
+        estimated_tokens: int = 0,
+        candidates: list[int] | None = None,
+    ):
+        candidates = (
+            list(range(self.num_dp_ranks)) if candidates is None else candidates
+        )
+        if not candidates:
+            return None
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
-            target_rank = self.total_requests.index(min(self.total_requests))
+            target_rank = min(candidates, key=self.total_requests.__getitem__)
         elif method == LoadBalanceMethod.TOTAL_TOKENS:
             # Use total_requests as a tie-breaker when total_tokens are equal
             target_rank = min(
-                range(self.num_dp_ranks),
+                candidates,
                 key=lambda i: (self.total_tokens[i], self.total_requests[i]),
             )
         else:
@@ -169,12 +186,24 @@ class DataParallelController:
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
+            LoadBalanceMethod.PREFIX_AFFINITY: self.prefix_affinity_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
-        self.refresh_load_budget_on_dispatch = self.load_balance_method in (
-            LoadBalanceMethod.TOTAL_REQUESTS,
-            LoadBalanceMethod.TOTAL_TOKENS,
+        self.refresh_load_budget_on_dispatch = is_load_aware_method(
+            self.load_balance_method.name
         )
+        self._affinity_fallback = LoadBalanceMethod.from_str(
+            get_parallel().prefix_affinity_fallback
+        )
+        self._affinity_max_load_skew = get_parallel().prefix_affinity_max_load_skew
+        self._affinity_hash_tokens = get_parallel().prefix_affinity_hash_tokens
+        self._affinity_disable_token_fallback = (
+            get_parallel().prefix_affinity_disable_token_fallback
+        )
+        # session_params reconstructs incremental history inside one scheduler.
+        # Unlike top-level session_id, it cannot safely spill to another rank.
+        self._incremental_session_owners: dict[str, int] = {}
+        self._open_incremental_sessions: set[str] = set()
 
         self.launch_dp_size: int = get_parallel().num_dp_ranks
         self.max_dp_size: int = (
@@ -268,6 +297,7 @@ class DataParallelController:
             )
             return
         self.status = list(ranks.status)
+        self._refresh_active_workers()
 
     def add_elastic_workers(self, slot_offset: int, slot_count: int):
         """Activate a range of pre-bound worker slots."""
@@ -359,6 +389,8 @@ class DataParallelController:
                 (TokenizedEmbeddingReqInput, self.dispatching_with_trace),
                 (BatchTokenizedGenerateReqInput, self.dispatch_batch_generate),
                 (BatchTokenizedEmbeddingReqInput, self.dispatch_batch_embedding),
+                (OpenSessionReqInput, self.open_session),
+                (CloseSessionReqInput, self.close_session),
                 (BlockReqInput, self.send_to_all_workers),
                 (ProfileReq, self.send_to_all_workers),
                 (ActiveRanksOutput, self.update_active_ranks),
@@ -371,6 +403,30 @@ class DataParallelController:
             ]
         )
         self._request_dispatcher.add_fallback_fn(self.send_control_message)
+
+    def open_session(self, obj: OpenSessionReqInput):
+        if self.load_balance_method != LoadBalanceMethod.PREFIX_AFFINITY:
+            self.send_control_message(obj)
+            return
+        if obj.session_id is None:
+            # TokenizerManager normally assigns the id before dispatch. Keep the
+            # control-plane failure explicit if a nonstandard caller did not.
+            raise ValueError("prefix_affinity requires open_session.session_id")
+        self._open_incremental_sessions.add(obj.session_id)
+        # The API does not choose a routed_dp_rank until the first generation
+        # request. Open lightweight replicas now; the controller sends every
+        # generation request only to the owner chosen on the first turn.
+        self.send_control_message(obj)
+
+    def close_session(self, obj: CloseSessionReqInput):
+        if self.load_balance_method != LoadBalanceMethod.PREFIX_AFFINITY:
+            self.send_control_message(obj)
+            return
+        self._open_incremental_sessions.discard(obj.session_id)
+        self._incremental_session_owners.pop(obj.session_id, None)
+        # Open was broadcast so every rank has a lightweight Session replica;
+        # close must use the same control-message broadcast domain.
+        self.send_control_message(obj)
 
     def launch_dp_schedulers(self, server_args, port_args):
         base_gpu_id = 0
@@ -790,7 +846,11 @@ class DataParallelController:
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
-        target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
+        target_worker = self.dp_budget.dispatch(
+            LoadBalanceMethod.TOTAL_REQUESTS, candidates=self._active_workers
+        )
+        if target_worker is None:
+            raise RuntimeError("No active DP workers are available for routing.")
         sock_send(self.workers[target_worker], req)
 
     def total_tokens_scheduler(self, req: Req):
@@ -798,9 +858,184 @@ class DataParallelController:
             return
         estimated_tokens = len(req.input_ids)
         target_worker = self.dp_budget.dispatch(
-            LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
+            LoadBalanceMethod.TOTAL_TOKENS,
+            estimated_tokens=estimated_tokens,
+            candidates=self._active_workers,
         )
+        if target_worker is None:
+            raise RuntimeError("No active DP workers are available for routing.")
         sock_send(self.workers[target_worker], req)
+
+    def prefix_affinity_scheduler(self, req: Req):
+        """Route full-prompt requests by cache affinity and incremental
+        ``session_params`` requests by a fail-closed owner rank.
+
+        A top-level ``session_id`` only labels a complete prompt and can safely
+        spill: a miss recomputes/transfers the full prefix. ``session_params``
+        instead reconstructs history inside the scheduler, so moving it would
+        lose history rather than merely lose a cache hit.
+        """
+        incremental_session_id = self._incremental_session_id(req)
+        if incremental_session_id is not None:
+            self._route_incremental_session(req, incremental_session_id)
+            return
+
+        if self.maybe_external_dp_rank_routing(req):
+            return
+
+        route_key = getattr(req, "routing_key", None)
+        if not route_key:
+            session_id = getattr(req, "session_id", None)
+            if session_id:
+                route_key = f"session:{session_id}"
+        if not route_key and not self._affinity_disable_token_fallback:
+            route_key = self._token_prefix_key(req, self._affinity_hash_tokens)
+        if not route_key:
+            self._affinity_fallback_dispatch(req)
+            return
+
+        live = self._active_workers
+        if not live:
+            raise RuntimeError("No active DP workers are available for routing.")
+        ranked = self._rendezvous_ranked(str(route_key), live)
+        if len(live) == 1:
+            self._dispatch_affinity_rank(ranked[0], req)
+            return
+
+        loads = [self._rank_load(rank) for rank in live]
+        threshold = self._affinity_max_load_skew * max(sum(loads) / len(loads), 1.0)
+        for rank in ranked:
+            if self._rank_load(rank) <= threshold:
+                self._dispatch_affinity_rank(rank, req)
+                return
+        self._affinity_fallback_dispatch(req)
+
+    @staticmethod
+    def _incremental_session_id(req: Req) -> str | None:
+        session_params = getattr(req, "session_params", None)
+        return getattr(session_params, "id", None)
+
+    def _route_incremental_session(self, req: Req, session_id: str) -> None:
+        explicit_rank = getattr(req, "routed_dp_rank", None)
+        owner = self._incremental_session_owners.get(session_id)
+        if owner is None:
+            if session_id not in self._open_incremental_sessions:
+                self._reject_incremental_session(
+                    req,
+                    session_id,
+                    "no owner is registered; call /open_session first",
+                )
+                return
+            if explicit_rank is not None:
+                owner = explicit_rank
+                if not self._is_live_rank(owner):
+                    self._reject_incremental_session(
+                        req,
+                        session_id,
+                        f"requested DP rank {owner} is not active",
+                    )
+                    return
+            else:
+                live = self._active_workers
+                if not live:
+                    raise RuntimeError(
+                        "No active DP workers are available for routing."
+                    )
+                owner = self._rendezvous_ranked(f"incremental:{session_id}", live)[0]
+            self._incremental_session_owners[session_id] = owner
+        else:
+            if explicit_rank is not None and explicit_rank != owner:
+                self._reject_incremental_session(
+                    req,
+                    session_id,
+                    f"owner is DP rank {owner}, but routed_dp_rank={explicit_rank}",
+                )
+                return
+            if not self._is_live_rank(owner):
+                self._reject_incremental_session(
+                    req,
+                    session_id,
+                    f"owner DP rank {owner} is not active",
+                )
+                return
+
+        self._increment_rank_budget(owner, req)
+        sock_send(self.workers[owner], req)
+
+    def _is_live_rank(self, rank: int) -> bool:
+        return not (
+            rank < 0
+            or rank >= len(self.workers)
+            or rank not in self._active_workers
+            or self.workers[rank] is None
+        )
+
+    def _reject_incremental_session(
+        self, req: Req, session_id: str, reason: str
+    ) -> None:
+        live = self._active_workers
+        if not live:
+            raise RuntimeError("No active DP workers are available for routing.")
+        req.dp_routing_error = (
+            f"Incremental session {session_id!r} cannot be routed: {reason}. "
+            "Scheduler-local history migration is unsupported; close/reopen the "
+            "session and resend the complete prompt."
+        )
+        sock_send(self.workers[live[0]], req)
+
+    def _affinity_fallback_dispatch(self, req: Req) -> None:
+        if self._affinity_fallback == LoadBalanceMethod.ROUND_ROBIN:
+            self.round_robin_scheduler(req)
+        elif self._affinity_fallback == LoadBalanceMethod.TOTAL_REQUESTS:
+            self.total_requests_scheduler(req)
+        else:
+            self.total_tokens_scheduler(req)
+
+    @staticmethod
+    def _hash64(data: bytes) -> int:
+        return int.from_bytes(hashlib.blake2b(data, digest_size=8).digest(), "little")
+
+    def _rendezvous_ranked(self, key: str, ranks: list[int]) -> list[int]:
+        key_bytes = key.encode("utf-8", errors="surrogatepass")
+        scores = {
+            rank: self._hash64(key_bytes + b"\x00" + str(rank).encode("ascii"))
+            for rank in ranks
+        }
+        return sorted(ranks, key=scores.__getitem__, reverse=True)
+
+    @staticmethod
+    def _token_prefix_key(req: Req, prefix_len: int) -> str | None:
+        if prefix_len <= 0:
+            return None
+        input_ids = getattr(req, "input_ids", None)
+        if input_ids is None or len(input_ids) == 0:
+            return None
+        digest = hashlib.blake2b(digest_size=16)
+        prefix = input_ids[:prefix_len]
+        tobytes = getattr(prefix, "tobytes", None)
+        if callable(tobytes):
+            digest.update(tobytes())
+        else:
+            for token in prefix:
+                digest.update(int(token).to_bytes(8, "little", signed=True))
+        return "token-prefix:" + digest.hexdigest()
+
+    @staticmethod
+    def _estimated_tokens(req: Req) -> int:
+        input_ids = getattr(req, "input_ids", None)
+        return 0 if input_ids is None else len(input_ids)
+
+    def _increment_rank_budget(self, rank: int, req: Req) -> None:
+        self.dp_budget.total_requests[rank] += 1
+        self.dp_budget.total_tokens[rank] += self._estimated_tokens(req)
+
+    def _dispatch_affinity_rank(self, rank: int, req: Req) -> None:
+        self._increment_rank_budget(rank, req)
+        sock_send(self.workers[rank], req)
+
+    def _rank_load(self, rank: int) -> float:
+        # Resident KV is the value affinity preserves, not an overload signal.
+        return float(self.dp_budget.total_requests[rank])
 
     def event_loop(self):
         while True:

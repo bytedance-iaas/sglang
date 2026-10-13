@@ -17,6 +17,33 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestSchedulerSamplingMaskValidation(CustomTestCase):
+    def test_dp_routing_error_becomes_request_abort(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_session_radix_cache = False
+        scheduler.model_config = SimpleNamespace(vocab_size=128)
+        scheduler.tokenizer = None
+        scheduler._add_request_to_queue = MagicMock()
+        scheduler.init_req_max_new_tokens = MagicMock()
+        recv_req = MagicMock(
+            session_params=SimpleNamespace(id="incremental-a"),
+            session_id=None,
+            dp_routing_error="owner rank inactive",
+            rid="req-a",
+            input_text=None,
+            input_ids=[1, 2],
+            sampling_params=MagicMock(),
+            http_worker_ipc="ipc://worker",
+            bootstrap_port=1,
+        )
+        req = MagicMock()
+
+        with patch("sglang.srt.managers.scheduler.Req", return_value=req):
+            scheduler.handle_generate_request(recv_req)
+
+        req.set_finish_with_abort.assert_called_once_with("owner rank inactive")
+        scheduler.init_req_max_new_tokens.assert_called_once_with(req)
+        scheduler._add_request_to_queue.assert_called_once_with(req)
+
     def test_disabled_pd_masks_return_bad_request_before_admission(self):
         """Neither PD role may queue mask requests without metadata buffers."""
         for mode in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
@@ -43,6 +70,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 recv_req = MagicMock(
                     session_params=None,
                     session_id=None,
+                    dp_routing_error=None,
                     input_embeds=None,
                     bootstrap_port=1,
                     bootstrap_room=9,

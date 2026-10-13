@@ -2781,6 +2781,21 @@ class Scheduler(
             recv_req.session_id is not None and self.enable_session_radix_cache
         )
 
+        if recv_req.dp_routing_error is not None:
+            req = Req(
+                recv_req.rid,
+                recv_req.input_text,
+                recv_req.input_ids,
+                recv_req.sampling_params,
+                vocab_size=self.model_config.vocab_size,
+                http_worker_ipc=recv_req.http_worker_ipc,
+            )
+            req.tokenizer = self.tokenizer
+            req.set_finish_with_abort(recv_req.dp_routing_error)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
         if session_id is None or radix_native_session:
             # Normal non-session request, or a radix-native session request
             if recv_req.input_embeds is not None:

@@ -98,9 +98,37 @@ class Parallel(msgspec.Struct):
                 "follow_bootstrap_room",
                 "total_requests",
                 "total_tokens",
+                "prefix_affinity",
             ],
         ),
     ] = "auto"
+    prefix_affinity_fallback: A[
+        str,
+        Arg(
+            help=(
+                "Load-balance method used by 'prefix_affinity' when no affinity "
+                "key is available. Incremental session_params requests never use "
+                "this fallback after acquiring an owner rank."
+            ),
+            choices=["round_robin", "total_requests", "total_tokens"],
+        ),
+    ] = "total_tokens"
+    prefix_affinity_max_load_skew: A[
+        float,
+        "For 'prefix_affinity': a full-prompt request may spill from its preferred "
+        "rank when active request count exceeds this multiple of the live-rank "
+        "average. Must be >= 1.0.",
+    ] = 1.5
+    prefix_affinity_hash_tokens: A[
+        int,
+        "For 'prefix_affinity': number of leading input tokens hashed when the "
+        "request has no routing_key or top-level session_id.",
+    ] = 4096
+    prefix_affinity_disable_token_fallback: A[
+        bool,
+        "For 'prefix_affinity': requests without routing_key, top-level session_id, "
+        "or incremental session_params.id go directly to the fallback method.",
+    ] = False
     attn_cp_size: A[
         int,
         Arg(
