@@ -276,6 +276,27 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
 
 
 class TestNixlTransferStatus(CustomTestCase):
+    def test_ready_diag_timestamps_preserve_component_order(self):
+        status = TransferStatus(diag_started_at=10.0, expects_state=True)
+        status.num_pp_ranks_expected = 1
+
+        status.received_aux = True
+        status.update_diag_timestamps(11.0)
+        self.assertEqual(status.diag_aux_ready_at, 11.0)
+        self.assertIsNone(status.diag_kv_ready_at)
+        self.assertIsNone(status.diag_state_ready_at)
+
+        status.expected_kvs_per_pp[0] = 1
+        status.received_kvs_per_pp[0].add(0)
+        status.update_diag_timestamps(12.0)
+        self.assertEqual(status.diag_kv_ready_at, 12.0)
+        self.assertIsNone(status.diag_state_ready_at)
+
+        status.received_state_per_pp.add(0)
+        status.update_diag_timestamps(13.0)
+        self.assertEqual(status.diag_state_ready_at, 13.0)
+        self.assertTrue(status.is_done())
+
     def test_not_done_until_aux_and_expected_count_arrive(self):
         status = TransferStatus()
 
@@ -338,6 +359,34 @@ class TestNixlKVSenderChunkPolicy(CustomTestCase):
         self.assertTrue(sender.should_send_kv_chunk(0, last_chunk=True))
         self.assertFalse(sender.should_send_kv_chunk(0, last_chunk=False))
         self.assertTrue(sender.should_send_kv_chunk(3, last_chunk=False))
+
+    @patch("sglang.srt.disaggregation.nixl.conn._PD_READY_DIAG", True)
+    @patch("sglang.srt.disaggregation.nixl.conn.time.perf_counter", return_value=12.0)
+    @patch("sglang.srt.disaggregation.nixl.conn.logger.info")
+    def test_success_logs_first_and_last_submit_tail(self, log_info, _perf_counter):
+        sender = object.__new__(NixlKVSender)
+        sender._send_failed = False
+        sender._transfer_start_time = 10.0
+        sender._last_transfer_submit_time = 11.0
+        sender._ready_diag_logged = False
+        sender._transfer_metric = SimpleNamespace(
+            transfer_latency_s=None,
+            transfer_total_bytes=4096,
+        )
+        sender.bootstrap_room = 17
+        sender.chunk_id = 3
+        sender.kv_mgr = SimpleNamespace(
+            kv_args=SimpleNamespace(engine_rank=2),
+            _staging_outstanding={},
+            check_status=lambda _room: KVPoll.Success,
+        )
+
+        self.assertEqual(sender.poll(), KVPoll.Success)
+
+        self.assertEqual(sender._transfer_metric.transfer_latency_s, 2.0)
+        self.assertTrue(sender._ready_diag_logged)
+        log_info.assert_called_once()
+        self.assertEqual(log_info.call_args.args[1:4], (17, 2, 3))
 
 
 class TestNixlAbortHandling(CustomTestCase):
@@ -679,6 +728,24 @@ class TestNixlNotifications(CustomTestCase):
 
         self.assertTrue(mgr.transfer_statuses[8].is_done())
 
+    @patch("sglang.srt.disaggregation.nixl.conn._PD_READY_DIAG", True)
+    @patch(
+        "sglang.srt.disaggregation.nixl.conn.time.perf_counter",
+        side_effect=[11.0, 12.0, 13.0],
+    )
+    def test_notifications_record_component_ready_order(self, _perf_counter):
+        mgr = self._make_manager(["9_aux", "9_kv_0_1_0", "9_state_0"], required={9: 1})
+        status = mgr.transfer_statuses[9]
+        status.diag_started_at = 10.0
+        status.expects_state = True
+
+        mgr.update_transfer_status()
+
+        self.assertEqual(status.diag_aux_ready_at, 11.0)
+        self.assertEqual(status.diag_kv_ready_at, 12.0)
+        self.assertEqual(status.diag_state_ready_at, 13.0)
+        self.assertTrue(status.is_done())
+
 
 class TestNixlReceiverPoll(CustomTestCase):
     def _make_receiver(self, status=KVPoll.WaitingForInput):
@@ -768,6 +835,35 @@ class TestNixlReceiverPoll(CustomTestCase):
         self.assertNotIn(11, mgr.transfer_statuses)
         self.assertNotIn(11, mgr.addr_to_rooms_tracker["prefill:8998"])
         self.assertEqual(receiver.conclude_state, KVPoll.Success)
+
+    @patch("sglang.srt.disaggregation.nixl.conn._PD_READY_DIAG", True)
+    @patch("sglang.srt.disaggregation.nixl.conn.time.perf_counter", return_value=13.5)
+    @patch("sglang.srt.disaggregation.nixl.conn.logger.info")
+    def test_transfer_done_logs_component_winner(self, log_info, _perf_counter):
+        receiver, mgr = self._make_receiver(status=KVPoll.WaitingForInput)
+        receiver.started_transfer = True
+        receiver.init_time = 10.0
+        mgr.kv_args.engine_rank = 4
+        status = TransferStatus(
+            received_aux=True,
+            expects_state=True,
+            diag_started_at=10.0,
+            diag_aux_ready_at=11.0,
+            diag_kv_ready_at=12.0,
+            diag_state_ready_at=13.0,
+        )
+        status.num_pp_ranks_expected = 1
+        status.expected_kvs_per_pp[0] = 1
+        status.received_kvs_per_pp[0].add(0)
+        status.received_state_per_pp.add(0)
+        mgr.transfer_statuses = {11: status}
+        mgr.check_transfer_done.return_value = True
+
+        self.assertEqual(receiver.poll(), KVPoll.Success)
+
+        log_info.assert_called_once()
+        self.assertIn("winner=%s", log_info.call_args.args[0])
+        self.assertIn("state", log_info.call_args.args)
 
 
 class TestNixlNodeFailure(CustomTestCase):

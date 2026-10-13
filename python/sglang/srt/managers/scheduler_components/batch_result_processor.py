@@ -36,6 +36,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_memory,
     get_observability,
+    get_parallel,
     mamba_extra_buffer_lazy_enabled,
     mamba_track_grid,
     max_speculative_num_draft_tokens,
@@ -73,6 +74,29 @@ if TYPE_CHECKING:
     from sglang.srt.sampling.sampling_observer import HostAuxiliaryOutput
 
 logger = logging.getLogger(__name__)
+_PD_READY_DIAG = envs.SGLANG_PD_READY_DIAG.get()
+
+
+def _maybe_log_pd_ready_first_decode(req: Req, was_first_decode: bool) -> None:
+    if (
+        not _PD_READY_DIAG
+        or not was_first_decode
+        or req.time_stats.disagg_mode != DisaggregationMode.DECODE
+    ):
+        return
+    stats = req.time_stats
+    logger.info(
+        "PD_READY_DIAG role=decode_first rid=%s room=%s rank=%s "
+        "transfer_ms=%.3f ready_to_schedule_ms=%.3f "
+        "schedule_to_finish_ms=%.3f ready_to_finish_ms=%.3f",
+        req.rid,
+        req.bootstrap_room,
+        get_parallel().attn_tp_rank,
+        (stats.wait_queue_entry_time - stats.decode_transfer_queue_entry_time) * 1000,
+        (stats.last_decode_scheduled_time - stats.wait_queue_entry_time) * 1000,
+        (stats.last_decode_finish_time - stats.last_decode_scheduled_time) * 1000,
+        (stats.last_decode_finish_time - stats.wait_queue_entry_time) * 1000,
+    )
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
@@ -957,7 +981,9 @@ class SchedulerBatchResultProcessor:
             new_accept_len = len(next_token_id)
 
             self._maybe_update_reasoning_tokens(req, next_token_id)
+            was_first_decode = req.time_stats.last_decode_finish_time == 0.0
             req.time_stats.set_last_decode_finish_time()
+            _maybe_log_pd_ready_first_decode(req, was_first_decode)
             req.update_finish_state(new_accept_len)
 
             self._handle_finish_state_updated_req(req, batch, result, i, logits_output)

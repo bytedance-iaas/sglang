@@ -66,6 +66,7 @@ except ImportError:
     _NIXL_TRANSPORT_ERRORS = (RuntimeError,)
 
 logger = logging.getLogger(__name__)
+_PD_READY_DIAG = envs.SGLANG_PD_READY_DIAG.get()
 
 GUARD = "NixlMsgGuard".encode("ascii")
 KV_MEM_KINDS = {"VRAM", "DRAM"}
@@ -377,6 +378,39 @@ class TransferStatus:
     received_kv_parts_per_pp: Optional[Dict[Tuple[int, int], Set[int]]] = None
     expected_kv_parts_per_pp: Optional[Dict[Tuple[int, int], int]] = None
 
+    # Opt-in diagnostic timestamps in the decode process's perf-counter domain.
+    diag_started_at: Optional[float] = None
+    diag_kv_ready_at: Optional[float] = None
+    diag_aux_ready_at: Optional[float] = None
+    diag_state_ready_at: Optional[float] = None
+    diag_logged: bool = False
+
+    def kv_is_done(self) -> bool:
+        if self.num_pp_ranks_expected is None:
+            return False
+        if len(self.expected_kvs_per_pp) < self.num_pp_ranks_expected:
+            return False
+        return all(
+            len(self.received_kvs_per_pp[pp_rank]) == expected
+            for pp_rank, expected in self.expected_kvs_per_pp.items()
+        )
+
+    def state_is_done(self) -> bool:
+        return not self.expects_state or (
+            self.num_pp_ranks_expected is not None
+            and len(self.received_state_per_pp) >= self.num_pp_ranks_expected
+        )
+
+    def update_diag_timestamps(self, now: float) -> None:
+        if self.diag_started_at is None:
+            return
+        if self.diag_kv_ready_at is None and self.kv_is_done():
+            self.diag_kv_ready_at = now
+        if self.diag_aux_ready_at is None and self.received_aux:
+            self.diag_aux_ready_at = now
+        if self.diag_state_ready_at is None and self.state_is_done():
+            self.diag_state_ready_at = now
+
     def is_done(self):
         if self.num_pp_ranks_expected is None or not self.received_aux:
             return False
@@ -386,14 +420,7 @@ class TransferStatus:
             and len(self.received_state_per_pp) < self.num_pp_ranks_expected
         ):
             return False
-        # All PP ranks must have reported their expected count
-        if len(self.expected_kvs_per_pp) < self.num_pp_ranks_expected:
-            return False
-        # Each PP rank must have received all expected chunks
-        for pp_rank, expected in self.expected_kvs_per_pp.items():
-            if len(self.received_kvs_per_pp[pp_rank]) != expected:
-                return False
-        return True
+        return self.kv_is_done()
 
 
 class NixlKVManager(StagingManagerMixin, CommonKVManager):
@@ -2549,6 +2576,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 elif tag == "state":
                     pp_rank = int(components[2]) if len(components) > 2 else 0
                     self.transfer_statuses[room].received_state_per_pp.add(pp_rank)
+                if _PD_READY_DIAG:
+                    self.transfer_statuses[room].update_diag_timestamps(
+                        time.perf_counter()
+                    )
 
     def _handle_stg_notification(self, components, room: int):
         """Handle a staging RDMA notification tag.
@@ -2831,6 +2862,8 @@ class NixlKVSender(CommonKVSender):
         self._send_failed = False
         self._send_error: Optional[Exception] = None
         self._transfer_start_time: Optional[float] = None
+        self._last_transfer_submit_time: Optional[float] = None
+        self._ready_diag_logged = False
 
     def send(
         self,
@@ -2851,6 +2884,8 @@ class NixlKVSender(CommonKVSender):
             len(kv_indices) > 0 or state_indices is not None
         ):
             self._transfer_start_time = time.perf_counter()
+        if _PD_READY_DIAG:
+            self._last_transfer_submit_time = time.perf_counter()
 
         self.kv_mgr.add_transfer_request(
             self.bootstrap_room,
@@ -2890,6 +2925,30 @@ class NixlKVSender(CommonKVSender):
             self._transfer_metric.transfer_latency_s = (
                 time.perf_counter() - self._transfer_start_time
             )
+        if status == KVPoll.Success and _PD_READY_DIAG and not self._ready_diag_logged:
+            now = time.perf_counter()
+            first_ms = (
+                (now - self._transfer_start_time) * 1000
+                if self._transfer_start_time is not None
+                else -1.0
+            )
+            last_ms = (
+                (now - self._last_transfer_submit_time) * 1000
+                if self._last_transfer_submit_time is not None
+                else -1.0
+            )
+            logger.info(
+                "PD_READY_DIAG role=prefill_transfer room=%s rank=%s "
+                "chunks=%s first_submit_to_done_ms=%.3f "
+                "last_submit_to_done_ms=%.3f total_bytes=%s",
+                self.bootstrap_room,
+                self.kv_mgr.kv_args.engine_rank,
+                self.chunk_id,
+                first_ms,
+                last_ms,
+                self._transfer_metric.transfer_total_bytes,
+            )
+            self._ready_diag_logged = True
         return status
 
     def clear(self) -> None:
@@ -3011,6 +3070,10 @@ class NixlKVReceiver(CommonKVReceiver):
 
         self.started_transfer = True
         self.init_time = time.time()
+        if _PD_READY_DIAG:
+            self.kv_mgr.transfer_statuses[self.bootstrap_room].diag_started_at = (
+                time.perf_counter()
+            )
 
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
@@ -3029,6 +3092,57 @@ class NixlKVReceiver(CommonKVReceiver):
         # deadline would otherwise lose to the timeout purely by poll ordering.
         self.kv_mgr.update_transfer_status()
         if self.kv_mgr.check_transfer_done(self.bootstrap_room):  # type: ignore
+            transfer_status = self.kv_mgr.transfer_statuses[self.bootstrap_room]
+            if _PD_READY_DIAG and not transfer_status.diag_logged:
+                now = time.perf_counter()
+                transfer_status.update_diag_timestamps(now)
+                started = transfer_status.diag_started_at or now
+                components = {
+                    "kv": transfer_status.diag_kv_ready_at,
+                    "aux": transfer_status.diag_aux_ready_at,
+                }
+                if transfer_status.expects_state:
+                    components["state"] = transfer_status.diag_state_ready_at
+                ready_components = {
+                    name: value
+                    for name, value in components.items()
+                    if value is not None
+                }
+                winner = (
+                    max(ready_components, key=ready_components.get)
+                    if ready_components
+                    else "unknown"
+                )
+                logger.info(
+                    "PD_READY_DIAG role=decode_transfer room=%s rank=%s "
+                    "kv_ms=%.3f aux_ms=%.3f state_ms=%.3f all_ms=%.3f "
+                    "winner=%s kv_chunks=%s state_pp=%s",
+                    self.bootstrap_room,
+                    self.kv_mgr.kv_args.engine_rank,
+                    (
+                        (transfer_status.diag_kv_ready_at - started) * 1000
+                        if transfer_status.diag_kv_ready_at is not None
+                        else -1.0
+                    ),
+                    (
+                        (transfer_status.diag_aux_ready_at - started) * 1000
+                        if transfer_status.diag_aux_ready_at is not None
+                        else -1.0
+                    ),
+                    (
+                        (transfer_status.diag_state_ready_at - started) * 1000
+                        if transfer_status.diag_state_ready_at is not None
+                        else -1.0
+                    ),
+                    (now - started) * 1000,
+                    winner,
+                    sum(
+                        len(chunks)
+                        for chunks in transfer_status.received_kvs_per_pp.values()
+                    ),
+                    len(transfer_status.received_state_per_pp),
+                )
+                transfer_status.diag_logged = True
             self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
                 self.bootstrap_room
             )

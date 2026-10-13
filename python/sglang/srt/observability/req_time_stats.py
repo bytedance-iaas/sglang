@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 from typing_extensions import Self
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import (
     EncoderMetricsCollector,
@@ -48,6 +49,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
+_PD_READY_DIAG = envs.SGLANG_PD_READY_DIAG.get()
 
 
 logger = logging.getLogger(__name__)
@@ -1228,8 +1230,9 @@ class EncoderReqTimeStats(ReqTimeStatsBase):
 
 
 def set_schedule_time_batch(batch: ScheduleBatch):
-    # only for tracing
-    if not get_global_tracing_enabled():
+    # The ready diagnostic also needs the first decode schedule timestamp, but
+    # keeps all trace emission disabled unless tracing itself is enabled.
+    if not get_global_tracing_enabled() and not _PD_READY_DIAG:
         return
 
     ts = time.perf_counter()
