@@ -1,4 +1,6 @@
-"""Exact scoring and overflow regression tests for the opt-in SM90 indexer."""
+"""Exact scoring and overflow regression tests for the SM90 paired indexer."""
+
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -71,6 +73,22 @@ def test_zero_cache_and_mixed_generated_pages(constant):
     args = (x.q, x.weights, x.mapping, x.req, x.lens, x.table, x.page, x.ratio, x.width)
     expected = prefix_logits(*args)
     actual = paired_prefix_logits(*args, group_size=6)
+    valid = torch.arange(x.width, device="cuda")[None, :] < x.lens[:, None]
+    torch.testing.assert_close(actual[valid], expected[valid], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("group,rows", [(4, 12), (6, 12), (1, 12), (3, 12), (6, 11)])
+def test_default_paired_dispatch_and_fallback(group, rows):
+    from sglang.kernels.ops.attention.dsv4 import sm90_paired_indexer as paired
+
+    x = GroupedFixture().make_inputs(rows=rows, width=8192, heads=32, group=group)
+    args = (x.q, x.weights, x.mapping, x.req, x.lens, x.table, x.page, x.ratio, x.width)
+    expected = prefix_logits(*args)
+    with patch.object(
+        paired, "paired_prefix_logits", wraps=paired_prefix_logits
+    ) as optimized:
+        actual = prefix_logits(*args, group_size=group)
+    assert optimized.call_count == int(group in (4, 6) and rows % 2 == 0)
     valid = torch.arange(x.width, device="cuda")[None, :] < x.lens[:, None]
     torch.testing.assert_close(actual[valid], expected[valid], atol=0, rtol=0)
 

@@ -186,11 +186,8 @@ def prefix_logits(
     """
     assert candidates is None or (visible is not None and mask is None)
     if _fallback is None:
-        from sglang.srt.environ import envs
-
         if (
-            envs.SGLANG_OPT_DSV41_SM90_PAIRED_INDEXER.get()
-            and group_size in (4, 6)
+            group_size in (4, 6)
             and q.shape[0] % 2 == 0
             and q.is_contiguous()
             and weights.is_contiguous()

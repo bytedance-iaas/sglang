@@ -8,7 +8,6 @@ import torch
 
 import sglang.kernels.ops.layernorm.mhc as mhc
 from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
-from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -97,16 +96,17 @@ def test_empty_coefficients():
 
 
 @pytest.mark.parametrize(
-    "enabled,invariant,model_type,rows,expected_tree",
+    "invariant,model_type,rows,expected_tree",
     [
-        (True, False, "deepseek_v41", 108, True),
-        (False, False, "deepseek_v41", 108, False),
-        (True, True, "deepseek_v41", 108, False),
-        (True, False, "deepseek_v4", 108, False),
-        (True, False, "deepseek_v41", 2049, False),
+        (False, "deepseek_v41", 18, True),
+        (False, "deepseek_v41", 108, True),
+        (False, "deepseek_v41", 2048, True),
+        (True, "deepseek_v41", 108, False),
+        (False, "deepseek_v4", 108, False),
+        (False, "deepseek_v41", 2049, False),
     ],
 )
-def test_model_dispatch(enabled, invariant, model_type, rows, expected_tree):
+def test_model_dispatch(invariant, model_type, rows, expected_tree):
     import sglang.srt.models.deepseek_v4 as model
 
     x, weight, scale, base = _inputs(rows)
@@ -119,7 +119,6 @@ def test_model_dispatch(enabled, invariant, model_type, rows, expected_tree):
     )
     expected = _original_coefficients(x, weight, scale, base)
     with (
-        envs.SGLANG_OPT_DSV41_SM90_MHC.override(enabled),
         patch(
             "sglang.srt.batch_invariant_ops.is_batch_invariant_mode_enabled",
             return_value=invariant,
@@ -153,11 +152,8 @@ def test_sm90_does_not_create_compensated_weights():
         hc_ffn_fn=weight.clone(),
         config=SimpleNamespace(model_type="deepseek_v41"),
     )
-    with (
-        envs.SGLANG_OPT_DSV41_SM90_MHC.override(True),
-        patch.object(
-            mhc, "split_bf16_hc_weight", side_effect=AssertionError("BF16 split")
-        ),
+    with patch.object(
+        mhc, "split_bf16_hc_weight", side_effect=AssertionError("BF16 split")
     ):
         DeepseekV4DecoderLayer.refresh_mhc_norm_weight_cache(layer)
     assert layer._hc_attn_bf16_parts is None
@@ -166,8 +162,10 @@ def test_sm90_does_not_create_compensated_weights():
     assert layer._hc_ffn_tf32_parts is None
 
 
-@pytest.mark.parametrize("rows", [1, 18, 108, 192])
+@pytest.mark.parametrize("rows", [1, 18, 64, 65, 108, 192, 2048, 2049])
 def test_post_mix_is_bitwise_exact(monkeypatch, rows):
+    import sglang.srt.models.deepseek_v4 as model
+
     monkeypatch.setattr(mhc, "is_dsa_prefill_cp_interleave", lambda: False)
     torch.manual_seed(15)
     x = torch.randn(rows, 5120, device="cuda", dtype=torch.bfloat16)
@@ -175,5 +173,8 @@ def test_post_mix_is_bitwise_exact(monkeypatch, rows):
     post = torch.rand(rows, 4, device="cuda")
     comb = torch.rand(rows, 4, 4, device="cuda")
     expected = mhc.mhc_post(x, residual, post, comb)
-    actual = mhc_post_split_h(x, residual, post, comb)
+    layer = SimpleNamespace(hc_mult=4, hc_pre_from_prev_sublayer=True)
+    with patch.object(model, "mhc_post_split_h", wraps=mhc_post_split_h) as split:
+        actual = model.DeepseekV4DecoderLayer.hc_post(layer, x, residual, post, comb)
+    assert split.call_count == int(rows <= 2048)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)

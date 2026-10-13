@@ -2930,10 +2930,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_pre_from_prev_sublayer
                 and get_platform().is_sm90
                 and x.is_cuda
-                and (
-                    1 <= x.shape[0] <= 64
-                    or (envs.SGLANG_OPT_DSV41_SM90_MHC.get() and x.shape[0] <= 2048)
-                )
+                and 1 <= x.shape[0] <= 2048
                 and x.shape[1] == 5120
                 and residual.shape == (x.shape[0], 4, 5120)
                 and x.dtype == residual.dtype == torch.bfloat16
@@ -3242,7 +3239,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             x.is_cuda
             and torch.version.cuda is not None
             and get_platform().is_sm90
-            and envs.SGLANG_OPT_DSV41_SM90_MHC.get()
             and x.dtype == torch.bfloat16
             and x_flat.is_contiguous()
             and hc_fn.shape == (24, 20480)
