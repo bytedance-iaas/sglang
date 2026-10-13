@@ -1549,6 +1549,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # producer layers use a 0-row buffer. Pair by model layer before PP
         # pointer slicing, and drop an entry when either peer elided it.
         if state_type == StateType.DSA and dst_item_lens is not None:
+            original_entries = len(item_lens)
             pairs = build_state_transfer_entry_pairs(
                 src_item_lens=item_lens,
                 dst_item_lens=dst_item_lens,
@@ -1559,6 +1560,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             src_data_ptrs = [src_data_ptrs[i] for i, _ in pairs]
             dst_data_ptrs = [dst_data_ptrs[j] for _, j in pairs]
             item_lens = [item_lens[i] for i, _ in pairs]
+            if len(pairs) < original_entries:
+                logger.info_once(
+                    "NIXL PD DSA index-K state transfer skips "
+                    f"{original_entries - len(pairs)}/{original_entries} "
+                    "layer-aligned entries."
+                )
 
         # Convert pointer lists to np.uint64 arrays up front.
         # torch.int exceeds np.int64 range on Intel XPU (addresses have bit 63 set, e.g.

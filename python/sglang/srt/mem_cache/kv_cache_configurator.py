@@ -100,12 +100,15 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
         disagg.disaggregation_transfer_backend == "nixl"
         and not memory_config.enable_hierarchical_cache
     )
-    return (
+    enabled = (
         not memory_config.enable_hisparse
         and not is_draft_worker
         and not memory_config.enable_hierarchical_cache
         and supports_layout
     )
+    if enabled and disagg.disaggregation_mode != "null":
+        logger.info_once("NIXL PD uses producer-only DSA index-K state buffers.")
+    return enabled
 
 
 _is_hip = is_hip()
