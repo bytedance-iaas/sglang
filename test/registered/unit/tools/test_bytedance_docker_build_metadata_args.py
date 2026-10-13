@@ -298,5 +298,6 @@ class TestDockerBuildMetadataArgs(unittest.TestCase):
             dev_workflow,
         )
 
+
 if __name__ == "__main__":
     unittest.main()
