@@ -5,7 +5,10 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.disaggregation.prefill import (
+    SchedulerDisaggregationPrefillMixin,
+    _needs_draft_host_output,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
@@ -488,6 +491,139 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         host_output,
         [0],
     )
+
+
+@pytest.mark.parametrize(
+    ("inflight_middle_chunks", "expected"),
+    [([1], False), ([2, 1], False), ([0], True), ([1, 0], True)],
+)
+def test_draft_host_output_gate_snapshots_final_chunk_presence(
+    inflight_middle_chunks, expected
+):
+    batch = SimpleNamespace(
+        reqs=[
+            SimpleNamespace(inflight_middle_chunks=value)
+            for value in inflight_middle_chunks
+        ]
+    )
+    assert _needs_draft_host_output(batch) is expected
+
+
+class _FailOnHostCopy:
+    def to(self, *_args, **_kwargs):
+        raise AssertionError("all-middle batch must not copy draft output to host")
+
+
+def _disagg_prefill_req(*, inflight_middle_chunks):
+    return SimpleNamespace(
+        rid=f"req-{inflight_middle_chunks}",
+        origin_input_ids=[1, 2],
+        extend_range=None,
+        tmp_end_idx=1,
+        output_ids=[],
+        finished_len=None,
+        inflight_middle_chunks=inflight_middle_chunks,
+        pending_bootstrap=False,
+        return_logprob=False,
+        return_sampling_mask=False,
+        grammar=None,
+        time_stats=SimpleNamespace(
+            set_prefill_finished_time=Mock(),
+            set_prefill_transfer_queue_entry_time=Mock(),
+            set_last_chunked_prefill_finish_time=Mock(),
+        ),
+    )
+
+
+def _disagg_prefill_scheduler(*, chunked_req):
+    processor = SimpleNamespace(
+        move_logprobs_to_cpu=Mock(),
+        consume_auxiliary_output=Mock(),
+        snapshot_auxiliary_output_starts=Mock(return_value=[0]),
+    )
+    return SimpleNamespace(
+        batch_result_processor=processor,
+        spec_algorithm=SimpleNamespace(is_eagle=lambda: True),
+        tree_cache=object(),
+        disagg_prefill_inflight_queue=[],
+        send_kv_chunk=Mock(),
+        clear_pending_chunk_send=Mock(),
+        optimistic_release_and_requeue=Mock(),
+        metrics_reporter=SimpleNamespace(report_prefill_stats=Mock()),
+        chunked_req=chunked_req,
+        enable_overlap=False,
+    )
+
+
+def test_disaggregated_prefill_skips_draft_host_copy_for_all_middle_batch():
+    req = _disagg_prefill_req(inflight_middle_chunks=1)
+    draft = SimpleNamespace(
+        hidden_states=_FailOnHostCopy(),
+        dsa_topk_indices=_FailOnHostCopy(),
+    )
+    result = GenerationBatchResult(
+        logits_output=None,
+        next_token_ids=torch.tensor([7]),
+        next_draft_input=draft,
+    )
+    batch = SimpleNamespace(
+        reqs=[req],
+        spec_info=draft,
+        prefill_stats=None,
+        dp_cooperation_info=None,
+    )
+    scheduler = _disagg_prefill_scheduler(chunked_req=req)
+
+    with patch("sglang.srt.disaggregation.prefill.is_aborted", return_value=False):
+        SchedulerDisaggregationPrefillMixin.process_batch_result_disagg_prefill(
+            scheduler,
+            batch,
+            result,
+        )
+
+    assert req.inflight_middle_chunks == 0
+    req.time_stats.set_last_chunked_prefill_finish_time.assert_called_once()
+    scheduler.send_kv_chunk.assert_not_called()
+
+
+def test_disaggregated_prefill_keeps_draft_host_copy_for_mixed_batch():
+    middle_req = _disagg_prefill_req(inflight_middle_chunks=1)
+    final_req = _disagg_prefill_req(inflight_middle_chunks=0)
+    draft = SimpleNamespace(
+        hidden_states=torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+        dsa_topk_indices=torch.tensor([[5, 6], [7, 8]]),
+        topk_p=torch.tensor([[0.1], [0.2]]),
+        topk_index=torch.tensor([[9], [10]]),
+    )
+    result = GenerationBatchResult(
+        logits_output=None,
+        next_token_ids=torch.tensor([7, 8]),
+        next_draft_input=draft,
+    )
+    batch = SimpleNamespace(
+        reqs=[middle_req, final_req],
+        spec_info=draft,
+        prefill_stats=None,
+        dp_cooperation_info=None,
+    )
+    scheduler = _disagg_prefill_scheduler(chunked_req=middle_req)
+
+    with (
+        patch("sglang.srt.disaggregation.prefill.is_aborted", return_value=False),
+        patch("sglang.srt.disaggregation.prefill.maybe_cache_unfinished_req"),
+    ):
+        SchedulerDisaggregationPrefillMixin.process_batch_result_disagg_prefill(
+            scheduler,
+            batch,
+            result,
+        )
+
+    assert middle_req.inflight_middle_chunks == 0
+    assert torch.equal(final_req.hidden_states_tensor, draft.hidden_states[1])
+    assert torch.equal(final_req.output_dsa_topk_indices, draft.dsa_topk_indices[1])
+    assert final_req.output_topk_p.item() == pytest.approx(0.2)
+    assert final_req.output_topk_index.item() == 10
+    scheduler.send_kv_chunk.assert_called_once_with(final_req, last_chunk=True)
 
 
 def test_logprob_only_reuses_preprocessing_without_observer_lifecycle():

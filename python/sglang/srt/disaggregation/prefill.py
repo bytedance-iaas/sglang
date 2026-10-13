@@ -102,6 +102,11 @@ def should_force_retry(req: Req) -> bool:
     return int.from_bytes(digest[:8], "big") < retry_prob * 2**64
 
 
+def _needs_draft_host_output(batch: ScheduleBatch) -> bool:
+    """Whether this completed batch contains a final prefill chunk."""
+    return any(req.inflight_middle_chunks <= 0 for req in batch.reqs)
+
+
 def _transfer_start_layer(*, pool, hf_text_config) -> int:
     # Hybrid pools count all layers in start_layer, but peer KV lists contain only
     # full-attention layers, so translate to a full-attention-relative offset.
@@ -722,7 +727,12 @@ class SchedulerDisaggregationPrefillMixin:
         draft_input = result.next_draft_input
         draft_hidden_states_cpu = None
         draft_dsa_topk_indices_cpu = None
-        if self.spec_algorithm.is_eagle() and draft_input is not None:
+        needs_draft_host_output = _needs_draft_host_output(batch)
+        if (
+            self.spec_algorithm.is_eagle()
+            and draft_input is not None
+            and needs_draft_host_output
+        ):
             draft_hidden_states_cpu = draft_input.hidden_states.to(
                 "cpu", non_blocking=False
             )
@@ -730,6 +740,10 @@ class SchedulerDisaggregationPrefillMixin:
                 draft_dsa_topk_indices_cpu = batch.spec_info.dsa_topk_indices.to(
                     "cpu", non_blocking=False
                 )
+        elif self.spec_algorithm.is_eagle() and draft_input is not None:
+            logger.info_once(
+                "PD prefill skips speculative host output copies for all-middle batches."
+            )
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
         next_token_ids = result.next_token_ids.tolist()
         self.batch_result_processor.move_logprobs_to_cpu(
