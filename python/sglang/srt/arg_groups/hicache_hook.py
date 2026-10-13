@@ -15,6 +15,40 @@ from sglang.srt.arg_groups.overrides import (
 logger = logging.getLogger(__name__)
 
 
+def handle_eic_env(server_args: Any):
+    """Apply the EIC environment-variable switch before hicache handling.
+
+    Environment variables win over CLI arguments: when EnableEicCache is
+    present, its strict 'True' value decides enable_eic_cache, and an
+    explicit non-'True' value overrides --enable-eic-cache. When it turns
+    EIC on, the endpoint and instance id are validated here so an invalid
+    configuration fails at startup instead of silently cold-starting.
+    Endpoint and instance id are not stored on ServerArgs; clients read
+    them through eic_env_config at construction time.
+    """
+    import os
+
+    from sglang.srt.mem_cache.storage.eic.eic_env_config import (
+        ENV_ENABLE_EIC_CACHE,
+        load_eic_config,
+        parse_eic_switch,
+    )
+
+    if ENV_ENABLE_EIC_CACHE not in os.environ:
+        return
+    cfg = resolving_view(server_args)
+    enabled = parse_eic_switch(os.environ.get(ENV_ENABLE_EIC_CACHE))
+    if enabled:
+        # Raises ValueError on a missing or invalid endpoint / instance id.
+        load_eic_config(cli_enabled=bool(getattr(cfg, "enable_eic_cache", False)))
+    declare_resolution(server_args, "_handle_eic_env", enable_eic_cache=enabled)
+    logger.info(
+        "EIC env switch applied: EnableEicCache=%r -> enable_eic_cache=%s",
+        os.environ.get(ENV_ENABLE_EIC_CACHE),
+        enabled,
+    )
+
+
 def handle_hicache(server_args: Any):
     """Normalize hicache-related knobs into a valid runtime configuration.
 
