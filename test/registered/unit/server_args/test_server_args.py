@@ -2388,6 +2388,86 @@ class TestAdaptiveSpecArgs(CustomTestCase):
         self.assertEqual(resolution_result(args, "speculative_num_steps"), 3)
         self.assertEqual(resolution_result(args, "speculative_num_draft_tokens"), 4)
 
+    def test_attention_dp_keeps_adaptive_enabled(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump({"1": {"candidate_steps": [1, 3]}}, f)
+            f.flush()
+
+            args = ServerArgs(model_path="dummy")
+            args.speculative_algorithm = "EAGLE"
+            args.speculative_adaptive = True
+            args.speculative_adaptive_config = f.name
+            args.speculative_num_steps = 3
+            args.speculative_eagle_topk = 1
+            args.attn_dp_size = 8
+            args.tp_size = 8
+            args.device = "cuda"
+            args._model_config = SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    architectures=["LlamaForCausalLM"],
+                    get_text_config=lambda: SimpleNamespace(),
+                )
+            )
+
+            handle_speculative_decoding(args)
+
+        self.assertTrue(resolution_result(args, "speculative_adaptive"))
+        self.assertEqual(resolution_result(args, "speculative_num_steps"), 3)
+
+    def test_attention_dp_requires_fixed_tier_in_every_slot(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump(
+                {
+                    "1": {"candidate_steps": [1, 3, 5]},
+                    "8": {"candidate_steps": [1, 3]},
+                },
+                f,
+            )
+            f.flush()
+            args = ServerArgs(model_path="dummy")
+            args.speculative_algorithm = "EAGLE"
+            args.speculative_adaptive = True
+            args.speculative_adaptive_config = f.name
+            args.speculative_num_steps = 5
+            args.speculative_eagle_topk = 1
+            args.attn_dp_size = 8
+            args.tp_size = 8
+            args.device = "cuda"
+            args._model_config = SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    architectures=["LlamaForCausalLM"],
+                    get_text_config=lambda: SimpleNamespace(),
+                )
+            )
+
+            with self.assertRaisesRegex(
+                ValueError, "fixed launch tier steps=5.*slots.*8"
+            ):
+                handle_speculative_decoding(args)
+
+    def test_dp_spec_prefill_coordination_disables_adaptive(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump({"1": {"candidate_steps": [1, 3]}}, f)
+            f.flush()
+            args = ServerArgs(model_path="dummy")
+            args.speculative_algorithm = "EAGLE"
+            args.speculative_adaptive = True
+            args.speculative_adaptive_config = f.name
+            args.speculative_num_steps = 3
+            args.speculative_eagle_topk = 1
+            args.device = "cuda"
+            args._model_config = SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    architectures=["LlamaForCausalLM"],
+                    get_text_config=lambda: SimpleNamespace(),
+                )
+            )
+
+            with envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.override(True):
+                handle_speculative_decoding(args)
+
+        self.assertFalse(resolution_result(args, "speculative_adaptive"))
+
 
 class TestWaterfillArgs(CustomTestCase):
     def test_waterfill_enforces_shared_experts_fusion(self):

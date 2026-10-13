@@ -86,7 +86,10 @@ class BaseTpWorker(ABC):
         pass
 
     def on_verify_complete_cpu(
-        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int = 0,
+        feedback_steps: int | None = None,
     ) -> None:
         """No-op mirror of BaseSpecWorker's hook: PP+spec non-last stages
         process relayed spec results through a plain worker."""

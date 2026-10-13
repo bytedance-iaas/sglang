@@ -66,6 +66,65 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
         self.assertIsNone(call_kwargs["mamba_track_indices"])
         self.assertIsNone(call_kwargs["mamba_steps_to_track"])
 
+    def test_bonus_commits_but_rejected_rows_do_not(self):
+        """accept_lens includes the committed target bonus token.
+
+        Zero correct drafts therefore commits verify row 0 (the bonus), while
+        later proposed rows are rejected and must not select persistent state.
+        """
+        from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
+
+        target_worker = self._make_mock_target_worker()
+        batch = MagicMock()
+        batch.forward_mode.is_idle.return_value = False
+        batch.mamba_track_indices = None
+        batch.seq_lens = torch.tensor([10, 20], dtype=torch.int32)
+        accept_lens = torch.tensor([1, 3], dtype=torch.int32)
+        accept_index = torch.tensor(
+            [[0, -1, -1, -1], [4, 5, 6, -1]], dtype=torch.int32
+        )
+
+        with patch(
+            "sglang.srt.speculative.spec_utils.mambaish_config",
+            return_value={"some": "config"},
+        ):
+            commit_mamba_states_after_verify(
+                target_worker,
+                batch,
+                accept_lens,
+                accept_index,
+                draft_token_num=4,
+            )
+
+        call_kwargs = target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify.call_args.kwargs
+        torch.testing.assert_close(
+            call_kwargs["last_correct_step_indices"],
+            torch.tensor([0, 2], dtype=torch.int32),
+        )
+
+    def test_idle_batch_never_commits_mamba_state(self):
+        from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
+
+        target_worker = self._make_mock_target_worker()
+        batch = MagicMock()
+        batch.forward_mode.is_idle.return_value = True
+        batch.mamba_track_indices = None
+        batch.seq_lens = torch.empty(0, dtype=torch.int32)
+
+        with patch(
+            "sglang.srt.speculative.spec_utils.mambaish_config",
+            return_value={"some": "config"},
+        ):
+            commit_mamba_states_after_verify(
+                target_worker,
+                batch,
+                torch.empty(0, dtype=torch.int32),
+                torch.empty((0, 4), dtype=torch.int32),
+                draft_token_num=4,
+            )
+
+        target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify.assert_not_called()
+
     def test_mamba_verify_update_not_called_for_non_mamba_model(self):
         from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
 

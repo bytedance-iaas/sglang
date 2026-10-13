@@ -123,6 +123,13 @@ class SchedulerInternalStateController:
         accept_length = self._average_accept_length()
         if accept_length is not None:
             state["avg_spec_accept_length"] = accept_length
+        decision_snapshot = getattr(
+            scheduler.draft_worker, "adaptive_spec_decision_snapshot", None
+        )
+        if callable(decision_snapshot):
+            decision = decision_snapshot()
+            if decision is not None:
+                state["adaptive_spec_decision"] = decision
         if scheduler.spec_algorithm.is_dspark() and scheduler.draft_worker is not None:
             info_record = scheduler.draft_worker.dump_info_records()
             if info_record is not None:

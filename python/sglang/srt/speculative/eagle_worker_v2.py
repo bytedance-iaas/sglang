@@ -1273,6 +1273,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
+        self._adaptive_feedback_correct_sum = 0
+        self._adaptive_feedback_request_count = 0
+        self._adaptive_feedback_batch_size = 0
+        self._adaptive_feedback_steps = -1
+        self._adaptive_feedback_epoch = 0
+        self._adaptive_consumed_epochs: list[int] = []
         if get_spec().speculative_adaptive and self._hosts_draft:
             self.adaptive_controller = AdaptiveController(
                 self,
@@ -1333,6 +1339,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
                     )
                 )
+                if get_parallel().attn_dp_size > 1:
+                    self.adaptive_controller.params.initialize_synchronized_steps(
+                        self.adaptive_controller.fixed_steps
+                    )
                 self.adaptive_controller.init_states(
                     cuda_graph_bs=(
                         None
@@ -1370,7 +1380,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         batch, plan, on_publish, grammar_barrier, pp_proxy_tensors
                     )
         else:
-            self.activate_step_by_batch(batch.seq_lens.shape[0])
+            self.activate_step_by_batch(batch)
 
             if batch.spec_info is None:
                 capture_mode = (
@@ -1689,16 +1699,126 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
     def on_verify_complete_cpu(
-        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int = 0,
+        feedback_steps: int | None = None,
     ) -> None:
         if self.adaptive_controller is not None:
-            self.adaptive_controller.on_verify_complete(
-                num_correct_drafts_per_req, batch_size=batch_size
+            if get_parallel().attn_dp_size <= 1:
+                self.adaptive_controller.on_verify_complete(
+                    num_correct_drafts_per_req, batch_size=batch_size
+                )
+                return
+            self._adaptive_feedback_correct_sum = sum(num_correct_drafts_per_req)
+            self._adaptive_feedback_request_count = len(num_correct_drafts_per_req)
+            self._adaptive_feedback_batch_size = batch_size
+            self._adaptive_feedback_steps = (
+                self.speculative_num_steps
+                if feedback_steps is None
+                else int(feedback_steps)
             )
+            self._adaptive_feedback_epoch += 1
 
-    def activate_step_by_batch(self, batch_size: int) -> None:
-        if self.adaptive_controller is not None:
-            self.adaptive_controller.activate_step_by_batch(batch_size)
+    def adaptive_spec_sync_snapshot(self) -> tuple[int, int, int, int, int, int, int]:
+        if self.adaptive_controller is None:
+            return (0, -1, -1, 0, 0, 0, 0)
+        return (
+            1,
+            self.speculative_num_steps,
+            self._adaptive_feedback_steps,
+            self._adaptive_feedback_correct_sum,
+            self._adaptive_feedback_request_count,
+            self._adaptive_feedback_batch_size,
+            self._adaptive_feedback_epoch,
+        )
+
+    def adaptive_spec_decision_snapshot(self) -> dict | None:
+        if self.adaptive_controller is None:
+            return None
+        decision = self.adaptive_controller.last_decision
+        return {
+            "steps": decision.steps,
+            "draft_tokens": decision.draft_tokens,
+            "fixed_steps": decision.fixed_steps,
+            "fixed_draft_tokens": decision.fixed_draft_tokens,
+            "rank_batch_sizes": list(decision.rank_batch_sizes),
+            "feedback_num_requests": decision.feedback_num_requests,
+            "feedback_total_correct_drafts": decision.feedback_total_correct_drafts,
+            "saved_rows_sum_len": decision.saved_rows_sum_len,
+            "saved_rows_max_len": decision.saved_rows_max_len,
+            "fallback_reason": decision.fallback_reason,
+        }
+
+    def activate_step_by_batch(self, batch: ScheduleBatch) -> None:
+        if self.adaptive_controller is None:
+            return
+
+        if get_parallel().attn_dp_size <= 1:
+            self.adaptive_controller.synchronize_dp_tier(
+                feedback_observations=[],
+                rank_batch_sizes=[batch.seq_lens.shape[0]],
+            )
+            return
+
+        rows = batch.global_adaptive_spec_sync
+        if rows is None:
+            self.adaptive_controller.activate_fixed("missing_dp_sync")
+            return
+
+        if any(not row[0] or row[1] < 0 for row in rows):
+            self.adaptive_controller.activate_fixed("incomplete_dp_sync")
+            return
+        active_rows = rows
+        rank_batch_sizes = [
+            int(bs) for bs in (batch.adaptive_spec_rank_batch_sizes or [])
+        ]
+        if not active_rows or len(rank_batch_sizes) != len(rows):
+            self.adaptive_controller.activate_fixed("incomplete_dp_sync")
+            return
+
+        active_steps = {int(row[1]) for row in active_rows}
+        if len(active_steps) != 1:
+            self.adaptive_controller.activate_fixed("active_tier_mismatch")
+            return
+
+        if not self._adaptive_consumed_epochs:
+            self._adaptive_consumed_epochs = [0] * len(rows)
+        elif len(self._adaptive_consumed_epochs) != len(rows):
+            self._adaptive_consumed_epochs = [int(row[6]) for row in rows]
+            self.adaptive_controller.activate_fixed("dp_width_changed")
+            return
+
+        feedback_rows = []
+        feedback_row_indices = []
+        for rank, row in enumerate(rows):
+            epoch = int(row[6])
+            if epoch < self._adaptive_consumed_epochs[rank]:
+                self._adaptive_consumed_epochs = [int(item[6]) for item in rows]
+                self.adaptive_controller.activate_fixed("feedback_epoch_regressed")
+                return
+            if epoch > self._adaptive_consumed_epochs[rank]:
+                feedback_rows.append(row)
+                feedback_row_indices.append(rank)
+        feedback_observations: list[tuple[int, int, int, int]] = []
+        fallback_reason = None
+        if feedback_rows:
+            feedback_observations = [
+                (int(row[3]), int(row[4]), int(row[5]), int(row[2]))
+                for row in feedback_rows
+            ]
+            # Consume every observed epoch exactly once.  The policy applies
+            # feedback only when its recorded verify tier still matches the
+            # routed slot; stale overlap feedback is ignored without pinning
+            # later rounds.
+            for rank, row in zip(feedback_row_indices, feedback_rows, strict=True):
+                self._adaptive_consumed_epochs[rank] = int(row[6])
+
+        self.adaptive_controller.synchronize_dp_tier(
+            feedback_observations=feedback_observations,
+            rank_batch_sizes=rank_batch_sizes,
+            fallback_reason=fallback_reason,
+        )
 
     # -- Adaptive speculative decoding protocol --
 

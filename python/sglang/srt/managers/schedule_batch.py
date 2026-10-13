@@ -2511,6 +2511,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Full DP token vector retained for Aiter MegaMoE even when the normal MLP
     # TP gather path stores only this rank's token count.
     global_spec_verify_tier_num_tokens: Optional[List[int]] = None
+    # Per-attention-DP-rank adaptive-spec snapshots piggybacked on the existing
+    # scheduler MLP-sync gather.  Each row is
+    # [enabled, active_steps, feedback_steps, correct_sum, request_count,
+    #  feedback_batch_size, feedback_epoch].  None when adaptive DP
+    # synchronization is off.
+    global_adaptive_spec_sync: Optional[List[List[int]]] = None
+    # Full attention-DP request-count vector from the same scheduler gather.
+    # Kept separate from global_num_tokens because a target/draft backend may
+    # intentionally publish only the local count for its MoE communication.
+    adaptive_spec_rank_batch_sizes: Optional[List[int]] = None
 
     # Member rows riding one forward; None whenever reqs and rows are 1:1.
     beam_tail: Optional[BeamTail] = None

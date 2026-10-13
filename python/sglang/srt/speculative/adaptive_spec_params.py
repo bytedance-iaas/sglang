@@ -16,7 +16,7 @@ from sglang.srt.arg_groups.overrides import (
     resolved_view,
     resolving_view,
 )
-from sglang.srt.runtime_context import attn_dp_enabled_of
+from sglang.srt.environ import envs
 from sglang.srt.utils import log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -67,11 +67,6 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
             f"speculative_eagle_topk={cfg.speculative_eagle_topk} "
             "(only topk=1 is supported)"
         )
-    if attn_dp_enabled_of(resolved_view(server_args)):
-        return (
-            "attention DP is not supported "
-            "(adaptive tier decisions are not synchronized across DP ranks)"
-        )
     if resolved_view(server_args).enable_multi_layer_eagle:
         return (
             "enable_multi_layer_eagle=True is not supported "
@@ -86,6 +81,11 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
         return (
             "enable_pdmux=True is not supported "
             "(adaptive state swap does not update decode_attn_backend_group)"
+        )
+    if envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
+        return (
+            "DP speculative/prefill coordination is not supported "
+            "(prefill ranks do not participate in decode-tier policy)"
         )
     return None
 
@@ -140,6 +140,24 @@ def resolve_candidate_steps_from_config(
     return sorted(all_steps)
 
 
+def validate_synchronized_initial_steps(
+    initial_steps: int, cfg_path: str | None = None
+) -> None:
+    """Validate that every BS slot can represent one DP-wide launch tier."""
+    _, bs_entries = _load_adaptive_config(cfg_path)
+    incompatible = sorted(
+        bs
+        for bs, entry in bs_entries.items()
+        if initial_steps not in entry["candidate_steps"]
+    )
+    if incompatible:
+        raise ValueError(
+            "attention-DP adaptive spec requires the fixed launch tier "
+            f"steps={initial_steps} in every batch-size slot; missing from "
+            f"slots {incompatible}"
+        )
+
+
 class AdaptiveStepSlot:
     """Tracks acceptance rate via EMA and adapts num_steps accordingly.
 
@@ -183,10 +201,30 @@ class AdaptiveStepSlot:
         if not num_correct_drafts_per_req:
             return False
 
-        if self.current_steps > 0:
-            batch_avg = sum(num_correct_drafts_per_req) / len(
-                num_correct_drafts_per_req
+        return self.update_aggregate(
+            total_correct_drafts=sum(num_correct_drafts_per_req),
+            num_requests=len(num_correct_drafts_per_req),
+        )
+
+    def update_aggregate(
+        self, total_correct_drafts: int, num_requests: int
+    ) -> bool:
+        """Update from a rank-aggregated acceptance summary.
+
+        ``total_correct_drafts`` excludes the verifier bonus token.  The
+        aggregate form lets attention-DP ranks share one policy observation
+        without all-gathering per-request acceptance vectors.
+        """
+        if num_requests <= 0:
+            return False
+        if total_correct_drafts < 0:
+            raise ValueError(
+                "total_correct_drafts must be non-negative, got "
+                f"{total_correct_drafts}"
             )
+
+        if self.current_steps > 0:
+            batch_avg = total_correct_drafts / num_requests
             self.ema_accept_len = (
                 1 - self.ema_alpha
             ) * self.ema_accept_len + self.ema_alpha * batch_avg
@@ -314,6 +352,84 @@ class AdaptiveSpeculativeParams:
         if params.update(num_correct_drafts_per_req):
             return params.current_steps
         return None
+
+    def initialize_synchronized_steps(self, steps: int) -> None:
+        """Set every BS slot to one DP-wide launch tier.
+
+        A synchronized tier must be representable by every slot because any
+        combination of local DP batch sizes can appear in one lockstep round.
+        """
+        incompatible = [
+            bs
+            for bs, params in self._slots.items()
+            if steps not in params.candidate_steps
+        ]
+        if incompatible:
+            raise ValueError(
+                "attention-DP adaptive spec requires the fixed launch tier "
+                f"steps={steps} in every batch-size slot; missing from slots "
+                f"{incompatible}"
+            )
+        for params in self._slots.values():
+            params.current_steps = steps
+            params.ema_accept_len = float(steps - 1)
+            params._batch_count = 0
+
+    def observe_verify_complete_aggregates(
+        self, observations: list[tuple[int, int, int, int]]
+    ) -> None:
+        """Feed per-rank ``(correct, requests, batch_size, steps)`` observations.
+
+        Ranks routed to the same BS slot are combined before one policy update;
+        different slots retain their own acceptance histories.  Feedback whose
+        verify tier no longer matches its slot is stale and deliberately
+        ignored instead of perturbing the current policy.
+        """
+        by_slot: dict[int, tuple[AdaptiveStepSlot, int, int, int] | None] = {}
+        for correct, requests, batch_size, feedback_steps in observations:
+            if requests <= 0 or batch_size <= 0:
+                continue
+            if feedback_steps < 0 or correct < 0 or correct > requests * feedback_steps:
+                raise ValueError(
+                    "invalid adaptive-spec feedback: "
+                    f"correct={correct}, requests={requests}, "
+                    f"batch_size={batch_size}, steps={feedback_steps}"
+                )
+            params = self._route(batch_size)
+            slot_id = id(params)
+            previous = by_slot.get(slot_id, (params, 0, 0, feedback_steps))
+            if previous is None:
+                continue
+            _, total_correct, total_requests, expected_steps = previous
+            if feedback_steps != expected_steps:
+                by_slot[slot_id] = None
+                continue
+            by_slot[slot_id] = (
+                params,
+                total_correct + correct,
+                total_requests + requests,
+                expected_steps,
+            )
+        for aggregate in by_slot.values():
+            if aggregate is None:
+                continue
+            params, total_correct, total_requests, feedback_steps = aggregate
+            if params.current_steps != feedback_steps:
+                continue
+            params.update_aggregate(total_correct, total_requests)
+
+    def get_compatible_steps_for_batches(
+        self, batch_sizes: list[int]
+    ) -> int | None:
+        """Return the common tier selected by all active DP ranks.
+
+        ``None`` means the local batch-size slots disagree, so the caller must
+        conservatively use the configured fixed tier for this round.
+        """
+        selected = {self.get_steps_for_batch(batch_size) for batch_size in batch_sizes}
+        if len(selected) != 1:
+            return None
+        return next(iter(selected))
 
     def cuda_graph_bs_for_step(self, step: int) -> list[int] | None:
         """Return cuda_graph_bs values that can reach *step* at runtime.

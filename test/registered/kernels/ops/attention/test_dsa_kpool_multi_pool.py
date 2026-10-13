@@ -206,7 +206,115 @@ class TestDsaKpoolMultiPool(CustomTestCase):
         )
 
     def test_effective_n_only_compresses_accepted_pools(self):
+        # The full proposal window remains in the per-request scratch tail so
+        # verify can use fixed Graph geometry.  effective_n gates persistent
+        # pool compression at the committed (drafts + bonus) frontier.
         self._run_compress_case(effective_n=2, expected_closed_pools=1)
+
+    def test_zero_cache_loc_padding_writes_neither_tail_nor_cache(self):
+        torch.manual_seed(43)
+        pool = self._pool()
+        n = self.NUM_DRAFT_TOKENS
+        tail_size = self.POOL_SIZE + n
+        tail_k = torch.randn(
+            1, tail_size, INDEX_HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+        )
+        tail_score = torch.randn_like(tail_k)
+        cache = self._empty_cache()
+        tail_k_before = tail_k.clone()
+        tail_score_before = tail_score.clone()
+        cache_before = cache.clone()
+
+        kpool_write_tail_and_maybe_compress(
+            pool=pool,
+            buf=cache,
+            key=torch.randn(n, INDEX_HEAD_DIM, dtype=torch.bfloat16, device="cuda"),
+            score=torch.randn(
+                n, INDEX_HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+            ),
+            tail_k=tail_k,
+            tail_score=tail_score,
+            ape=torch.randn(
+                self.POOL_SIZE,
+                INDEX_HEAD_DIM,
+                dtype=torch.float32,
+                device="cuda",
+            ),
+            req_pool_indices=torch.zeros(1, dtype=torch.int64, device="cuda"),
+            write_start=torch.zeros(1, dtype=torch.int32, device="cuda"),
+            tail_logical_start=torch.zeros(1, dtype=torch.int32, device="cuda"),
+            write_loc=torch.zeros((1, 2), dtype=torch.int64, device="cuda"),
+            # Graph padding/IDLE rows carry a null cache location.
+            out_cache_loc=torch.zeros(n, dtype=torch.int64, device="cuda"),
+            num_draft_tokens=n,
+            round_scale=False,
+            effective_n_per_batch=torch.zeros(1, dtype=torch.int32, device="cuda"),
+        )
+
+        torch.testing.assert_close(tail_k, tail_k_before, atol=0, rtol=0)
+        torch.testing.assert_close(tail_score, tail_score_before, atol=0, rtol=0)
+        torch.testing.assert_close(cache, cache_before, atol=0, rtol=0)
+
+    def test_write_plan_graph_replay_refreshes_values_at_stable_addresses(self):
+        n = self.NUM_DRAFT_TOKENS
+        plan = _alloc_kpool_write_plan_buffers(
+            max_bs=2,
+            num_draft_tokens=n,
+            kpool=self.POOL_SIZE,
+            device=torch.device("cuda"),
+            is_verify=True,
+            is_v2=True,
+        )
+        write_start = torch.tensor([3, 7], dtype=torch.int32, device="cuda")
+        req_pool_indices = torch.tensor([5, 9], dtype=torch.int64, device="cuda")
+        real_page_table = torch.full(
+            (2 * n, 8), 8, dtype=torch.int32, device="cuda"
+        )
+
+        def update():
+            update_kpool_write_plan_cuda_graph(
+                write_start=write_start,
+                req_pool_indices=req_pool_indices,
+                real_page_table=real_page_table,
+                req_out=plan.req,
+                write_start_out=plan.write_start,
+                tail_logical_start_out=plan.tail_logical_start,
+                write_loc_out=plan.write_loc,
+                pool_seqlens_per_q_out=plan.pool_seqlens_per_q,
+                seqlens_per_q_out=plan.seqlens_per_q,
+                kpool=self.POOL_SIZE,
+                num_draft_tokens=n,
+                index_page_size=self.INDEX_PAGE_SIZE,
+            )
+
+        update()  # JIT warmup before capture.
+        torch.cuda.synchronize()
+        buffers = (
+            plan.req,
+            plan.write_start,
+            plan.tail_logical_start,
+            plan.write_loc,
+            plan.pool_seqlens_per_q,
+            plan.seqlens_per_q,
+            plan.effective_n_per_batch,
+        )
+        pointers = tuple(t.data_ptr() for t in buffers)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            update()
+
+        write_start.copy_(torch.tensor([11, 15], device="cuda", dtype=torch.int32))
+        req_pool_indices.copy_(torch.tensor([13, 17], device="cuda", dtype=torch.int64))
+        graph.replay()
+        torch.cuda.synchronize()
+
+        self.assertEqual(tuple(t.data_ptr() for t in buffers), pointers)
+        torch.testing.assert_close(plan.req, req_pool_indices)
+        torch.testing.assert_close(plan.write_start, write_start)
+        torch.testing.assert_close(
+            plan.tail_logical_start,
+            torch.tensor([8, 12], dtype=torch.int32, device="cuda"),
+        )
 
 
 if __name__ == "__main__":

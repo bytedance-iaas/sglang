@@ -400,6 +400,86 @@ class TestPrefillCudaGraphVote(CustomTestCase):
             info.all_gather(device="cpu", group=None)
             self.assertFalse(info.can_run_prefill_cuda_graph)
 
+    @patch.object(dp_attn, "get_parallel")
+    @patch.object(dp_attn, "all_gather_single")
+    def test_adaptive_spec_sync_piggybacks_on_existing_gather(self, gather, parallel):
+        infos = [
+            dp_attn.MLPSyncBatchInfo(
+                num_dp_ranks=2,
+                tp_size=1,
+                cp_size=1,
+                num_tokens=tokens,
+                num_tokens_for_logprob=tokens,
+                can_run_decode_cuda_graph=True,
+                can_run_draft_cuda_graph=True,
+                can_run_prefill_cuda_graph=False,
+                is_extend_in_batch=False,
+                local_can_run_tbo=False,
+                local_forward_mode=(
+                    ForwardMode.DECODE.value if tokens else ForwardMode.IDLE.value
+                ),
+                adaptive_spec_enabled=True,
+                adaptive_spec_active_steps=5,
+                adaptive_spec_feedback_steps=5,
+                adaptive_spec_correct_sum=correct,
+                adaptive_spec_request_count=count,
+                adaptive_spec_feedback_batch_size=count,
+                adaptive_spec_feedback_epoch=epoch,
+                adaptive_spec_local_batch_size=tokens,
+            )
+            for tokens, correct, count, epoch in ((16, 79, 16, 4), (0, 0, 0, 0))
+        ]
+        values = torch.cat([info._get_local_tensor(device="cpu") for info in infos])
+        gather.side_effect = lambda output, *a, **kw: output.copy_(values)
+        parallel.return_value.tp_group.active_ranks_cpu = torch.ones(2)
+
+        infos[0].all_gather(device="cpu", group=None)
+
+        self.assertEqual(
+            infos[0].global_adaptive_spec_sync,
+            [
+                [1, 5, 5, 79, 16, 16, 4],
+                [1, 5, 5, 0, 0, 0, 0],
+            ],
+        )
+        self.assertEqual(infos[0].adaptive_spec_rank_batch_sizes, [16, 0])
+
+    def test_missing_elastic_rank_fallback_disables_adaptive_vote(self):
+        info = dp_attn.MLPSyncBatchInfo(
+            num_dp_ranks=1,
+            tp_size=1,
+            cp_size=1,
+            num_tokens=0,
+            num_tokens_for_logprob=0,
+            can_run_decode_cuda_graph=True,
+            can_run_draft_cuda_graph=True,
+            can_run_prefill_cuda_graph=False,
+            is_extend_in_batch=False,
+            local_can_run_tbo=False,
+            local_forward_mode=ForwardMode.IDLE.value,
+            adaptive_spec_enabled=True,
+        )
+        fallback = info._get_fallback_tensor(device="cpu")
+        self.assertEqual(fallback[10:17].tolist(), [0, -1, -1, 0, 0, 0, 0])
+        self.assertEqual(fallback[17].item(), 0)
+
+    def test_adaptive_off_preserves_existing_metadata_width(self):
+        info = dp_attn.MLPSyncBatchInfo(
+            num_dp_ranks=1,
+            tp_size=1,
+            cp_size=1,
+            num_tokens=4,
+            num_tokens_for_logprob=4,
+            can_run_decode_cuda_graph=True,
+            can_run_draft_cuda_graph=True,
+            can_run_prefill_cuda_graph=False,
+            is_extend_in_batch=False,
+            local_can_run_tbo=False,
+            local_forward_mode=ForwardMode.DECODE.value,
+        )
+        self.assertEqual(info._get_local_tensor(device="cpu").numel(), 10)
+        self.assertEqual(info._get_fallback_tensor(device="cpu").numel(), 10)
+
 
 if __name__ == "__main__":
     unittest.main()

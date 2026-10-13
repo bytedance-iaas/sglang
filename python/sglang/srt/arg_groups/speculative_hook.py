@@ -1298,6 +1298,7 @@ def _init_adaptive_speculative_params(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     from sglang.srt.speculative.adaptive_spec_params import (
         resolve_candidate_steps_from_config,
+        validate_synchronized_initial_steps,
     )
 
     candidate_steps = resolve_candidate_steps_from_config(
@@ -1323,6 +1324,12 @@ def _init_adaptive_speculative_params(server_args: ServerArgs) -> None:
             f"--speculative-num-steps={cfg.speculative_num_steps} "
             f"is not in the adaptive config candidate_steps {candidate_steps}. "
             "Pass one of those values."
+        )
+
+    if attn_dp_enabled_of(resolved_view(server_args)):
+        validate_synchronized_initial_steps(
+            cfg.speculative_num_steps,
+            cfg_path=cfg.speculative_adaptive_config,
         )
 
     declare_resolution(

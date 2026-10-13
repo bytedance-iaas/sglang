@@ -125,6 +125,17 @@ class MLPSyncBatchInfo:
     prefill_cuda_graph_max_prefix_len: int = 0
     # Every request in the local batch is a health-check probe.
     is_health_check: bool = False
+    # Adaptive-spec state and the previous decode round's acceptance summary.
+    # These fields ride the scheduler's existing DP all-gather; no extra
+    # collective is introduced by adaptive tier synchronization.
+    adaptive_spec_enabled: bool = False
+    adaptive_spec_active_steps: int = -1
+    adaptive_spec_feedback_steps: int = -1
+    adaptive_spec_correct_sum: int = 0
+    adaptive_spec_request_count: int = 0
+    adaptive_spec_feedback_batch_size: int = 0
+    adaptive_spec_feedback_epoch: int = 0
+    adaptive_spec_local_batch_size: int = 0
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
@@ -134,43 +145,65 @@ class MLPSyncBatchInfo:
     global_num_tokens_for_logprob: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
+    global_adaptive_spec_sync: list[list[int]] = None
+    adaptive_spec_rank_batch_sizes: list[int] = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
-        return torch.tensor(
-            [
-                self.num_tokens,
-                self.num_tokens_for_logprob,
-                int(self.can_run_decode_cuda_graph),
-                int(self.is_extend_in_batch),
-                int(self.local_can_run_tbo),
-                self.local_forward_mode,
-                int(self.can_run_prefill_cuda_graph),
-                self.prefill_cuda_graph_max_prefix_len,
-                int(self.can_run_draft_cuda_graph),
-                int(self.is_health_check),
-            ],
-            device=device,
-            dtype=dtype,
-        )
+        values = [
+            self.num_tokens,
+            self.num_tokens_for_logprob,
+            int(self.can_run_decode_cuda_graph),
+            int(self.is_extend_in_batch),
+            int(self.local_can_run_tbo),
+            self.local_forward_mode,
+            int(self.can_run_prefill_cuda_graph),
+            self.prefill_cuda_graph_max_prefix_len,
+            int(self.can_run_draft_cuda_graph),
+            int(self.is_health_check),
+        ]
+        if self.adaptive_spec_enabled:
+            values.extend(
+                [
+                    int(self.adaptive_spec_enabled),
+                    self.adaptive_spec_active_steps,
+                    self.adaptive_spec_feedback_steps,
+                    self.adaptive_spec_correct_sum,
+                    self.adaptive_spec_request_count,
+                    self.adaptive_spec_feedback_batch_size,
+                    self.adaptive_spec_feedback_epoch,
+                    self.adaptive_spec_local_batch_size,
+                ]
+            )
+        return torch.tensor(values, device=device, dtype=dtype)
 
     def _get_fallback_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
-        return torch.tensor(
-            [
-                0,  # num_tokens
-                0,  # num_tokens_for_logprob
-                1,  # can_run_decode_cuda_graph
-                0,  # is_extend_in_batch
-                1,  # local_can_run_tbo
-                ForwardMode.IDLE.value,  # local_forward_mode
-                0,  # can_run_prefill_cuda_graph
-                0,  # prefill_cuda_graph_max_prefix_len
-                1,  # can_run_draft_cuda_graph
-                0,  # is_health_check
-            ],
-            device=device,
-            dtype=dtype,
-        )
+        values = [
+            0,  # num_tokens
+            0,  # num_tokens_for_logprob
+            1,  # can_run_decode_cuda_graph
+            0,  # is_extend_in_batch
+            1,  # local_can_run_tbo
+            ForwardMode.IDLE.value,  # local_forward_mode
+            0,  # can_run_prefill_cuda_graph
+            0,  # prefill_cuda_graph_max_prefix_len
+            1,  # can_run_draft_cuda_graph
+            0,  # is_health_check
+        ]
+        if self.adaptive_spec_enabled:
+            values.extend(
+                [
+                    0,  # adaptive_spec_enabled
+                    -1,  # adaptive_spec_active_steps
+                    -1,  # adaptive_spec_feedback_steps
+                    0,  # adaptive_spec_correct_sum
+                    0,  # adaptive_spec_request_count
+                    0,  # adaptive_spec_feedback_batch_size
+                    0,  # adaptive_spec_feedback_epoch
+                    0,  # adaptive_spec_local_batch_size
+                ]
+            )
+        return torch.tensor(values, device=device, dtype=dtype)
 
     def finalize_local(self):
         """Populate gather-derived metadata from the sole attention-DP rank."""
@@ -178,6 +211,16 @@ class MLPSyncBatchInfo:
         self.global_num_tokens = [self.num_tokens]
         self.global_num_tokens_for_logprob = [self.num_tokens_for_logprob]
         self.any_health_check = self.is_health_check
+        self.global_adaptive_spec_sync = (
+            self.tp0_info_cpu[:, 10:17].tolist()
+            if self.tp0_info_cpu.shape[1] >= 18
+            else None
+        )
+        self.adaptive_spec_rank_batch_sizes = (
+            self.tp0_info_cpu[:, 17].tolist()
+            if self.tp0_info_cpu.shape[1] >= 18
+            else None
+        )
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 self.tp0_info_cpu[:, 5].tolist()
@@ -253,6 +296,12 @@ class MLPSyncBatchInfo:
         self.prefill_cuda_graph_max_prefix_len = int(tp0_info_cpu[:, 7].max())
         self.can_run_draft_cuda_graph = bool(tp0_info_cpu[:, 8].min())
         self.any_health_check = bool(tp0_info_cpu[:, 9].max())
+        self.global_adaptive_spec_sync = (
+            tp0_info_cpu[:, 10:17].tolist() if tp0_info_cpu.shape[1] >= 18 else None
+        )
+        self.adaptive_spec_rank_batch_sizes = (
+            tp0_info_cpu[:, 17].tolist() if tp0_info_cpu.shape[1] >= 18 else None
+        )
         self.sync_wait_seconds = time.perf_counter() - sync_start
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
@@ -301,6 +350,10 @@ def _update_gather_batch(
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
         batch.global_forward_mode = mlp_sync_info.global_forward_mode
+    batch.global_adaptive_spec_sync = mlp_sync_info.global_adaptive_spec_sync
+    batch.adaptive_spec_rank_batch_sizes = (
+        mlp_sync_info.adaptive_spec_rank_batch_sizes
+    )
 
     # Check forward mode for cuda graph
     batch.can_run_decode_cuda_graph = mlp_sync_info.can_run_decode_cuda_graph
@@ -457,6 +510,7 @@ def prepare_mlp_sync_batch_raw(
     draft_require_mlp_tp_gather: Optional[bool] = None,
     dwdp: bool = False,
     sync_wait_carry: Optional[DPSyncWaitCarry] = None,
+    adaptive_spec_sync: Optional[tuple[int, int, int, int, int, int, int]] = None,
 ):
     parallel = get_parallel()
     num_dp_ranks = parallel.num_dp_ranks
@@ -549,6 +603,7 @@ def prepare_mlp_sync_batch_raw(
         )
     skip_all_gather = should_skip_scheduler_all_gather(num_dp_ranks)
 
+    adaptive_spec_sync = adaptive_spec_sync or (0, -1, -1, 0, 0, 0, 0)
     mlp_sync_info = MLPSyncBatchInfo(
         num_dp_ranks=num_dp_ranks,
         tp_size=attn_tp_size,
@@ -563,6 +618,20 @@ def prepare_mlp_sync_batch_raw(
         local_forward_mode=local_forward_mode,
         prefill_cuda_graph_max_prefix_len=prefill_cuda_graph_max_prefix_len,
         is_health_check=is_health_check,
+        adaptive_spec_enabled=bool(adaptive_spec_sync[0]),
+        adaptive_spec_active_steps=adaptive_spec_sync[1],
+        adaptive_spec_feedback_steps=adaptive_spec_sync[2],
+        adaptive_spec_correct_sum=adaptive_spec_sync[3],
+        adaptive_spec_request_count=adaptive_spec_sync[4],
+        adaptive_spec_feedback_batch_size=adaptive_spec_sync[5],
+        adaptive_spec_feedback_epoch=adaptive_spec_sync[6],
+        adaptive_spec_local_batch_size=(
+            local_batch.batch_size()
+            if local_batch is not None
+            and not local_batch.forward_mode.is_prebuilt()
+            and not local_batch.forward_mode.is_idle()
+            else 0
+        ),
     )
 
     if num_dp_ranks == 1:
@@ -648,6 +717,9 @@ class SchedulerDPAttnAdapter:
     enable_overlap: bool
     spec_algorithm: SpeculativeAlgorithm
     get_require_mlp_sync: Callable[[], bool]
+    get_adaptive_spec_sync: Optional[
+        Callable[[], tuple[int, int, int, int, int, int, int]]
+    ] = None
     sync_wait_carry: DPSyncWaitCarry = field(default_factory=DPSyncWaitCarry)
 
     def drop_sync_wait_carry(self) -> None:
@@ -675,6 +747,11 @@ class SchedulerDPAttnAdapter:
             offload_tags=self.offload_tags,
             dwdp=get_parallel().dwdp_size > 1,
             sync_wait_carry=self.sync_wait_carry,
+            adaptive_spec_sync=(
+                self.get_adaptive_spec_sync()
+                if self.get_adaptive_spec_sync is not None
+                else None
+            ),
         )
 
     def maybe_prepare_mlp_sync_batch(

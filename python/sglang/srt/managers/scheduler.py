@@ -2338,6 +2338,9 @@ class Scheduler(
             if isinstance(self.tp_worker, BaseSpecWorker)
             else self.tp_worker
         )
+        adaptive_sync_snapshot = getattr(
+            self.model_worker, "adaptive_spec_sync_snapshot", None
+        )
         self.dp_attn_adapter = SchedulerDPAttnAdapter(
             model_runner=target_worker.model_runner,
             req_to_token_pool=self.req_to_token_pool,
@@ -2348,6 +2351,9 @@ class Scheduler(
             enable_overlap=self.enable_overlap,
             spec_algorithm=self.spec_algorithm,
             get_require_mlp_sync=lambda: self.require_mlp_sync,
+            get_adaptive_spec_sync=(
+                adaptive_sync_snapshot if callable(adaptive_sync_snapshot) else None
+            ),
         )
 
     def init_pool_stats_observer(self) -> None:

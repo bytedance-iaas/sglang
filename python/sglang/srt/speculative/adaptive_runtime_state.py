@@ -63,7 +63,33 @@ class AdaptiveSpecPolicy(Protocol):
         self, num_correct_drafts_per_req: list[int], batch_size: int
     ) -> int | None: ...
 
+    def initialize_synchronized_steps(self, steps: int) -> None: ...
+
+    def observe_verify_complete_aggregates(
+        self, observations: list[tuple[int, int, int, int]]
+    ) -> None: ...
+
+    def get_compatible_steps_for_batches(
+        self, batch_sizes: list[int]
+    ) -> int | None: ...
+
     def cuda_graph_bs_for_step(self, step: int) -> list[int] | None: ...
+
+
+@dataclass(frozen=True)
+class AdaptiveTierDecision:
+    """One synchronized tier decision and its physical-row accounting."""
+
+    steps: int
+    draft_tokens: int
+    fixed_steps: int
+    fixed_draft_tokens: int
+    rank_batch_sizes: tuple[int, ...]
+    feedback_num_requests: int
+    feedback_total_correct_drafts: int
+    saved_rows_sum_len: int
+    saved_rows_max_len: int
+    fallback_reason: str | None = None
 
 
 class AdaptiveController:
@@ -87,6 +113,19 @@ class AdaptiveController:
         self.worker = worker
         self.params: AdaptiveSpecPolicy = policy
         self._states: dict[int, SpecRuntimeState] = {}
+        self.fixed_steps = worker.speculative_num_steps
+        self.last_decision = AdaptiveTierDecision(
+            steps=self.fixed_steps,
+            draft_tokens=self.fixed_steps + 1,
+            fixed_steps=self.fixed_steps,
+            fixed_draft_tokens=self.fixed_steps + 1,
+            rank_batch_sizes=(),
+            feedback_num_requests=0,
+            feedback_total_correct_drafts=0,
+            saved_rows_sum_len=0,
+            saved_rows_max_len=0,
+            fallback_reason=None,
+        )
 
     @property
     def candidate_steps(self) -> list[int]:
@@ -133,6 +172,83 @@ class AdaptiveController:
         )
         if new_step is not None:
             self._activate(new_step)
+
+    def synchronize_dp_tier(
+        self,
+        *,
+        feedback_observations: list[tuple[int, int, int, int]],
+        rank_batch_sizes: list[int],
+        fallback_reason: str | None = None,
+    ) -> AdaptiveTierDecision:
+        """Apply one DP-wide observation and activate one compatible tier.
+
+        IDLE ranks are represented by missing/zero batch sizes and do not add
+        feedback.  A heterogeneous tier choice is fail-closed for this round:
+        every rank uses the configured fixed tier, so the target/draft/EP
+        collective geometry stays identical cluster-wide.
+        """
+        total_correct_drafts = sum(obs[0] for obs in feedback_observations)
+        num_feedback_requests = sum(obs[1] for obs in feedback_observations)
+        if num_feedback_requests > 0 and fallback_reason is None:
+            self.params.observe_verify_complete_aggregates(feedback_observations)
+
+        rank_batches = [int(bs) for bs in rank_batch_sizes]
+        batches = [bs for bs in rank_batches if bs > 0]
+        target = None
+        if fallback_reason is None and batches:
+            target = self.params.get_compatible_steps_for_batches(batches)
+            if target is None:
+                fallback_reason = "heterogeneous_tier"
+        if target is None:
+            target = self.fixed_steps
+            self.params.initialize_synchronized_steps(self.fixed_steps)
+
+        self._activate(target)
+        decision = self._build_tier_decision(
+            steps=target,
+            rank_batch_sizes=rank_batches,
+            feedback_num_requests=num_feedback_requests,
+            feedback_total_correct_drafts=total_correct_drafts,
+            fallback_reason=fallback_reason,
+        )
+        self.last_decision = decision
+        return decision
+
+    def activate_fixed(self, reason: str) -> AdaptiveTierDecision:
+        self.params.initialize_synchronized_steps(self.fixed_steps)
+        return self.synchronize_dp_tier(
+            feedback_observations=[],
+            rank_batch_sizes=[],
+            fallback_reason=reason,
+        )
+
+    def _build_tier_decision(
+        self,
+        *,
+        steps: int,
+        rank_batch_sizes: list[int],
+        feedback_num_requests: int,
+        feedback_total_correct_drafts: int,
+        fallback_reason: str | None,
+    ) -> AdaptiveTierDecision:
+        fixed_width = self.fixed_steps + 1
+        width = steps + 1
+        saved_width = max(0, fixed_width - width)
+        sum_bs = sum(rank_batch_sizes)
+        max_bs = max(rank_batch_sizes, default=0)
+        num_ranks = len(rank_batch_sizes)
+        return AdaptiveTierDecision(
+            steps=steps,
+            draft_tokens=width,
+            fixed_steps=self.fixed_steps,
+            fixed_draft_tokens=fixed_width,
+            rank_batch_sizes=tuple(rank_batch_sizes),
+            feedback_num_requests=feedback_num_requests,
+            feedback_total_correct_drafts=feedback_total_correct_drafts,
+            saved_rows_sum_len=saved_width * sum_bs,
+            saved_rows_max_len=saved_width * max_bs * num_ranks,
+            fallback_reason=fallback_reason,
+        )
 
     def _activate(self, speculative_num_steps: int) -> None:
         state = self._states.get(speculative_num_steps)

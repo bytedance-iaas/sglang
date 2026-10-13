@@ -244,6 +244,28 @@ class TestAdaptiveStepSlot(CustomTestCase):
         params = self._make_params_from_config(3, {"candidate_steps": [1, 3, 7]})
         self.assertEqual(params.ceiling_coeff, 0)
 
+    def test_aggregate_update_matches_per_request_update(self):
+        config = {
+            "candidate_steps": [1, 3, 7],
+            "ema_alpha": 1.0,
+            "warmup_batches": 0,
+            "update_interval": 1,
+        }
+        per_request = self._make_params_from_config(3, config)
+        aggregate = self._make_params_from_config(3, config)
+
+        self.assertEqual(
+            per_request.update([0, 1, 2, 3]),
+            aggregate.update_aggregate(total_correct_drafts=6, num_requests=4),
+        )
+        self.assertEqual(per_request.current_steps, aggregate.current_steps)
+        self.assertEqual(per_request.ema_accept_len, aggregate.ema_accept_len)
+
+    def test_aggregate_rejects_negative_correct_count(self):
+        params = self._make_params_from_config(3, {"candidate_steps": [1, 3]})
+        with self.assertRaisesRegex(ValueError, "must be non-negative"):
+            params.update_aggregate(total_correct_drafts=-1, num_requests=2)
+
 
 class TestAdaptiveSpeculativeParams(CustomTestCase):
     def test_default_config_loads(self):
@@ -393,6 +415,72 @@ class TestBatchSizeRouting(CustomTestCase):
             params.on_verify_complete([7, 7, 7], batch_size=1)
         self.assertGreater(params.get_steps_for_batch(1), 1)
         self.assertEqual(params.get_steps_for_batch(32), 1)
+
+    def test_compatible_tier_accepts_heterogeneous_batch_sizes(self):
+        params = self._params()
+        # bs=1 and bs=8 use different policy slots, but both start at tier 3.
+        self.assertEqual(params.get_compatible_steps_for_batches([1, 8]), 3)
+
+    def test_incompatible_tier_returns_none_for_conservative_fallback(self):
+        params = self._params()
+        # bs=32 starts at tier 1 while bs=1 starts at tier 3.
+        self.assertIsNone(params.get_compatible_steps_for_batches([1, 32]))
+
+    def test_dp_aggregate_updates_each_participating_slot_once(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump(
+                {
+                    "1": {
+                        "candidate_steps": [1, 3],
+                        "ema_alpha": 1.0,
+                        "warmup_batches": 0,
+                        "update_interval": 1,
+                    },
+                    "8": {
+                        "candidate_steps": [1, 3],
+                        "ema_alpha": 1.0,
+                        "warmup_batches": 0,
+                        "update_interval": 1,
+                    },
+                },
+                f,
+            )
+            f.flush()
+            params = AdaptiveSpeculativeParams(initial_steps=3, cfg_path=f.name)
+
+        # Duplicate rank-local batch sizes map to one slot and must consume one
+        # policy interval, not one interval per rank.
+        params.observe_verify_complete_aggregates(
+            [(0, 4, 4, 3), (0, 4, 4, 3), (0, 8, 8, 3)]
+        )
+        self.assertEqual(params._slots[1]._batch_count, 1)
+        self.assertEqual(params._slots[8]._batch_count, 1)
+        self.assertEqual(params.get_compatible_steps_for_batches([4, 8]), 1)
+
+    def test_synchronized_initial_steps_sets_every_slot(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump(
+                {
+                    "1": {"candidate_steps": [1, 3, 5]},
+                    "8": {"candidate_steps": [1, 3, 5]},
+                },
+                f,
+            )
+            f.flush()
+            params = AdaptiveSpeculativeParams(initial_steps=3, cfg_path=f.name)
+        params.initialize_synchronized_steps(5)
+        self.assertEqual(params.get_compatible_steps_for_batches([1, 8]), 5)
+        self.assertTrue(all(slot._batch_count == 0 for slot in params._slots.values()))
+
+    def test_synchronized_initial_steps_rejects_missing_slot_tier(self):
+        params = self._params()
+        with self.assertRaisesRegex(ValueError, "steps=5.*slots.*8"):
+            params.initialize_synchronized_steps(5)
+
+    def test_dp_feedback_rejects_impossible_accept_count(self):
+        params = self._params()
+        with self.assertRaisesRegex(ValueError, "invalid adaptive-spec feedback"):
+            params.observe_verify_complete_aggregates([(13, 4, 4, 3)])
 
 
 class TestResolveCandidateSteps(CustomTestCase):
