@@ -18,13 +18,15 @@ Scheme (fold-every-commit, no circular ring / periodic flush):
     directly as its initial state (no lag, no chunked reconstruction).
 
 The exact-fold is a BITWISE CLONE of ``fused_recurrent_gated_delta_rule_fwd_kernel``'s
-``IS_KDA`` branch (fused_recurrent.py): same [BK, BV] fp32 tile (K rows, V cols),
+``IS_KDA`` branch (fused_recurrent.py): same full-K fp32 reduction per V column,
 same division-form L2 norm (eps inside sqrt), same per-K gate decay
 ``h *= exp(gk)``, same decay→delta→rank-1 op order. Given identical inputs the
 folded checkpoint is bit-identical to the recurrent baseline's committed state
 (the delta-rule recurrence is contractive, so no length-dependent error). Do NOT
 reorder into tl.dot / reciprocal-multiply; keep num_warps=1 so the reduction
-trees match.
+trees match. The opt-in SM90 prefetch path narrows independent V tiles to 8,
+but does not alter the K reduction or recurrence. Its masked next-token loads
+follow sgl-project/sglang#44024 at a12e57af; the default remains the original.
 
 Linear chain only (dspark γ chain, topk<=1).
 """
@@ -34,6 +36,20 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+
+from sglang.srt.environ import envs
+
+
+def _fold_prefetch_enabled(state: torch.Tensor) -> bool:
+    # Adapted from sgl-project/sglang#44024 (a12e57af). Its GB300 default
+    # is not a portable tuning result. Keep the unchanged BV32 path elsewhere.
+    return (
+        envs.SGLANG_EXPERIMENTAL_KDA_FOLD_PREFETCH.get()
+        and state.is_cuda
+        and state.dtype == torch.float32
+        and state.shape[-2:] == (128, 128)
+        and torch.cuda.get_device_capability(state.device) == (9, 0)
+    )
 
 
 @triton.jit
@@ -71,6 +87,7 @@ def kda_replayssm_exact_fold_kernel(
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     NULL_BLOCK_ID: tl.constexpr,
     HAS_TRACK: tl.constexpr,
+    PREFETCH: tl.constexpr = False,
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
@@ -122,35 +139,56 @@ def kda_replayssm_exact_fold_kernel(
     )
     b_h = tl.load(p_h0, mask=mask_h, other=0.0).to(tl.float32)
 
+    if PREFETCH:
+        p_k = rawk_cache + state_idx * stride_rawk_slot + i_h * MAX_CACHE_LEN * K + o_k
+        p_v = rawv_cache + state_idx * stride_rawv_slot + i_hv * MAX_CACHE_LEN * V + o_v
+        p_g = gk_cache + state_idx * stride_gk_slot + i_hv * MAX_CACHE_LEN * K + o_k
+        p_b = beta_cache + state_idx * stride_beta_slot + i_hv * MAX_CACHE_LEN
+        nxt_k = tl.load(p_k, mask=mask_k, other=0.0)
+        nxt_v = tl.load(p_v, mask=mask_v, other=0.0)
+        nxt_g = tl.load(p_g, mask=mask_k, other=0.0)
+        nxt_b = tl.load(p_b)
+
     for t in range(0, n_commit):
-        phys = t.to(tl.int64)
-        b_k = tl.load(
-            rawk_cache
-            + state_idx * stride_rawk_slot
-            + (i_h * MAX_CACHE_LEN + phys) * K
-            + o_k,
-            mask=mask_k,
-            other=0.0,
-        ).to(tl.float32)
-        b_v = tl.load(
-            rawv_cache
-            + state_idx * stride_rawv_slot
-            + (i_hv * MAX_CACHE_LEN + phys) * V
-            + o_v,
-            mask=mask_v,
-            other=0.0,
-        ).to(tl.float32)
-        b_gk = tl.load(
-            gk_cache
-            + state_idx * stride_gk_slot
-            + (i_hv * MAX_CACHE_LEN + phys) * K
-            + o_k,
-            mask=mask_k,
-            other=0.0,
-        ).to(tl.float32)
-        b_beta = tl.load(
-            beta_cache + state_idx * stride_beta_slot + i_hv * MAX_CACHE_LEN + phys
-        ).to(tl.float32)
+        if PREFETCH:
+            b_k = nxt_k.to(tl.float32)
+            b_v = nxt_v.to(tl.float32)
+            b_gk = nxt_g.to(tl.float32)
+            b_beta = nxt_b.to(tl.float32)
+            has_next = t + 1 < n_commit
+            nxt_k = tl.load(p_k + (t + 1) * K, mask=mask_k & has_next, other=0.0)
+            nxt_v = tl.load(p_v + (t + 1) * V, mask=mask_v & has_next, other=0.0)
+            nxt_g = tl.load(p_g + (t + 1) * K, mask=mask_k & has_next, other=0.0)
+            nxt_b = tl.load(p_b + t + 1, mask=has_next, other=0.0)
+        else:
+            phys = t.to(tl.int64)
+            b_k = tl.load(
+                rawk_cache
+                + state_idx * stride_rawk_slot
+                + (i_h * MAX_CACHE_LEN + phys) * K
+                + o_k,
+                mask=mask_k,
+                other=0.0,
+            ).to(tl.float32)
+            b_v = tl.load(
+                rawv_cache
+                + state_idx * stride_rawv_slot
+                + (i_hv * MAX_CACHE_LEN + phys) * V
+                + o_v,
+                mask=mask_v,
+                other=0.0,
+            ).to(tl.float32)
+            b_gk = tl.load(
+                gk_cache
+                + state_idx * stride_gk_slot
+                + (i_hv * MAX_CACHE_LEN + phys) * K
+                + o_k,
+                mask=mask_k,
+                other=0.0,
+            ).to(tl.float32)
+            b_beta = tl.load(
+                beta_cache + state_idx * stride_beta_slot + i_hv * MAX_CACHE_LEN + phys
+            ).to(tl.float32)
 
         # --- verbatim recurrent update, IS_KDA branch (see module docstring) ---
         if USE_QK_L2NORM_IN_KERNEL:
@@ -202,7 +240,8 @@ def commit_kda_replayssm_spec(
     num_slots, HV, V, K = checkpoint_state.shape
     B = ssm_state_indices.shape[0]
     BK = triton.next_power_of_2(K)
-    BV = min(triton.next_power_of_2(V), 32)
+    prefetch = _fold_prefetch_enabled(checkpoint_state)
+    BV = min(triton.next_power_of_2(V), 8 if prefetch else 32)
     grid = (triton.cdiv(V, BV), B, HV)
     has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
     if has_track:
@@ -249,6 +288,7 @@ def commit_kda_replayssm_spec(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         NULL_BLOCK_ID=null_block_id,
         HAS_TRACK=has_track,
+        PREFETCH=prefetch,
         num_warps=1,
         num_stages=3,
     )
@@ -281,7 +321,8 @@ def commit_kda_replayssm_spec_all_layers(
     num_layers, num_slots, HV, V, K = checkpoint_state.shape
     B = ssm_state_indices.shape[0]
     BK = triton.next_power_of_2(K)
-    BV = min(triton.next_power_of_2(V), 32)
+    prefetch = _fold_prefetch_enabled(checkpoint_state)
+    BV = min(triton.next_power_of_2(V), 8 if prefetch else 32)
     grid = (triton.cdiv(V, BV), B, HV * num_layers)
     has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
     if has_track:
@@ -328,6 +369,7 @@ def commit_kda_replayssm_spec_all_layers(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         NULL_BLOCK_ID=null_block_id,
         HAS_TRACK=has_track,
+        PREFETCH=prefetch,
         num_warps=1,
         num_stages=3,
     )

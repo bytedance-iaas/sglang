@@ -1412,6 +1412,9 @@ class Envs:
     # Experimental; auto-falls back to eager if the backend's prep is not capturable.
     SGLANG_ENABLE_METADATA_GLUE_GRAPH = EnvBool(False)
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
+    # Opt-in exact ReplaySSM fold: SM90, FP32 state and K=V=128 only.
+    # Narrow V tiles plus masked next-token input prefetch; verify is unchanged.
+    SGLANG_EXPERIMENTAL_KDA_FOLD_PREFETCH = EnvBool(False)
     # Preserve the measured GLM-5.3-Flash projection controls while keeping
     # upstream's #39688 full-fusion behavior as the default. ``a_only`` keeps
     # the merged qkv/beta/f_a/g_a projection but executes f_b/g_b separately;
