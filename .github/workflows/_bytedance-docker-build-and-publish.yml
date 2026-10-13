@@ -118,7 +118,7 @@ on:
         default: true
 
       install_iaas_kernels:
-        description: "Preinstall the pinned SM90 NVLink wheel (amd64/cu130, local source only)"
+        description: "Preinstall the pinned SM90 NVLink/RDMA wheel and FP4 LTO tools (amd64/cu130, local source only)"
         required: false
         type: boolean
         default: false
@@ -169,7 +169,7 @@ jobs:
           # BRANCH_TYPE=local copies Git metadata into the image for versioning.
           persist-credentials: false
 
-      - name: Configure iaas-kernels NVLink image
+      - name: Configure iaas-kernels NVLink/RDMA image
         env:
           INSTALL_IAAS_KERNELS: ${{ inputs.install_iaas_kernels }}
           IAAS_KERNELS_READ_TOKEN: ${{ secrets.IAAS_KERNELS_READ_TOKEN }}

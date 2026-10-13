@@ -1,4 +1,4 @@
-"""Build the pinned NVLink wheel with the consuming image's Torch/CUDA ABI."""
+"""Build the pinned NVLink/RDMA wheel and SM90 FP4 LTO runtime tools."""
 
 import argparse
 import base64
@@ -11,7 +11,13 @@ import tomllib
 import zipfile
 from pathlib import Path
 
-from check_iaas_kernels_image import check_environment, load_lock, require
+from build_iaas_kernels_lto import build_lto
+from check_iaas_kernels_image import (
+    check_environment,
+    check_rdma_info,
+    load_lock,
+    require,
+)
 
 
 def build(lock_path, source, output, token_file):
@@ -47,7 +53,7 @@ def build(lock_path, source, output, token_file):
     require(head == lock["revision"], "Fetched iaas-kernels commit mismatch")
     project = tomllib.loads((source / "pyproject.toml").read_text())
     require(project["project"]["version"] == lock["version"], "Source version mismatch")
-    env = dict(os.environ, IAAS_KERNELS_BUILD_RDMA="0", TVM_FFI_CUDA_ARCH_LIST="9.0a")
+    env = dict(os.environ, IAAS_KERNELS_BUILD_RDMA="1", TVM_FFI_CUDA_ARCH_LIST="9.0a")
     subprocess.run(["bash", "build_sgl_deep_gemm.sh"], cwd=source, env=env, check=True)
     submodules = subprocess.check_output(
         git + ["submodule", "status", "--recursive"], text=True
@@ -62,10 +68,10 @@ def build(lock_path, source, output, token_file):
     with zipfile.ZipFile(wheel) as archive:
         info = json.loads(archive.read("iaas_kernels/BUILD_INFO.json"))
         native = archive.read("iaas_kernels/_iaas_kernels.so")
-        require(
-            not any("_rdma.so" in name for name in archive.namelist()),
-            "Unexpected RDMA extension in NVLink wheel",
-        )
+        rdma_info = json.loads(archive.read("iaas_kernels/RDMA_BUILD_INFO.json"))
+        rdma_native = archive.read("iaas_kernels/_iaas_kernels_rdma.so")
+        check_rdma_info(lock, info, rdma_info)
+    lto = build_lto(lock, source.parent / "nvshmem-lto-source", output / "lto")
     manifest = dict(
         lock=lock,
         build_info=info,
@@ -73,6 +79,9 @@ def build(lock_path, source, output, token_file):
         wheel=wheel.name,
         wheel_sha256=hashlib.sha256(wheel.read_bytes()).hexdigest(),
         native_sha256=hashlib.sha256(native).hexdigest(),
+        rdma_build_info=rdma_info,
+        rdma_native_sha256=hashlib.sha256(rdma_native).hexdigest(),
+        lto=lto,
     )
     shutil.copy2(wheel, output / wheel.name)
     shutil.copy2(lock_path, output / "iaas-kernels.lock.json")
