@@ -1,6 +1,6 @@
 """Correctness tests for the DeepSeek-V4 JIT top-k transform v1.
 
-``topk_transform_paged`` dispatches to ``deepseek_v4/topk_v1.cuh`` on CUDA. Its
+``topk_transform_512`` dispatches to ``deepseek_v4/topk_v1.cuh`` on CUDA. Its
 radix select first bins scores by the high byte of their ordered FP16 value and
 stashes the threshold bin in shared memory (8192 entries). These tests put the
 threshold bin on both sides of that capacity, with strictly higher values
@@ -22,7 +22,7 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged
+from sglang.kernels.ops.attention.dsv4.topk import topk_transform_512
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -30,7 +30,7 @@ register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-l
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or is_hip(),
-    reason="topk_transform_paged uses the JIT v1 kernel on CUDA only",
+    reason="topk_transform_512 uses the JIT v1 kernel on CUDA only",
 )
 
 # kSMEM / (2 * sizeof(int32_t)) in topk_v1.cuh: entries per stash round.
@@ -91,7 +91,7 @@ def _run_and_check(
     scores_view = storage[:, :stride]
     scores_view.copy_(scores)
     assert scores_view.is_contiguous() == (view_pad == 0)
-    topk_transform_paged(
+    topk_transform_512(
         scores_view,
         seq_lens.cuda(),
         page_table.cuda(),
