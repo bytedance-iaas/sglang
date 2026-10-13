@@ -61,9 +61,10 @@ CPUNicAffinity = {
 
 
 def get_eic_config_file_path():
-    if os.environ.get(REMOTE_EIC_YAML_ENV_VAR) is not None:
+    # An empty REMOTE_EIC_YAML counts as unset, matching eic_env_config.
+    config_file = os.environ.get(REMOTE_EIC_YAML_ENV_VAR)
+    if config_file:
         logger.info(f"eic init with env var {REMOTE_EIC_YAML_ENV_VAR}")
-        config_file = os.environ.get(REMOTE_EIC_YAML_ENV_VAR)
     else:
         config_file = "/sgl-workspace/config/remote-eic.yaml"
         logger.info(f"eic init with default config, config_file {config_file}")
@@ -242,7 +243,8 @@ class EICStorage(HiCacheStorage):
         init_option.log_dir = eic_log_dir
         init_option.log_level = eic.LogLevel(eic_log_level)
         init_option.transport_type = eic.TransportType(eic_trans_type)
-        init_option.flag_file = eic_flag_file
+        if eic_flag_file is not None:
+            init_option.flag_file = eic_flag_file
 
         if G_EnableGPUNicAffinity:
             gpu_id = torch.cuda.current_device()

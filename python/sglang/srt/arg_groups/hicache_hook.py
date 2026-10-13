@@ -38,6 +38,15 @@ def handle_eic_env(server_args: Any):
         return
     cfg = resolving_view(server_args)
     enabled = parse_eic_switch(os.environ.get(ENV_ENABLE_EIC_CACHE))
+    if not enabled and getattr(cfg, "hicache_storage_backend", None) == "eic":
+        # The env switch disables EIC, but the pluggable EIC storage
+        # backend would still be built and fail late. Report the
+        # conflicting combination at argument resolution instead.
+        raise ValueError(
+            "EnableEicCache is not 'True' (EIC disabled) but "
+            "--hicache-storage-backend eic requires EIC: remove the "
+            "storage backend or set EnableEicCache=True"
+        )
     if enabled:
         # Raises ValueError on a missing or invalid endpoint / instance id.
         load_eic_config(cli_enabled=bool(getattr(cfg, "enable_eic_cache", False)))

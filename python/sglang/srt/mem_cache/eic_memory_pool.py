@@ -85,9 +85,10 @@ CPUNicAffinity = {
 
 
 def get_eic_config_file_path():
-    if os.environ.get(REMOTE_EIC_YAML_ENV_VAR) is not None:
+    # An empty REMOTE_EIC_YAML counts as unset, matching eic_env_config.
+    config_file = os.environ.get(REMOTE_EIC_YAML_ENV_VAR)
+    if config_file:
         logger.info(f"eic init with env var {REMOTE_EIC_YAML_ENV_VAR}")
-        config_file = os.environ.get(REMOTE_EIC_YAML_ENV_VAR)
     else:
         config_file = "/sgl-workspace/config/remote-eic.yaml"
         logger.info(f"eic init with default config, config_file {config_file}")
