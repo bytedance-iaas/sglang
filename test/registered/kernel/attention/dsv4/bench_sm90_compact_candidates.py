@@ -3,6 +3,9 @@
 Uses the production 2048 x 8 candidate budget and exact-by-score checks. Query
 projection, RoPE, attention and serving are excluded. Consumers use identical
 source-selected blocks, so cutoff ties cannot change the compared workload.
+Source baselines use grouped full-width scoring and mask publication; consumer
+baselines use the prefix path's full-mask compatibility mode. The automatic
+paths publish and consume compact blocks without environment switches.
 """
 
 import json
@@ -13,7 +16,6 @@ import torch
 from bench_sm90_fp4_grouped_indexer import interleaved_times
 from test_sm90_length_aware_indexer import TestSm90LengthAwareIndexer
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     CandidateMasks,
     published_masks,
@@ -65,8 +67,7 @@ def benchmark():
             source = check.fixture.make_backend_case(x, "source", 512)
             source.layer.indexer.candidate_topk_blocks = 2048
             source.layer.indexer.candidate_block_size = 8
-            with envs.SGLANG_OPT_DSV41_SM90_COMPACT_CANDIDATES.override(True):
-                check.run_case(source)
+            check.run_case(source)
             candidates = source.state.forward_metadata.candidate_metadata
             mask = published_masks(candidates).mask
         else:
@@ -77,14 +78,16 @@ def benchmark():
                 case.state.forward_metadata.candidate_metadata = (
                     candidates if compact else CandidateMasks(mask=mask)
                 )
-            with envs.SGLANG_OPT_DSV41_SM90_COMPACT_CANDIDATES.override(compact):
+            if role == "source" and not compact:
+                case.run_mapped()
+            else:
                 check.run_case(case)
 
         for compact in (False, True):
             run(compact)
             check.check_outputs(x, case, role, mask)
         times = interleaved_times(
-            {"stage2": lambda: run(False), "compact": lambda: run(True)},
+            {"mask": lambda: run(False), "compact": lambda: run(True)},
             rounds,
             target_ms,
             batch=10,
