@@ -347,14 +347,16 @@ def _run_mega_routed(
         shared_block_m = 0
         if shared_l1_weights is not None:
             shared_block_m = deep_gemm.get_block_m_for_mega_moe(
-                num_ranks=buf.group.size(),
-                num_experts=buf.num_experts,
+                # This helper is a positional-only pybind function in the
+                # DeepGEMM shared-MegaMoE ABI.
+                buf.group.size(),
+                buf.num_experts,
                 # DeepGEMM rounds the requested capacity up for its buffer.
-                num_max_tokens_per_rank=buf.num_max_tokens_per_rank,
+                buf.num_max_tokens_per_rank,
                 # Match the non-null output allocation passed to DeepGEMM.
-                num_tokens=max(num_tokens, 1),
-                num_topk=buf.num_topk,
-                mma_type=buf.mma_type,
+                max(num_tokens, 1),
+                buf.num_topk,
+                buf.mma_type,
             )
         mega_moe_pre_dispatch(
             hidden_states,

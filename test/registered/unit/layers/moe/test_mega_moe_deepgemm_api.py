@@ -458,6 +458,11 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         )
         self.assertIs(pre_dispatch.call_args.kwargs["shared_x_sf"], shared_x_sf)
         self.assertEqual(pre_dispatch.call_args.kwargs["shared_block_m"], 32)
+        self.assertEqual(
+            deep_gemm.get_block_m_for_mega_moe.call_args.args,
+            (8, 8, 64, 1, 2, "fp8xfp8"),
+        )
+        self.assertEqual(deep_gemm.get_block_m_for_mega_moe.call_args.kwargs, {})
         kernel_call = deep_gemm.fp8_fp4_mega_moe.call_args
         self.assertIs(kernel_call.args[1], routed_l1)
         self.assertIs(kernel_call.args[2], routed_l2)
