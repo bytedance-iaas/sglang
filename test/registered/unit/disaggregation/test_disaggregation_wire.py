@@ -32,6 +32,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
 )
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
+    build_state_transfer_entry_pairs,
     get_dsv4_c128_state_indices,
     setup_state_kv_args,
 )
@@ -145,6 +146,42 @@ class TestDisaggregationWire(unittest.TestCase):
 
 
 class TestCPReplicatedStateTransfer(unittest.TestCase):
+    def test_state_pairs_skip_elided_entry_on_either_peer(self):
+        cases = [
+            ([64, 0, 64], [64, 64, 64]),
+            ([64, 64, 64], [64, 0, 64]),
+        ]
+        for src_lens, dst_lens in cases:
+            with self.subTest(src_lens=src_lens, dst_lens=dst_lens):
+                self.assertEqual(
+                    build_state_transfer_entry_pairs(
+                        src_item_lens=src_lens,
+                        dst_item_lens=dst_lens,
+                        src_layer_ids=[10, 20, 30],
+                        dst_layer_ids=[30, 20, 10],
+                    ),
+                    [(0, 2), (2, 0)],
+                )
+
+    def test_state_pairs_reject_non_elided_stride_mismatch(self):
+        with self.assertRaisesRegex(RuntimeError, "item length mismatch"):
+            build_state_transfer_entry_pairs(
+                src_item_lens=[64],
+                dst_item_lens=[32],
+                src_layer_ids=[10],
+                dst_layer_ids=[10],
+            )
+
+    def test_state_pairs_allow_pp1_positional_fallback(self):
+        self.assertEqual(
+            build_state_transfer_entry_pairs(
+                src_item_lens=[64, 0],
+                dst_item_lens=[64, 64],
+                allow_positional_fallback=True,
+            ),
+            [(0, 0)],
+        )
+
     def test_only_nonzero_cp_ranks_without_layer_split_skip_state(self):
         cases = [
             (1, 0, False, False),

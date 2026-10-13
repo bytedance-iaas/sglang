@@ -41,6 +41,7 @@ from sglang.srt.disaggregation.common.utils import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    build_state_transfer_entry_pairs,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
     resolve_dcp_dst_entry_indices,
@@ -1496,6 +1497,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_mem_kind: str = "VRAM",
         force_flat: bool = False,
         bypass_prepped: bool = False,
+        dst_item_lens: Optional[list[int]] = None,
+        src_layer_ids: Optional[list[int]] = None,
+        dst_layer_ids: Optional[list[int]] = None,
     ):
         """Generic KV cache transfer supporting both MHA and MLA architectures.
         Used by both send_kvcache and maybe_send_extra.
@@ -1541,6 +1545,21 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             return xfer_handle
 
         # Non-prepped path: used for state transfers (SWA/NSA) via maybe_send_extra.
+        # DSA index-K pools keep one layer-aligned entry per model layer; shared
+        # producer layers use a 0-row buffer. Pair by model layer before PP
+        # pointer slicing, and drop an entry when either peer elided it.
+        if state_type == StateType.DSA and dst_item_lens is not None:
+            pairs = build_state_transfer_entry_pairs(
+                src_item_lens=item_lens,
+                dst_item_lens=dst_item_lens,
+                src_layer_ids=src_layer_ids,
+                dst_layer_ids=dst_layer_ids,
+                allow_positional_fallback=self.pp_size == 1,
+            )
+            src_data_ptrs = [src_data_ptrs[i] for i, _ in pairs]
+            dst_data_ptrs = [dst_data_ptrs[j] for _, j in pairs]
+            item_lens = [item_lens[i] for i, _ in pairs]
+
         # Convert pointer lists to np.uint64 arrays up front.
         # torch.int exceeds np.int64 range on Intel XPU (addresses have bit 63 set, e.g.
         # 0xffff81ab54e01000). Casting here prevents overflow when these values
@@ -2396,6 +2415,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     dst_gpu_id=dst_gpu_id,
                     notif=comp_notif,
                     state_type=st,
+                    dst_item_lens=dst_lens if st == StateType.DSA else None,
+                    src_layer_ids=src_lids if st == StateType.DSA else None,
+                    dst_layer_ids=dst_lids if st == StateType.DSA else None,
                 )
             elif st == StateType.MINIMAX_INDEX_K:
                 # Equal-TP / PP=1 only. Sub-pools are compacted sparse-layer

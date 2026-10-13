@@ -95,11 +95,16 @@ logger = logging.getLogger(__name__)
 
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     memory_config = get_memory()
+    disagg = get_disagg()
+    supports_layout = disagg.disaggregation_mode == "null" or (
+        disagg.disaggregation_transfer_backend == "nixl"
+        and not memory_config.enable_hierarchical_cache
+    )
     return (
         not memory_config.enable_hisparse
         and not is_draft_worker
         and not memory_config.enable_hierarchical_cache
-        and get_disagg().disaggregation_mode == "null"
+        and supports_layout
     )
 
 

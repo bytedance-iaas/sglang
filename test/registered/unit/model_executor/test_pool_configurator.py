@@ -81,6 +81,7 @@ def _make_model_runner(
     speculative_num_steps=None,
     speculative_eagle_topk=None,
     disaggregation_mode="null",
+    disaggregation_transfer_backend="mooncake",
     max_running_requests=None,
     disaggregation_decode_extra_slots=0,
     kv_lora_rank=512,
@@ -146,6 +147,7 @@ def _make_model_runner(
         speculative_num_steps=speculative_num_steps,
         speculative_eagle_topk=speculative_eagle_topk,
         disaggregation_mode=disaggregation_mode,
+        disaggregation_transfer_backend=disaggregation_transfer_backend,
         max_running_requests=max_running_requests,
         disaggregation_decode_extra_slots=disaggregation_decode_extra_slots,
         enable_hisparse=False,
@@ -852,6 +854,36 @@ class TestDSAIndexerAllocationPolicy(CustomTestCase):
             cfg = DefaultPoolConfigurator(mr)
 
         self.assertEqual(cfg._cell_size, (576 + 132) * num_layers)
+
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_nixl_pd_prices_producer_layers_only(
+        self,
+        _mock_calculate_mla_kv_cache_dim,
+    ):
+        num_layers = 6
+        mr = _make_model_runner(
+            self,
+            num_layers=num_layers,
+            use_mla_backend=True,
+            disaggregation_mode="prefill",
+            disaggregation_transfer_backend="nixl",
+        )
+        _configure_dsa_model(mr)
+        mr.model_config.hf_config.index_topk_freq = 4
+        mr.model_config.hf_config.index_skip_topk_offset = 3
+
+        with mock_cpu_env(kv_size=1):
+            from sglang.srt.model_executor.pool_configurator import (
+                DefaultPoolConfigurator,
+            )
+
+            cfg = DefaultPoolConfigurator(mr)
+
+        producer_layers = 3
+        self.assertEqual(cfg._cell_size, 576 * num_layers + 132 * producer_layers)
 
 
 class TestFactory(CustomTestCase):

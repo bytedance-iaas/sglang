@@ -10,6 +10,7 @@ from typing import (
     List,
     Literal,
     Optional,
+    Sequence,
     Tuple,
     Type,
     overload,
@@ -913,6 +914,51 @@ def build_transfer_entry_pairs(
             f"both peers; got src={n_src} dst={n_dst} entries"
         )
     return [(i, i) for i in range(n_src)]
+
+
+def is_elided_entry(
+    src_len: int,
+    dst_lens: Optional[Sequence[int]],
+    dst_index: int,
+) -> bool:
+    """Whether either peer represents this state entry as a 0-row buffer."""
+    return src_len == 0 or (
+        dst_lens is not None and dst_index < len(dst_lens) and dst_lens[dst_index] == 0
+    )
+
+
+def build_state_transfer_entry_pairs(
+    *,
+    src_item_lens: Sequence[int],
+    dst_item_lens: Sequence[int],
+    src_layer_ids: Optional[List[int]] = None,
+    dst_layer_ids: Optional[List[int]] = None,
+    allow_positional_fallback: bool = False,
+) -> List[Tuple[int, int]]:
+    """Pair state entries and drop 0-row entries elided by either peer.
+
+    Non-elided entries must retain identical per-token strides. This keeps the
+    existing transfer arithmetic valid while allowing producer-only DSA index-K
+    pools to preserve layer-aligned wire metadata.
+    """
+    pairs = build_transfer_entry_pairs(
+        src_layer_ids or [],
+        dst_layer_ids or [],
+        len(src_item_lens),
+        len(dst_item_lens),
+        allow_positional_fallback=allow_positional_fallback,
+    )
+    result = []
+    for i, j in pairs:
+        if is_elided_entry(src_item_lens[i], dst_item_lens, j):
+            continue
+        if src_item_lens[i] != dst_item_lens[j]:
+            raise RuntimeError(
+                "State item length mismatch for paired entries "
+                f"src[{i}]={src_item_lens[i]} dst[{j}]={dst_item_lens[j]}"
+            )
+        result.append((i, j))
+    return result
 
 
 def build_kv_layer_ids(
