@@ -485,6 +485,22 @@ def _apply_wo_a_bf16_matmul(
     # o [T, G, D] @ wo_a [G, R, D] -> [T, G, R]; the fast paths below are gated
     # on the exact validated TP4 shapes and write token-major output directly.
     global _wo_a_aiter_batched_gemm_disabled
+    if (
+        fast_path
+        and _is_cuda
+        and is_target_verify
+        and envs.SGLANG_OPT_DSV41_SM90_WO_A.get()
+        and get_platform().is_sm90
+        and 96 <= o.shape[0] <= 192
+        and o.shape[1:] == (8, 4096)
+        and wo_a.shape == (8, 1024, 4096)
+        and o.dtype == wo_a.dtype == torch.bfloat16
+        and o.is_contiguous()
+        and wo_a.is_contiguous()
+    ):
+        from sglang.kernels.ops.attention.dsv4.sm90_wo_a import wo_a_bf16_sm90
+
+        return wo_a_bf16_sm90(o, wo_a)
     # the gfx950 routes, like the CUDA ones, are V4.1's (fast_path); DSv4 keeps the
     # aiter batched GEMM / einsum below
     hip_fast_path = fast_path and _is_hip and _is_gfx95_supported

@@ -1647,6 +1647,8 @@ class Envs:
     # Compact candidate lists for the length-aware static-verify path. Sources
     # reuse prefix scores; consumers visit selected blocks instead of full masks.
     SGLANG_OPT_DSV41_SM90_COMPACT_CANDIDATES = EnvBool(False)
+    # BF16 O-A with 8 local groups and 96..192 target-verify rows; H20 opt-in.
+    SGLANG_OPT_DSV41_SM90_WO_A = EnvBool(False)
     # Overlap layers 1/14's shared-host embedding lookups with earlier layers. The
     # WKV projection stays on the main stream so this path works on Hopper and
     # with DP attention without introducing a side-stream collective or GEMM.
