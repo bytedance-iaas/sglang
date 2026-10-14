@@ -74,17 +74,17 @@ and page mappings across CUDA Graph replay. Native 64-head dispatch remains
 covered by the existing tests.
 
 ```bash
-PYTHONPATH=python python3 test/registered/kernel/attention/dsv4/test_sm90_fp4_grouped_indexer.py -v
+PYTHONPATH=python python3 test/registered/kernels/ops/attention/dsv4/test_sm90_fp4_grouped_indexer.py -v
 
 PYTHONPATH=python SM90_INDEXER_BENCH_HEADS=32 SM90_INDEXER_BENCH_RATIO=1 \
   SM90_INDEXER_BENCH_CASES='12:16384:0.5,48:16384:0.5,12:1048896:0.00781031,48:1048896:0.00781031' \
   SM90_INDEXER_BENCH_OUTPUT=/tmp/sm90-indexer-32-heads-ratio1.json \
-  python3 test/registered/kernel/attention/dsv4/bench_sm90_fp4_grouped_indexer.py
+  python3 test/registered/kernels/benchmark/attention/dsv4/bench_sm90_fp4_grouped_indexer.py
 
 PYTHONPATH=python SM90_INDEXER_BENCH_HEADS=32 SM90_INDEXER_BENCH_RATIO=2 \
   SM90_INDEXER_BENCH_CASES='12:8192:0.5,48:8192:0.5,12:524480:0.00781,48:524480:0.00781' \
   SM90_INDEXER_BENCH_OUTPUT=/tmp/sm90-indexer-32-heads-ratio2.json \
-  python3 test/registered/kernel/attention/dsv4/bench_sm90_fp4_grouped_indexer.py
+  python3 test/registered/kernels/benchmark/attention/dsv4/bench_sm90_fp4_grouped_indexer.py
 ```
 
 `width` is measured after compression. Repeat with seed 23 and new output
@@ -213,12 +213,12 @@ with zero errors. A separate graph-replay initcheck covering ordinary, source
 and consumer paths passed without suppressions.
 
 ```bash
-PYTHONPATH=python python3 test/registered/kernel/attention/dsv4/test_sm90_length_aware_indexer.py -v
+PYTHONPATH=python python3 test/registered/kernels/ops/attention/dsv4/test_sm90_length_aware_indexer.py -v
 
 PYTHONPATH=python SM90_PREFIX_BENCH_SEED=11 \
   SM90_PREFIX_BENCH_CASES='12:524480:4096:2:none,48:1048896:8192:1:none,48:1048896:8192:1:source,48:1048896:8192:1:consumer' \
   SM90_PREFIX_BENCH_OUTPUT=/tmp/sm90-prefix-seed11.json \
-  python3 test/registered/kernel/attention/dsv4/bench_sm90_length_aware_indexer.py
+  python3 test/registered/kernels/benchmark/attention/dsv4/bench_sm90_length_aware_indexer.py
 ```
 
 Repeat with seed 23 and a new filename. The benchmark checks all three paths
@@ -302,11 +302,11 @@ underfilled TopK without raw output, and graph replay across dense/sparse/empty
 candidate layouts. They extend the same length-aware test file above.
 
 ```bash
-PYTHONPATH=python python3 test/registered/kernel/attention/dsv4/test_sm90_length_aware_indexer.py -v
+PYTHONPATH=python python3 test/registered/kernels/ops/attention/dsv4/test_sm90_length_aware_indexer.py -v
 
 PYTHONPATH=python SM90_COMPACT_BENCH_SEED=11 \
   SM90_COMPACT_BENCH_OUTPUT=/tmp/sm90-compact-seed11.json \
-  python3 test/registered/kernel/attention/dsv4/bench_sm90_compact_candidates.py
+  python3 test/registered/kernels/benchmark/attention/dsv4/bench_sm90_compact_candidates.py
 ```
 
 The benchmark compares the existing full-mask path with the compact path on
@@ -396,11 +396,11 @@ profiler replay durations are not used as A/B latency measurements.
 From the repository root, with Hopper/CUDA dependencies installed:
 
 ```bash
-PYTHONPATH=python python3 test/registered/kernel/attention/dsv4/test_sm90_fp4_grouped_indexer.py -v
+PYTHONPATH=python python3 test/registered/kernels/ops/attention/dsv4/test_sm90_fp4_grouped_indexer.py -v
 
 PYTHONPATH=python SM90_INDEXER_BENCH_SEED=11 \
   SM90_INDEXER_BENCH_OUTPUT=/tmp/sm90-indexer-seed11.json \
-  python3 test/registered/kernel/attention/dsv4/bench_sm90_fp4_grouped_indexer.py
+  python3 test/registered/kernels/benchmark/attention/dsv4/bench_sm90_fp4_grouped_indexer.py
 ```
 
 The benchmark toggles the opt-in flag during separate graph captures; it does
@@ -452,7 +452,7 @@ remain a limitation of full-backend initcheck on this environment. Do not report
 an exception-assisted run as an unqualified clean initcheck run.
 
 For this exact binary, add
-`--suppressions test/registered/kernel/attention/dsv4/pytorch-2.13-topk-initcheck.xml`
+`--suppressions test/registered/kernels/ops/attention/dsv4/pytorch-2.13-topk-initcheck.xml`
 to the initcheck command. The signatures are `computeBlockDigitCounts+0x260`
 and `computeBlockwiseWithinKCounts+0x380`, each a four-byte global read. An
 intentional uninitialized-read Triton negative control still reports an error

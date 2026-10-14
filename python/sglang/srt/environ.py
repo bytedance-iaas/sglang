@@ -1644,6 +1644,8 @@ class Envs:
     # and length-aware TopK v2. Requires GROUPED_INDEXER. Equal-score cutoff
     # ties may select different positions than PyTorch; default remains off.
     SGLANG_OPT_DSV41_SM90_LENGTH_AWARE_INDEXER = EnvBool(False)
+    # Exact bitwise FP4 decode plus pipelined prefix scoring; H20 opt-in A/B.
+    SGLANG_OPT_DSV41_SM90_PREFIX_LOGITS = EnvBool(False)
     # Compact candidate lists for the length-aware static-verify path. Sources
     # reuse prefix scores; consumers visit selected blocks instead of full masks.
     SGLANG_OPT_DSV41_SM90_COMPACT_CANDIDATES = EnvBool(False)

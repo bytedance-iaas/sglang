@@ -10,8 +10,7 @@ import os
 from pathlib import Path
 
 import torch
-from bench_sm90_fp4_grouped_indexer import interleaved_times
-from test_sm90_length_aware_indexer import TestSm90LengthAwareIndexer
+from bench_sm90_fp4_grouped_indexer import interleaved_times, load_test_fixture
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.candidate_indexer import select_candidate_blocks
@@ -36,7 +35,9 @@ def benchmark():
         "SM90_PREFIX_BENCH_CASES",
         "12:524480:4096:2:none,48:1048896:8192:1:source,48:1048896:8192:1:consumer",
     ).split(",")
-    check = TestSm90LengthAwareIndexer("test_backend_roles_and_layouts")
+    check = load_test_fixture(
+        "test_sm90_length_aware_indexer"
+    ).TestSm90LengthAwareIndexer("test_backend_roles_and_layouts")
     check.setUp()
     records = []
     for shape in cases:

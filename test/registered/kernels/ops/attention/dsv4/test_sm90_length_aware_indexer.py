@@ -129,6 +129,109 @@ class TestSm90LengthAwareIndexer(CustomTestCase):
                 actual[:, :width][valid], expected[valid], atol=0, rtol=0
             )
 
+    def test_fast_prefix_graph_at_steady_batch(self):
+        # Exercise dispatch boundaries and 16/19/20/30/32 requests x 6 tokens.
+        # Replay changes both row lengths and non-prefix candidate block lists.
+        for rows, ratio in (
+            (95, 2),
+            (96, 1),
+            (96, 2),
+            (114, 1),
+            (114, 2),
+            (120, 1),
+            (120, 2),
+            (132, 1),
+            (180, 2),
+            (192, 1),
+            (193, 1),
+        ):
+            width = 18435
+            x = self.fixture.make_inputs(rows=rows, width=width, ratio=ratio, heads=32)
+            lengths = x.lens.int()
+            visible = lengths.clone()
+            candidates = CandidateBlocks(
+                blocks=torch.arange(2048, device="cuda", dtype=torch.int32)
+                .expand(rows, -1)
+                .contiguous(),
+                lengths=torch.full((rows,), 16384, device="cuda", dtype=torch.int32),
+                is_prefix=torch.ones(rows, device="cuda", dtype=torch.int32),
+                width=width,
+                block_size=8,
+            )
+            for compact in (False, True):
+                score_width = 16384 if compact else width
+
+                def run(enabled):
+                    with envs.SGLANG_OPT_DSV41_SM90_PREFIX_LOGITS.override(enabled):
+                        return prefix_logits(
+                            x.q,
+                            x.weights,
+                            x.mapping,
+                            x.req,
+                            lengths,
+                            x.table,
+                            x.page,
+                            ratio,
+                            score_width,
+                            candidates=candidates if compact else None,
+                            visible=visible if compact else None,
+                        )
+
+                for _ in range(3):
+                    run(True)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    actual = run(True)
+                    selected = select_prefix_topk(actual, lengths, 512)
+                for maximum in (18435, 513, 0, 1, 8193):
+                    visible.copy_(
+                        (maximum - torch.arange(rows, device="cuda") % 6).clamp_min(0)
+                    )
+                    lengths.copy_(visible.clamp_max(score_width))
+                    # A valid noncontiguous list includes the incomplete final block.
+                    candidates.blocks.copy_(
+                        (
+                            torch.arange(2048, device="cuda", dtype=torch.int32) + 257
+                        ).expand(rows, -1)
+                    )
+                    candidates.is_prefix.zero_()
+                    x.mapping.copy_(x.mapping.roll(x.page * ratio, 1))
+                    x.q.copy_(x.q.roll(1, 1))
+                    graph.replay()
+                    expected = run(False)
+                    valid = (
+                        torch.arange(score_width, device="cuda")[None, :]
+                        < lengths[:, None]
+                    )
+                    torch.testing.assert_close(
+                        actual[:, :score_width][valid],
+                        expected[:, :score_width][valid],
+                        atol=0,
+                        rtol=0,
+                    )
+                    # TopK has arbitrary output order and cutoff-tie selection.
+                    idx = selected.long()
+                    got = expected.gather(1, idx.clamp_min(0)).masked_fill(
+                        idx < 0, -torch.inf
+                    )
+                    want = (
+                        expected[:, :score_width]
+                        .masked_fill(~valid, -torch.inf)
+                        .topk(512)
+                        .values
+                    )
+                    torch.testing.assert_close(
+                        got.sort(descending=True).values, want, atol=0, rtol=0
+                    )
+                    self.assertTrue(torch.all((idx < 0) | (idx < lengths[:, None])))
+                    ordered = idx.sort().values
+                    self.assertTrue(
+                        torch.all(
+                            (ordered[:, 1:] != ordered[:, :-1]) | (ordered[:, 1:] < 0)
+                        )
+                    )
+                graph.reset()
+
     def test_topk_ignores_tail_and_handles_ties(self):
         for width in (1028, 131072):
             lens = torch.tensor(
