@@ -307,6 +307,8 @@ class DSAMetadata:
     # metadata instance. Graph capture therefore keeps the scheduler buffers
     # alive without sharing them across batch sizes or phases.
     kpool_flashmla_sched_meta: dict[tuple, object] = field(default_factory=dict)
+    # Capture/eager buffers belong to this metadata instance and one stream.
+    kpool_flashmla_pad_buffers: dict[tuple, torch.Tensor] = field(default_factory=dict)
 
 
 @torch.compile
@@ -2332,6 +2334,12 @@ class DeepseekSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                query_len=(
+                    6
+                    if forward_batch.forward_mode.is_target_verify()
+                    and self.speculative_num_draft_tokens == 6
+                    else 1
+                ),
             )
         elif dsa_impl == "fa3":
             return self._forward_fa3(
@@ -3097,13 +3105,15 @@ class DeepseekSparseAttnBackend(
         layer,
         metadata: DSAMetadata,
         page_table_1,
+        query_len: int = 1,
     ) -> torch.Tensor:
         from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
         cache_seqlens = metadata.dsa_cache_seqlens_int32
         assert metadata.flashmla_metadata is not None
 
-        # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
+        # Preserve the legacy flattened output/call contract unless the native
+        # MTP experiment explicitly selects a supported grouped query below.
         q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
         num_q_heads = q_all.shape[2]
         target_q_heads = self.flashmla_kv_num_q_heads
@@ -3127,12 +3137,55 @@ class DeepseekSparseAttnBackend(
         if use_kpool_native_v32:
             from sgl_kernel.flash_mla import FlashMLASchedMeta
 
+            stream_id = int(torch.cuda.current_stream(q_input.device).cuda_stream)
             padding = (-page_table_1.shape[-1]) % 64
             if padding:
-                page_table_1 = torch.nn.functional.pad(
-                    page_table_1, (0, padding), value=-1
-                )
+                if (
+                    envs.SGLANG_EXPERIMENTAL_DSA_KPOOL_FUSED_SENTINEL_PAD.get()
+                    and page_table_1.is_contiguous()
+                ):
+                    from sglang.kernels.ops.attention.dsa.sentinel_pad import (
+                        pad_kpool_indices,
+                    )
+
+                    pad_key = (
+                        stream_id,
+                        q_input.device.index,
+                        page_table_1.shape[0],
+                        page_table_1.shape[1],
+                        padding,
+                    )
+                    buffer = metadata.kpool_flashmla_pad_buffers.get(pad_key)
+                    if buffer is None:
+                        buffer = page_table_1.new_empty(
+                            page_table_1.shape[0], page_table_1.shape[1] + padding
+                        )
+                        metadata.kpool_flashmla_pad_buffers[pad_key] = buffer
+                    page_table_1 = pad_kpool_indices(page_table_1, buffer)
+                else:
+                    page_table_1 = torch.nn.functional.pad(
+                        page_table_1, (0, padding), value=-1
+                    )
             indices = page_table_1.unsqueeze(1)
+            if (
+                envs.SGLANG_EXPERIMENTAL_DSA_KPOOL_MTP_QUERY6.get()
+                and query_len == 6
+                and q_input.shape[0] > 0
+                and q_input.shape[0] % 6 == 0
+                and page_table_1.shape[0] == q_input.shape[0]
+                and q_input.is_contiguous()
+            ):
+                query_batch = q_input.shape[0] // 6
+                q_input = q_input.view(query_batch, 6, target_q_heads, layer.head_dim)
+                indices = page_table_1.view(query_batch, 6, page_table_1.shape[-1])
+                if not getattr(self, "_kpool_query6_dispatch_logged", False):
+                    logger.info(
+                        "Activated experimental native MTP query6 route: "
+                        "rows=%d query_batch=%d query_len=6",
+                        q_all.shape[0],
+                        query_batch,
+                    )
+                    self._kpool_query6_dispatch_logged = True
             if not getattr(self, "_kpool_flashmla_v32_dispatch_logged", False):
                 logger.info(
                     "Activated experimental DSA KPool native FlashMLA route: "
@@ -3146,7 +3199,6 @@ class DeepseekSparseAttnBackend(
                     indices.shape[-1],
                 )
                 self._kpool_flashmla_v32_dispatch_logged = True
-            stream_id = int(torch.cuda.current_stream(q_input.device).cuda_stream)
             sched_key = (
                 stream_id,
                 q_input.shape[0],
@@ -3193,7 +3245,9 @@ class DeepseekSparseAttnBackend(
         if target_q_heads != num_q_heads:
             o = o[:, :, :num_q_heads, :]
 
-        return o
+        # The owning caller expects token-major rows with a singleton query
+        # dimension, including captured padding rows and head-count padding.
+        return o.reshape(-1, 1, num_q_heads, v_head_dim)
 
     def _forward_standard_mha(
         self,

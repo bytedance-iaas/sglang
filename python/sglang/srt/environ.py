@@ -1335,6 +1335,8 @@ class Envs:
     # V3.2 does not support dynamic topk_length, so the consumer pads the fixed
     # Graph width to a 64-column multiple and marks invalid columns with -1.
     SGLANG_EXPERIMENTAL_DSA_KPOOL_FLASHMLA_V32 = EnvBool(False)
+    SGLANG_EXPERIMENTAL_DSA_KPOOL_MTP_QUERY6 = EnvBool(False)
+    SGLANG_EXPERIMENTAL_DSA_KPOOL_FUSED_SENTINEL_PAD = EnvBool(False)
 
     # ===================================================================
     # Kernel selection and fused backends

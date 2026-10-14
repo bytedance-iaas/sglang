@@ -44,6 +44,89 @@ def _backend(**overrides):
 
 
 class TestDSAKPoolFlashMLAV32(unittest.TestCase):
+    def test_query6_preserves_rows_output_and_scheduler_ownership(self):
+        captured = []
+        flashmla = ModuleType("sgl_kernel.flash_mla")
+        flashmla.FlashMLASchedMeta = _FakeSchedMeta
+
+        def run(**kwargs):
+            captured.append(kwargs)
+            return kwargs["q"].clone(), None
+
+        flashmla.flash_mla_with_kvcache = run
+        sgl_kernel = ModuleType("sgl_kernel")
+        sgl_kernel.flash_mla = flashmla
+        backend = _backend()
+        metadata = SimpleNamespace(
+            dsa_cache_seqlens_int32=torch.full((96,), 2048, dtype=torch.int32),
+            flashmla_metadata=SimpleNamespace(),
+            kpool_flashmla_sched_meta={},
+        )
+        q = torch.arange(96 * 2 * 512).reshape(96, 2, 512).float()
+        kv = torch.empty((64, 64, 1, 528), dtype=torch.float8_e4m3fn)
+        indices = torch.arange(96 * 2051, dtype=torch.int32).view(96, 2051)
+        with (
+            patch.dict(
+                "sys.modules",
+                {"sgl_kernel": sgl_kernel, "sgl_kernel.flash_mla": flashmla},
+            ),
+            patch.object(
+                envs.SGLANG_EXPERIMENTAL_DSA_KPOOL_FLASHMLA_V32,
+                "get",
+                return_value=True,
+            ),
+            patch.object(
+                envs.SGLANG_EXPERIMENTAL_DSA_KPOOL_FUSED_SENTINEL_PAD,
+                "get",
+                return_value=False,
+            ),
+        ):
+            for enabled, stream, query_len in [
+                (False, 7, 6),
+                (True, 7, 6),
+                (True, 8, 6),
+                (True, 7, 1),
+            ]:
+                with (
+                    patch.object(
+                        envs.SGLANG_EXPERIMENTAL_DSA_KPOOL_MTP_QUERY6,
+                        "get",
+                        return_value=enabled,
+                    ),
+                    patch(
+                        "torch.cuda.current_stream",
+                        return_value=SimpleNamespace(cuda_stream=stream),
+                    ),
+                ):
+                    output = DeepseekSparseAttnBackend._forward_flashmla_kv(
+                        backend,
+                        q,
+                        kv,
+                        512,
+                        1.0,
+                        SimpleNamespace(tp_q_head_num=2, head_dim=512),
+                        metadata,
+                        indices,
+                        query_len=query_len,
+                    )
+                    self.assertEqual(output.shape, (96, 1, 2, 512))
+                    self.assertTrue(torch.equal(output[:, 0], q))
+                    self.assertTrue(
+                        torch.equal(
+                            captured[-1]["indices"].reshape(96, -1)[:, :2051], indices
+                        )
+                    )
+                    self.assertTrue(
+                        torch.all(captured[-1]["indices"][..., 2051:] == -1)
+                    )
+        self.assertEqual(captured[0]["q"].shape, (96, 1, 2, 512))
+        self.assertEqual(captured[1]["q"].shape, (16, 6, 2, 512))
+        self.assertEqual(len(metadata.kpool_flashmla_sched_meta), 3)
+        self.assertIs(
+            captured[0]["tile_scheduler_metadata"],
+            captured[3]["tile_scheduler_metadata"],
+        )
+
     def test_router_requires_explicit_opt_in(self):
         backend = _backend()
         with patch.object(
