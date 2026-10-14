@@ -58,7 +58,9 @@ def main():
     args = parser.parse_args()
     if socket.gethostname() != args.expected_host:
         raise SystemExit("Refusing a host identity mismatch")
-    if not args.service.startswith("actions.runner.") or not args.service.endswith(".service"):
+    if not args.service.startswith("actions.runner.") or not args.service.endswith(
+        ".service"
+    ):
         raise SystemExit("Refusing an unexpected service")
     running = listeners(args.service)
     if len(running) != 1:
@@ -68,7 +70,9 @@ def main():
         while worker_active() and time.monotonic() < deadline:
             time.sleep(1)
     if worker_active() and not (args.stage_only or args.verify_only):
-        raise SystemExit("Runner.Worker is active; defer the restart until the host is idle")
+        raise SystemExit(
+            "Runner.Worker is active; defer the restart until the host is idle"
+        )
     env = environment(running[0])
     exclusions = []
     for variable in ("NO_PROXY", "no_proxy"):
@@ -84,13 +88,22 @@ def main():
     escaped = merged.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
     content = f'{MARKER}\n[Service]\nEnvironment="NO_PROXY={escaped}"\nEnvironment="no_proxy={escaped}"\n'
     # Sort after an existing override.conf, which can also set NO_PROXY.
-    target = Path("/etc/systemd/system") / (args.service + ".d") / "zz-broker-direct.conf"
+    target = (
+        Path("/etc/systemd/system") / (args.service + ".d") / "zz-broker-direct.conf"
+    )
     if target.exists() and not target.read_text().startswith(MARKER):
         raise SystemExit("Refusing to replace an unrelated drop-in")
-    result = {"host": args.expected_host, "service": args.service,
-              "drop_in": str(target), "NO_PROXY": merged, "apply": args.apply}
+    result = {
+        "host": args.expected_host,
+        "service": args.service,
+        "drop_in": str(target),
+        "NO_PROXY": merged,
+        "apply": args.apply,
+    }
     if args.verify_only:
-        if not all(BROKER in env.get(key, "").split(",") for key in ("NO_PROXY", "no_proxy")):
+        if not all(
+            BROKER in env.get(key, "").split(",") for key in ("NO_PROXY", "no_proxy")
+        ):
             raise SystemExit("The active listener is missing Broker direct routing")
         if not target.exists() or not target.read_text().startswith(MARKER):
             raise SystemExit("The persistent Broker drop-in is missing")
@@ -123,8 +136,13 @@ def main():
         current = listeners(args.service)
         if len(current) == 1:
             current_env = environment(current[0])
-            if all(BROKER in current_env.get(key, "").split(",") for key in ("NO_PROXY", "no_proxy")):
-                subprocess.run(["systemctl", "is-active", "--quiet", args.service], check=True)
+            if all(
+                BROKER in current_env.get(key, "").split(",")
+                for key in ("NO_PROXY", "no_proxy")
+            ):
+                subprocess.run(
+                    ["systemctl", "is-active", "--quiet", args.service], check=True
+                )
                 result.update(listener_pid=int(current[0].name), verified=True)
                 print(json.dumps(result))
                 return

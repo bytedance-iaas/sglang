@@ -1,4 +1,5 @@
 name: Bytedance Maintain Build Runner
+run-name: Runner maintenance - ${{ inputs.operation || 'clean_disk' }} - ${{ inputs.runner }}
 
 on:
   workflow_dispatch:
