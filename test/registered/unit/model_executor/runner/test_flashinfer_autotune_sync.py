@@ -64,16 +64,15 @@ def _gate_worker(rank, world_size, master_port, cache_path, writer):
 class TestAutotuneTacticSyncGroup(CustomTestCase):
     def test_dsv41_pp_skips_state_free_dummy_forward(self):
         model_runner = SimpleNamespace(
-            ps=SimpleNamespace(pp_size=4),
             model_config=SimpleNamespace(
                 hf_config=SimpleNamespace(model_type="deepseek_v41")
             ),
         )
-        self.assertFalse(should_run_flashinfer_autotune(model_runner))
+        with get_parallel().override(pp_size=4):
+            self.assertFalse(should_run_flashinfer_autotune(model_runner))
 
     def test_dsv41_pp_allows_model_owned_prefill_only_autotune(self):
         model_runner = SimpleNamespace(
-            ps=SimpleNamespace(pp_size=2),
             model_config=SimpleNamespace(
                 hf_config=SimpleNamespace(model_type="deepseek_v41")
             ),
@@ -90,6 +89,7 @@ class TestAutotuneTacticSyncGroup(CustomTestCase):
             moe=SimpleNamespace(moe_runner_backend="flashinfer_mxfp4"),
         )
         with (
+            get_parallel().override(pp_size=2),
             patch.object(autotune, "get_exec", return_value=runtime),
             patch.object(
                 autotune.envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND,

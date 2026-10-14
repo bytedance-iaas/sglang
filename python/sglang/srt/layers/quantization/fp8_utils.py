@@ -618,11 +618,6 @@ def dispatch_w8a8_block_fp8_linear(
     1. The --fp8-gemm-backend server argument (preferred)
     2. Auto-detection based on hardware capabilities
     """
-    # Only Triton reads the block size at launch; DeepGEMM, the FlashInfer
-    # groupwise kernels and CUTLASS take 128-wide K blocks only.
-    if weight_block_size is not None and weight_block_size[1] != 128:
-        return partial(triton_w8a8_block_fp8_linear, act_scale_ue8m0=act_scale_ue8m0)
-
     backend = get_fp8_gemm_runner_backend()
     if backend.is_humming():
         if not get_platform().is_sm90:
