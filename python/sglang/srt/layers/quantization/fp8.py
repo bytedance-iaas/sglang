@@ -863,6 +863,8 @@ class Fp8LinearMethod(LinearMethodBase):
             and getattr(self.quant_config, "scale_fmt", None) == "ue8m0"
             and getattr(layer, "orig_dtype", None) == torch.bfloat16
             and not self.use_marlin
+            # Humming owns a packed cache; its raw fallback takes FP8 weights.
+            and not self.use_humming
             and not getattr(layer, "keep_plain_weight_layout", False)
         ):
             from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
