@@ -437,9 +437,11 @@ class ModelRunner:
 
         # Select plugin allocators after setting the device, before distributed
         # communicators can allocate symmetric memory.
+        # Use resolved settings so auto transport sees the effective EP size.
+        from sglang.srt.arg_groups.model_override_base import resolved_view
         from sglang.srt.plugins.fused_moe import prepare_fused_moe_worker
 
-        prepare_fused_moe_worker(server_args)
+        prepare_fused_moe_worker(resolved_view(server_args))
 
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().

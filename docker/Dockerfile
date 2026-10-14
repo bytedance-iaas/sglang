@@ -305,10 +305,6 @@ RUN --mount=type=secret,id=iaas_kernels_token \
         test "$INSTALL_IAAS_KERNELS" = "0"; \
     fi
 
-# Optional export target for archiving the exact wheel and its provenance.
-FROM scratch AS iaas_kernels_wheel
-COPY --from=iaas_kernels_builder /wheels/ /
-
 ########################################################
 # PARALLEL STAGE 3: FlashInfer Cache (needs torch_deps)
 ########################################################

@@ -15,8 +15,10 @@ build or GPU validation was performed. #824's Torch 2.13.0 results do not valida
 this branch's dependency combination.
 
 The direct prerequisites supplied by this port are #779's image lock, wheel
-builder, image checker, Dockerfile integration and worker initializer hooks.
-#791 already supplied the other MegaMoE routing and weight hooks.
+builder, image checker, Dockerfile integration, worker initializer hooks and
+`--megamoe-transport` argument. #791 already supplied the other MegaMoE routing
+and weight hooks. The worker hook receives the target branch's resolved settings
+so automatic transport selection uses the effective EP size rather than raw input.
 
 The packaging profile from #824 targets **linux/amd64, CUDA 13.0.3, Python 3.12,
 Torch 2.13.0, NVLink and RDMA**.
@@ -70,8 +72,6 @@ The image saves source/submodule SHAs, build ABI, wheel SHA256 and native librar
 SHA256 in `/opt/sglang/share/iaas-kernels/manifest.json`, alongside its lock file.
 The manifest records both native extensions, RDMA API/NVSHMEM versions, LTO source
 revision, build commands, compiler version, linker/archive hashes and link probe.
-Use target `iaas_kernels_wheel` with `--output type=local,dest=<directory>` and the
-same build arguments to export the wheel and provenance from the builder cache.
 The package currently uses version `0.1.0.dev0`; identify binaries by the pinned
 commit and wheel digest, not by the version string alone.
 
