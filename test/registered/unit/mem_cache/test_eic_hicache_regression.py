@@ -251,6 +251,52 @@ class TestEICHiCacheRegression(unittest.TestCase):
         freed = alloc.swa_attn_allocator.free.call_args[0][0]
         self.assertEqual(sorted(freed.tolist()), [512, 768])
 
+    def test_free_swa_drops_reserved_page_slots_without_dedup(self):
+        # Without dedup, slots in reserved page 0 ([1, page_size)) must
+        # still not be credited: page 0 is never allocated, so freeing it
+        # would push available_size() past the pool size.
+        from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+
+        alloc = object.__new__(SWATokenToKVPoolAllocator)
+        alloc.page_size = 256
+        alloc.swa_attn_allocator = mock.Mock()
+        alloc.full_to_swa_index_mapping = torch.tensor(
+            [0, 100, 255, 256, 512], dtype=torch.int64
+        )
+        alloc._expand_to_full_pages = lambda idx: idx
+        alloc.dedup_aliased_swa = False
+        alloc.free_group = None
+
+        SWATokenToKVPoolAllocator.free_swa(alloc, torch.arange(5))
+
+        freed = alloc.swa_attn_allocator.free.call_args[0][0]
+        self.assertEqual(sorted(freed.tolist()), [256, 512])
+
+    def test_free_swa_group_end_dedups_across_calls(self):
+        # Aliased slots freed in separate group entries must be freed
+        # once at group end, not once per entry.
+        from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+
+        alloc = object.__new__(SWATokenToKVPoolAllocator)
+        alloc.page_size = 256
+        alloc.swa_attn_allocator = mock.Mock()
+        alloc.full_to_swa_index_mapping = torch.tensor(
+            [512, 512, 768, 768], dtype=torch.int64
+        )
+        alloc._expand_to_full_pages = lambda idx: idx
+        alloc.dedup_aliased_swa = True
+        alloc.free_group = []
+        alloc.swa_free_group = []
+        alloc.full_free_group = []
+
+        SWATokenToKVPoolAllocator.free_swa(alloc, torch.arange(2))
+        SWATokenToKVPoolAllocator.free_swa(alloc, torch.arange(2, 4))
+        SWATokenToKVPoolAllocator.free_group_end(alloc)
+
+        self.assertEqual(alloc.swa_attn_allocator.free.call_count, 1)
+        freed = alloc.swa_attn_allocator.free.call_args[0][0]
+        self.assertEqual(sorted(freed.tolist()), [512, 768])
+
     def test_pp_bcast_from_first_is_nonblocking_isend(self):
         # PP consensus must be a non-blocking isend down the pipeline: the stages
         # run out of phase, so a collective or a blocking send/recv (which makes
