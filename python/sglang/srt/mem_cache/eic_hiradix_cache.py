@@ -336,6 +336,33 @@ class EICHiRadixCache(RadixCache):
         logger.info(
             f"EICHiRadixCache load_back_threshold set to {self.load_back_threshold}"
         )
+        self._probe_backoff_failures = int(config.get("eic_probe_backoff_failures", 3))
+        self._probe_backoff_seconds = float(config.get("eic_probe_backoff_seconds", 5.0))
+        self._probe_fail_streak = 0
+        self._probe_backoff_until = 0.0
+
+    def _probe_in_backoff(self) -> bool:
+        return time.monotonic() < getattr(self, "_probe_backoff_until", 0.0)
+
+    def _note_probe_result(self, lens) -> None:
+        # A wholesale-miss round means the data plane is failing (or the
+        # cache is cold); after a few in a row, stop probing on every
+        # scheduler iteration and retry after a cooldown. Any hit clears
+        # the state immediately.
+        if any(n > 0 for n in lens):
+            self._probe_fail_streak = 0
+            self._probe_backoff_until = 0.0
+            return
+        self._probe_fail_streak = getattr(self, "_probe_fail_streak", 0) + 1
+        failures = getattr(self, "_probe_backoff_failures", 3)
+        if self._probe_fail_streak >= failures:
+            seconds = getattr(self, "_probe_backoff_seconds", 5.0)
+            self._probe_backoff_until = time.monotonic() + seconds
+            self._probe_fail_streak = 0
+            logger.warning(
+                "EIC remote probe failing wholesale; skipping remote match "
+                f"for {seconds:.1f}s"
+            )
 
     def reset(self):
         TreeNode.counter = 0
@@ -1735,7 +1762,12 @@ class EICPagedHiRadixCache(EICHiRadixCache):
 
         fetches = []  # (slot, last_node, compute_key, prev_hash)
         eic_keys = 0
-        for slot in range(local_n):
+        # Probing runs on the scheduler thread every batch-forming loop,
+        # and a miss is retried next loop (only hits are marked). When
+        # the data plane is down every probe is an RPC timeout, so a
+        # wholesale-failure backoff keeps the loop from stalling on it.
+        probe_slots = 0 if self._probe_in_backoff() else local_n
+        for slot in range(probe_slots):
             req = waiting_queue[slot]
             if req.rid in self.match_req_set:
                 continue
@@ -1765,6 +1797,7 @@ class EICPagedHiRadixCache(EICHiRadixCache):
             lens = self.cache_controller.batch_find_longest_prefix_in_eic(
                 [f[2] for f in fetches], [f[3] for f in fetches]
             )
+            self._note_probe_result(lens)
             if len(lens) == len(fetches):
                 for (slot, *_), n in zip(fetches, lens):
                     len_tensor[slot] = n

@@ -1853,6 +1853,36 @@ class TestEICHiCacheRegression(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[1], ["k0", "k1"])
 
+    def test_probe_backoff_after_wholesale_failures(self):
+        # Probing runs on the scheduler thread every loop and a miss is
+        # retried next loop, so a down data plane stalls scheduling on
+        # RPC timeouts. After N wholesale-miss rounds the cache must
+        # stop probing for a cooldown; any hit clears the state.
+        from sglang.srt.mem_cache.eic_hiradix_cache import EICHiRadixCache
+
+        cache = object.__new__(EICHiRadixCache)
+        EICHiRadixCache.init_hyper_params(
+            cache,
+            {
+                "save_decode_cache": True,
+                "load_back_threshold": 10,
+                "eic_probe_backoff_failures": 3,
+                "eic_probe_backoff_seconds": 60.0,
+            },
+        )
+        self.assertFalse(cache._probe_in_backoff())
+        cache._note_probe_result([0, 0])
+        cache._note_probe_result([0])
+        self.assertFalse(cache._probe_in_backoff())
+        cache._note_probe_result([0, 0, 0])
+        self.assertTrue(cache._probe_in_backoff())
+        # A hit clears both the streak and an active backoff.
+        cache._note_probe_result([4])
+        self.assertFalse(cache._probe_in_backoff())
+        cache._note_probe_result([0])
+        cache._note_probe_result([0])
+        self.assertFalse(cache._probe_in_backoff())
+
     def test_memory_pool_refuses_a_region_the_client_will_not_register(self):
         # register_memory's bool return was dropped. An unregistered region still
         # "works": the client falls back to a CPU memcpy of whatever pointer it was
