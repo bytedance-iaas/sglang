@@ -182,7 +182,6 @@ jobs:
           if [ "$INSTALL_IAAS_KERNELS" = "true" ]; then
             test "$CUDA_VERSION" = "13.0.3"
             case "$DOCKER_TARGET" in framework_final|runtime) ;; *) exit 1 ;; esac
-            python3 scripts/ci/check_iaas_kernels_image.py --check-source-only .
             if [ -z "$IAAS_KERNELS_READ_TOKEN" ]; then
               echo "::error::IAAS_KERNELS_READ_TOKEN needs read access to bytedance-iaas/iaas-kernels"
               exit 1

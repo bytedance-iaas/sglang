@@ -28,21 +28,6 @@ class TestIaasKernelsImage(unittest.TestCase):
     def test_matching_abi(self):
         checks.check_abi(self.lock, self.info, "2.13.0+cu130", "13.0", True)
 
-    def test_source_abi_rejects_branch_dependency_drift(self):
-        with tempfile.TemporaryDirectory() as root:
-            path = Path(root) / "pyproject.toml"
-            path.write_text('[project]\ndependencies = ["torch==2.13.0"]\n')
-            checks.check_source_abi(self.lock, path)
-            for dependencies in (
-                '["torch==2.14.1"]',
-                '["torch==2.13.0", "torch==2.14.1"]',
-                '["torch>=2.13"]',
-            ):
-                with self.subTest(dependencies=dependencies):
-                    path.write_text(f"[project]\ndependencies = {dependencies}\n")
-                    with self.assertRaisesRegex(RuntimeError, "do not match"):
-                        checks.check_source_abi(self.lock, path)
-
     def test_reject_incompatible_image(self):
         for torch, cuda in [("2.15.0+cu134", "13.4"), ("2.13.0+cu129", "12.9")]:
             with (

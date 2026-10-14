@@ -1,23 +1,20 @@
 # iaas-kernels in internal images
 
-## poc_dsv4.1 port status: blocked on Torch compatibility
+## poc_dsv4.1 port notes
 
-This port of [#824](https://github.com/bytedance-iaas/sglang/pull/824) is a draft.
-`poc_dsv4.1` pins **Torch 2.14.1**, while the pinned iaas-kernels revision
+This ports [#824](https://github.com/bytedance-iaas/sglang/pull/824) to a branch
+that pins **Torch 2.14.1**. The pinned iaas-kernels revision
 `602ec86884ecc4e684473d18cf215aa60e36b4de` declares **torch>=2.13,<2.14** and
-the original image lock targets **Torch 2.13.0**. The source preflight deliberately
-rejects `INSTALL_IAAS_KERNELS=1` until a compatible provider revision is qualified
-and the image lock is updated. Changing only the lock or installing with
-`--no-deps` does not establish compatibility. The branch's Torch version, uv
-Python setup, and other upstream dependency pins are preserved.
+the original image lock targets **Torch 2.13.0**. This version difference remains
+unvalidated. The port adds no source-version preflight; the original build/runtime
+ABI checks are retained. The branch's Torch version, uv Python setup, and other
+upstream dependency pins are preserved.
 
-Before merging, qualify iaas-kernels against Torch 2.14.1, including its symmetric
-memory allocator/NVSHMEM ABI, rebuild its wheel and LTO tools, update the source
-pin and lock together, and run candidate-image checks on the intended hardware.
-The validation from #824 used Torch 2.13.0 and does not validate this combination.
-This port has only local Mac CPU/static checks; no Docker build or GPU validation.
+Validation for this port is limited to local Mac CPU/static checks; no Docker
+build or GPU validation was performed. #824's Torch 2.13.0 results do not validate
+this branch's dependency combination.
 
-Included prerequisites absent from the target branch:
+Included dependencies absent from the target branch:
 
 - #779's image lock/wheel/checker and pre-distributed worker initializer hooks;
   #791 already supplied the other MegaMoE routing/weight hooks.
@@ -28,8 +25,10 @@ Included prerequisites absent from the target branch:
   (#811), as consumed by #824's reusable workflow. Only build-related files and
   required Dockerfile sections are ported; the whole `ep_main` branch is not merged.
 
-The description below documents the original Torch 2.13.0 profile. It becomes
-applicable to this branch only after the compatibility blocker above is resolved.
+The private CI dependencies above support the original image production workflow;
+TOS transport, publishing and image provenance are not requirements of the RDMA
+kernels themselves. The description below documents the original Torch 2.13.0
+profile, whose compatibility with this branch remains unvalidated.
 
 The internal release and development workflows preinstall the SM90 MegaMoE
 provider for **linux/amd64, CUDA 13.0.3, Python 3.12, Torch 2.13.0,

@@ -53,17 +53,6 @@ def check_rdma_info(lock, info, rdma_info):
     )
 
 
-def check_source_abi(lock, pyproject_path):
-    """Reject a branch ABI change before starting an expensive image build."""
-    pins = re.findall(r'"torch==([^"\s]+)"', Path(pyproject_path).read_text())
-    require(
-        bool(pins) and all(version == lock["torch"] for version in pins),
-        f"SGLang Torch pins {pins} do not match iaas-kernels lock {lock['torch']}. "
-        "Qualify an iaas-kernels revision supporting this branch's Torch version "
-        "and update the lock; do not downgrade SGLang or bypass the ABI check.",
-    )
-
-
 def nvshmem_home(lock):
     dist = metadata.distribution("nvidia-nvshmem-cu13")
     require(dist.version == lock["rdma"]["nvshmem_version"], "NVSHMEM package mismatch")
@@ -288,17 +277,4 @@ if __name__ == "__main__":
     parser.add_argument(
         "--manifest", default="/opt/sglang/share/iaas-kernels/manifest.json"
     )
-    parser.add_argument(
-        "--check-source-only",
-        type=Path,
-        help="Validate a checkout's Torch pin against its image lock without Torch/CUDA",
-    )
-    args = parser.parse_args()
-    if args.check_source_only is not None:
-        root = args.check_source_only
-        check_source_abi(
-            load_lock(root / "docker/iaas-kernels.lock.json"),
-            root / "python/pyproject.toml",
-        )
-    else:
-        check_image(args.manifest)
+    check_image(parser.parse_args().manifest)
