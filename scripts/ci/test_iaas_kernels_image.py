@@ -28,10 +28,26 @@ class TestIaasKernelsImage(unittest.TestCase):
     def test_matching_abi(self):
         checks.check_abi(self.lock, self.info, "2.13.0+cu130", "13.0", True)
 
+    def test_source_abi_rejects_branch_dependency_drift(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "pyproject.toml"
+            path.write_text('[project]\ndependencies = ["torch==2.13.0"]\n')
+            checks.check_source_abi(self.lock, path)
+            for dependencies in (
+                '["torch==2.14.1"]',
+                '["torch==2.13.0", "torch==2.14.1"]',
+                '["torch>=2.13"]',
+            ):
+                with self.subTest(dependencies=dependencies):
+                    path.write_text(f"[project]\ndependencies = {dependencies}\n")
+                    with self.assertRaisesRegex(RuntimeError, "do not match"):
+                        checks.check_source_abi(self.lock, path)
+
     def test_reject_incompatible_image(self):
         for torch, cuda in [("2.15.0+cu134", "13.4"), ("2.13.0+cu129", "12.9")]:
-            with self.subTest(torch=torch), self.assertRaisesRegex(
-                RuntimeError, "Unsupported image ABI"
+            with (
+                self.subTest(torch=torch),
+                self.assertRaisesRegex(RuntimeError, "Unsupported image ABI"),
             ):
                 checks.check_abi(self.lock, self.info, torch, cuda, True)
 
@@ -94,8 +110,9 @@ class TestIaasKernelsImage(unittest.TestCase):
             ("checkout", "f" * 40),
             ("cxx11_abi", False),
         ]:
-            with self.subTest(key=key), self.assertRaisesRegex(
-                RuntimeError, "RDMA wheel"
+            with (
+                self.subTest(key=key),
+                self.assertRaisesRegex(RuntimeError, "RDMA wheel"),
             ):
                 checks.check_rdma_info(self.lock, info, dict(rdma, **{key: value}))
 
@@ -157,9 +174,10 @@ class TestIaasKernelsImage(unittest.TestCase):
                 path.parent.mkdir(exist_ok=True)
                 path.touch()
             dist = Mock(version="3.4.5", locate_file=Mock(return_value=home))
-            with patch.object(
-                checks.metadata, "distribution", return_value=dist
-            ), patch.dict(checks.os.environ, {}, clear=True):
+            with (
+                patch.object(checks.metadata, "distribution", return_value=dist),
+                patch.dict(checks.os.environ, {}, clear=True),
+            ):
                 self.assertEqual(checks.nvshmem_home(self.lock), home.resolve())
                 dist.version = "3.5.0"
                 with self.assertRaisesRegex(RuntimeError, "package mismatch"):
@@ -199,14 +217,16 @@ class TestIaasKernelsImage(unittest.TestCase):
 
     def test_swallowed_plugin_exception_is_a_smoke_failure(self):
         # load_plugins() can return successfully after logging a load exception.
-        with self.plugin_modules(registered=False), self.assertRaisesRegex(
-            RuntimeError, "factory was not registered"
+        with (
+            self.plugin_modules(registered=False),
+            self.assertRaisesRegex(RuntimeError, "factory was not registered"),
         ):
             checks.check_plugin()
 
     def test_eager_cuda_initialization_is_a_smoke_failure(self):
-        with self.plugin_modules(initialized=True), self.assertRaisesRegex(
-            RuntimeError, "CUDA was initialized"
+        with (
+            self.plugin_modules(initialized=True),
+            self.assertRaisesRegex(RuntimeError, "CUDA was initialized"),
         ):
             checks.check_plugin()
 

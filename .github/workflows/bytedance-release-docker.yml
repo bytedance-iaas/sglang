@@ -62,7 +62,7 @@ jobs:
             exit 1
           fi
 
-          COMMUNITY_VERSION="$(python3 python/tools/get_version_tag.py --tag-only | sed 's/^v//')"
+          COMMUNITY_VERSION="$(python3 scripts/release/get_version_tag.py --tag-only | sed 's/^v//')"
           if [ -z "${COMMUNITY_VERSION}" ] || ! echo "${COMMUNITY_VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
             echo "::error::Invalid community version resolved from checkout: ${COMMUNITY_VERSION}"
             exit 1

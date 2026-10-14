@@ -256,6 +256,13 @@ COPY rust/sglang-grpc      /tmp/sglang_deps/rust/sglang-grpc
 COPY rust/sglang-mm        /tmp/sglang_deps/rust/sglang-mm
 COPY rust/sglang-api-types /tmp/sglang_deps/rust/sglang-api-types
 
+# Fail before dependency resolution if the branch and provider ABIs diverge.
+COPY docker/iaas-kernels.lock.json /tmp/sglang_deps/docker/iaas-kernels.lock.json
+COPY scripts/ci/check_iaas_kernels_image.py /tmp/check_iaas_kernels_image.py
+RUN if [ "$INSTALL_IAAS_KERNELS" = "1" ]; then \
+        python3 /tmp/check_iaas_kernels_image.py --check-source-only /tmp/sglang_deps; \
+    fi
+
 # Install sglang dependencies (torch, transformers, etc.).
 # Generate constraints.txt to prevent reinstalling these deps in later stages.
 RUN --mount=type=cache,target=/root/.cache/uv \

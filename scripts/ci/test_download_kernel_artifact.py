@@ -137,22 +137,26 @@ class KernelArtifactTests(unittest.TestCase):
             "--output",
             str(self.output),
         ]
-        with patch("sys.argv", argv), patch.object(
-            download.subprocess, "run", side_effect=gh
+        with (
+            patch("sys.argv", argv),
+            patch.object(download.subprocess, "run", side_effect=gh),
         ):
             download.main()
         self.assertEqual(len(downloads), 2)
         self.assertEqual((self.output / WHEEL).read_bytes(), wheel)
 
     def test_explicit_proxy_is_passed_without_exposing_token(self):
-        with patch.dict(
-            download.os.environ,
-            {"KERNEL_ARTIFACT_HTTPS_PROXY": "http://proxy.example:3128"},
-        ), patch.object(
-            download.subprocess,
-            "run",
-            return_value=SimpleNamespace(stdout='{"artifacts": []}'),
-        ) as run:
+        with (
+            patch.dict(
+                download.os.environ,
+                {"KERNEL_ARTIFACT_HTTPS_PROXY": "http://proxy.example:3128"},
+            ),
+            patch.object(
+                download.subprocess,
+                "run",
+                return_value=SimpleNamespace(stdout='{"artifacts": []}'),
+            ) as run,
+        ):
             download.github_api("repos/owner/repo/actions/runs/1/artifacts", text=True)
         command = run.call_args.args[0]
         self.assertIn("--proxy", command)
@@ -177,32 +181,40 @@ class KernelArtifactTests(unittest.TestCase):
             Path(command[5]).write_bytes(wheel_data)
             return SimpleNamespace(returncode=0)
 
-        with patch.dict(
-            download.os.environ,
-            {
-                "KERNEL_ARTIFACT_TOS_ENDPOINT": "tos-cn-beijing.volces.com",
-                "KERNEL_ARTIFACT_TOS_REGION": "cn-beijing",
-                "KERNEL_ARTIFACT_TOS_BUCKET": "ai-infra",
-                "KERNEL_ARTIFACT_TOS_PREFIX": "sglang-ci/kernel-wheels",
-                "TOSUTIL_CONFIG_B64": base64.b64encode(b"encrypted-config").decode(),
-            },
-        ), patch.object(download.subprocess, "run", side_effect=tos):
+        with (
+            patch.dict(
+                download.os.environ,
+                {
+                    "KERNEL_ARTIFACT_TOS_ENDPOINT": "tos-cn-beijing.volces.com",
+                    "KERNEL_ARTIFACT_TOS_REGION": "cn-beijing",
+                    "KERNEL_ARTIFACT_TOS_BUCKET": "ai-infra",
+                    "KERNEL_ARTIFACT_TOS_PREFIX": "sglang-ci/kernel-wheels",
+                    "TOSUTIL_CONFIG_B64": base64.b64encode(
+                        b"encrypted-config"
+                    ).decode(),
+                },
+            ),
+            patch.object(download.subprocess, "run", side_effect=tos),
+        ):
             result = download.recover_tos_wheel(tos_uri, wheel_sha256, self.output)
         self.assertEqual(result, self.output / WHEEL)
         self.assertEqual(result.read_bytes(), wheel_data)
 
     def test_tos_transport_requires_configuration_before_download(self):
         tos_uri = f"tos://ai-infra/sglang-ci/kernel-wheels/1/{WHEEL}"
-        with patch.dict(
-            download.os.environ,
-            {
-                "KERNEL_ARTIFACT_TOS_BUCKET": "ai-infra",
-                "KERNEL_ARTIFACT_TOS_PREFIX": "sglang-ci/kernel-wheels",
-                "KERNEL_ARTIFACT_TOS_ENDPOINT": "tos-cn-beijing.volces.com",
-                "KERNEL_ARTIFACT_TOS_REGION": "cn-beijing",
-            },
-            clear=True,
-        ), patch.object(download.subprocess, "run") as run:
+        with (
+            patch.dict(
+                download.os.environ,
+                {
+                    "KERNEL_ARTIFACT_TOS_BUCKET": "ai-infra",
+                    "KERNEL_ARTIFACT_TOS_PREFIX": "sglang-ci/kernel-wheels",
+                    "KERNEL_ARTIFACT_TOS_ENDPOINT": "tos-cn-beijing.volces.com",
+                    "KERNEL_ARTIFACT_TOS_REGION": "cn-beijing",
+                },
+                clear=True,
+            ),
+            patch.object(download.subprocess, "run") as run,
+        ):
             with self.assertRaisesRegex(ValueError, "configuration"):
                 download.recover_tos_wheel(tos_uri, "0" * 64, self.output)
             run.assert_not_called()
@@ -252,13 +264,15 @@ class KernelArtifactTests(unittest.TestCase):
             "--output",
             str(self.output),
         ]
-        with patch("sys.argv", argv), patch.object(
-            download, "find_artifact", return_value=metadata
-        ), patch.object(
-            download.subprocess,
-            "run",
-            side_effect=download.subprocess.TimeoutExpired("gh", 300),
-        ) as run:
+        with (
+            patch("sys.argv", argv),
+            patch.object(download, "find_artifact", return_value=metadata),
+            patch.object(
+                download.subprocess,
+                "run",
+                side_effect=download.subprocess.TimeoutExpired("gh", 300),
+            ) as run,
+        ):
             with self.assertRaisesRegex(RuntimeError, "verification failed"):
                 download.main()
         self.assertEqual(run.call_count, 6)
