@@ -1880,9 +1880,8 @@ class TestEICHiCacheRegression(unittest.TestCase):
         host = object.__new__(EICDeepSeekV4TokenToKVPoolHost)
         device_pool = SimpleNamespace(
             swa_kv_pool=None,
-            c4_kv_pool=None,
-            c128_kv_pool=None,
-            c4_indexer_kv_pool=SimpleNamespace(index_k_with_scale_buffer=None),
+            kv_pools={},
+            index_pools={},
             compress_state_pools=[
                 SimpleNamespace(
                     ratio=2,
@@ -1898,26 +1897,99 @@ class TestEICHiCacheRegression(unittest.TestCase):
             EICDeepSeekV4TokenToKVPoolHost._estimate_page_bytes(host, device_pool), 0
         )
 
+        indexer_pool = SimpleNamespace(
+            page_size=64,
+            contiguous_page_row_buffers=lambda: [
+                torch.zeros(4, 50, dtype=torch.uint8),
+                torch.zeros(4, 50, dtype=torch.uint8),
+            ],
+        )
         v4_pool = SimpleNamespace(
             swa_kv_pool=SimpleNamespace(
                 kv_buffer=[torch.zeros(1), torch.zeros(1)], bytes_per_page_padded=100
             ),
-            c4_kv_pool=SimpleNamespace(
-                kv_buffer=[torch.zeros(1)], bytes_per_page_padded=200
-            ),
-            c128_kv_pool=SimpleNamespace(kv_buffer=[], bytes_per_page_padded=300),
-            c4_indexer_kv_pool=SimpleNamespace(
-                index_k_with_scale_buffer=[
-                    torch.zeros(4, 50, dtype=torch.uint8),
-                    torch.zeros(4, 50, dtype=torch.uint8),
-                ]
-            ),
-            compress_state_pools=[],
+            kv_pools={
+                4: SimpleNamespace(
+                    kv_buffer=[torch.zeros(1)],
+                    bytes_per_page_padded=200,
+                    page_size=64,
+                ),
+                128: SimpleNamespace(
+                    kv_buffer=[], bytes_per_page_padded=300, page_size=2
+                ),
+            },
+            index_pools={4: indexer_pool},
+            compress_state_pools=[
+                SimpleNamespace(
+                    ratio=4,
+                    ring_size=2,
+                    kv_score_buffer=SimpleNamespace(
+                        kv_score=[torch.zeros(50, dtype=torch.uint8)]
+                    ),
+                )
+            ],
             indexer_compress_state_pools=[],
         )
-        # 2*100 (SWA) + 200 (C4) + 2*50 (indexer page row bytes) = 500.
+        # 2*100 (SWA) + 200 (C4) + 2*50 (indexer rows) + 2*50 (C4 state).
         self.assertEqual(
-            EICDeepSeekV4TokenToKVPoolHost._estimate_page_bytes(host, v4_pool), 500
+            EICDeepSeekV4TokenToKVPoolHost._estimate_page_bytes(host, v4_pool), 600
+        )
+
+    def test_dsv41_estimate_page_bytes_covers_c1_c2_pools(self):
+        # DSv4.1 layouts pack C1/C2 KV and FP4 indexer pools that the v4
+        # named attributes miss, and skip state pools whose ratio has no
+        # layers. Live layout (bytes per page): swa 40*149760, c1 149760,
+        # c1_indexer 17408, c2 3*74880, c2_indexer 3*8704, plus a vestigial
+        # ratio-4 state pool that must not be counted.
+        from sglang.srt.mem_cache.eic_memory_pool import (
+            EICDeepSeekV4TokenToKVPoolHost,
+        )
+
+        def kv_pool(layers, page_bytes, pool_page_size):
+            return SimpleNamespace(
+                kv_buffer=[torch.zeros(1)] * layers,
+                bytes_per_page_padded=page_bytes,
+                page_size=pool_page_size,
+            )
+
+        def indexer_pool(rows):
+            # One device index page row is 4352 bytes (64 slots x 68 B);
+            # a FULL page packs 4 (C1) or 2 (C2) index pages per layer.
+            return SimpleNamespace(
+                page_size=64,
+                contiguous_page_row_buffers=lambda: [
+                    torch.zeros(4, row, dtype=torch.uint8) for row in rows
+                ],
+            )
+
+        host = object.__new__(EICDeepSeekV4TokenToKVPoolHost)
+        device_pool = SimpleNamespace(
+            swa_kv_pool=kv_pool(40, 149760, 256),
+            kv_pools={
+                1: kv_pool(1, 149760, 256),
+                2: kv_pool(3, 74880, 128),
+                4: kv_pool(0, 149760, 64),
+                128: kv_pool(0, 300, 2),
+            },
+            index_pools={
+                1: indexer_pool([4352]),
+                2: indexer_pool([4352] * 3),
+            },
+            compress_state_pools=[
+                SimpleNamespace(
+                    ratio=4,
+                    ring_size=16,
+                    kv_score_buffer=SimpleNamespace(
+                        kv_score=[torch.zeros(96, dtype=torch.uint8)]
+                    ),
+                )
+            ],
+            indexer_compress_state_pools=[],
+        )
+        expected = 40 * 149760 + 149760 + 17408 + 3 * 74880 + 3 * 8704
+        self.assertEqual(
+            EICDeepSeekV4TokenToKVPoolHost._estimate_page_bytes(host, device_pool),
+            expected,
         )
 
     def test_dsv41_swa_indices_without_swa_pool(self):
