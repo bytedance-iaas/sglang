@@ -74,12 +74,13 @@ from sglang.srt.layers.attention.dsv4.late_layer import (
     scatter_tail_rows as _scatter_tail_rows,
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
-from sglang.srt.layers.cp.interleave import attn_cp_interleave_gather
 from sglang.srt.layers.cp.utils import (
     cp_gather_full_sequence_states,
     cp_interleave_input_ids,
     cp_materialize_global_token_order,
     cp_shard_hidden_states,
+    dsa_prefill_cp_fused_symm_mem,
+    dsa_prefill_cp_moe_gather,
     is_cp_active,
 )
 from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
@@ -3555,7 +3556,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         if _use_cp:
             moe_a2a_backend = get_moe_a2a_backend()
             if moe_a2a_backend.is_none():
-                hidden_states = attn_cp_interleave_gather(hidden_states)
+                hidden_states = dsa_prefill_cp_moe_gather(hidden_states)
             else:
                 assert (
                     moe_a2a_backend.is_deepep()
@@ -4862,18 +4863,23 @@ class DeepseekV4Model(nn.Module):
                 )
         if self.hc_pre_from_prev_sublayer:
             assert not run_tbo, "two-batch overlap is not wired for this hc scheme"
-            hidden_states, last_pre, tail = self._forward_layers_hc_pre_from_prev(
-                positions,
-                hidden_states,
+            with dsa_prefill_cp_fused_symm_mem(
+                self.layers[self.start_layer].mlp,
                 forward_batch,
-                input_ids,
-                input_ids_global,
-                capture_dspark,
-                dspark_aux_hidden_states,
-                prev_pre,
-                pp_tail_active,
-                token_parallel=token_parallel,
-            )
+                hidden_states,
+            ):
+                hidden_states, last_pre, tail = self._forward_layers_hc_pre_from_prev(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    input_ids,
+                    input_ids_global,
+                    capture_dspark,
+                    dspark_aux_hidden_states,
+                    prev_pre,
+                    pp_tail_active,
+                    token_parallel=token_parallel,
+                )
         elif run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
             # disabled here (each layer self-contained), so no trailing hc_post.
@@ -4883,40 +4889,47 @@ class DeepseekV4Model(nn.Module):
                 forward_batch=forward_batch,
             )
         else:
-            use_fused = self.use_fused_mhc_post_pre
-            prev_residual, prev_post, prev_comb = None, None, None
-            last_layer = None
-            for i in range(self.start_layer, self.end_layer):
-                layer = self.layers[i]
-                last_layer = layer
-                ctx = (
-                    nullcontext()
-                    if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-                    else get_global_expert_distribution_recorder().with_current_layer(i)
-                )
-                with ctx:
-                    hidden_states, prev_residual, prev_post, prev_comb = layer(
-                        positions=positions,
-                        hidden_states=hidden_states,
-                        forward_batch=forward_batch,
-                        input_ids=input_ids,
-                        input_ids_global=input_ids_global,
-                        prev_residual=prev_residual,
-                        prev_post=prev_post,
-                        prev_comb=prev_comb,
-                    )
-                if capture_dspark and i in self.dspark_layers_to_capture:
-                    if use_fused:
-                        completed = layer.hc_post(
-                            hidden_states, prev_residual, prev_post, prev_comb
+            with dsa_prefill_cp_fused_symm_mem(
+                self.layers[self.start_layer].mlp,
+                forward_batch,
+                hidden_states,
+            ):
+                use_fused = self.use_fused_mhc_post_pre
+                prev_residual, prev_post, prev_comb = None, None, None
+                last_layer = None
+                for i in range(self.start_layer, self.end_layer):
+                    layer = self.layers[i]
+                    last_layer = layer
+                    ctx = (
+                        nullcontext()
+                        if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                        else get_global_expert_distribution_recorder().with_current_layer(
+                            i
                         )
-                    else:
-                        completed = hidden_states
-                    dspark_aux_hidden_states.append(completed.mean(dim=1))
-            if use_fused and last_layer is not None:
-                hidden_states = last_layer.hc_post(
-                    hidden_states, prev_residual, prev_post, prev_comb
-                )
+                    )
+                    with ctx:
+                        hidden_states, prev_residual, prev_post, prev_comb = layer(
+                            positions=positions,
+                            hidden_states=hidden_states,
+                            forward_batch=forward_batch,
+                            input_ids=input_ids,
+                            input_ids_global=input_ids_global,
+                            prev_residual=prev_residual,
+                            prev_post=prev_post,
+                            prev_comb=prev_comb,
+                        )
+                    if capture_dspark and i in self.dspark_layers_to_capture:
+                        if use_fused:
+                            completed = layer.hc_post(
+                                hidden_states, prev_residual, prev_post, prev_comb
+                            )
+                        else:
+                            completed = hidden_states
+                        dspark_aux_hidden_states.append(completed.mean(dim=1))
+                if use_fused and last_layer is not None:
+                    hidden_states = last_layer.hc_post(
+                        hidden_states, prev_residual, prev_post, prev_comb
+                    )
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
