@@ -1867,18 +1867,15 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
 
     def _estimate_page_bytes(self, device_pool) -> int:
         # Best-effort sizing hint only: the authoritative page size is the
-        # packed spec sum built in __init__. DSv4.1 stages may omit pools
-        # (unified KV has no SWA pool; a stage may have no C4/C128 layers)
-        # or use indexer/state layouts without the v4 attributes, so every
-        # access is guarded and a missing piece contributes 0.
+        # packed spec sum built in __init__. Mirror the assembler's pool
+        # set: the SWA pool plus every ratio pool in kv_pools/index_pools
+        # (DSv4.1 adds C1/C2 KV and FP4 indexer pools that the v4 named
+        # attributes c4_kv_pool/c4_indexer_kv_pool do not cover). Only C4
+        # state is packed, and only when this stage holds C4 layers.
         page_bytes = 0
         seen = set()
 
-        kv_pools = [
-            device_pool.swa_kv_pool,
-            device_pool.c4_kv_pool,
-            device_pool.c128_kv_pool,
-        ]
+        kv_pools = [device_pool.swa_kv_pool, *device_pool.kv_pools.values()]
         for pool in kv_pools:
             if pool is None or id(pool) in seen:
                 continue
@@ -1886,23 +1883,37 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
             if pool.kv_buffer:
                 page_bytes += len(pool.kv_buffer) * int(pool.bytes_per_page_padded)
 
-        indexer_pool = device_pool.c4_indexer_kv_pool
-        if indexer_pool is not None and id(indexer_pool) not in seen:
-            buffers = indexer_pool.index_k_with_scale_buffer
-            if buffers:
-                page_bytes += len(buffers) * (
-                    buffers[0].shape[1] * buffers[0].element_size()
-                )
+        for ratio, pool in device_pool.index_pools.items():
+            if pool is None or id(pool) in seen:
+                continue
+            seen.add(id(pool))
+            # The assembler reshapes index pages into FULL-page rows: one
+            # packed page holds (kv page slots / index page slots) index
+            # pages. Ratio 4 packs exactly one; C1/C2 pack several.
+            kv_pool = device_pool.kv_pools.get(ratio)
+            index_pages = 1
+            if kv_pool is not None and pool.page_size:
+                index_pages = max(1, kv_pool.page_size // pool.page_size)
+            row_bytes = sum(
+                buf.shape[1] * buf.element_size()
+                for buf in pool.contiguous_page_row_buffers()
+            )
+            page_bytes += index_pages * row_bytes
 
-        for pools in (
-            device_pool.compress_state_pools,
-            device_pool.indexer_compress_state_pools,
-        ):
-            for pool in pools:
-                if pool is None or pool.ratio == 128:
-                    continue
-                state_tensor = pool.kv_score_buffer.kv_score
-                page_bytes += int(pool.ring_size * state_tensor[0].nbytes)
+        # Only C4 state is packed (the assembler builds state host pools
+        # from c4 layers only; low-ratio ring state is rebuilt, not
+        # cached), and only when this stage actually holds C4 layers.
+        c4_pool = device_pool.kv_pools.get(4)
+        if c4_pool is not None and c4_pool.kv_buffer:
+            for pools in (
+                device_pool.compress_state_pools,
+                device_pool.indexer_compress_state_pools,
+            ):
+                for pool in pools:
+                    if pool is None or pool.ratio != 4:
+                        continue
+                    state_tensor = pool.kv_score_buffer.kv_score
+                    page_bytes += int(pool.ring_size * state_tensor[0].nbytes)
         return page_bytes
 
     def get_size_per_token(self):
