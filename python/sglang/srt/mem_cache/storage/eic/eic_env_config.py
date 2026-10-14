@@ -39,8 +39,9 @@ DEFAULT_FIXED_CONFIG = {
     "enable_gpu_nic_affinity": False,
     "save_decode_cache": True,
     "load_back_threshold": 10,
-    "eic_probe_backoff_failures": 3,
-    "eic_probe_backoff_seconds": 5.0,
+    "eic_probe_backoff_seconds": 30.0,
+    "eic_probe_backoff_max_seconds": 300.0,
+    "eic_probe_backoff_write_failures": 3,
 }
 
 

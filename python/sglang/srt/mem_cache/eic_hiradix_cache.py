@@ -336,32 +336,87 @@ class EICHiRadixCache(RadixCache):
         logger.info(
             f"EICHiRadixCache load_back_threshold set to {self.load_back_threshold}"
         )
-        self._probe_backoff_failures = int(config.get("eic_probe_backoff_failures", 3))
-        self._probe_backoff_seconds = float(config.get("eic_probe_backoff_seconds", 5.0))
-        self._probe_fail_streak = 0
+        self._probe_backoff_seconds = float(
+            config.get("eic_probe_backoff_seconds", 30.0)
+        )
+        self._probe_backoff_max_seconds = float(
+            config.get("eic_probe_backoff_max_seconds", 300.0)
+        )
+        self._write_backoff_failures = int(
+            config.get("eic_probe_backoff_write_failures", 3)
+        )
+        self._probe_fail_level = 0
         self._probe_backoff_until = 0.0
+        self._write_fail_streak = 0
+        self._write_backoff_level = 0
+        self._write_backoff_until = 0.0
+        self._write_probe_outstanding = False
+
+    def _backoff_cooldown(self, level: int) -> float:
+        base = getattr(self, "_probe_backoff_seconds", 30.0)
+        cap = getattr(self, "_probe_backoff_max_seconds", 300.0)
+        return min(base * (2**level), cap)
 
     def _probe_in_backoff(self) -> bool:
         return time.monotonic() < getattr(self, "_probe_backoff_until", 0.0)
 
     def _note_probe_result(self, lens) -> None:
         # A wholesale-miss round means the data plane is failing (or the
-        # cache is cold); after a few in a row, stop probing on every
-        # scheduler iteration and retry after a cooldown. Any hit clears
-        # the state immediately.
+        # cache is cold). The first one already enters a long cooldown:
+        # each probe round costs an RPC timeout on the scheduler thread,
+        # and data-plane recovery is an operator-timescale event, so
+        # retrying every few seconds only stalls scheduling. The
+        # cooldown doubles per consecutive wholesale failure up to a
+        # cap; any hit clears the state immediately.
         if any(n > 0 for n in lens):
-            self._probe_fail_streak = 0
+            self._probe_fail_level = 0
             self._probe_backoff_until = 0.0
             return
-        self._probe_fail_streak = getattr(self, "_probe_fail_streak", 0) + 1
-        failures = getattr(self, "_probe_backoff_failures", 3)
-        if self._probe_fail_streak >= failures:
-            seconds = getattr(self, "_probe_backoff_seconds", 5.0)
-            self._probe_backoff_until = time.monotonic() + seconds
-            self._probe_fail_streak = 0
+        if not lens:
+            return
+        level = getattr(self, "_probe_fail_level", 0)
+        seconds = self._backoff_cooldown(level)
+        self._probe_backoff_until = time.monotonic() + seconds
+        self._probe_fail_level = level + 1
+        logger.warning(
+            "EIC remote probe failing wholesale; skipping remote match "
+            f"for {seconds:.1f}s"
+        )
+
+    def _write_in_backoff(self) -> bool:
+        return time.monotonic() < getattr(self, "_write_backoff_until", 0.0)
+
+    def _write_suppressed(self) -> bool:
+        # During write backoff no remote write is issued; the node keeps
+        # its device copy and simply is not backed up remotely. The
+        # first write after the cooldown expires is let through alone
+        # as the recovery probe; its ack decides the next state.
+        if self._write_in_backoff():
+            return True
+        if getattr(self, "_write_probe_outstanding", False):
+            return True
+        if getattr(self, "_write_backoff_level", 0) > 0:
+            self._write_probe_outstanding = True
+        return False
+
+    def _note_write_result(self, success: bool) -> None:
+        if success:
+            self._write_fail_streak = 0
+            self._write_backoff_level = 0
+            self._write_backoff_until = 0.0
+            self._write_probe_outstanding = False
+            return
+        self._write_probe_outstanding = False
+        self._write_fail_streak = getattr(self, "_write_fail_streak", 0) + 1
+        threshold = getattr(self, "_write_backoff_failures", 3)
+        if self._write_fail_streak >= threshold and not self._write_in_backoff():
+            level = getattr(self, "_write_backoff_level", 0)
+            seconds = self._backoff_cooldown(level)
+            self._write_backoff_until = time.monotonic() + seconds
+            self._write_backoff_level = level + 1
             logger.warning(
-                "EIC remote probe failing wholesale; skipping remote match "
-                f"for {seconds:.1f}s"
+                "EIC write_through failing wholesale; suppressing remote "
+                f"writes for {seconds:.1f}s"
             )
 
     def reset(self):
@@ -379,6 +434,12 @@ class EICHiRadixCache(RadixCache):
         self._load_reports = {}
         self._await_load = {}
         self._verdict_outbox = []
+        self._probe_fail_level = 0
+        self._probe_backoff_until = 0.0
+        self._write_fail_streak = 0
+        self._write_backoff_level = 0
+        self._write_backoff_until = 0.0
+        self._write_probe_outstanding = False
         # Comm-layer state deliberately survives reset: seq counters must stay
         # monotonic (a pre-reset store batch may still be in flight), epochs
         # must never reuse, tombstones expire by round. Flush is idle-gated, so
@@ -399,6 +460,8 @@ class EICHiRadixCache(RadixCache):
         if not write_back and (
             node.parent != self.root_node and not node.parent.backuped
         ):
+            return 0
+        if self._write_suppressed():
             return 0
         host_indices = self.cache_controller.write(
             device_indices=node.value,
@@ -610,6 +673,8 @@ class EICHiRadixCache(RadixCache):
             ack_id, success = self.cache_controller.ack_write_queue.get_nowait()
             ack_list.append(ack_id)
             flags.append(success)
+        for success in flags:
+            self._note_write_result(success)
         for ack_id, success in zip(ack_list, flags):
             if not success:
                 node = self.ongoing_write_through[ack_id]
@@ -1786,6 +1851,11 @@ class EICPagedHiRadixCache(EICHiRadixCache):
             prev_hash = last_node.content_hash[-1] if last_node.content_hash else None
             fetches.append((slot, last_node, req_key[prefix_len:], prev_hash))
             eic_keys += (len(req_key) - prefix_len) // self.page_size
+            if getattr(self, "_probe_fail_level", 0) > 0:
+                # Recovery probe: after a wholesale failure, feel for
+                # the data plane with a single request instead of
+                # stalling the whole waiting queue on a full round.
+                break
             if 0 < self.eic_check_max_num <= eic_keys:
                 break
 
@@ -1881,6 +1951,8 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         if not write_back and (
             node.parent != self.root_node and not node.parent.backuped
         ):
+            return 0
+        if self._write_suppressed():
             return 0
         if _need_calculate_hash(node, self.page_size):
             self._calculate_content_hash(node)

@@ -1554,6 +1554,9 @@ class TestEICHiCacheRegression(unittest.TestCase):
         cache._insert_remote_node.assert_not_called()
         self.assertEqual(cache.match_req_set, {})
 
+        # The miss is retried once the probe backoff from the wholesale
+        # miss expires (the write may have landed in the meantime).
+        cache._probe_backoff_until = 0.0
         cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [768]
         with patch_hash:
             EICPagedHiRadixCache.match_from_remote(cache, [req])
@@ -1768,8 +1771,11 @@ class TestEICHiCacheRegression(unittest.TestCase):
     def test_probe_backoff_after_wholesale_failures(self):
         # Probing runs on the scheduler thread every loop and a miss is
         # retried next loop, so a down data plane stalls scheduling on
-        # RPC timeouts. After N wholesale-miss rounds the cache must
-        # stop probing for a cooldown; any hit clears the state.
+        # RPC timeouts. The first wholesale-miss round must already
+        # enter a long cooldown, the cooldown doubles per consecutive
+        # wholesale failure up to a cap, and any hit clears the state.
+        import time
+
         from sglang.srt.mem_cache.eic_hiradix_cache import EICHiRadixCache
 
         cache = object.__new__(EICHiRadixCache)
@@ -1778,22 +1784,114 @@ class TestEICHiCacheRegression(unittest.TestCase):
             {
                 "save_decode_cache": True,
                 "load_back_threshold": 10,
-                "eic_probe_backoff_failures": 3,
-                "eic_probe_backoff_seconds": 60.0,
+                "eic_probe_backoff_seconds": 10.0,
+                "eic_probe_backoff_max_seconds": 25.0,
             },
         )
         self.assertFalse(cache._probe_in_backoff())
+        # First wholesale failure already backs off for the base cooldown.
         cache._note_probe_result([0, 0])
-        cache._note_probe_result([0])
-        self.assertFalse(cache._probe_in_backoff())
-        cache._note_probe_result([0, 0, 0])
         self.assertTrue(cache._probe_in_backoff())
-        # A hit clears both the streak and an active backoff.
+        self.assertAlmostEqual(
+            cache._probe_backoff_until - time.monotonic(), 10.0, delta=1.0
+        )
+        # Next failure after expiry doubles the cooldown.
+        cache._probe_backoff_until = 0.0
+        cache._note_probe_result([0])
+        self.assertAlmostEqual(
+            cache._probe_backoff_until - time.monotonic(), 20.0, delta=1.0
+        )
+        # Growth is capped.
+        cache._probe_backoff_until = 0.0
+        cache._note_probe_result([0])
+        self.assertAlmostEqual(
+            cache._probe_backoff_until - time.monotonic(), 25.0, delta=1.0
+        )
+        # A hit clears both the level and an active backoff, so the next
+        # failure starts from the base cooldown again.
         cache._note_probe_result([4])
         self.assertFalse(cache._probe_in_backoff())
         cache._note_probe_result([0])
-        cache._note_probe_result([0])
-        self.assertFalse(cache._probe_in_backoff())
+        self.assertAlmostEqual(
+            cache._probe_backoff_until - time.monotonic(), 10.0, delta=1.0
+        )
+
+    def test_match_from_remote_canary_probes_one_request_after_failure(self):
+        # While recovering from a wholesale probe failure, a probe
+        # round must feel for the data plane with a single request
+        # instead of stalling the whole waiting queue on a full round.
+        cache = self._remote_cache()
+        cache._probe_fail_level = 1
+        cache._probe_backoff_until = 0.0
+        node = SimpleNamespace(id=1, content_hash=None)
+        cache._match_for_remote_fetch = lambda root, key: (512, node)
+        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [0]
+        reqs = [
+            mock.Mock(
+                rid=r,
+                origin_input_ids=list(range(4096)),
+                output_ids=[9],
+                extra_key=None,
+            )
+            for r in ("A", "B", "C")
+        ]
+        with mock.patch(
+            "sglang.srt.mem_cache.eic_hiradix_cache._need_calculate_hash",
+            return_value=False,
+        ):
+            EICPagedHiRadixCache.match_from_remote(cache, reqs)
+        probed = cache.cache_controller.batch_find_longest_prefix_in_eic.call_args[0][0]
+        self.assertEqual(len(probed), 1)
+
+    def test_write_backoff_after_wholesale_failures(self):
+        # write_through writes run on a write thread, but a down data
+        # plane makes every mset pay a multi-second timeout and churns
+        # host pages. After N consecutive failed write acks the cache
+        # must suppress remote writes for a cooldown; afterwards a
+        # single probe write decides whether writes resume.
+        import time
+
+        from sglang.srt.mem_cache.eic_hiradix_cache import EICHiRadixCache
+
+        cache = object.__new__(EICHiRadixCache)
+        EICHiRadixCache.init_hyper_params(
+            cache,
+            {
+                "save_decode_cache": True,
+                "load_back_threshold": 10,
+                "eic_probe_backoff_seconds": 10.0,
+                "eic_probe_backoff_max_seconds": 25.0,
+                "eic_probe_backoff_write_failures": 3,
+            },
+        )
+        self.assertFalse(cache._write_suppressed())
+        cache._note_write_result(False)
+        cache._note_write_result(False)
+        self.assertFalse(cache._write_suppressed())
+        cache._note_write_result(False)
+        self.assertTrue(cache._write_in_backoff())
+        self.assertTrue(cache._write_suppressed())
+        self.assertAlmostEqual(
+            cache._write_backoff_until - time.monotonic(), 10.0, delta=1.0
+        )
+        # After expiry exactly one probe write is let through.
+        cache._write_backoff_until = 0.0
+        self.assertFalse(cache._write_suppressed())
+        self.assertTrue(cache._write_suppressed())
+        # A failed probe re-enters backoff with a doubled cooldown.
+        cache._note_write_result(False)
+        self.assertTrue(cache._write_in_backoff())
+        self.assertAlmostEqual(
+            cache._write_backoff_until - time.monotonic(), 20.0, delta=1.0
+        )
+        # A successful probe clears the state entirely.
+        cache._write_backoff_until = 0.0
+        self.assertFalse(cache._write_suppressed())
+        cache._note_write_result(True)
+        self.assertFalse(cache._write_in_backoff())
+        self.assertFalse(cache._write_suppressed())
+        cache._note_write_result(False)
+        self.assertFalse(cache._write_suppressed())
 
     def test_memory_pool_refuses_a_region_the_client_will_not_register(self):
         # register_memory's bool return was dropped. An unregistered region still
