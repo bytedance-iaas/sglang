@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from sglang.srt.plugins import fused_moe
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -11,12 +11,28 @@ class TestFusedMoERegistration(unittest.TestCase):
     def setUp(self):
         self.registry = patch.dict(fused_moe._factories, {}, clear=True)
         self.registry.start()
+        self.initializers = patch.dict(fused_moe._worker_initializers, {}, clear=True)
+        self.initializers.start()
         self.loader = patch("sglang.srt.plugins.load_plugins")
         self.loader.start()
 
     def tearDown(self):
         self.loader.stop()
         self.registry.stop()
+        self.initializers.stop()
+
+    def test_worker_initializers_load_plugins_and_propagate_failure(self):
+        initializer = Mock()
+        fused_moe.register_fused_moe_worker_initializer("iaas_kernels", initializer)
+        fused_moe.register_fused_moe_worker_initializer("iaas_kernels", initializer)
+        args = object()
+        fused_moe.prepare_fused_moe_worker(args)
+        initializer.assert_called_once_with(args)
+        with self.assertRaisesRegex(ValueError, "already registered"):
+            fused_moe.register_fused_moe_worker_initializer("iaas_kernels", Mock())
+        initializer.side_effect = RuntimeError("allocator already in use")
+        with self.assertRaisesRegex(RuntimeError, "allocator already in use"):
+            fused_moe.prepare_fused_moe_worker(args)
 
     def test_scoped_registration_and_duplicate(self):
         factory = lambda layer: layer
