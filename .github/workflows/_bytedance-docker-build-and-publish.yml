@@ -1,0 +1,773 @@
+name: Bytedance Build and Publish Volcengine Docker Image
+
+# Reusable workflow: builds one amd64 CUDA image variant and publishes the
+# matching Volcengine CR tag. Callers use a matrix when multiple variants are
+# needed, so the Docker build command stays in one file.
+
+on:
+  workflow_call:
+    inputs:
+      docker_target:
+        description: "Dockerfile target stage"
+        required: true
+        type: string
+      cuda_key:
+        description: "Logical CUDA tag key, e.g. cu130"
+        required: false
+        type: string
+        default: "cu130"
+      cuda_version:
+        description: "CUDA_VERSION build arg"
+        required: false
+        type: string
+        default: "13.0.3"
+      sgl_version:
+        description: "Version string passed as SGL_VERSION build arg"
+        required: false
+        type: string
+        default: ""
+      extra_build_args:
+        description: "Additional --build-arg flags appended to docker buildx build"
+        required: false
+        type: string
+        default: ""
+      checkout_ref:
+        description: "Git ref to checkout"
+        required: false
+        type: string
+        default: ""
+      tag_config:
+        description: "Deprecated compatibility input; Volcengine tags are generated from tag_mode."
+        required: false
+        type: string
+        default: ""
+      tag_mode:
+        description: "Tag mode passed to scripts/ci/get_volcengine_image_tag.py"
+        required: false
+        type: string
+        default: "version"
+      tag_value:
+        description: "Optional manual tag override; required as the value in version-mode tags"
+        required: false
+        type: string
+        default: ""
+      image_tag_override:
+        description: "Optional fully resolved image tag to publish instead of generating one"
+        required: false
+        type: string
+        default: ""
+      variant_suffix:
+        description: "Optional variant suffix appended before CUDA suffix"
+        required: false
+        type: string
+        default: ""
+      cuda_suffix:
+        description: "Optional CUDA suffix appended to Volcengine tags"
+        required: false
+        type: string
+        default: ""
+      publish_default_cuda_alias:
+        description: "Also publish an unsuffixed default tag for this CUDA variant"
+        required: false
+        type: boolean
+        default: false
+      use_environment:
+        description: "GitHub environment name (e.g. prod) or empty for none"
+        required: false
+        type: string
+        default: ""
+      registry_host:
+        description: "Volcengine CR registry host"
+        required: false
+        type: string
+        default: ""
+      image_repo:
+        description: "Full Volcengine CR image repository"
+        required: false
+        type: string
+        default: ""
+      artifact_name:
+        description: "Optional local sgl-kernel wheel artifact name"
+        required: false
+        type: string
+        default: ""
+      artifact_run_id:
+        description: "Optional workflow run ID containing artifact_name"
+        required: false
+        type: string
+        default: ""
+      kernel_tos_uri:
+        description: "Optional immutable TOS URI containing the kernel wheel"
+        required: false
+        type: string
+        default: ""
+      kernel_wheel_sha256:
+        description: "Authoritative SHA-256 required with kernel_tos_uri"
+        required: false
+        type: string
+        default: ""
+      image_formats:
+        description: "CSV of image formats to build and push. Default builds all three (oci,zstd,nydus); pass a subset to narrow."
+        required: false
+        type: string
+        default: "oci,zstd,nydus"
+      verify_image:
+        description: "Run in-container provenance/runtime verification after each pushed image. Default true. Callers that build a source tree without the ep_main runtime smoke tests (e.g. the deepseek_v4 nightly) pass false; provenance labels/env are still baked into the image regardless."
+        required: false
+        type: boolean
+        default: true
+
+      install_iaas_kernels:
+        description: "Preinstall the pinned SM90 NVLink wheel (amd64/cu130, local source only)"
+        required: false
+        type: boolean
+        default: false
+      concurrency_group:
+        description: "Concurrency group for builds that publish the same tag family"
+        required: false
+        type: string
+        default: "bytedance-x64-docker-build-node"
+
+jobs:
+  build-and-publish:
+    if: github.repository == 'bytedance-iaas/sglang'
+    environment: ${{ inputs.use_environment || null }}
+    runs-on: x64-docker-build-node
+    concurrency:
+      group: ${{ inputs.concurrency_group }}
+      cancel-in-progress: false
+    env:
+      CUDA_KEY: ${{ inputs.cuda_key }}
+      CUDA_SUFFIX: ${{ inputs.cuda_suffix }}
+      IMAGE_FORMATS: ${{ inputs.image_formats }}
+      IMAGE_REPO: ${{ inputs.image_repo }}
+      PUBLISH_DEFAULT_CUDA_ALIAS: ${{ inputs.publish_default_cuda_alias }}
+      REGISTRY_HOST: ${{ inputs.registry_host }}
+      SGL_VERSION: ${{ inputs.sgl_version }}
+      TAG_MODE: ${{ inputs.tag_mode }}
+      TAG_VALUE: ${{ inputs.tag_value }}
+      IMAGE_TAG_OVERRIDE: ${{ inputs.image_tag_override }}
+      VARIANT_SUFFIX: ${{ inputs.variant_suffix }}
+      VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
+      VOLCENGINE_CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
+      VOLCENGINE_CR_REPOSITORY: ${{ vars.VOLCENGINE_CR_REPOSITORY || 'sglang' }}
+      VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
+      VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
+    steps:
+      - name: Delete huge unnecessary tools folder
+        run: rm -rf /opt/hostedtoolcache
+
+      - name: Cleanup workspace (remove root-owned files from prior runs)
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+          # BRANCH_TYPE=local copies Git metadata into the image for versioning.
+          persist-credentials: false
+
+      - name: Configure iaas-kernels NVLink image
+        env:
+          INSTALL_IAAS_KERNELS: ${{ inputs.install_iaas_kernels }}
+          IAAS_KERNELS_READ_TOKEN: ${{ secrets.IAAS_KERNELS_READ_TOKEN }}
+          CUDA_VERSION: ${{ inputs.cuda_version }}
+          DOCKER_TARGET: ${{ inputs.docker_target }}
+        run: |
+          set -euo pipefail
+          : > /tmp/iaas-kernels.args
+          if [ "$INSTALL_IAAS_KERNELS" = "true" ]; then
+            test "$CUDA_VERSION" = "13.0.3"
+            case "$DOCKER_TARGET" in framework_final|runtime) ;; *) exit 1 ;; esac
+            if [ -z "$IAAS_KERNELS_READ_TOKEN" ]; then
+              echo "::error::IAAS_KERNELS_READ_TOKEN needs read access to bytedance-iaas/iaas-kernels"
+              exit 1
+            fi
+            printf '%s\n' --build-arg INSTALL_IAAS_KERNELS=1 \
+              --build-arg BRANCH_TYPE=local \
+              --secret id=iaas_kernels_token,env=IAAS_KERNELS_READ_TOKEN \
+              > /tmp/iaas-kernels.args
+            python3 -m unittest discover -s scripts/ci -p test_iaas_kernels_image.py -v
+          fi
+
+      - name: Resolve Volcengine publish target
+        run: |
+          set -euo pipefail
+
+          if [ -z "${IMAGE_REPO}" ]; then
+            if [ -z "${VOLCENGINE_CR_REGISTRY}" ] || [ -z "${VOLCENGINE_CR_NAMESPACE}" ]; then
+              echo "::error::Volcengine CR variables are required: VOLCENGINE_CR_REGISTRY and VOLCENGINE_CR_NAMESPACE"
+              exit 1
+            fi
+            IMAGE_REPO="${VOLCENGINE_CR_REGISTRY}/${VOLCENGINE_CR_NAMESPACE}/${VOLCENGINE_CR_REPOSITORY:-sglang}"
+          fi
+
+          if [ -z "${REGISTRY_HOST}" ] && [ -n "${VOLCENGINE_CR_REGISTRY}" ] && [[ "${IMAGE_REPO}" == "${VOLCENGINE_CR_REGISTRY}/"* ]]; then
+            REGISTRY_HOST="${VOLCENGINE_CR_REGISTRY}"
+          fi
+
+          if [ -z "${IMAGE_REPO}" ] || [[ "${IMAGE_REPO}" == /* ]] || [[ "${IMAGE_REPO}" == *'//'* ]]; then
+            echo "::error::Invalid image repository: '${IMAGE_REPO}'"
+            exit 1
+          fi
+
+          echo "IMAGE_REPO=${IMAGE_REPO}" >> "${GITHUB_ENV}"
+          echo "REGISTRY_HOST=${REGISTRY_HOST}" >> "${GITHUB_ENV}"
+          echo "Resolved image repository ${IMAGE_REPO}"
+
+      - name: Resolve Volcengine image tag
+        id: image-tag
+        run: |
+          set -euo pipefail
+          resolve_tag() {
+            local cuda_suffix="$1"
+            local tag_cmd=(python3 scripts/ci/get_volcengine_image_tag.py --mode "${TAG_MODE}")
+            if [ -n "${TAG_VALUE}" ]; then
+              tag_cmd+=(--tag-value "${TAG_VALUE}")
+            fi
+            if [ -n "${VARIANT_SUFFIX}" ]; then
+              tag_cmd+=(--variant-suffix "${VARIANT_SUFFIX}")
+            fi
+            if [ -n "${cuda_suffix}" ]; then
+              tag_cmd+=(--cuda-suffix "${cuda_suffix}")
+            fi
+            "${tag_cmd[@]}"
+          }
+
+          IMAGE_TAGS=()
+          if [ -n "${IMAGE_TAG_OVERRIDE}" ]; then
+            IMAGE_TAGS+=("${IMAGE_TAG_OVERRIDE}")
+          elif [ "${PUBLISH_DEFAULT_CUDA_ALIAS}" = "true" ]; then
+            IMAGE_TAGS+=("$(resolve_tag "")")
+            IMAGE_TAGS+=("$(resolve_tag "${CUDA_SUFFIX}")")
+          else
+            IMAGE_TAGS+=("$(resolve_tag "${CUDA_SUFFIX}")")
+          fi
+
+          {
+            echo "image-tags<<EOF"
+            printf '%s\n' "${IMAGE_TAGS[@]}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Validate requested image formats
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import sys
+
+          raw = os.environ.get("IMAGE_FORMATS", "oci,zstd,nydus")
+          tokens = [token.strip() for token in raw.split(",") if token.strip()]
+          if not tokens:
+              tokens = ["oci", "zstd", "nydus"]
+          allowed = {"oci", "zstd", "nydus"}
+          unknown = [token for token in tokens if token not in allowed]
+          if unknown:
+              print(
+                  f"::error::unknown image_formats tokens: {unknown}; "
+                  f"allowed: {sorted(allowed)}"
+              )
+              sys.exit(1)
+          print(f"Requested image formats: {tokens}")
+          PY
+
+      - name: Compute Docker build metadata args
+        id: build-metadata
+        env:
+          IMAGE_TAGS: ${{ steps.image-tag.outputs.image-tags }}
+        run: |
+          set -euo pipefail
+          BUILD_COMMIT="$(git rev-parse HEAD)"
+          BUILD_TREE="$(git rev-parse HEAD^{tree})"
+          PYTHON_MANIFEST_SHA256="$(python3 - <<'PY'
+          import hashlib
+          import subprocess
+
+          paths = subprocess.check_output(
+              ["git", "ls-files", "-z", "--", "python"]
+          ).split(b"\0")
+          digest = hashlib.sha256()
+          for raw_path in sorted(path for path in paths if path):
+              digest.update(raw_path)
+              digest.update(b"\0")
+              with open(raw_path, "rb") as source_file:
+                  digest.update(hashlib.sha256(source_file.read()).digest())
+          print(digest.hexdigest())
+          PY
+          )"
+          BUILD_SOURCE="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          BUILD_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          TAG_CONFIG="$(CUDA_KEY="${CUDA_KEY}" IMAGE_TAGS="${IMAGE_TAGS}" python3 -c 'import json, os; tags = [tag for tag in os.environ["IMAGE_TAGS"].splitlines() if tag]; print(json.dumps([{"cuda": os.environ["CUDA_KEY"], "tags": tags}], separators=(",", ":")))')"
+          python3 scripts/ci/utils/bytedance_docker_build_metadata_args.py \
+            --cuda "${CUDA_KEY}" \
+            --tag-config "${TAG_CONFIG}" \
+            --image-repo "${IMAGE_REPO}" \
+            --sgl-version "${SGL_VERSION}" \
+            --build-commit "${BUILD_COMMIT}" \
+            --build-tree "${BUILD_TREE}" \
+            --python-manifest-sha256 "${PYTHON_MANIFEST_SHA256}" \
+            --build-source "${BUILD_SOURCE}" \
+            --build-url "${BUILD_URL}" \
+            > /tmp/docker-metadata.args
+          {
+            echo "build-commit=${BUILD_COMMIT}"
+            echo "build-tree=${BUILD_TREE}"
+            echo "python-manifest-sha256=${PYTHON_MANIFEST_SHA256}"
+            echo "build-source=${BUILD_SOURCE}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Reclaim disposable caches and require build capacity
+        run: |
+          chmod +x scripts/ci/cleanup_build_runner_disk.sh
+          scripts/ci/cleanup_build_runner_disk.sh --required-gb 150
+
+      - name: Download local sgl-kernel wheel
+        if: ${{ inputs.artifact_name != '' || inputs.kernel_tos_uri != '' }}
+        # The Actions blob route has sustained less than 0.1 MiB/s from the
+        # image runners. Keep the transfer bounded, but allow resumed chunks
+        # enough wall time to finish a verified ~372 MiB wheel artifact.
+        timeout-minutes: 100
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KERNEL_ARTIFACT_NAME: ${{ inputs.artifact_name }}
+          KERNEL_ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id || github.run_id }}
+          KERNEL_ARTIFACT_HTTPS_PROXY: http://100.68.162.211:3128
+          KERNEL_ARTIFACT_TOS_ENDPOINT: tos-cn-beijing.volces.com
+          KERNEL_ARTIFACT_TOS_REGION: cn-beijing
+          KERNEL_ARTIFACT_TOS_BUCKET: ai-infra
+          KERNEL_ARTIFACT_TOS_PREFIX: sglang-ci/kernel-wheels
+          KERNEL_ARTIFACT_TOS_URI: ${{ inputs.kernel_tos_uri }}
+          KERNEL_WHEEL_SHA256: ${{ inputs.kernel_wheel_sha256 }}
+          TOSUTIL_CONFIG_B64: ${{ secrets.TOSUTIL_CONFIG_B64 }}
+        run: |
+          if [ -n "$KERNEL_ARTIFACT_TOS_URI" ]; then
+            scripts/ci/install_tosutil.sh
+          fi
+          python3 -m unittest discover -s scripts/ci -p test_download_kernel_artifact.py
+          python3 scripts/ci/download_kernel_artifact.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$KERNEL_ARTIFACT_RUN_ID" \
+            --name "$KERNEL_ARTIFACT_NAME" \
+            --output .ci-artifacts/sgl-kernel \
+            --tos-uri "$KERNEL_ARTIFACT_TOS_URI" \
+            --wheel-sha256 "$KERNEL_WHEEL_SHA256"
+
+      - name: Set up Docker Buildx with local Docker Hub mirror
+        uses: docker/setup-buildx-action@v3
+        with:
+          name: sgl-private-image-builder
+          keep-state: true
+          cleanup: false
+          driver-opts: |
+            network=host
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["127.0.0.1:5000"]
+            [worker.oci]
+              gc = true
+              reservedSpace = "10GB"
+              maxUsedSpace = "100GB"
+              minFreeSpace = "150GB"
+
+      - name: Login to Volcengine CR
+        run: |
+          set -euo pipefail
+          echo "${VOLCENGINE_CR_PASSWORD}" | docker login "${REGISTRY_HOST}" --username "${VOLCENGINE_CR_USERNAME}" --password-stdin
+
+      - name: Build and push AMD64 image
+        id: build
+        env:
+          IAAS_KERNELS_READ_TOKEN: ${{ secrets.IAAS_KERNELS_READ_TOKEN }}
+          IMAGE_TAGS: ${{ steps.image-tag.outputs.image-tags }}
+        run: |
+          set -euo pipefail
+          VERSION_ARG=""
+          if [ -n "${SGL_VERSION}" ]; then
+            VERSION_ARG="--build-arg SGL_VERSION=${SGL_VERSION}"
+          fi
+          mapfile -t METADATA_ARGS < /tmp/docker-metadata.args
+          mapfile -t IAAS_ARGS < /tmp/iaas-kernels.args
+
+          # When a zstd re-export will follow, export a full (mode=max) registry
+          # build cache so the zstd step can reuse these freshly built layers
+          # instead of recompiling from scratch. The heavy intermediate stages
+          # (torch_deps/framework/deepep) reach the final image via COPY --from,
+          # so mode=max is required to cache them; mode=min/inline would not.
+          # The cache ref is keyed to the resolved primary tag (unique per
+          # variant+cuda+run) to avoid collisions across concurrent matrix jobs.
+          CACHE_ARGS=()
+          if printf '%s' "${IMAGE_FORMATS}" | tr ',' '\n' | grep -qx "zstd"; then
+            PRIMARY_TAG=$(printf '%s\n' "${IMAGE_TAGS}" | grep -v '^[[:space:]]*$' | head -1 | tr -d '[:space:]')
+            CACHE_REF="${IMAGE_REPO}:buildcache-${PRIMARY_TAG}"
+            echo "cache-ref=${CACHE_REF}" >> "$GITHUB_OUTPUT"
+            CACHE_ARGS+=(--cache-to "type=registry,ref=${CACHE_REF},mode=max,image-manifest=true,oci-mediatypes=true")
+          fi
+
+          docker buildx build \
+            --builder sgl-private-image-builder \
+            --target ${{ inputs.docker_target }} \
+            --platform linux/amd64 \
+            --output type=image,name=${IMAGE_REPO},push-by-digest=true,name-canonical=true,push=true \
+            -f docker/Dockerfile \
+            --build-arg CUDA_VERSION=${{ inputs.cuda_version }} \
+            --build-arg BUILD_TYPE=all \
+            --build-arg GRACE_BLACKWELL=0 \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            --build-arg INSTALL_ONION=1 \
+            "${METADATA_ARGS[@]}" \
+            ${VERSION_ARG} \
+            ${{ inputs.extra_build_args }} \
+            "${IAAS_ARGS[@]}" \
+            "${CACHE_ARGS[@]}" \
+            --metadata-file /tmp/metadata.json \
+            .
+
+          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata.json'))['containerimage.digest'])")
+          echo "Pushed digest: ${DIGEST}"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify iaas-kernels candidate
+        if: ${{ inputs.install_iaas_kernels }}
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint python3 "${IMAGE_REPO}@${IMAGE_DIGEST}" \
+            /sgl-workspace/sglang/scripts/ci/check_iaas_kernels_image.py \
+            | tee /tmp/iaas-kernels-smoke.json
+
+      - name: Create Volcengine image tag
+        env:
+          IMAGE_TAGS: ${{ steps.image-tag.outputs.image-tags }}
+        run: |
+          set -euo pipefail
+          mapfile -t image_tags <<< "${IMAGE_TAGS}"
+          tag_args=()
+          for image_tag in "${image_tags[@]}"; do
+            [ -n "${image_tag}" ] || continue
+            tag_args+=(-t "${IMAGE_REPO}:${image_tag}")
+          done
+
+          docker buildx imagetools create \
+            "${tag_args[@]}" \
+            "${IMAGE_REPO}@${{ steps.build.outputs.digest }}"
+          for image_tag in "${image_tags[@]}"; do
+            [ -n "${image_tag}" ] || continue
+            echo "Published ${IMAGE_REPO}:${image_tag}"
+          done
+
+      - name: Verify pushed AMD64 image and source provenance
+        if: ${{ inputs.verify_image }}
+        env:
+          EXPECTED_BUILD_COMMIT: ${{ steps.build-metadata.outputs.build-commit }}
+          EXPECTED_BUILD_SOURCE: ${{ steps.build-metadata.outputs.build-source }}
+          EXPECTED_BUILD_TREE: ${{ steps.build-metadata.outputs.build-tree }}
+          EXPECTED_PYTHON_MANIFEST_SHA256: ${{ steps.build-metadata.outputs.python-manifest-sha256 }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          IMAGE_REF="${IMAGE_REPO}@${IMAGE_DIGEST}"
+          docker buildx imagetools inspect "${IMAGE_REF}"
+          docker buildx imagetools inspect \
+            "${IMAGE_REF}" \
+            --format '{{json .Image}}' \
+            > /tmp/image-config.json
+
+          python3 - /tmp/image-config.json <<'PY'
+          import json
+          import os
+          import sys
+
+          with open(sys.argv[1]) as config_file:
+              inspect = json.load(config_file)
+          if inspect["architecture"] != "amd64":
+              raise SystemExit(f"unexpected architecture: {inspect['architecture']}")
+          labels = inspect["config"].get("Labels") or {}
+          expected = {
+              "ai.sglang.build.commit": os.environ["EXPECTED_BUILD_COMMIT"],
+              "ai.sglang.build.tree": os.environ["EXPECTED_BUILD_TREE"],
+              "ai.sglang.build.python-manifest-sha256": os.environ[
+                  "EXPECTED_PYTHON_MANIFEST_SHA256"
+              ],
+              "org.opencontainers.image.source": os.environ["EXPECTED_BUILD_SOURCE"],
+          }
+          mismatches = {
+              key: (labels.get(key), value)
+              for key, value in expected.items()
+              if labels.get(key) != value
+          }
+          if mismatches:
+              raise SystemExit(f"image provenance mismatch: {mismatches}")
+          print(json.dumps({"architecture": inspect["architecture"], **expected}))
+          PY
+
+      # --- zstd format: re-export the just-built layers with zstd compression,
+      # then reuse the same provenance/runtime verification. It pulls the
+      # mode=max registry build cache written by the base step (--cache-from),
+      # so all intermediate stages are cache hits and only layer compression is
+      # redone. The config stays identical to base; only layer compression
+      # changes. (Without --cache-from the local BuildKit cache can be evicted
+      # between steps by the large image + verify pull, forcing a full rebuild.)
+      - name: Build and push AMD64 zstd image
+        id: build-zstd
+        if: ${{ contains(inputs.image_formats, 'zstd') }}
+        env:
+          IAAS_KERNELS_READ_TOKEN: ${{ secrets.IAAS_KERNELS_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION_ARG=""
+          if [ -n "${SGL_VERSION}" ]; then
+            VERSION_ARG="--build-arg SGL_VERSION=${SGL_VERSION}"
+          fi
+          mapfile -t METADATA_ARGS < /tmp/docker-metadata.args
+          mapfile -t IAAS_ARGS < /tmp/iaas-kernels.args
+
+          CACHE_FROM_ARGS=()
+          if [ -n "${{ steps.build.outputs.cache-ref }}" ]; then
+            CACHE_FROM_ARGS+=(--cache-from "type=registry,ref=${{ steps.build.outputs.cache-ref }}")
+          fi
+
+          docker buildx build \
+            --builder sgl-private-image-builder \
+            --target ${{ inputs.docker_target }} \
+            --platform linux/amd64 \
+            --output type=image,name=${IMAGE_REPO},push-by-digest=true,name-canonical=true,push=true,compression=zstd,compression-level=3,force-compression=true,oci-mediatypes=true \
+            -f docker/Dockerfile \
+            --build-arg CUDA_VERSION=${{ inputs.cuda_version }} \
+            --build-arg BUILD_TYPE=all \
+            --build-arg GRACE_BLACKWELL=0 \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            --build-arg INSTALL_ONION=1 \
+            "${METADATA_ARGS[@]}" \
+            ${VERSION_ARG} \
+            ${{ inputs.extra_build_args }} \
+            "${IAAS_ARGS[@]}" \
+            "${CACHE_FROM_ARGS[@]}" \
+            --metadata-file /tmp/metadata-zstd.json \
+            .
+
+          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-zstd.json'))['containerimage.digest'])")
+          echo "Pushed zstd digest: ${DIGEST}"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify iaas-kernels candidate-zstd
+        if: ${{ inputs.install_iaas_kernels && contains(inputs.image_formats, 'zstd') }}
+        env:
+          IMAGE_DIGEST: ${{ steps.build-zstd.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint python3 "${IMAGE_REPO}@${IMAGE_DIGEST}" \
+            /sgl-workspace/sglang/scripts/ci/check_iaas_kernels_image.py \
+            | tee /tmp/iaas-kernels-smoke-zstd.json
+
+      - name: Create Volcengine zstd image tag
+        if: ${{ contains(inputs.image_formats, 'zstd') }}
+        env:
+          IMAGE_TAGS: ${{ steps.image-tag.outputs.image-tags }}
+        run: |
+          set -euo pipefail
+          mapfile -t image_tags <<< "${IMAGE_TAGS}"
+          tag_args=()
+          for image_tag in "${image_tags[@]}"; do
+            [ -n "${image_tag}" ] || continue
+            tag_args+=(-t "${IMAGE_REPO}:${image_tag}-zstd")
+          done
+
+          docker buildx imagetools create \
+            "${tag_args[@]}" \
+            "${IMAGE_REPO}@${{ steps.build-zstd.outputs.digest }}"
+          for image_tag in "${image_tags[@]}"; do
+            [ -n "${image_tag}" ] || continue
+            echo "Published ${IMAGE_REPO}:${image_tag}-zstd"
+          done
+
+      - name: Verify pushed AMD64 zstd image and source provenance
+        if: ${{ inputs.verify_image && contains(inputs.image_formats, 'zstd') }}
+        env:
+          EXPECTED_BUILD_COMMIT: ${{ steps.build-metadata.outputs.build-commit }}
+          EXPECTED_BUILD_SOURCE: ${{ steps.build-metadata.outputs.build-source }}
+          EXPECTED_BUILD_TREE: ${{ steps.build-metadata.outputs.build-tree }}
+          EXPECTED_PYTHON_MANIFEST_SHA256: ${{ steps.build-metadata.outputs.python-manifest-sha256 }}
+          IMAGE_DIGEST: ${{ steps.build-zstd.outputs.digest }}
+        run: |
+          set -euo pipefail
+          IMAGE_REF="${IMAGE_REPO}@${IMAGE_DIGEST}"
+          docker buildx imagetools inspect "${IMAGE_REF}"
+
+          # zstd-compressed layers require Docker Engine >= 23 / containerd >= 1.5
+          # to pull and run. If this daemon cannot, degrade to manifest-only
+          # inspection (media-type + provenance labels) instead of failing.
+          if docker pull "${IMAGE_REF}"; then
+            python3 - "${IMAGE_REF}" <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+
+          inspect = json.loads(
+              subprocess.check_output(["docker", "image", "inspect", sys.argv[1]])
+          )[0]
+          if inspect["Architecture"] != "amd64":
+              raise SystemExit(f"unexpected architecture: {inspect['Architecture']}")
+          labels = inspect["Config"].get("Labels") or {}
+          expected = {
+              "ai.sglang.build.commit": os.environ["EXPECTED_BUILD_COMMIT"],
+              "ai.sglang.build.tree": os.environ["EXPECTED_BUILD_TREE"],
+              "ai.sglang.build.python-manifest-sha256": os.environ[
+                  "EXPECTED_PYTHON_MANIFEST_SHA256"
+              ],
+              "org.opencontainers.image.source": os.environ["EXPECTED_BUILD_SOURCE"],
+          }
+          mismatches = {
+              key: (labels.get(key), value)
+              for key, value in expected.items()
+              if labels.get(key) != value
+          }
+          if mismatches:
+              raise SystemExit(f"image provenance mismatch: {mismatches}")
+          print(json.dumps({"architecture": inspect["Architecture"], **expected}))
+          PY
+
+            docker run --rm \
+              -e EXPECTED_BUILD_COMMIT \
+              -e EXPECTED_BUILD_TREE \
+              -e EXPECTED_PYTHON_MANIFEST_SHA256 \
+              --entrypoint bash "${IMAGE_REF}" -lc '
+                set -euo pipefail
+                test "$SGLANG_BUILD_COMMIT" = "$EXPECTED_BUILD_COMMIT"
+                test "$SGLANG_BUILD_TREE" = "$EXPECTED_BUILD_TREE"
+                test "$SGLANG_PYTHON_MANIFEST_SHA256" = "$EXPECTED_PYTHON_MANIFEST_SHA256"
+                command -v oniond
+                python3 scripts/ci/verify_private_image_runtime.py
+              '
+          else
+            echo "::warning::daemon cannot pull zstd image; degrading to manifest-only check"
+            python3 - "${IMAGE_REF}" <<'PY'
+          import json
+          import subprocess
+          import sys
+
+          raw = subprocess.check_output(
+              ["docker", "buildx", "imagetools", "inspect", "--raw", sys.argv[1]]
+          )
+          manifest = json.loads(raw)
+          layers = manifest.get("layers", [])
+          media_types = {layer.get("mediaType", "") for layer in layers}
+          if not any("zstd" in media_type for media_type in media_types):
+              raise SystemExit(f"expected zstd layer media types, got: {media_types}")
+          print(json.dumps({"zstd_layer_media_types": sorted(media_types)}))
+          PY
+          fi
+
+      # --- nydus format: convert the already-pushed base OCI image into a
+      # nydus (lazy-loading) image with nydusify. A plain `docker run` cannot
+      # run nydus images (needs nydus-snapshotter), so CI validates with
+      # `nydusify check` + manifest/label inspection only. Real snapshotter
+      # mount + GPU serving is deferred to a ServingKit node.
+      - name: Install nydus tooling
+        if: ${{ contains(inputs.image_formats, 'nydus') }}
+        env:
+          NYDUS_VERSION: "2.3.0"
+        run: |
+          set -euo pipefail
+          tarball="nydus-static-v${NYDUS_VERSION}-linux-amd64.tgz"
+          url="https://github.com/dragonflyoss/nydus/releases/download/v${NYDUS_VERSION}/${tarball}"
+          echo "Downloading ${url}"
+          # The CI proxy is intermittently unstable, so wrap the download in an
+          # outer retry loop and let curl retry every error class (including
+          # curl 56 "Connection died") instead of only its default retryable set.
+          retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; }
+          retry curl -fL --retry 5 --retry-all-errors --retry-delay 2 -o "/tmp/${tarball}" "${url}"
+          tar -xzf "/tmp/${tarball}" -C /tmp
+          sudo install -m 0755 /tmp/nydus-static/nydusify /usr/local/bin/nydusify
+          sudo install -m 0755 /tmp/nydus-static/nydus-image /usr/local/bin/nydus-image
+          nydusify --version
+          nydus-image --version
+
+      - name: Convert and push nydus image
+        if: ${{ contains(inputs.image_formats, 'nydus') }}
+        env:
+          IMAGE_TAGS: ${{ steps.image-tag.outputs.image-tags }}
+          BASE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mapfile -t image_tags <<< "${IMAGE_TAGS}"
+          # nydusify convert is pull(base OCI)->convert->push(nydus). The pull and
+          # convert are deterministic and the push overwrites the same tag, so the
+          # whole convert is idempotent and safe to re-run. The internal registry
+          # push occasionally drops the connection mid-copy ("io: read/write on
+          # closed pipe"), so wrap the full convert in an outer retry loop.
+          retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 20s"; sleep 20; done; return 1; }
+          for image_tag in "${image_tags[@]}"; do
+            [ -n "${image_tag}" ] || continue
+            target="${IMAGE_REPO}:${image_tag}-nydus"
+            echo "Converting ${IMAGE_REPO}@${BASE_DIGEST} -> ${target}"
+            retry nydusify convert \
+              --nydus-image /usr/local/bin/nydus-image \
+              --source "${IMAGE_REPO}@${BASE_DIGEST}" \
+              --target "${target}"
+            echo "Published ${target}"
+          done
+
+      - name: Verify pushed nydus image
+        if: ${{ inputs.verify_image && contains(inputs.image_formats, 'nydus') }}
+        env:
+          IMAGE_TAGS: ${{ steps.image-tag.outputs.image-tags }}
+          EXPECTED_BUILD_COMMIT: ${{ steps.build-metadata.outputs.build-commit }}
+          EXPECTED_BUILD_SOURCE: ${{ steps.build-metadata.outputs.build-source }}
+        run: |
+          set -euo pipefail
+          mapfile -t image_tags <<< "${IMAGE_TAGS}"
+          for image_tag in "${image_tags[@]}"; do
+            [ -n "${image_tag}" ] || continue
+            target="${IMAGE_REPO}:${image_tag}-nydus"
+            echo "Checking ${target}"
+            nydusify check --target "${target}"
+            docker buildx imagetools inspect "${target}"
+            python3 - "${target}" <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+
+          target = sys.argv[1]
+          raw = subprocess.check_output(
+              ["docker", "buildx", "imagetools", "inspect", "--raw", target]
+          )
+          manifest = json.loads(raw)
+          layers = manifest.get("layers", [])
+          media_types = [layer.get("mediaType", "") for layer in layers]
+          annotations = {}
+          for layer in layers:
+              annotations.update(layer.get("annotations", {}) or {})
+          has_nydus = any(
+              "nydus" in media_type for media_type in media_types
+          ) or any("nydus" in key for key in annotations)
+          if not has_nydus:
+              raise SystemExit(
+                  f"expected nydus markers in manifest; layers={media_types} "
+                  f"annotations={sorted(annotations)}"
+              )
+          print(json.dumps({"nydus_layer_media_types": media_types}))
+          PY
+          done
+
+      - name: Remove disposable local images
+        if: always()
+        run: |
+          docker image prune -af || true
+          df -h /
+
+      - name: Upload iaas-kernels provenance and smoke results
+        if: ${{ always() && inputs.install_iaas_kernels }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: iaas-kernels-${{ inputs.docker_target }}-${{ inputs.cuda_key }}-${{ inputs.variant_suffix || 'base' }}
+          path: |
+            /tmp/iaas-kernels-smoke*.json
+            /tmp/metadata.json
+            /tmp/metadata-zstd.json
+          if-no-files-found: warn

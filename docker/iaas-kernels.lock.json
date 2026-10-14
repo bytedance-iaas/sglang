@@ -1,0 +1,11 @@
+{
+  "repository": "https://github.com/bytedance-iaas/iaas-kernels.git",
+  "revision": "aafe99be98b7af1ab92e75e36315f0cc74e9c642",
+  "version": "0.1.0.dev0",
+  "platform": "linux/amd64",
+  "python": "3.12",
+  "torch": "2.13.0",
+  "cuda": "13.0",
+  "apache-tvm-ffi": "0.1.11",
+  "transport": "nvlink"
+}

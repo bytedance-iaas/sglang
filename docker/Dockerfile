@@ -18,6 +18,11 @@ ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
+ARG INSTALL_LOCAL_SGL_KERNEL_WHEEL=0
+ARG INSTALL_AI_DYNAMO=1
+ARG INSTALL_IAAS_KERNELS=0
+ARG EIC_SDK_VERSION=1.5.2
+ARG EIC_SDK_RELEASE_ROOT=https://eic-sdk-release.tos-cn-beijing.volces.com/python
 ARG FLASHINFER_VERSION=0.7.0.post1
 ARG MOONCAKE_VERSION=0.3.13.post1
 ARG MSCCLPP_VERSION=sglang-v0.10.1
@@ -33,8 +38,11 @@ ENV PATH="${PATH}:/usr/local/nvidia/bin" \
 
 # Replace Ubuntu sources if specified
 RUN if [ -n "$UBUNTU_MIRROR" ]; then \
-    sed -i "s|http://.*archive.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list && \
-    sed -i "s|http://.*security.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list; \
+    for sources_file in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do \
+        if [ -f "$sources_file" ]; then \
+            sed -i -E "s#https?://(archive|security)\.ubuntu\.com#$UBUNTU_MIRROR#g" "$sources_file"; \
+        fi; \
+    done; \
 fi
 
 # create virtual env for sglang to avoid conflict with system python packages
@@ -155,6 +163,34 @@ ENV LANG=en_US.UTF-8 \
     LANGUAGE=en_US:en \
     LC_ALL=en_US.UTF-8
 
+# Lightweight private-delivery dependency smoke target. This intentionally
+# stops before the full SGLang framework build so CI can validate the private
+# apt repository and EIC SDK within the runner time limit.
+FROM base AS private_dependency_smoke
+
+ARG EIC_SDK_VERSION
+ARG EIC_SDK_RELEASE_ROOT
+ARG BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=http://mirrors.ivolces.com/extra-tools/ubuntu
+ARG BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system
+
+RUN VERSION_CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME}")" \
+    && curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 2 \
+        "${BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL}" \
+        | gpg --dearmor -o /etc/apt/trusted.gpg.d/volc-extra-tools.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/trusted.gpg.d/volc-extra-tools.gpg] ${BYTED_INTERNAL_EXTRA_TOOLS_APT_URL} ${VERSION_CODENAME} main" \
+        > /etc/apt/sources.list.d/volctools.list \
+    && apt-get update -o APT::Update::Error-Mode=any \
+    && apt-get install -y --no-install-recommends onion-ai-data \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+RUN retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; } \
+    && retry python3 -m pip install --force-reinstall \
+        "${EIC_SDK_RELEASE_ROOT}/eic-${EIC_SDK_VERSION}-py3-none-any.whl" \
+        --no-cache-dir \
+    && command -v oniond \
+    && python3 -c 'import eic; print(f"eic-module={eic.__file__}")'
+
 ########################################################
 ########## PARALLEL BUILDER STAGES ####################
 ########################################################
@@ -182,6 +218,8 @@ ARG CUDA_VERSION
 ARG BUILD_TYPE
 ARG SGL_KERNEL_VERSION
 ARG GITHUB_ARTIFACTORY
+ARG INSTALL_LOCAL_SGL_KERNEL_WHEEL
+ARG INSTALL_IAAS_KERNELS
 
 WORKDIR /sgl-workspace
 
@@ -193,6 +231,7 @@ RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.ru
     && rustc --version && cargo --version
 
 # Install sgl-kernel (from pre-built wheel)
+COPY .ci-artifacts/sgl-kernel/ /tmp/local-sgl-kernel/
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --upgrade pip setuptools wheel html5lib six \
     && case "$CUDA_VERSION" in \
@@ -200,7 +239,14 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
     # --no-deps prevents uv from pulling torch from default PyPI
-    && uv pip install sglang-kernel==${SGL_KERNEL_VERSION} --reinstall --no-deps
+    && if [ "$INSTALL_LOCAL_SGL_KERNEL_WHEEL" = "1" ]; then \
+        WHEEL_COUNT="$(find /tmp/local-sgl-kernel -maxdepth 1 -type f -name '*.whl' | wc -l)" \
+        && [ "$WHEEL_COUNT" -eq 1 ] \
+        && LOCAL_WHEEL="$(find /tmp/local-sgl-kernel -maxdepth 1 -type f -name '*.whl')" \
+        && uv pip install "$LOCAL_WHEEL" --reinstall --no-deps; \
+    else \
+        uv pip install sglang-kernel==${SGL_KERNEL_VERSION} --reinstall --no-deps; \
+    fi
 
 # Copy the dependency spec, Rust extension sources, and shared API types.
 # Split from the pip install so changes to these build inputs invalidate the
@@ -270,6 +316,36 @@ RUN mkdir -p /wheels && \
         git checkout ${HPC_OPS_COMMIT} && \
         python3 setup.py bdist_wheel -d /wheels; \
     fi
+
+########################################################
+# Optional internal SM90 wheel (needs torch_deps)
+########################################################
+FROM torch_deps AS iaas_kernels_builder
+
+ARG INSTALL_IAAS_KERNELS
+ARG TARGETARCH
+ARG CUDA_VERSION
+
+COPY docker/iaas-kernels.lock.json /build/iaas-kernels.lock.json
+COPY scripts/ci/build_iaas_kernels_wheel.py scripts/ci/check_iaas_kernels_image.py /build/
+# Build only the host extension here; SM90 kernels are JIT compiled at runtime.
+# The private repository token is a BuildKit secret, never a build argument.
+RUN --mount=type=secret,id=iaas_kernels_token \
+    --mount=type=cache,target=/root/.cache/pip \
+    mkdir -p /wheels && \
+    if [ "$INSTALL_IAAS_KERNELS" = "1" ]; then \
+        test "$TARGETARCH" = "amd64" && test "$CUDA_VERSION" = "13.0.3" && \
+        apt-get update && apt-get install -y --no-install-recommends libdw-dev libelf-dev ninja-build && \
+        rm -rf /var/lib/apt/lists/* && \
+        python3 -m pip install 'build==1.3.0' && \
+        python3 /build/build_iaas_kernels_wheel.py --lock /build/iaas-kernels.lock.json; \
+    else \
+        test "$INSTALL_IAAS_KERNELS" = "0"; \
+    fi
+
+# Optional export target for archiving the exact wheel and its provenance.
+FROM scratch AS iaas_kernels_wheel
+COPY --from=iaas_kernels_builder /wheels/ /
 
 ########################################################
 # PARALLEL STAGE 3: FlashInfer Cache (needs torch_deps)
@@ -392,6 +468,10 @@ ARG USE_LATEST_SGLANG
 ARG GITHUB_ARTIFACTORY
 ARG MOONCAKE_VERSION
 ARG MSCCLPP_VERSION
+ARG EIC_SDK_VERSION
+ARG EIC_SDK_RELEASE_ROOT
+ARG INSTALL_AI_DYNAMO
+ARG INSTALL_IAAS_KERNELS
 # Renamed from NCCL_VERSION: the nvidia/cuda base image sets ENV NCCL_VERSION
 # (Debian apt format, e.g. 2.28.3-1), which shadows a same-named ARG inside RUN.
 ARG SGL_NCCL_VERSION
@@ -408,6 +488,15 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     if ls /tmp/wheels/hpc-ops/*.whl >/dev/null 2>&1; then \
         uv pip install --no-deps /tmp/wheels/hpc-ops/*.whl; \
     fi && rm -rf /tmp/wheels/hpc-ops
+
+COPY --from=iaas_kernels_builder /wheels /tmp/wheels/iaas-kernels
+RUN mkdir -p /opt/sglang/share/iaas-kernels && \
+    if [ "$INSTALL_IAAS_KERNELS" = "1" ]; then \
+        apt-get update && apt-get install -y --no-install-recommends libdw1t64 libelf1t64 && \
+        rm -rf /var/lib/apt/lists/* && \
+        python3 -m pip install --force-reinstall --no-deps /tmp/wheels/iaas-kernels/*.whl && \
+        cp /tmp/wheels/iaas-kernels/*.json /opt/sglang/share/iaas-kernels/; \
+    fi && rm -rf /tmp/wheels/iaas-kernels
 
 # Copy flashinfer cubin (always) and jit-cache (if installed) packages
 COPY --from=flashinfer_cache /flashinfer_jit_output/ /opt/sglang/lib/python3.12/site-packages/
@@ -463,6 +552,25 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
     && apt install -y --no-install-recommends nsight-systems-cli \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Onion model/data tooling only for private-delivery builds.
+ARG INSTALL_ONION=0
+ARG BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=http://mirrors.ivolces.com/extra-tools/ubuntu
+ARG BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system
+RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
+    if [ "$INSTALL_ONION" = "1" ]; then \
+        VERSION_CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME}")" \
+        && curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 2 "${BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL}" \
+            | gpg --dearmor -o /etc/apt/trusted.gpg.d/volc-extra-tools.gpg \
+        && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/trusted.gpg.d/volc-extra-tools.gpg] ${BYTED_INTERNAL_EXTRA_TOOLS_APT_URL} ${VERSION_CODENAME} main" \
+            > /etc/apt/sources.list.d/volctools.list \
+        && apt-get update \
+        && apt-get install -y --no-install-recommends onion-ai-data \
+        && rm -rf /var/lib/apt/lists/* \
+        && apt-get clean; \
+    else \
+        echo "Skipping Onion installation (INSTALL_ONION=${INSTALL_ONION})"; \
+    fi
+
 # =============================================================================
 # Python packages and tools (before source copy for better caching)
 # =============================================================================
@@ -505,6 +613,15 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     termplotlib \
     "runai-model-streamer[s3,gcs,azure]>=0.15.7"
 
+# Install the EIC SDK required by the EIC HiCache backend. framework_final
+# inherits it directly, and runtime copies framework_final's site-packages.
+RUN if [ "$INSTALL_ONION" = "1" ]; then \
+    retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; } \
+    && retry python3 -m pip install --force-reinstall \
+    "${EIC_SDK_RELEASE_ROOT}/eic-${EIC_SDK_VERSION}-py3-none-any.whl" \
+    --no-cache-dir; \
+    fi
+
 # DeepEP needs SGL_NCCL_VERSION at runtime even if torch pins another version;
 # install it after the constrained dependency solve so the solve cannot revert it.
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -520,8 +637,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # Install the latest available AI Dynamo prerelease from NVIDIA's package index.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --prerelease=allow --index-strategy unsafe-best-match \
-        --extra-index-url https://pypi.nvidia.com/ ai-dynamo
+    if [ "$INSTALL_AI_DYNAMO" = "1" ]; then \
+        uv pip install --prerelease=allow --index-strategy unsafe-best-match \
+        --extra-index-url https://pypi.nvidia.com/ ai-dynamo; \
+    fi
 
 # Add yank script
 COPY --chown=root:root --chmod=755 docker/configs/yank /usr/local/bin/yank
@@ -629,18 +748,33 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
 
+# Check the actual installed package after all pip operations. Plugin load errors
+# are logged and swallowed by the loader, so explicitly assert registration.
+RUN if [ "$INSTALL_IAAS_KERNELS" = "1" ]; then \
+        test "$BRANCH_TYPE" = "local" && \
+        python3 scripts/ci/check_iaas_kernels_image.py; \
+    fi
+
 # Keep build provenance at the end so metadata changes do not invalidate build layers.
 ARG SGLANG_BUILD_COMMIT=unknown
+ARG SGLANG_BUILD_TREE=unknown
+ARG SGLANG_PYTHON_MANIFEST_SHA256=unknown
+ARG SGLANG_BUILD_SOURCE=https://github.com/sgl-project/sglang
 ARG SGLANG_BUILD_URL=
 ARG SGLANG_IMAGE_TAG=local/sglang:dev
 ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown} \
+    SGLANG_BUILD_TREE=${SGLANG_BUILD_TREE:-unknown} \
+    SGLANG_PYTHON_MANIFEST_SHA256=${SGLANG_PYTHON_MANIFEST_SHA256:-unknown} \
+    SGLANG_BUILD_SOURCE=${SGLANG_BUILD_SOURCE:-https://github.com/sgl-project/sglang} \
     SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-} \
     SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev}
-LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
+LABEL org.opencontainers.image.source="${SGLANG_BUILD_SOURCE}" \
       org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
       org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
       org.opencontainers.image.url="${SGLANG_BUILD_URL}" \
       ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
+      ai.sglang.build.tree="${SGLANG_BUILD_TREE}" \
+      ai.sglang.build.python-manifest-sha256="${SGLANG_PYTHON_MANIFEST_SHA256}" \
       ai.sglang.build.url="${SGLANG_BUILD_URL}" \
       ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
 
@@ -666,6 +800,7 @@ FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS runtime
 
 ARG CUDA_VERSION
 ARG TARGETARCH
+ARG INSTALL_IAAS_KERNELS=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG PYTHON_VERSION
 
@@ -729,6 +864,31 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
+# Native host-library dependencies for the optional SM90 wheel.
+RUN if [ "$INSTALL_IAAS_KERNELS" = "1" ]; then \
+        apt-get update && apt-get install -y --no-install-recommends libdw1t64 libelf1t64 && \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# Install Onion model/data tooling only for private-delivery builds.
+ARG INSTALL_ONION=0
+ARG BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=http://mirrors.ivolces.com/extra-tools/ubuntu
+ARG BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system
+RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
+    if [ "$INSTALL_ONION" = "1" ]; then \
+        VERSION_CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME}")" \
+        && curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 2 "${BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL}" \
+            | gpg --dearmor -o /etc/apt/trusted.gpg.d/volc-extra-tools.gpg \
+        && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/trusted.gpg.d/volc-extra-tools.gpg] ${BYTED_INTERNAL_EXTRA_TOOLS_APT_URL} ${VERSION_CODENAME} main" \
+            > /etc/apt/sources.list.d/volctools.list \
+        && apt-get update \
+        && apt-get install -y --no-install-recommends onion-ai-data \
+        && rm -rf /var/lib/apt/lists/* \
+        && apt-get clean; \
+    else \
+        echo "Skipping Onion installation (INSTALL_ONION=${INSTALL_ONION})"; \
+    fi
+
 # create virtual env for sglang to avoid conflict with system python packages
 COPY --from=uv /uv /uvx /usr/local/bin/
 COPY --from=base /opt/python /opt/python
@@ -763,6 +923,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
 # Copy Python site-packages from framework (already cleaned of __pycache__/tests/pyc files)
 COPY --from=framework_final /opt/sglang/lib/python3.12/site-packages /opt/sglang/lib/python3.12/site-packages
 COPY --from=framework_final /opt/sglang/bin/pip* /opt/sglang/bin/
+COPY --from=framework_final /opt/sglang/share/iaas-kernels /opt/sglang/share/iaas-kernels
 
 # Copy SGLang workspace
 COPY --from=framework_final /sgl-workspace /sgl-workspace
@@ -791,18 +952,32 @@ RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linu
 
 WORKDIR /sgl-workspace/sglang
 
+# Check the actual installed package after all pip operations. Plugin load errors
+# are logged and swallowed by the loader, so explicitly assert registration.
+RUN if [ "$INSTALL_IAAS_KERNELS" = "1" ]; then \
+        python3 scripts/ci/check_iaas_kernels_image.py; \
+    fi
+
 # Keep build provenance at the end so metadata changes do not invalidate build layers.
 ARG SGLANG_BUILD_COMMIT=unknown
+ARG SGLANG_BUILD_TREE=unknown
+ARG SGLANG_PYTHON_MANIFEST_SHA256=unknown
+ARG SGLANG_BUILD_SOURCE=https://github.com/sgl-project/sglang
 ARG SGLANG_BUILD_URL=
 ARG SGLANG_IMAGE_TAG=local/sglang:dev
 ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown} \
+    SGLANG_BUILD_TREE=${SGLANG_BUILD_TREE:-unknown} \
+    SGLANG_PYTHON_MANIFEST_SHA256=${SGLANG_PYTHON_MANIFEST_SHA256:-unknown} \
+    SGLANG_BUILD_SOURCE=${SGLANG_BUILD_SOURCE:-https://github.com/sgl-project/sglang} \
     SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-} \
     SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev}
-LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
+LABEL org.opencontainers.image.source="${SGLANG_BUILD_SOURCE}" \
       org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
       org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
       org.opencontainers.image.url="${SGLANG_BUILD_URL}" \
       ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
+      ai.sglang.build.tree="${SGLANG_BUILD_TREE}" \
+      ai.sglang.build.python-manifest-sha256="${SGLANG_PYTHON_MANIFEST_SHA256}" \
       ai.sglang.build.url="${SGLANG_BUILD_URL}" \
       ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
 
