@@ -14,15 +14,16 @@ SM90_INDEXER_BENCH_RATIO (1 or 2, default 2), and SM90_INDEXER_BENCH_OUTPUT
 uses mapped Triton, not the 64-head grouped CUDA kernel.
 """
 
+import importlib
 import json
 import math
 import os
 import random
 import statistics
+import sys
 from pathlib import Path
 
 import torch
-from test_sm90_fp4_grouped_indexer import TestSm90Fp4GroupedIndexer
 
 from sglang.kernels.jit.benchmark.utils import get_benchmark_range
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import fp4_index_logits_decode
@@ -32,6 +33,16 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(
     est_time=60, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
+
+
+def load_test_fixture(module_name):
+    # Correctness fixtures live under ops after the kernel taxonomy migration.
+    fixture_dir = Path(__file__).resolve().parents[3] / "ops" / "attention" / "dsv4"
+    sys.path.insert(0, str(fixture_dir))
+    try:
+        return importlib.import_module(module_name)
+    finally:
+        sys.path.remove(str(fixture_dir))
 
 
 def elapsed_ms(graph, repeats):
@@ -113,7 +124,9 @@ def benchmark():
     )
     if os.getenv("SM90_INDEXER_BENCH_CASES"):
         cases = os.environ["SM90_INDEXER_BENCH_CASES"].split(",")
-    fixture = TestSm90Fp4GroupedIndexer("test_matches_triton")
+    fixture = load_test_fixture(
+        "test_sm90_fp4_grouped_indexer"
+    ).TestSm90Fp4GroupedIndexer("test_matches_triton")
     records = []
     for shape in cases:
         rows, width, fraction = shape.split(":")
