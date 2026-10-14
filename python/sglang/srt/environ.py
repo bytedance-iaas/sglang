@@ -1616,6 +1616,8 @@ class Envs:
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
+    # Opt-in single-stage SM90 V4.1 TF32x3 projection and fused Sinkhorn.
+    SGLANG_OPT_DSV41_SM90_FUSED_MHC = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)

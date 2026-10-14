@@ -255,6 +255,20 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
         is_batch_invariant_mode_enabled,
     )
 
+    sm90_fused_mhc = (
+        x.is_cuda
+        and torch.version.cuda is not None
+        and get_platform().is_sm90
+        and envs.SGLANG_OPT_DSV41_SM90_FUSED_MHC.get()
+        and cfg.pre_from_prev
+        and cfg.mult == 4
+        and cfg.hidden == 5120
+        and x_flat.shape[1] == 20480
+        and 0 < x.shape[0] <= 256
+        and x.dtype == torch.bfloat16
+        and not is_batch_invariant_mode_enabled()
+    )
+
     parts = bf16_parts = None
     hopper_medium = get_platform().is_sm90 and 32 <= x_flat.shape[0] < 4096
     if (
@@ -263,6 +277,7 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
         and x_flat.is_contiguous()
         and (get_platform().is_sm100 or get_platform().is_sm90)
         and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
+        and not sm90_fused_mhc
         and not is_batch_invariant_mode_enabled()
     ):
         parts, bf16_parts = hc.tf32_parts, hc.bf16_parts
@@ -271,7 +286,9 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
         hopper_medium or 4096 <= x_flat.shape[0] <= 65536
     )
     hopper_fused_stats = get_platform().is_sm90 and (
-        x.shape[0] == 1 or (bf16_parts is not None and 32 <= x.shape[0] <= 65536)
+        sm90_fused_mhc
+        or x.shape[0] == 1
+        or (bf16_parts is not None and 32 <= x.shape[0] <= 65536)
     )
     # gfx950 uses the fused Triton port at every row count (MI350X).
     use_fused_stats = _is_gfx95_supported or (
@@ -319,6 +336,7 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
                 cfg.sinkhorn_iters,
                 cfg.rms_eps,
                 cfg.eps,
+                sm90_decode=sm90_fused_mhc,
             )
         return pre, post, comb
     if x.is_cuda and torch.version.cuda is not None:
