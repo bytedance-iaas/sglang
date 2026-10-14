@@ -372,7 +372,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             # Skip the reserved page and free each aliased SWA slot once.
             swa_indices = torch.unique(swa_indices[swa_indices >= self.page_size])
         else:
-            swa_indices = swa_indices[swa_indices > 0]
+            # Page 0 is never allocated (free_pages starts at page 1), so
+            # no slot below page_size may be credited back; with
+            # page_size == 1 this is the same as dropping slot 0.
+            swa_indices = swa_indices[swa_indices >= self.page_size]
         self.clear_full_to_swa_mapping(mapping_indices)
 
         if self.free_group is not None:
@@ -407,7 +410,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.swa_free_group:
             swa_free_group = self.swa_free_group
             self.swa_free_group = []
-            self.swa_attn_allocator.free(torch.cat(swa_free_group))
+            swa_indices = torch.cat(swa_free_group)
+            if self.dedup_aliased_swa:
+                # Aliased slots repeat across group entries; free once.
+                swa_indices = torch.unique(swa_indices)
+            self.swa_attn_allocator.free(swa_indices)
         if self.full_free_group:
             full_free_group = self.full_free_group
             self.full_free_group = []
