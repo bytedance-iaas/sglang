@@ -18,11 +18,7 @@ ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG INSTALL_LOCAL_SGL_KERNEL_WHEEL=0
-ARG INSTALL_AI_DYNAMO=1
 ARG INSTALL_IAAS_KERNELS=0
-ARG EIC_SDK_VERSION=1.5.2
-ARG EIC_SDK_RELEASE_ROOT=https://eic-sdk-release.tos-cn-beijing.volces.com/python
 ARG FLASHINFER_VERSION=0.7.0.post1
 ARG MOONCAKE_VERSION=0.3.13.post1
 ARG MSCCLPP_VERSION=sglang-v0.10.1
@@ -38,11 +34,8 @@ ENV PATH="${PATH}:/usr/local/nvidia/bin" \
 
 # Replace Ubuntu sources if specified
 RUN if [ -n "$UBUNTU_MIRROR" ]; then \
-    for sources_file in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do \
-        if [ -f "$sources_file" ]; then \
-            sed -i -E "s#https?://(archive|security)\.ubuntu\.com#$UBUNTU_MIRROR#g" "$sources_file"; \
-        fi; \
-    done; \
+    sed -i "s|http://.*archive.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list && \
+    sed -i "s|http://.*security.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list; \
 fi
 
 # create virtual env for sglang to avoid conflict with system python packages
@@ -163,34 +156,6 @@ ENV LANG=en_US.UTF-8 \
     LANGUAGE=en_US:en \
     LC_ALL=en_US.UTF-8
 
-# Lightweight private-delivery dependency smoke target. This intentionally
-# stops before the full SGLang framework build so CI can validate the private
-# apt repository and EIC SDK within the runner time limit.
-FROM base AS private_dependency_smoke
-
-ARG EIC_SDK_VERSION
-ARG EIC_SDK_RELEASE_ROOT
-ARG BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=http://mirrors.ivolces.com/extra-tools/ubuntu
-ARG BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system
-
-RUN VERSION_CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME}")" \
-    && curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 2 \
-        "${BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL}" \
-        | gpg --dearmor -o /etc/apt/trusted.gpg.d/volc-extra-tools.gpg \
-    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/trusted.gpg.d/volc-extra-tools.gpg] ${BYTED_INTERNAL_EXTRA_TOOLS_APT_URL} ${VERSION_CODENAME} main" \
-        > /etc/apt/sources.list.d/volctools.list \
-    && apt-get update -o APT::Update::Error-Mode=any \
-    && apt-get install -y --no-install-recommends onion-ai-data \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
-
-RUN retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; } \
-    && retry python3 -m pip install --force-reinstall \
-        "${EIC_SDK_RELEASE_ROOT}/eic-${EIC_SDK_VERSION}-py3-none-any.whl" \
-        --no-cache-dir \
-    && command -v oniond \
-    && python3 -c 'import eic; print(f"eic-module={eic.__file__}")'
-
 ########################################################
 ########## PARALLEL BUILDER STAGES ####################
 ########################################################
@@ -218,7 +183,6 @@ ARG CUDA_VERSION
 ARG BUILD_TYPE
 ARG SGL_KERNEL_VERSION
 ARG GITHUB_ARTIFACTORY
-ARG INSTALL_LOCAL_SGL_KERNEL_WHEEL
 ARG INSTALL_IAAS_KERNELS
 
 WORKDIR /sgl-workspace
@@ -231,7 +195,6 @@ RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.ru
     && rustc --version && cargo --version
 
 # Install sgl-kernel (from pre-built wheel)
-COPY .ci-artifacts/sgl-kernel/ /tmp/local-sgl-kernel/
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --upgrade pip setuptools wheel html5lib six \
     && case "$CUDA_VERSION" in \
@@ -239,14 +202,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
     # --no-deps prevents uv from pulling torch from default PyPI
-    && if [ "$INSTALL_LOCAL_SGL_KERNEL_WHEEL" = "1" ]; then \
-        WHEEL_COUNT="$(find /tmp/local-sgl-kernel -maxdepth 1 -type f -name '*.whl' | wc -l)" \
-        && [ "$WHEEL_COUNT" -eq 1 ] \
-        && LOCAL_WHEEL="$(find /tmp/local-sgl-kernel -maxdepth 1 -type f -name '*.whl')" \
-        && uv pip install "$LOCAL_WHEEL" --reinstall --no-deps; \
-    else \
-        uv pip install sglang-kernel==${SGL_KERNEL_VERSION} --reinstall --no-deps; \
-    fi
+    && uv pip install sglang-kernel==${SGL_KERNEL_VERSION} --reinstall --no-deps
 
 # Copy the dependency spec, Rust extension sources, and shared API types.
 # Split from the pip install so changes to these build inputs invalidate the
@@ -474,9 +430,6 @@ ARG USE_LATEST_SGLANG
 ARG GITHUB_ARTIFACTORY
 ARG MOONCAKE_VERSION
 ARG MSCCLPP_VERSION
-ARG EIC_SDK_VERSION
-ARG EIC_SDK_RELEASE_ROOT
-ARG INSTALL_AI_DYNAMO
 ARG INSTALL_IAAS_KERNELS
 # Renamed from NCCL_VERSION: the nvidia/cuda base image sets ENV NCCL_VERSION
 # (Debian apt format, e.g. 2.28.3-1), which shadows a same-named ARG inside RUN.
@@ -561,25 +514,6 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
     && apt install -y --no-install-recommends nsight-systems-cli \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Onion model/data tooling only for private-delivery builds.
-ARG INSTALL_ONION=0
-ARG BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=http://mirrors.ivolces.com/extra-tools/ubuntu
-ARG BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system
-RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
-    if [ "$INSTALL_ONION" = "1" ]; then \
-        VERSION_CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME}")" \
-        && curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 2 "${BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL}" \
-            | gpg --dearmor -o /etc/apt/trusted.gpg.d/volc-extra-tools.gpg \
-        && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/trusted.gpg.d/volc-extra-tools.gpg] ${BYTED_INTERNAL_EXTRA_TOOLS_APT_URL} ${VERSION_CODENAME} main" \
-            > /etc/apt/sources.list.d/volctools.list \
-        && apt-get update \
-        && apt-get install -y --no-install-recommends onion-ai-data \
-        && rm -rf /var/lib/apt/lists/* \
-        && apt-get clean; \
-    else \
-        echo "Skipping Onion installation (INSTALL_ONION=${INSTALL_ONION})"; \
-    fi
-
 # =============================================================================
 # Python packages and tools (before source copy for better caching)
 # =============================================================================
@@ -622,15 +556,6 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     termplotlib \
     "runai-model-streamer[s3,gcs,azure]>=0.15.7"
 
-# Install the EIC SDK required by the EIC HiCache backend. framework_final
-# inherits it directly, and runtime copies framework_final's site-packages.
-RUN if [ "$INSTALL_ONION" = "1" ]; then \
-    retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; } \
-    && retry python3 -m pip install --force-reinstall \
-    "${EIC_SDK_RELEASE_ROOT}/eic-${EIC_SDK_VERSION}-py3-none-any.whl" \
-    --no-cache-dir; \
-    fi
-
 # DeepEP needs SGL_NCCL_VERSION at runtime even if torch pins another version;
 # install it after the constrained dependency solve so the solve cannot revert it.
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -646,10 +571,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # Install the latest available AI Dynamo prerelease from NVIDIA's package index.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    if [ "$INSTALL_AI_DYNAMO" = "1" ]; then \
-        uv pip install --prerelease=allow --index-strategy unsafe-best-match \
-        --extra-index-url https://pypi.nvidia.com/ ai-dynamo; \
-    fi
+    uv pip install --prerelease=allow --index-strategy unsafe-best-match \
+        --extra-index-url https://pypi.nvidia.com/ ai-dynamo
 
 # Add yank script
 COPY --chown=root:root --chmod=755 docker/configs/yank /usr/local/bin/yank
@@ -766,24 +689,16 @@ RUN if [ "$INSTALL_IAAS_KERNELS" = "1" ]; then \
 
 # Keep build provenance at the end so metadata changes do not invalidate build layers.
 ARG SGLANG_BUILD_COMMIT=unknown
-ARG SGLANG_BUILD_TREE=unknown
-ARG SGLANG_PYTHON_MANIFEST_SHA256=unknown
-ARG SGLANG_BUILD_SOURCE=https://github.com/sgl-project/sglang
 ARG SGLANG_BUILD_URL=
 ARG SGLANG_IMAGE_TAG=local/sglang:dev
 ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown} \
-    SGLANG_BUILD_TREE=${SGLANG_BUILD_TREE:-unknown} \
-    SGLANG_PYTHON_MANIFEST_SHA256=${SGLANG_PYTHON_MANIFEST_SHA256:-unknown} \
-    SGLANG_BUILD_SOURCE=${SGLANG_BUILD_SOURCE:-https://github.com/sgl-project/sglang} \
     SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-} \
     SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev}
-LABEL org.opencontainers.image.source="${SGLANG_BUILD_SOURCE}" \
+LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
       org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
       org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
       org.opencontainers.image.url="${SGLANG_BUILD_URL}" \
       ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
-      ai.sglang.build.tree="${SGLANG_BUILD_TREE}" \
-      ai.sglang.build.python-manifest-sha256="${SGLANG_PYTHON_MANIFEST_SHA256}" \
       ai.sglang.build.url="${SGLANG_BUILD_URL}" \
       ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
 
@@ -879,25 +794,6 @@ RUN if [ "$INSTALL_IAAS_KERNELS" = "1" ]; then \
         rm -rf /var/lib/apt/lists/*; \
     fi
 
-# Install Onion model/data tooling only for private-delivery builds.
-ARG INSTALL_ONION=0
-ARG BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=http://mirrors.ivolces.com/extra-tools/ubuntu
-ARG BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system
-RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
-    if [ "$INSTALL_ONION" = "1" ]; then \
-        VERSION_CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME}")" \
-        && curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 2 "${BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL}" \
-            | gpg --dearmor -o /etc/apt/trusted.gpg.d/volc-extra-tools.gpg \
-        && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/trusted.gpg.d/volc-extra-tools.gpg] ${BYTED_INTERNAL_EXTRA_TOOLS_APT_URL} ${VERSION_CODENAME} main" \
-            > /etc/apt/sources.list.d/volctools.list \
-        && apt-get update \
-        && apt-get install -y --no-install-recommends onion-ai-data \
-        && rm -rf /var/lib/apt/lists/* \
-        && apt-get clean; \
-    else \
-        echo "Skipping Onion installation (INSTALL_ONION=${INSTALL_ONION})"; \
-    fi
-
 # create virtual env for sglang to avoid conflict with system python packages
 COPY --from=uv /uv /uvx /usr/local/bin/
 COPY --from=base /opt/python /opt/python
@@ -969,24 +865,16 @@ RUN if [ "$INSTALL_IAAS_KERNELS" = "1" ]; then \
 
 # Keep build provenance at the end so metadata changes do not invalidate build layers.
 ARG SGLANG_BUILD_COMMIT=unknown
-ARG SGLANG_BUILD_TREE=unknown
-ARG SGLANG_PYTHON_MANIFEST_SHA256=unknown
-ARG SGLANG_BUILD_SOURCE=https://github.com/sgl-project/sglang
 ARG SGLANG_BUILD_URL=
 ARG SGLANG_IMAGE_TAG=local/sglang:dev
 ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown} \
-    SGLANG_BUILD_TREE=${SGLANG_BUILD_TREE:-unknown} \
-    SGLANG_PYTHON_MANIFEST_SHA256=${SGLANG_PYTHON_MANIFEST_SHA256:-unknown} \
-    SGLANG_BUILD_SOURCE=${SGLANG_BUILD_SOURCE:-https://github.com/sgl-project/sglang} \
     SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-} \
     SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev}
-LABEL org.opencontainers.image.source="${SGLANG_BUILD_SOURCE}" \
+LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
       org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
       org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
       org.opencontainers.image.url="${SGLANG_BUILD_URL}" \
       ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
-      ai.sglang.build.tree="${SGLANG_BUILD_TREE}" \
-      ai.sglang.build.python-manifest-sha256="${SGLANG_PYTHON_MANIFEST_SHA256}" \
       ai.sglang.build.url="${SGLANG_BUILD_URL}" \
       ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
 

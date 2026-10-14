@@ -16,21 +16,15 @@ else
   BASE_IMG="pytorch/manylinux2_28-builder"
 fi
 
-# Persistent local BuildKit cache is optional. Private image CI disables it and
-# uses a run-scoped builder so failed/cancelled jobs cannot grow storage forever.
+# Create cache directories for persistent build artifacts in home directory
+# Using home directory to persist across workspace cleanups/checkouts
 CACHE_DIR="${HOME}/.cache/sgl-kernel"
 BUILDX_CACHE_DIR="${CACHE_DIR}/buildx"
 CCACHE_HOST_DIR="${CACHE_DIR}/ccache"
-USE_LOCAL_BUILDX_CACHE="${USE_LOCAL_BUILDX_CACHE:-1}"
-if [ "${USE_LOCAL_BUILDX_CACHE}" = "1" ]; then
-  mkdir -p "${BUILDX_CACHE_DIR}"
-fi
-if [ "${USE_CCACHE:-1}" = "1" ]; then
-  mkdir -p "${CCACHE_HOST_DIR}"
-fi
+mkdir -p "${BUILDX_CACHE_DIR}" "${CCACHE_HOST_DIR}"
 
 # Ensure a buildx builder with docker-container driver (required for cache export)
-BUILDER_NAME="${SGL_KERNEL_BUILDER_NAME:-sgl-kernel-builder}"
+BUILDER_NAME="sgl-kernel-builder"
 # RESET_BUILDER=1 removes and recreates the builder to clear corrupted internal
 # state (e.g. stale containerd snapshots from base image layer GC).
 if [ "${RESET_BUILDER:-0}" = "1" ]; then
@@ -40,19 +34,7 @@ if [ "${RESET_BUILDER:-0}" = "1" ]; then
   mkdir -p "${BUILDX_CACHE_DIR}"
 fi
 if ! docker buildx inspect "${BUILDER_NAME}" >/dev/null 2>&1; then
-  CREATE_ARGS=(
-    --name "${BUILDER_NAME}"
-    --driver docker-container
-    --use
-    --bootstrap
-  )
-  if [ -n "${BUILDKIT_DRIVER_OPT:-}" ]; then
-    CREATE_ARGS+=(--driver-opt "${BUILDKIT_DRIVER_OPT}")
-  fi
-  if [ -n "${BUILDKITD_CONFIG:-}" ]; then
-    CREATE_ARGS+=(--buildkitd-config "${BUILDKITD_CONFIG}")
-  fi
-  docker buildx create "${CREATE_ARGS[@]}"
+  docker buildx create --name "${BUILDER_NAME}" --driver docker-container --use --bootstrap
 else
   docker buildx use "${BUILDER_NAME}"
 fi
@@ -77,7 +59,6 @@ echo "Builder:        ${BUILDER_NAME}"
 echo "BUILD_JOBS:     ${BUILD_JOBS:-auto}"
 echo "NVCC_THREADS:   ${NVCC_THREADS:-32}"
 echo "USE_CCACHE:     ${USE_CCACHE:-1}"
-echo "Local cache:    ${USE_LOCAL_BUILDX_CACHE}"
 echo "RESET_BUILDER:  ${RESET_BUILDER:-0}"
 echo "GITHUB_ARTIFACTORY: ${GITHUB_ARTIFACTORY:-github.com}"
 echo "PYTORCH_INDEX_BASE: ${PYTORCH_INDEX_BASE:-https://download.pytorch.org/whl}"
@@ -99,13 +80,6 @@ BUILD_ARGS=()
 
 # ---- Step 1: Build deps image (layer cached, fast on repeat) ----
 DEPS_TAG="sgl-kernel-deps:cuda${CUDA_VERSION}-${PY_TAG}-${ARCH}"
-CACHE_ARGS=()
-if [ "${USE_LOCAL_BUILDX_CACHE}" = "1" ]; then
-  CACHE_ARGS+=(
-    --cache-from "type=local,src=${BUILDX_CACHE_DIR}"
-    --cache-to "type=local,dest=${BUILDX_CACHE_DIR},mode=max"
-  )
-fi
 
 docker buildx build \
   --builder "${BUILDER_NAME}" \
@@ -116,7 +90,8 @@ docker buildx build \
   --build-arg PYTHON_VERSION="${PYTHON_VERSION}" \
   --build-arg PYTHON_TAG="${PY_TAG}" \
   "${BUILD_ARGS[@]}" \
-  "${CACHE_ARGS[@]}" \
+  --cache-from "type=local,src=${BUILDX_CACHE_DIR}" \
+  --cache-to "type=local,dest=${BUILDX_CACHE_DIR},mode=max" \
   --target deps \
   --load \
   -t "${DEPS_TAG}" \
@@ -131,15 +106,10 @@ BUILD_JOBS_FLAG="${BUILD_JOBS:-0}"
 NVCC_THREADS_FLAG="${NVCC_THREADS:-32}"
 GITHUB_ARTIFACTORY_FLAG="${GITHUB_ARTIFACTORY:-github.com}"
 
-CCACHE_MOUNT=()
-if [ "${CCACHE_FLAG}" = "1" ]; then
-  CCACHE_MOUNT=(-v "${CCACHE_HOST_DIR}:/ccache")
-fi
-
 docker run --rm \
   --network=host \
   -v "$(pwd):/sgl-kernel" \
-  "${CCACHE_MOUNT[@]}" \
+  -v "${CCACHE_HOST_DIR}:/ccache" \
   -w /sgl-kernel \
   -e ARCH="${ARCH}" \
   -e GITHUB_ARTIFACTORY="${GITHUB_ARTIFACTORY_FLAG}" \
@@ -154,7 +124,7 @@ NVCC_THREADS='"${NVCC_THREADS_FLAG}"'
 if [ "${USE_CCACHE}" = "1" ]; then
   export CCACHE_DIR=/ccache
   export CCACHE_BASEDIR=/sgl-kernel
-  export CCACHE_MAXSIZE=${CCACHE_MAXSIZE:-10G}
+  export CCACHE_MAXSIZE=10G
   export CCACHE_COMPILERCHECK=content
   export CCACHE_COMPRESS=true
   export CCACHE_SLOPPINESS=file_macro,time_macros,include_file_mtime,include_file_ctime

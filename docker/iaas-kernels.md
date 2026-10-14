@@ -1,4 +1,4 @@
-# iaas-kernels in internal images
+# iaas-kernels RDMA image packaging
 
 ## poc_dsv4.1 port notes
 
@@ -14,46 +14,27 @@ Validation for this port is limited to local Mac CPU/static checks; no Docker
 build or GPU validation was performed. #824's Torch 2.13.0 results do not validate
 this branch's dependency combination.
 
-Included dependencies absent from the target branch:
+The direct prerequisites supplied by this port are #779's image lock, wheel
+builder, image checker, Dockerfile integration and worker initializer hooks.
+#791 already supplied the other MegaMoE routing and weight hooks.
 
-- #779's image lock/wheel/checker and pre-distributed worker initializer hooks;
-  #791 already supplied the other MegaMoE routing/weight hooks.
-- Private image workflow foundation (`1ad053bf3f`), optional Onion/EIC dependencies
-  (#770/#771), local AOT wheel installation and image provenance labels.
-- Build disk/cache and mirror controls (#784/#785/#793), artifact reuse/download
-  fixes (#795/#797/#806/#809), queue controls (#789/#808), and TOS transport
-  (#811), as consumed by #824's reusable workflow. Only build-related files and
-  required Dockerfile sections are ported; the whole `ep_main` branch is not merged.
-
-The private CI dependencies above support the original image production workflow;
-TOS transport, publishing and image provenance are not requirements of the RDMA
-kernels themselves. The description below documents the original Torch 2.13.0
-profile, whose compatibility with this branch remains unvalidated.
-
-The internal release and development workflows preinstall the SM90 MegaMoE
-provider for **linux/amd64, CUDA 13.0.3, Python 3.12, Torch 2.13.0,
-NVLink and RDMA**.
+The packaging profile from #824 targets **linux/amd64, CUDA 13.0.3, Python 3.12,
+Torch 2.13.0, NVLink and RDMA**.
 `docker/iaas-kernels.lock.json` pins the source commit, package version and ABI.
 The pin includes the fixed-M64 FP4 RDMA RS implementation (RDMA API v3).
 The pinned commit must be available in the private source repository before
 starting a release; a commit present only in a developer's local main cannot
-be fetched by CI. There is no fallback to a moving branch or an older wheel.
+be fetched by the wheel builder. There is no fallback to a moving branch or an
+older wheel.
 
-The shared Dockerfile defaults to `INSTALL_IAAS_KERNELS=0`; unrelated upstream,
-ARM, CUDA 12 and other workflow callers retain their existing behavior. Internal
-release builds use the selected internal tag's local source, not an upstream
-SGLang clone. Internal development builds use the selected branch/PR checkout.
-The lightweight `private_dependency_smoke` target does not install this package.
+The shared Dockerfile defaults to `INSTALL_IAAS_KERNELS=0`. Enable the package
+explicitly and use `BRANCH_TYPE=local` to build the selected SGLang checkout.
+Both `framework_final` and `runtime` are supported targets.
 
-## Credentials and build
+## Build
 
-Configure `IAAS_KERNELS_READ_TOKEN` in the internal CI environment/repository with
-Contents read access to the private `bytedance-iaas/iaas-kernels` repository. The
-standard `GITHUB_TOKEN` is scoped to SGLang and cannot read that private repository.
-The workflow passes this credential as a BuildKit secret. It is not stored in
-build arguments, the Git remote URL, wheel metadata, or image layers.
-
-For a local Linux build, export `IAAS_KERNELS_READ_TOKEN` securely, then run:
+For a Linux build, export `IAAS_KERNELS_READ_TOKEN` with Contents read access to
+`bytedance-iaas/iaas-kernels`, then pass it as a BuildKit secret:
 
 ```bash
 docker buildx build --platform linux/amd64 --target framework_final \
@@ -62,6 +43,9 @@ docker buildx build --platform linux/amd64 --target framework_final \
   --secret id=iaas_kernels_token,env=IAAS_KERNELS_READ_TOKEN \
   -f docker/Dockerfile --load -t sglang:iaas-rdma .
 ```
+
+The token is not stored in build arguments, Git remote URLs, wheel metadata or
+image layers.
 
 The `iaas_kernels_builder` stage inherits `torch_deps`, fetches the pinned commit
 and submodules, and invokes `build_sgl_deep_gemm.sh` with
@@ -91,7 +75,7 @@ same build arguments to export the wheel and provenance from the builder cache.
 The package currently uses version `0.1.0.dev0`; identify binaries by the pinned
 commit and wheel digest, not by the version string alone.
 
-## Verification and publishing
+## Verification
 
 The final stages run `scripts/ci/check_iaas_kernels_image.py` without a GPU. The
 check validates the installed source/ABI/binaries, RDMA API v3, NVSHMEM 3.4.5,
@@ -100,10 +84,7 @@ of `deep_gemm` by `sgl-deep-gemm`, both native host libraries, and plugin regist
 without CUDA initialization.
 Registration is asserted explicitly because SGLang logs and catches plugin errors.
 
-For OCI and zstd candidates, CI runs the same check on the pushed **digest** before
-assigning release tags, then uploads the result and image digest metadata. Nydus
-uses the already checked OCI source through the existing conversion workflow.
-CPU regressions can also be run locally:
+CPU regressions can be run locally:
 
 ```bash
 python3 -m unittest discover -s scripts/ci -p test_iaas_kernels_image.py -v
@@ -116,8 +97,7 @@ throughput. Before qualifying a new source/ABI pin, run the companion repository
 FP4/FP8 correctness and repeatability regressions, a TP8/EP8 service smoke test,
 and a two-node TP16/EP16 FP4 RDMA service smoke test
 on the candidate image with a fresh task-specific JIT cache. Existing operator
-validation is not validation of a newly built image. This change does not add a
-GPU release gate or claim that ID119 output randomness is resolved.
+validation is not validation of a newly built image.
 
 ## Runtime selection
 
