@@ -786,6 +786,37 @@ class EICKVClient:
         logger.debug(f"eic set {len(keys)}")
         return self._sync_set_impl(keys, obj_inputs, device_indices, copy_func)
 
+    def _refetch_failed_set(self, keys, vals_entries, set_option, outcome):
+        # Per-key RPC timeouts; re-set the failed keys once. Returns the
+        # merged outcome so callers see one status per original key.
+        codes = list(outcome.status_codes)[: len(keys)]
+        codes += [None] * (len(keys) - len(codes))
+        failed = [i for i, c in enumerate(codes) if c != eic.StatusCode.SUCCESS]
+        retry_keys, retry_vals = eic.StringVector(), eic.IOBuffers()
+        for i in failed:
+            retry_keys.append(keys[i])
+            retry_vals.append(*vals_entries[i])
+        status, retry_outcome = self.connection.mset(
+            retry_keys, retry_vals, set_option
+        )
+        retry_codes = list(retry_outcome.status_codes)
+        for j, i in enumerate(failed):
+            if status == eic.StatusCode.SUCCESS or (
+                status == eic.StatusCode.PARTIAL_FAILED
+                and j < len(retry_codes)
+                and retry_codes[j] == eic.StatusCode.SUCCESS
+            ):
+                codes[i] = eic.StatusCode.SUCCESS
+        recovered = sum(codes[i] == eic.StatusCode.SUCCESS for i in failed)
+        stats.incr("mset.refetch")
+        stats.incr("mset.recovered", recovered)
+        logger.info(
+            f"eic mset refetched {len(failed)} failed keys, {recovered} recovered"
+        )
+        ok = all(c == eic.StatusCode.SUCCESS for c in codes)
+        status = eic.StatusCode.SUCCESS if ok else eic.StatusCode.PARTIAL_FAILED
+        return status, SimpleNamespace(status_codes=codes)
+
     def _sync_set_impl(
         self,
         keys: List[str],
@@ -833,12 +864,13 @@ class EICKVClient:
             logger.error("set impl input obj_inputs and device_indices are both None")
             return False
 
+        vals_entries = []
         for i, key in enumerate(keys):
             keys_vec.append(key)
             data_ptr, data_size, registered = values_data_ptrs[i]
-            vals_vec.append(
-                data_ptr, data_size, registered and self.enable_kv_set_direct
-            )
+            entry = (data_ptr, data_size, registered and self.enable_kv_set_direct)
+            vals_entries.append(entry)
+            vals_vec.append(*entry)
 
         # set options
         set_option = eic.SetOption()
@@ -847,13 +879,27 @@ class EICKVClient:
         t0 = time.perf_counter()
         status_code, set_outcome = self.connection.mset(keys_vec, vals_vec, set_option)
 
-        if status_code != eic.StatusCode.SUCCESS:
+        if status_code == eic.StatusCode.PARTIAL_FAILED:
+            # A partial batch means most keys landed; re-set only the failed
+            # keys once instead of failing the whole batch (and the request
+            # writing it). Mirrors _refetch_failed on the mget side.
+            status_code, set_outcome = self._refetch_failed_set(
+                keys, vals_entries, set_option, set_outcome
+            )
+        elif status_code != eic.StatusCode.SUCCESS:
             # kv set is idempotent: retry once on per-key RPC timeout.
             stats.incr("mset.retry")
             status_code, set_outcome = self.connection.mset(
                 keys_vec, vals_vec, set_option
             )
-        failed_keys = 0 if status_code == eic.StatusCode.SUCCESS else count
+        if status_code == eic.StatusCode.SUCCESS:
+            failed_keys = 0
+        elif status_code == eic.StatusCode.PARTIAL_FAILED:
+            failed_keys = sum(
+                c != eic.StatusCode.SUCCESS for c in set_outcome.status_codes
+            )
+        else:
+            failed_keys = count
         stats.record_rpc(
             "mset",
             time.perf_counter() - t0,
