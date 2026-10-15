@@ -304,8 +304,6 @@ class SchedulerPPMixin:
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
 
-                self.process_bootstrapped_queue()
-
                 transferred_rids = self._pp_pd_get_prefill_transferred_ids()
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
@@ -352,6 +350,9 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
+                # Bootstrap consensus uses blocking CPU collectives. Keep it off
+                # the launch critical path by overlapping it with this forward.
+                self.process_bootstrapped_queue()
                 send_release_work, release_rids = (
                     self._pp_pd_send_consensus_release_ids(
                         tmbs, next_first_rank_mb_id, release_rids, transferred_rids

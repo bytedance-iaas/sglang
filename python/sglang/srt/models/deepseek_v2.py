@@ -1280,6 +1280,8 @@ class DeepseekV2MoE(nn.Module):
                 )
                 if ag_out is not None:
                     hidden_states = ag_out
+                    # The gathered CP rows do not share the local prefix bound.
+                    num_token_non_padded = None
             # router_logits: (num_tokens, n_experts)
             if _is_hip:
                 router_logits, router_logits_partials = _hip_moe.forward_gate(
