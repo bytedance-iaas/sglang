@@ -29,8 +29,6 @@ Paired scoring is selected automatically for supported groups within the
 existing length-aware path; it has no additional environment switch. Turning
 off the existing grouped or length-aware setting prevents entry to paired
 scoring. Turning off compact candidates retains mask publication/consumption.
-The supported SM90 mHC optimization is selected independently without adding
-an mHC environment switch. Its original projection arithmetic is retained.
 
 ## Supported contract
 

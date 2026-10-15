@@ -2930,7 +2930,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_pre_from_prev_sublayer
                 and get_platform().is_sm90
                 and x.is_cuda
-                and 1 <= x.shape[0] <= 2048
+                and 1 <= x.shape[0] <= 64
                 and x.shape[1] == 5120
                 and residual.shape == (x.shape[0], 4, 5120)
                 and x.dtype == residual.dtype == torch.bfloat16
@@ -3233,31 +3233,16 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         x_flat = x.flatten(1)
 
-        from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-
-        use_sm90_mhc = (
-            x.is_cuda
-            and torch.version.cuda is not None
-            and get_platform().is_sm90
-            and x.dtype == torch.bfloat16
-            and x_flat.is_contiguous()
-            and hc_fn.shape == (24, 20480)
-            and self.hc_mult == 4
-            and getattr(self.config, "model_type", None) == "deepseek_v41"
-            and 0 < x.shape[0] <= 2048
-            and not is_batch_invariant_mode_enabled()
-        )
-
         if (
             x.is_cuda
             and torch.version.cuda is not None
             and (
                 get_platform().is_blackwell
-                or (get_platform().is_sm90 and (x.shape[0] == 1 or use_sm90_mhc))
+                or (get_platform().is_sm90 and x.shape[0] == 1)
             )
             and x.dtype == torch.bfloat16
         ):
-            # Keep the original projection; fuse its reduction with Sinkhorn.
+            # Fusing the split-K reduction with sinkhorn keeps it batch-invariant.
             main_stream = torch.cuda.current_stream()
             if stats_stream is not None:
                 x.record_stream(stats_stream)
@@ -3322,7 +3307,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                         self.hc_sinkhorn_iters,
                         self.rms_norm_eps,
                         self.hc_eps,
-                        tree_reduce=use_sm90_mhc,
                     )
             if stats_stream is not None:
                 # Allocated on the side stream, read on the main stream after the join.
@@ -3541,11 +3525,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         # the compact DP layout and attention-TP-aligned communication buffers.
         with (
             context,
-            (
-                late_dp_layout.activate(forward_batch)
-                if late_dp_layout is not None
-                else nullcontext()
-            ),
+            late_dp_layout.activate(forward_batch)
+            if late_dp_layout is not None
+            else nullcontext(),
         ):
             x = self._run_moe_ffn_dp_sync(
                 late_dp_layout.pad(x) if late_dp_layout is not None else x,
@@ -4472,11 +4454,9 @@ class DeepseekV4Model(nn.Module):
                     # Sharded tables need identical IDs on every TP rank for
                     # their reduction; shared tables can look up local rows.
                     emb = engram.embed(
-                        (
-                            token_parallel.local(layer_hash_ids)
-                            if engram.embed._shared
-                            else layer_hash_ids
-                        ),
+                        token_parallel.local(layer_hash_ids)
+                        if engram.embed._shared
+                        else layer_hash_ids,
                         forward_batch,
                     )
                     if not engram.embed._shared:
@@ -4803,14 +4783,11 @@ class DeepseekV4Model(nn.Module):
 
             metadata.candidate_metadata = CandidateMasks(
                 mask=tensors.get("pp_candidate_mask"),
-                request_masks=(
-                    [
-                        tensors[f"pp_candidate_{index}"]
-                        for index in range(candidate_count)
-                    ]
-                    if candidate_count
-                    else None
-                ),
+                request_masks=[
+                    tensors[f"pp_candidate_{index}"] for index in range(candidate_count)
+                ]
+                if candidate_count
+                else None,
             )
         candidate_ratio = tensors.get("pp_candidate_ratio")
         index_metadata = (

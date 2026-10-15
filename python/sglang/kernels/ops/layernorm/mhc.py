@@ -2290,75 +2290,6 @@ def _hc_mix_reduce_sinkhorn_kernel(
     tl.store(comb_ptr + row * HC * HC + jj * HC + kk, comb)
 
 
-@triton.jit
-def _hc_mix_reduce_sinkhorn_tree_kernel(
-    part_mix_ptr,
-    part_sq_ptr,
-    scale_ptr,
-    base_ptr,
-    pre_ptr,
-    post_ptr,
-    comb_ptr,
-    m,
-    inv_k,
-    rms_eps,
-    MIX: tl.constexpr,
-    HC: tl.constexpr,
-    NUM_SLICES: tl.constexpr,
-    ITERS: tl.constexpr,
-    EPS: tl.constexpr,
-):
-    """One CTA per row keeps the sinkhorn reductions two-dimensional."""
-    row = tl.program_id(0)
-    if row >= m:
-        return
-    j = tl.arange(0, HC)
-    jj = j[:, None]
-    kk = j[None, :]
-
-    tl.static_assert(NUM_SLICES <= 128)
-    slices = tl.arange(0, 128)
-    off = (slices * m + row) * MIX
-    vpre = tl.load(
-        part_mix_ptr + off[:, None] + j[None, :], slices[:, None] < NUM_SLICES, 0
-    )
-    vpost = tl.load(
-        part_mix_ptr + off[:, None] + HC + j[None, :], slices[:, None] < NUM_SLICES, 0
-    )
-    vcomb = tl.load(
-        part_mix_ptr
-        + off[:, None, None]
-        + 2 * HC
-        + jj[None, :, :] * HC
-        + kk[None, :, :],
-        slices[:, None, None] < NUM_SLICES,
-        0,
-    )
-    a_pre = tl.sum(vpre, 0)
-    a_post = tl.sum(vpost, 0)
-    a_comb = tl.sum(vcomb, 0)
-    sq = tl.sum(tl.load(part_sq_ptr + slices * m + row, slices < NUM_SLICES, 0), 0)
-    rsqrt = 1.0 / tl.sqrt(sq * inv_k + rms_eps)
-
-    s0 = tl.load(scale_ptr + 0)
-    s1 = tl.load(scale_ptr + 1)
-    s2 = tl.load(scale_ptr + 2)
-
-    pre = tl.sigmoid(a_pre * rsqrt * s0 + tl.load(base_ptr + j)) + EPS
-    tl.store(pre_ptr + row * HC + j, pre)
-    post = 2.0 * tl.sigmoid(a_post * rsqrt * s1 + tl.load(base_ptr + HC + j))
-    tl.store(post_ptr + row * HC + j, post)
-
-    comb = a_comb * rsqrt * s2 + tl.load(base_ptr + 2 * HC + jj * HC + kk)
-    comb = tl.exp(comb - tl.max(comb, axis=1)[:, None])
-    comb = comb / tl.sum(comb, axis=1)[:, None] + EPS
-    comb = comb / (tl.sum(comb, axis=0)[None, :] + EPS)
-    for _ in tl.static_range(ITERS - 1):
-        comb = comb / (tl.sum(comb, axis=1)[:, None] + EPS)
-        comb = comb / (tl.sum(comb, axis=0)[None, :] + EPS)
-    tl.store(comb_ptr + row * HC * HC + jj * HC + kk, comb)
-
-
 def hc_mix_stats_sinkhorn(
     x_flat: torch.Tensor,
     hc_fn: torch.Tensor,
@@ -2368,15 +2299,11 @@ def hc_mix_stats_sinkhorn(
     sinkhorn_iters: int,
     rms_eps: float,
     hc_eps: float,
-    *,
-    tree_reduce: bool = False,
 ):
     """Fuse the reduce and sinkhorn stages of hc_mix_stats followed by hc_split_sinkhorn.
 
-    The projection always uses the original FP32 weights and split-K kernel.
-    Opt-in tree reduction changes only the partial-sum accumulation order.
-    Sinkhorn uses the Triton port's transcendental lowering, which differs from
-    TileLang; the formulas and iteration count are unchanged.
+    The split-K kernel fixes the reduction order; sinkhorn uses the Triton port's
+    transcendental lowering, which differs from TileLang.
     """
     assert x_flat.dim() == 2 and hc_fn.dim() == 2
     assert x_flat.stride(1) == 1 and hc_fn.stride(1) == 1
@@ -2414,12 +2341,7 @@ def hc_mix_stats_sinkhorn(
         num_warps=_HC_MIX_NUM_WARPS,
         num_stages=_num_stages_for(m, k),
     )
-    reduce_kernel = (
-        _hc_mix_reduce_sinkhorn_tree_kernel
-        if tree_reduce
-        else _hc_mix_reduce_sinkhorn_kernel
-    )
-    reduce_kernel[(m,)](
+    _hc_mix_reduce_sinkhorn_kernel[(m,)](
         part_mix,
         part_sq,
         hc_scale.float().contiguous(),
