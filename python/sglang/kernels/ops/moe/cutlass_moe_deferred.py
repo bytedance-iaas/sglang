@@ -5,12 +5,66 @@ from functools import cache
 from pathlib import Path
 
 import torch
+import triton
+import triton.language as tl
 
 _original_sm90_generator = None
 _DSV41_EP4_PROFILE_IDS = {
     256: (56, 241),
     8192: (20, 153),
 }
+
+
+@triton.jit
+def _canonicalize_deferred_map_kernel(
+    source,
+    expert_ids,
+    target,
+    tokens: tl.constexpr,
+    top_k: tl.constexpr,
+    expert_token_stride: tl.constexpr,
+    expert_slot_stride: tl.constexpr,
+    start_expert: tl.constexpr,
+    end_expert: tl.constexpr,
+    block: tl.constexpr,
+):
+    offset = tl.program_id(0) * block + tl.arange(0, block)
+    in_range = offset < tokens * top_k
+    token = offset // top_k
+    slot = offset % top_k
+    expert = tl.load(
+        expert_ids + token * expert_token_stride + slot * expert_slot_stride,
+        mask=in_range,
+        other=-1,
+    )
+    local = in_range & (expert >= start_expert) & (expert < end_expert)
+    # CUTLASS stores [slot, token] and only initializes local expert entries.
+    row = tl.load(source + slot * tokens + token, mask=local, other=-1)
+    tl.store(target + offset, row, mask=in_range)
+
+
+def canonicalize_deferred_map(
+    source: torch.Tensor,
+    expert_ids: torch.Tensor,
+    ep_rank: int,
+    local_experts: int,
+) -> torch.Tensor:
+    """Return token-major indices, with -1 for every nonlocal route."""
+    tokens, top_k = expert_ids.shape
+    target = torch.empty_like(source)
+    if tokens:
+        _canonicalize_deferred_map_kernel[(triton.cdiv(tokens * top_k, 256),)](
+            source,
+            expert_ids,
+            target,
+            tokens,
+            top_k,
+            *expert_ids.stride(),
+            ep_rank * local_experts,
+            (ep_rank + 1) * local_experts,
+            256,
+        )
+    return target
 
 
 @cache
@@ -175,6 +229,8 @@ def cutlass_fused_moe_deferred(
         FlashInferTrtllmDeferredFinalizeOutput,
     )
 
+    if kwargs.get("cluster_size", 1) != 1:
+        raise ValueError("The SM90 deferred MoE overlay requires cluster_size=1")
     install_sm90_deferred_overlay()
     if (
         _use_tuned_dsv41_ep4_tactics()
@@ -207,7 +263,12 @@ def cutlass_fused_moe_deferred(
         **kwargs,
     )
     gemm2_out = storage[:gemm2_numel].view(expanded_rows, hidden_size)
-    expanded_idx = storage[gemm2_numel:].view(torch.int32)
+    expanded_idx = canonicalize_deferred_map(
+        storage[gemm2_numel:].view(torch.int32),
+        kwargs["token_selected_experts"],
+        kwargs.get("ep_rank", 0),
+        kwargs["fc1_expert_weights"].shape[0],
+    )
     return FlashInferTrtllmDeferredFinalizeOutput(
         gemm2_out=gemm2_out,
         expert_weights=kwargs["token_final_scales"],

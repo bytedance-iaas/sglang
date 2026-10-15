@@ -9,6 +9,7 @@ small quant_info payload and route through ``MoeRunner``.
 from __future__ import annotations
 
 import contextvars
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Generator, Optional
@@ -514,6 +515,21 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
     # working with SGLang's currently pinned release.
     humming_kwargs = {"use_wfp4afp8_humming": True} if use_wfp4afp8_humming else {}
     deferred_finalize = _deferred_finalize_enabled.get()
+    if (
+        os.environ.get("SGLANG_DSV41_SKIP_TINY_CUTLASS_MOE") == "1"
+        and not deferred_finalize
+        and x.shape[0] < topk_weights.shape[1]
+    ):
+        return StandardCombineInput(
+            hidden_states=torch.zeros(
+                (x.shape[0], origin_hidden),
+                dtype=output_dtype,
+                device=x.device,
+            )
+        )
+    use_fused_finalize = envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get() or (
+        not deferred_finalize and 0 < x.shape[0] < topk_weights.shape[1]
+    )
     if deferred_finalize:
         assert use_wfp4afp8_humming
         assert not do_pad
@@ -568,7 +584,7 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
 
     flashinfer_cutlass_fused_moe(
         output=out,
-        use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
+        use_fused_finalize=use_fused_finalize,
         **moe_kwargs,
     )
 
