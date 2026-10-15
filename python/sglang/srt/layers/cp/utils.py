@@ -442,6 +442,27 @@ def dsa_prefill_cp_fused_symm_mem(
             comm.set_use_cp_fused_symm_mem(False)
 
 
+@contextmanager
+def dsa_prefill_cp_fused_symm_mem_for_rows(num_local_rows: int):
+    """Use standard CP collectives when a late-layer tail is too small to
+    amortize the fused symmetric-memory protocol."""
+    from sglang.srt.distributed import get_tp_group
+
+    comm = get_tp_group().torch_symm_mem_comm
+    suspended = (
+        comm is not None
+        and comm.use_cp_fused_symm_mem
+        and num_local_rows * get_parallel().attn_cp_size <= 128
+    )
+    if suspended:
+        comm.set_use_cp_fused_symm_mem(False)
+    try:
+        yield
+    finally:
+        if suspended:
+            comm.set_use_cp_fused_symm_mem(True)
+
+
 def dsa_prefill_cp_moe_gather(hidden_states: torch.Tensor) -> torch.Tensor:
     """MoE-input CP gather; no-op while the fused CP AG/RS path holds
     use_cp_fused_symm_mem (the MoE gathers inside the fused kernel)."""
@@ -559,6 +580,7 @@ __all__ = [
     "cp_shard_position_ids",
     "cp_split_before_forward",
     "dsa_prefill_cp_fused_symm_mem",
+    "dsa_prefill_cp_fused_symm_mem_for_rows",
     "dsa_prefill_cp_fused_symm_mem_eligible",
     "dsa_prefill_cp_moe_gather",
     "dsa_prefill_cp_moe_reduce_scatter",
