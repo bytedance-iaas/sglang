@@ -1,0 +1,79 @@
+name: Bytedance TOS Transport Smoke
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/bytedance-tos-transport-smoke.yml"
+      - ".github/workflows/_bytedance-build-kernel.yml"
+      - ".github/workflows/_bytedance-docker-build-and-publish.yml"
+      - "scripts/ci/download_kernel_artifact.py"
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Build runner pool whose TOS transport should be tested"
+        required: true
+        type: choice
+        options:
+          - x64-kernel-build-node
+          - x64-docker-build-node
+
+permissions:
+  contents: read
+
+jobs:
+  tos-smoke:
+    if: github.repository == 'bytedance-iaas/sglang' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    environment: prod
+    runs-on: ${{ inputs.runner || 'x64-docker-build-node' }}
+    timeout-minutes: 5
+    env:
+      TOS_BUCKET: ai-infra
+      TOS_ENDPOINT: tos-cn-beijing.volces.com
+      TOS_PREFIX: sglang-ci/kernel-wheels/probes
+      TOS_REGION: cn-beijing
+      TOSUTIL_CONFIG_B64: ${{ secrets.TOSUTIL_CONFIG_B64 }}
+    steps:
+      - name: Checkout TOS bootstrap script
+        uses: actions/checkout@v4
+
+      - name: Install pinned tosutil
+        run: scripts/ci/install_tosutil.sh
+
+      - name: Upload, download, and verify run-scoped object
+        id: probe
+        run: |
+          set -euo pipefail
+          test -n "${TOSUTIL_CONFIG_B64}"
+          tos_config="$(mktemp /tmp/tosutil-config.XXXXXX)"
+          trap 'rm -f "${tos_config}"' EXIT
+          printf '%s' "${TOSUTIL_CONFIG_B64}" | base64 --decode > "${tos_config}"
+          chmod 0600 "${tos_config}"
+          probe_dir="$(mktemp -d /tmp/sglang-tos-probe.XXXXXX)"
+          object_key="${TOS_PREFIX}/${GITHUB_REPOSITORY_ID}/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/${{ inputs.runner || 'x64-docker-build-node' }}.bin"
+          probe_uri="tos://${TOS_BUCKET}/${object_key}"
+          printf '%s\n' "${GITHUB_REPOSITORY}:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}:${{ inputs.runner || 'x64-docker-build-node' }}" > "${probe_dir}/source.bin"
+          source_sha256="$(sha256sum "${probe_dir}/source.bin" | awk '{print $1}')"
+          timeout 60s tosutil cp "${probe_dir}/source.bin" "${probe_uri}" \
+            -e="${TOS_ENDPOINT}" -re="${TOS_REGION}" -vchecksum \
+            -conf="${tos_config}"
+          timeout 60s tosutil cp "${probe_uri}" "${probe_dir}/download.bin" \
+            -e="${TOS_ENDPOINT}" -re="${TOS_REGION}" -vchecksum -f \
+            -conf="${tos_config}"
+          download_sha256="$(sha256sum "${probe_dir}/download.bin" | awk '{print $1}')"
+          test "${source_sha256}" = "${download_sha256}"
+          echo "probe_uri=${probe_uri}" >> "$GITHUB_OUTPUT"
+          echo "TOS transport smoke passed on ${{ inputs.runner || 'x64-docker-build-node' }}"
+
+      - name: Delete run-scoped probe object
+        if: always() && steps.probe.outputs.probe_uri != ''
+        env:
+          PROBE_URI: ${{ steps.probe.outputs.probe_uri }}
+        run: |
+          set -euo pipefail
+          tos_config="$(mktemp /tmp/tosutil-config.XXXXXX)"
+          trap 'rm -f "${tos_config}"' EXIT
+          printf '%s' "${TOSUTIL_CONFIG_B64}" | base64 --decode > "${tos_config}"
+          chmod 0600 "${tos_config}"
+          timeout 30s tosutil rm "${PROBE_URI}" \
+            -e="${TOS_ENDPOINT}" -re="${TOS_REGION}" -f \
+            -conf="${tos_config}"

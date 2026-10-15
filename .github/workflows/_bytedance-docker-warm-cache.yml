@@ -1,0 +1,268 @@
+name: Bytedance Warm Volcengine Docker Build Cache
+
+# Volcengine self-hosted runners are recycled after roughly 96 minutes. Build
+# the dependency-heavy `framework` stage separately and export its full cache,
+# then let a fresh runner finish and verify the publishable image.
+
+on:
+  workflow_call:
+    outputs:
+      cache_ref:
+        description: "Run-scoped registry cache consumed by the publish job"
+        value: ${{ jobs.warm-cache.outputs.cache_ref }}
+    inputs:
+      checkout_ref:
+        description: "Git ref to checkout"
+        required: false
+        type: string
+        default: ""
+      cuda_key:
+        description: "Logical CUDA key used in the cache tag"
+        required: false
+        type: string
+        default: "cu130"
+      cuda_version:
+        description: "CUDA_VERSION build arg"
+        required: false
+        type: string
+        default: "13.0.3"
+      sgl_version:
+        description: "Optional SGL_VERSION build arg"
+        required: false
+        type: string
+        default: ""
+      extra_build_args:
+        description: "Additional --build-arg flags used by the publish build"
+        required: false
+        type: string
+        default: ""
+      variant_suffix:
+        description: "Optional image variant suffix used in the cache tag"
+        required: false
+        type: string
+        default: ""
+      use_environment:
+        description: "GitHub environment containing CR and TOS credentials"
+        required: false
+        type: string
+        default: ""
+      registry_host:
+        description: "Volcengine CR registry host"
+        required: false
+        type: string
+        default: ""
+      image_repo:
+        description: "Full Volcengine CR image repository"
+        required: false
+        type: string
+        default: ""
+      artifact_name:
+        description: "Optional local sgl-kernel wheel artifact name"
+        required: false
+        type: string
+        default: ""
+      artifact_run_id:
+        description: "Optional workflow run ID containing artifact_name"
+        required: false
+        type: string
+        default: ""
+      kernel_tos_uri:
+        description: "Optional immutable TOS URI containing the kernel wheel"
+        required: false
+        type: string
+        default: ""
+      kernel_wheel_sha256:
+        description: "Authoritative SHA-256 required with kernel_tos_uri"
+        required: false
+        type: string
+        default: ""
+      install_iaas_kernels:
+        description: "Build the pinned SM90 NVLink/RDMA wheel into framework"
+        required: false
+        type: boolean
+        default: false
+      concurrency_group:
+        description: "Concurrency group for this run-scoped cache producer"
+        required: false
+        type: string
+        default: "bytedance-x64-docker-cache-warm"
+
+jobs:
+  warm-cache:
+    if: github.repository == 'bytedance-iaas/sglang'
+    environment: ${{ inputs.use_environment || null }}
+    runs-on: x64-docker-build-node
+    concurrency:
+      group: ${{ inputs.concurrency_group }}
+      cancel-in-progress: false
+    outputs:
+      cache_ref: ${{ steps.cache-ref.outputs.cache_ref }}
+    env:
+      SGL_CACHE_BUILDER: builder-sgl-cache-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.cuda_key }}-${{ inputs.variant_suffix || 'base' }}
+      CUDA_KEY: ${{ inputs.cuda_key }}
+      IMAGE_REPO: ${{ inputs.image_repo }}
+      REGISTRY_HOST: ${{ inputs.registry_host }}
+      SGL_VERSION: ${{ inputs.sgl_version }}
+      VARIANT_SUFFIX: ${{ inputs.variant_suffix }}
+      VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
+      VOLCENGINE_CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
+      VOLCENGINE_CR_REPOSITORY: ${{ vars.VOLCENGINE_CR_REPOSITORY || 'sglang' }}
+      VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
+      VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
+    steps:
+      - name: Delete huge unnecessary tools folder
+        run: rm -rf /opt/hostedtoolcache
+
+      - name: Cleanup workspace (remove root-owned files from prior runs)
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Configure iaas-kernels NVLink/RDMA image
+        env:
+          INSTALL_IAAS_KERNELS: ${{ inputs.install_iaas_kernels }}
+          IAAS_KERNELS_READ_TOKEN: ${{ secrets.IAAS_KERNELS_READ_TOKEN }}
+          CUDA_VERSION: ${{ inputs.cuda_version }}
+        run: |
+          set -euo pipefail
+          : > /tmp/iaas-kernels.args
+          if [ "$INSTALL_IAAS_KERNELS" = "true" ]; then
+            test "$CUDA_VERSION" = "13.0.3"
+            if [ -z "$IAAS_KERNELS_READ_TOKEN" ]; then
+              echo "::error::IAAS_KERNELS_READ_TOKEN needs read access to bytedance-iaas/iaas-kernels"
+              exit 1
+            fi
+            printf '%s\n' --build-arg INSTALL_IAAS_KERNELS=1 \
+              --build-arg BRANCH_TYPE=local \
+              --secret id=iaas_kernels_token,env=IAAS_KERNELS_READ_TOKEN \
+              > /tmp/iaas-kernels.args
+            python3 -m unittest discover -s scripts/ci -p test_iaas_kernels_image.py -v
+          fi
+
+      - name: Resolve Volcengine cache target
+        run: |
+          set -euo pipefail
+          if [ -z "${IMAGE_REPO}" ]; then
+            if [ -z "${VOLCENGINE_CR_REGISTRY}" ] || [ -z "${VOLCENGINE_CR_NAMESPACE}" ]; then
+              echo "::error::Volcengine CR variables are required"
+              exit 1
+            fi
+            IMAGE_REPO="${VOLCENGINE_CR_REGISTRY}/${VOLCENGINE_CR_NAMESPACE}/${VOLCENGINE_CR_REPOSITORY:-sglang}"
+          fi
+          if [ -z "${REGISTRY_HOST}" ] && [ -n "${VOLCENGINE_CR_REGISTRY}" ] && [[ "${IMAGE_REPO}" == "${VOLCENGINE_CR_REGISTRY}/"* ]]; then
+            REGISTRY_HOST="${VOLCENGINE_CR_REGISTRY}"
+          fi
+          if [ -z "${IMAGE_REPO}" ] || [[ "${IMAGE_REPO}" == /* ]] || [[ "${IMAGE_REPO}" == *'//'* ]]; then
+            echo "::error::Invalid image repository: '${IMAGE_REPO}'"
+            exit 1
+          fi
+          echo "IMAGE_REPO=${IMAGE_REPO}" >> "$GITHUB_ENV"
+          echo "REGISTRY_HOST=${REGISTRY_HOST}" >> "$GITHUB_ENV"
+
+      - name: Reclaim disposable caches and require build capacity
+        run: |
+          chmod +x scripts/ci/cleanup_build_runner_disk.sh
+          scripts/ci/cleanup_build_runner_disk.sh --required-gb 150
+
+      - name: Download local sgl-kernel wheel
+        if: ${{ inputs.artifact_name != '' || inputs.kernel_tos_uri != '' }}
+        timeout-minutes: 20
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KERNEL_ARTIFACT_NAME: ${{ inputs.artifact_name }}
+          KERNEL_ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id || github.run_id }}
+          KERNEL_ARTIFACT_HTTPS_PROXY: http://100.68.162.211:3128
+          KERNEL_ARTIFACT_TOS_ENDPOINT: tos-cn-beijing.volces.com
+          KERNEL_ARTIFACT_TOS_REGION: cn-beijing
+          KERNEL_ARTIFACT_TOS_BUCKET: ai-infra
+          KERNEL_ARTIFACT_TOS_PREFIX: sglang-ci/kernel-wheels
+          KERNEL_ARTIFACT_TOS_URI: ${{ inputs.kernel_tos_uri }}
+          KERNEL_WHEEL_SHA256: ${{ inputs.kernel_wheel_sha256 }}
+          TOSUTIL_CONFIG_B64: ${{ secrets.TOSUTIL_CONFIG_B64 }}
+        run: |
+          if [ -n "$KERNEL_ARTIFACT_TOS_URI" ]; then
+            scripts/ci/install_tosutil.sh
+          fi
+          python3 -m unittest discover -s scripts/ci -p test_download_kernel_artifact.py
+          python3 scripts/ci/download_kernel_artifact.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$KERNEL_ARTIFACT_RUN_ID" \
+            --name "$KERNEL_ARTIFACT_NAME" \
+            --output .ci-artifacts/sgl-kernel \
+            --tos-uri "$KERNEL_ARTIFACT_TOS_URI" \
+            --wheel-sha256 "$KERNEL_WHEEL_SHA256"
+
+      - name: Set up Docker Buildx with local Docker Hub mirror
+        uses: docker/setup-buildx-action@v3
+        with:
+          name: ${{ env.SGL_CACHE_BUILDER }}
+          keep-state: false
+          cleanup: true
+          driver-opts: |
+            network=host
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["127.0.0.1:5000"]
+            [worker.oci]
+              gc = true
+              reservedSpace = "10GB"
+              maxUsedSpace = "100GB"
+              minFreeSpace = "150GB"
+
+      - name: Verify BuildKit connection
+        run: docker buildx du --builder "${SGL_CACHE_BUILDER}"
+
+      - name: Login to Volcengine CR
+        run: |
+          set -euo pipefail
+          echo "${VOLCENGINE_CR_PASSWORD}" | docker login "${REGISTRY_HOST}" --username "${VOLCENGINE_CR_USERNAME}" --password-stdin
+
+      - name: Resolve run-scoped cache reference
+        id: cache-ref
+        run: |
+          set -euo pipefail
+          safe_variant="$(printf '%s' "${VARIANT_SUFFIX:-base}" | sed 's/[^A-Za-z0-9_.-]/-/g')"
+          cache_ref="${IMAGE_REPO}:buildcache-prewarm-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${CUDA_KEY}-${safe_variant}"
+          echo "cache_ref=${cache_ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Warm dependency-heavy framework cache
+        env:
+          IAAS_KERNELS_READ_TOKEN: ${{ secrets.IAAS_KERNELS_READ_TOKEN }}
+          CACHE_REF: ${{ steps.cache-ref.outputs.cache_ref }}
+        run: |
+          set -euo pipefail
+          VERSION_ARG=()
+          if [ -n "${SGL_VERSION}" ]; then
+            VERSION_ARG+=(--build-arg "SGL_VERSION=${SGL_VERSION}")
+          fi
+          mapfile -t IAAS_ARGS < /tmp/iaas-kernels.args
+
+          docker buildx build \
+            --builder "${SGL_CACHE_BUILDER}" \
+            --target framework \
+            --platform linux/amd64 \
+            --output type=cacheonly \
+            --cache-to "type=registry,ref=${CACHE_REF},mode=max,image-manifest=true,oci-mediatypes=true" \
+            -f docker/Dockerfile \
+            --build-arg CUDA_VERSION=${{ inputs.cuda_version }} \
+            --build-arg BUILD_TYPE=all \
+            --build-arg GRACE_BLACKWELL=0 \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            --build-arg INSTALL_ONION=1 \
+            "${VERSION_ARG[@]}" \
+            ${{ inputs.extra_build_args }} \
+            "${IAAS_ARGS[@]}" \
+            .
+
+      - name: Remove run-scoped BuildKit state
+        if: always()
+        run: |
+          docker buildx rm "${SGL_CACHE_BUILDER}" || true
+          docker image prune -af || true
+          df -h /
