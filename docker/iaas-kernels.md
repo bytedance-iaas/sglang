@@ -7,8 +7,16 @@ that pins **Torch 2.14.1**. The pinned iaas-kernels revision
 `602ec86884ecc4e684473d18cf215aa60e36b4de` declares **torch>=2.13,<2.14** and
 the original image lock targets **Torch 2.13.0**. This version difference remains
 unvalidated. The port adds no source-version preflight; the original build/runtime
-ABI checks are retained. The branch's Torch version, uv Python setup, and other
-upstream dependency pins are preserved.
+ABI checks are retained. The branch's Torch, FlashInfer, DeepGEMM, and other
+upstream dependency pins are preserved. The CUDA Dockerfile uses ep_main's system
+Python 3.12 and pip setup, with complete FlashInfer 0.7 provider-wheel exports.
+
+With `INSTALL_IAAS_KERNELS=1`, the wheel builder's `check_environment()` rejects
+Torch 2.14.1 against the Torch 2.13.0 lock before fetching or compiling the source.
+The private warm-cache and release workflows currently enable this option, so
+removing the GHCR uv dependency does not by itself unblock those full builds.
+Enabling this package with Torch 2.14.1 requires a compatible source revision and
+a newly validated ABI pin; changing the lock alone is not validation.
 
 Validation for this port is limited to local Mac CPU/static checks; no Docker
 build or GPU validation was performed. #824's Torch 2.13.0 results do not validate
