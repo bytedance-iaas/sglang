@@ -11,7 +11,6 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod  # noqa: E402
-from sglang.srt.mem_cache.kv_cache_builder import get_draft_kv_pool  # noqa: E402
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig  # noqa: E402
 from sglang.srt.model_executor.runner.base_runner import (  # noqa: E402
     _allocate_decode_buffers,
@@ -182,8 +181,6 @@ class TestDSparkPPContext(CustomTestCase):
             max_num_token=max_num_token,
             hidden_size=4,
             dtype=torch.float32,
-            dp_size=1,
-            pp_size=8,
             is_encoder_decoder=False,
             require_mlp_tp_gather=False,
             seq_len_fill_value=1,
@@ -193,9 +190,13 @@ class TestDSparkPPContext(CustomTestCase):
             enable_mamba_track=False,
             hc_hidden_size=16,
         )
-        with get_parallel().override(moe_ep_size=1):
+        with get_parallel().override(
+            moe_ep_size=1, num_dp_ranks=1, attn_dp_size=1, pp_size=8
+        ):
             eager_buffers = _allocate_decode_buffers(vocab_size=8, **common_kwargs)
             graph_buffers = DecodeInputBuffers.create(
+                num_dp_ranks=1,
+                pp_size=8,
                 next_token_logits_buffer=torch.zeros((max_num_token, 8)),
                 **common_kwargs,
             )
@@ -216,6 +217,7 @@ class TestDSparkPPContext(CustomTestCase):
         torch.nn.Module.__init__(model)
         model.config = SimpleNamespace(hidden_size=hidden_size)
         model.is_nemotron_35_draft = False
+        model.quantizable = False
         model.num_context_features = 3
         model.fc = torch.nn.Linear(3 * hidden_size, hidden_size, bias=False)
         model.hidden_norm = torch.nn.RMSNorm(hidden_size, eps=1e-6)
@@ -302,6 +304,7 @@ class TestDSparkPPContext(CustomTestCase):
     def test_context_only_rank_does_not_require_draft_attention_backend(self):
         target_backend = object()
         worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker._hosts_draft = True
         worker._is_context_only_pp_prefill_rank = True
         worker._target_worker = SimpleNamespace(
             model_runner=SimpleNamespace(attn_backend=target_backend)
@@ -312,6 +315,7 @@ class TestDSparkPPContext(CustomTestCase):
 
     def test_lifecycle_only_rank_does_not_allocate_draft_pool(self):
         worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker._hosts_draft = True
         worker._draft_worker = Mock()
         worker._is_lifecycle_only_pp_prefill_rank = True
 
@@ -320,22 +324,15 @@ class TestDSparkPPContext(CustomTestCase):
         worker._draft_worker.alloc_memory_pool.assert_not_called()
 
     def test_lifecycle_only_rank_does_not_publish_draft_pool(self):
-        worker = SimpleNamespace(is_lifecycle_only_pp_prefill_rank=True)
-        spec_algorithm = SimpleNamespace(
-            is_ngram=lambda: False,
-            is_dspark=lambda: True,
-        )
-
-        self.assertIsNone(
-            get_draft_kv_pool(
-                draft_worker=worker,
-                spec_algorithm=spec_algorithm,
-                server_args=SimpleNamespace(enable_multi_layer_eagle=False),
-            )
-        )
+        worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker._hosts_draft = True
+        worker._is_lifecycle_only_pp_prefill_rank = True
+        self.assertIsNone(worker.primary_draft_kv_pool)
+        self.assertEqual(worker._draft_model_runners(), ())
 
     def test_non_last_pp_prefill_uses_minimal_draft_kv_pool(self):
         worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker._hosts_draft = True
         worker._draft_worker = Mock()
         worker._is_pd_prefill = True
         worker._draft_is_moe = True
@@ -359,6 +356,7 @@ class TestDSparkPPContext(CustomTestCase):
 
     def test_last_pp_prefill_keeps_full_draft_kv_pool(self):
         worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker._hosts_draft = True
         worker._draft_worker = Mock()
         worker._is_pd_prefill = True
         worker._draft_is_moe = True

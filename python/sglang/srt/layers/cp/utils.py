@@ -17,6 +17,8 @@
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
+import torch
+
 from sglang.srt.layers.cp.base import (
     BaseContextParallelMetadata,
     ContextParallelStrategy,
@@ -35,10 +37,20 @@ from sglang.srt.layers.cp.zigzag import (
     ZigzagContextParallelMetadata,
     ZigzagCPStrategy,
 )
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-from sglang.srt.runtime_context import get_parallel, uses_mla_backend
+from sglang.srt.layers.moe.utils import (
+    get_moe_a2a_backend,
+    get_moe_runner_backend,
+)
+from sglang.srt.runtime_context import (
+    get_parallel,
+    max_prefill_buffer_tokens,
+    uses_mla_backend,
+)
 
 if TYPE_CHECKING:
+    from sglang.srt.distributed.device_communicators.torch_symm_mem import (
+        TorchSymmMemCommunicator,
+    )
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
@@ -166,7 +178,12 @@ def prepare_cp_forward(forward_batch) -> None:
         )
         pad_logical_token_to_physical(forward_batch.attn_cp_metadata)
 
-    if getattr(forward_batch, "global_num_tokens_cpu", None) is not None:
+    # Under CP-TP group sharing the model owns the CP row layout and gathers
+    # full rows for its MLPs, so their buffers keep the full-batch length.
+    if (
+        not get_parallel().enable_cp_tp_group_sharing
+        and getattr(forward_batch, "global_num_tokens_cpu", None) is not None
+    ):
         from sglang.srt.layers.dp_attention import set_local_dp_buffer_len
 
         set_local_dp_buffer_len(
@@ -273,8 +290,10 @@ def cp_shard_model_inputs(
 ):
     """Restore the shared batch so logits processing keeps full-batch metadata."""
     assert is_cp_active(forward_batch)
-    sharded_hidden_states = cp_shard_hidden_states(
-        complete_hidden_states, forward_batch
+    sharded_hidden_states = (
+        cp_shard_hidden_states(complete_hidden_states, forward_batch)
+        if complete_hidden_states is not None
+        else None
     )
     sharded_positions = cp_shard_position_ids(complete_position_ids, forward_batch)
     model_input_ids = (
@@ -295,6 +314,7 @@ def cp_shard_model_inputs(
     spec_hidden_states_backup = None
     if (
         spec_hidden_states is not None
+        and complete_hidden_states is not None
         and spec_hidden_states.shape[0] == complete_hidden_states.shape[0]
     ):
         spec_hidden_states_backup = spec_hidden_states
@@ -321,6 +341,202 @@ def _to_int_list(values) -> Optional[list[int]]:
     return [int(x) for x in values]
 
 
+def dsa_prefill_cp_fused_symm_mem_eligible(
+    mlp: Any,
+    forward_batch: Any,
+    hidden_states: torch.Tensor,
+    comm: Optional["TorchSymmMemCommunicator"],
+) -> bool:
+    """Eligibility gate for the fused CP AG/RS prefill path: when True the
+    caller skips the standalone dsa_cp gather / reduce-scatter, so this must
+    be rank-consistent and run before any collective."""
+    from sglang.srt.batch_overlap.single_batch_overlap import SboFlags
+    from sglang.srt.distributed.device_communicators.symm_mem_kernels import (
+        MOE_RS_CHUNK_WIDTH,
+    )
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.attention.dsa.utils import (
+        dsa_use_prefill_cp,
+        is_dsa_prefill_cp_interleave,
+    )
+    from sglang.srt.model_executor.runner import get_is_capture_mode
+
+    if comm is None or comm.disabled:
+        return False
+    if not envs.SGLANG_OPT_USE_TORCH_SYMM_MEM_FUSED_KERNEL.get():
+        return False
+    if get_is_capture_mode():
+        return False
+    if not dsa_use_prefill_cp(forward_batch):
+        return False
+    if not get_moe_a2a_backend().is_none():
+        return False
+    if not is_dsa_prefill_cp_interleave():
+        # AG places rank r at offset r * M_local; only equal round-robin
+        # shards keep that arithmetic exact.
+        return False
+    parallel = get_parallel()
+    if parallel.attn_dp_size != 1 or parallel.attn_tp_size != 1:
+        # Same layout the dsa_cp_* collectives assert.
+        return False
+    # MoE-side eligibility: standalone block-quantized shared experts on either
+    # the in-place Triton runner, or the DSV4.1 deferred FlashInfer path. The
+    # latter reuses its existing fused finalize + reduce-scatter and only takes
+    # the symmetric-memory AG + shared-expert GEMM half of this optimization.
+    if mlp.num_fused_shared_experts != 0:
+        return False
+    if SboFlags.fuse_shared_experts_inside_sbo():
+        return False
+    gate_up_proj = mlp.shared_experts.gate_up_proj
+    quant_method = getattr(gate_up_proj, "quant_method", None)
+    use_humming = getattr(quant_method, "use_humming", False)
+    humming_ready = use_humming and getattr(gate_up_proj, "humming_fp8_ready", False)
+    block_fp8_ready = mlp.shared_experts_weight_block_size == [128, 128]
+    if not (humming_ready or block_fp8_ready):
+        return False
+    if not mlp.experts.moe_runner_config.inplace:
+        return False
+    runner_backend = get_moe_runner_backend()
+    if not (
+        runner_backend.is_triton()
+        or (
+            runner_backend.is_flashinfer_mxfp4()
+            and mlp.experts.supports_deferred_finalize
+        )
+    ):
+        return False
+    if hidden_states.shape[-1] % MOE_RS_CHUNK_WIDTH != 0:
+        return False
+    # AG kernel and its symm buffer are bf16-only.
+    if hidden_states.dtype != torch.bfloat16:
+        return False
+    # hidden_states is the CP shard here; symm buffers size global tokens.
+    m_global = hidden_states.shape[0] * parallel.attn_cp_size
+    return 0 < m_global <= max_prefill_buffer_tokens()
+
+
+@contextmanager
+def dsa_prefill_cp_fused_symm_mem(
+    mlp: Any,
+    forward_batch: Any,
+    hidden_states: torch.Tensor,
+):
+    """Hold comm.use_cp_fused_symm_mem around the non-TBO prefill layer loop.
+
+    While held, the MoE path replaces the standalone dsa_cp gather /
+    reduce-scatter with the fused AG/RS symm-mem kernels; the hold decision
+    comes from dsa_prefill_cp_fused_symm_mem_eligible and is rank-consistent.
+    """
+    from sglang.srt.distributed import get_tp_group
+
+    comm = get_tp_group().torch_symm_mem_comm
+    held = comm is not None and dsa_prefill_cp_fused_symm_mem_eligible(
+        mlp, forward_batch, hidden_states, comm
+    )
+    if held:
+        comm.set_use_cp_fused_symm_mem(True)
+    try:
+        yield
+    finally:
+        if held:
+            comm.set_use_cp_fused_symm_mem(False)
+
+
+def dsa_prefill_cp_moe_gather(hidden_states: torch.Tensor) -> torch.Tensor:
+    """MoE-input CP gather; no-op while the fused CP AG/RS path holds
+    use_cp_fused_symm_mem (the MoE gathers inside the fused kernel)."""
+    from sglang.srt.distributed import get_tp_group
+    from sglang.srt.layers.cp.interleave import attn_cp_interleave_gather
+
+    comm = get_tp_group().torch_symm_mem_comm
+    if comm is not None and comm.use_cp_fused_symm_mem:
+        return hidden_states
+    return attn_cp_interleave_gather(hidden_states)
+
+
+def dsa_prefill_cp_moe_reduce_scatter(hidden_states: torch.Tensor) -> torch.Tensor:
+    """MoE-output CP reduce-scatter; no-op while the fused CP AG/RS path
+    holds use_cp_fused_symm_mem (the fused RS already ran in the runner)."""
+    from sglang.srt.distributed import get_tp_group
+    from sglang.srt.layers.layer_boundary.ops import (
+        attn_cp_interleave_reduce_scatter,
+    )
+
+    comm = get_tp_group().torch_symm_mem_comm
+    if comm is not None and comm.use_cp_fused_symm_mem:
+        # Experts emitted unreduced [M, topk, H]; a 3D tensor here means fused
+        # RS fell back after that, which nothing repairs.
+        assert hidden_states.dim() == 2, (
+            "fused CP RS fell back after no_topk_reduce expert output; "
+            "add the missing condition to dsa_prefill_cp_fused_symm_mem_eligible"
+        )
+        return hidden_states
+    return attn_cp_interleave_reduce_scatter(hidden_states)
+
+
+def dsa_prefill_cp_shared_experts(
+    mlp: Any,
+    hidden_states: torch.Tensor,
+    gemm_output_zero_allocator: Any = None,
+    pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Shared experts forward with the fused CP AG piggyback: returns
+    (ag_out, shared_output), ag_out = gathered full-token states, else None."""
+    from sglang.srt.distributed.device_communicators.symm_mem_kernels import (
+        maybe_fused_ag_shared_experts,
+    )
+
+    shared_experts = mlp.shared_experts
+    ag_out, gate_up_local = maybe_fused_ag_shared_experts(
+        hidden_states, shared_experts.gate_up_proj
+    )
+    if ag_out is None:
+        if pre_quant_input is not None:
+            # SGLANG_OPT_MOE_QUANT_ONCE: (q, s) rows may be padded to a
+            # multiple of 4; the padded rows flow through the MLP (all ops
+            # are row-local) and are sliced off here.
+            out = shared_experts(hidden_states, gateup_pre_quant=pre_quant_input)
+            return None, out[: hidden_states.shape[0]]
+        return None, shared_experts(
+            hidden_states, gemm_output_zero_allocator=gemm_output_zero_allocator
+        )
+    if gate_up_local is not None:
+        return ag_out, shared_experts(
+            hidden_states,
+            gemm_output_zero_allocator=gemm_output_zero_allocator,
+            precomputed_gate_up=gate_up_local,
+        )
+    if pre_quant_input is not None:
+        # SGLANG_OPT_MOE_QUANT_ONCE: (q, s) rows may be padded to a multiple of 4.
+        out = shared_experts(hidden_states, gateup_pre_quant=pre_quant_input)
+        return ag_out, out[: hidden_states.shape[0]]
+    return ag_out, shared_experts(
+        hidden_states, gemm_output_zero_allocator=gemm_output_zero_allocator
+    )
+
+
+def dsa_prefill_cp_shared_add_rs(
+    mlp: Any,
+    final_hidden_states: torch.Tensor,
+    shared_output: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Fused routed-topk sum + shared-add + CP reduce-scatter; None when the
+    fused path is inactive (the caller falls back to the regular combine)."""
+    from sglang.srt.distributed.device_communicators.symm_mem_kernels import (
+        maybe_fused_shared_add_rs,
+    )
+
+    # tp_size arg = shard divisor = cp_size (RS runs on the attn CP group).
+    return maybe_fused_shared_add_rs(
+        final_hidden_states,
+        shared_output,
+        get_parallel().attn_cp_size,
+        mlp.n_shared_experts,
+        mlp.top_k,
+        mlp.routed_scaling_factor,
+    )
+
+
 __all__ = [
     "BaseContextParallelMetadata",
     "CPAttentionBackendKind",
@@ -342,6 +558,12 @@ __all__ = [
     "cp_shard_model_inputs",
     "cp_shard_position_ids",
     "cp_split_before_forward",
+    "dsa_prefill_cp_fused_symm_mem",
+    "dsa_prefill_cp_fused_symm_mem_eligible",
+    "dsa_prefill_cp_moe_gather",
+    "dsa_prefill_cp_moe_reduce_scatter",
+    "dsa_prefill_cp_shared_add_rs",
+    "dsa_prefill_cp_shared_experts",
     "prepare_cp_forward",
     "is_glm_dsa_cache_layer_split_enabled",
     "get_glm_dsa_cp_layer_shard_info",

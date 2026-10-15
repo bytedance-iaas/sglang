@@ -17,6 +17,23 @@ class FusedMoEBackend(Protocol):
 
 
 _factories: dict[tuple[str, tuple[int, int]], Callable] = {}
+_worker_initializers: dict[str, Callable] = {}
+
+
+def register_fused_moe_worker_initializer(name: str, initializer):
+    previous = _worker_initializers.get(name)
+    if previous is not None and previous is not initializer:
+        raise ValueError(f"Fused MoE worker initializer already registered for {name}")
+    _worker_initializers[name] = initializer
+
+
+def prepare_fused_moe_worker(server_args):
+    """Run before distributed communicators allocate symmetric memory."""
+    from sglang.srt.plugins import load_plugins
+
+    load_plugins()
+    for initializer in _worker_initializers.values():
+        initializer(server_args)
 
 
 def register_fused_moe_backend(name: str, capability: tuple[int, int], factory):

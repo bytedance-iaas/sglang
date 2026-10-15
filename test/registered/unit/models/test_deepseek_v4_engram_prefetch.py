@@ -68,10 +68,8 @@ class TestDeepseekV4EngramPrefetch(CustomTestCase):
         layers = [
             SimpleNamespace(
                 engram=None,
-                forward_hc_pre_from_prev=lambda **kwargs: (
-                    kwargs["hidden_states"],
-                    None,
-                ),
+                hc_cfg=object(),
+                forward_hc_pre_from_prev=lambda **kwargs: kwargs["state"],
             )
             for _ in range(config.num_hidden_layers)
         ]
@@ -107,14 +105,14 @@ class TestDeepseekV4EngramPrefetch(CustomTestCase):
                     _is_cuda=True,
                     _is_hip=False,
                     _is_npu=False,
-                    get_pp_group=Mock(return_value=pp_group),
+                    get_parallel=Mock(return_value=SimpleNamespace(pp_group=pp_group)),
                     is_dp_attention_enabled=Mock(return_value=True),
                     get_platform=Mock(
                         return_value=SimpleNamespace(is_blackwell=False, is_sm90=True)
                     ),
                     VocabParallelEmbedding=Mock(return_value=nn.Identity()),
                     RMSNorm=Mock(return_value=nn.Identity()),
-                    make_layers=Mock(return_value=(layers, start_layer, end_layer)),
+                    make_pp_layers=Mock(return_value=(layers, start_layer, end_layer)),
                     is_cross_layer_mhc_fusion_enabled=Mock(return_value=False),
                     _is_fused_mhc_post_pre_enabled_xpu=Mock(return_value=False),
                     get_exec=Mock(
@@ -166,6 +164,7 @@ class TestDeepseekV4EngramPrefetch(CustomTestCase):
     ):
         hidden = torch.arange(ids.numel() * 4, dtype=torch.float32).reshape(-1, 2, 2)
         batch = SimpleNamespace(
+            contains_mm_inputs=lambda: True,
             forward_mode=mode,
             is_extend_in_batch=dp_layout is not None,
             input_ids=ids,
@@ -178,6 +177,11 @@ class TestDeepseekV4EngramPrefetch(CustomTestCase):
         main_stream = Mock()
         with (
             patch.object(deepseek_v4, "is_cp_active", return_value=cp),
+            patch.object(
+                deepseek_v4,
+                "cp_shard_hidden_states",
+                side_effect=lambda ids, batch: ids[1::2],
+            ),
             patch.object(
                 deepseek_v4,
                 "get_parallel",
@@ -469,7 +473,9 @@ class TestDeepseekV4EngramPrefetch(CustomTestCase):
         ids = torch.tensor([1, 7, 2, 3, 4, 5])
         for rows in (torch.tensor([3, 4, 5]), torch.tensor([1, 4])):
             tail = SimpleNamespace(
-                rows=lambda x: None if x is None else x[rows], positions=rows
+                rows=lambda x: None if x is None else x[rows],
+                positions=rows,
+                cp_metadata=None,
             )
             for budget in (0, rows.numel() * 2 - 1, rows.numel() * 2):
                 with self.subTest(rows=rows, budget=budget):
@@ -498,7 +504,9 @@ class TestDeepseekV4EngramPrefetch(CustomTestCase):
             for rows in (torch.tensor([3, 4, 5]), torch.tensor([1, 4])):
                 with self.subTest(start=start, rows=rows):
                     tail = SimpleNamespace(
-                        rows=lambda x: None if x is None else x[rows], positions=rows
+                        rows=lambda x: None if x is None else x[rows],
+                        positions=rows,
+                        cp_metadata=None,
                     )
                     model, sync = self._make_model(), self._make_model(enabled=False)
                     model.late_layer_start = sync.late_layer_start = start

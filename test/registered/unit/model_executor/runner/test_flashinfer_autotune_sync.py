@@ -34,6 +34,7 @@ from sglang.srt.model_executor.runner.flashinfer_autotune import (
     should_run_flashinfer_autotune,
     should_run_flashinfer_prefill_only_autotune,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.test_utils import CustomTestCase, find_available_port
 
 ENV = {"flashinfer_version": "0.6.17", "gpu": "NVIDIA GB300"}
@@ -63,16 +64,15 @@ def _gate_worker(rank, world_size, master_port, cache_path, writer):
 class TestAutotuneTacticSyncGroup(CustomTestCase):
     def test_dsv41_pp_skips_state_free_dummy_forward(self):
         model_runner = SimpleNamespace(
-            ps=SimpleNamespace(pp_size=4),
             model_config=SimpleNamespace(
                 hf_config=SimpleNamespace(model_type="deepseek_v41")
             ),
         )
-        self.assertFalse(should_run_flashinfer_autotune(model_runner))
+        with get_parallel().override(pp_size=4):
+            self.assertFalse(should_run_flashinfer_autotune(model_runner))
 
     def test_dsv41_pp_allows_model_owned_prefill_only_autotune(self):
         model_runner = SimpleNamespace(
-            ps=SimpleNamespace(pp_size=2),
             model_config=SimpleNamespace(
                 hf_config=SimpleNamespace(model_type="deepseek_v41")
             ),
@@ -89,6 +89,7 @@ class TestAutotuneTacticSyncGroup(CustomTestCase):
             moe=SimpleNamespace(moe_runner_backend="flashinfer_mxfp4"),
         )
         with (
+            get_parallel().override(pp_size=2),
             patch.object(autotune, "get_exec", return_value=runtime),
             patch.object(
                 autotune.envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND,
@@ -273,11 +274,7 @@ class TestAutotuneCachePhases(CustomTestCase):
         tuner = AutoTuner.get()
         tuner.clear_cache()
         self.addCleanup(tuner.clear_cache)
-        runner = SimpleNamespace(
-            device="cuda",
-            forward_stream=torch.cuda.Stream(),
-            tp_group=SimpleNamespace(world_size=1),
-        )
+        runner = SimpleNamespace(device="cuda", forward_stream=torch.cuda.Stream())
         with tempfile.TemporaryDirectory() as directory:
             target, draft = (
                 Path(directory) / name for name in ("target.json", "draft.json")
@@ -301,6 +298,7 @@ class TestAutotuneCachePhases(CustomTestCase):
                     autotune, "get_flashinfer_autotune_skip_ops", return_value=set()
                 ),
                 autotune.envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.override(True),
+                get_parallel().override(tp_group=SimpleNamespace(world_size=1)),
             ):
                 with autotune.flashinfer_autotune_context(runner, run_lm_head=False):
                     self.assertEqual(

@@ -10,6 +10,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
+
 from .sm90_fp4_indexer import _e2m1_decode
 from .topk import topk_transform_ragged_v2
 
@@ -55,6 +57,16 @@ def prepare_candidate_lengths(pos, ratio, width, candidates=None):
 
 
 @triton.jit
+def _e2m1_decode_bits(code):
+    # Exact BF16 encodings of {0, .5, 1, 1.5, 2, 3, 4, 6}, including sign.
+    # Keep scale multiplication in FP32, including its subnormal/Inf behavior.
+    magnitude = (code & 7).to(tl.uint32)
+    bits = tl.where(magnitude < 2, magnitude * 0x3F00, (magnitude + 252) << 6)
+    bits |= (code.to(tl.uint32) & 8) << 12
+    return bits.to(tl.uint16).to(tl.bfloat16, bitcast=True).to(tl.float32)
+
+
+@triton.jit
 def _prefix_logits(
     Q,
     W,
@@ -80,6 +92,7 @@ def _prefix_logits(
     HAS_BLOCKS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     FALLBACK=None,
+    FAST_DECODE: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     if FALLBACK is not None:
@@ -116,7 +129,9 @@ def _prefix_logits(
             valid = valid & tl.load(
                 MASK + row * MASK_STRIDE + col, visible, other=False
             )
-        if tl.sum(valid.to(tl.int32), 0) > 0:
+        # Masked loads produce zero keys, so an empty tile is safe to compute.
+        # Removing this branch permits software pipelining in the opt-in path.
+        if FAST_DECODE or tl.sum(valid.to(tl.int32), 0) > 0:
             slot = (
                 tl.load(
                     MAPPING + request * MAP_STRIDE + position * RATIO, valid, other=0
@@ -140,8 +155,12 @@ def _prefix_logits(
                 other=127,
             )
             scale = tl.exp2(scales.to(tl.float32) - 127.0)[:, :, None]
-            lo = _e2m1_decode(payload & 15)
-            hi = _e2m1_decode(payload >> 4)
+            if FAST_DECODE:
+                lo = _e2m1_decode_bits(payload & 15)
+                hi = _e2m1_decode_bits(payload >> 4)
+            else:
+                lo = _e2m1_decode(payload & 15)
+                hi = _e2m1_decode(payload >> 4)
             kl = tl.reshape(tl.reshape(lo, (64, 4, 16)) * scale, (64, 64)).to(
                 tl.bfloat16
             )
@@ -223,6 +242,18 @@ def prefix_logits(
         triton.cdiv(width, 64),
         max(8, triton.next_power_of_2(triton.cdiv(8 * sm_count, rows))),
     )
+    fast_decode = envs.SGLANG_OPT_DSV41_SM90_PREFIX_LOGITS.get()
+    stages = 2 if fast_decode else 3
+    if fast_decode and 96 <= rows <= 256 and width >= 8192:
+        tiles = min(triton.cdiv(width, 64), 32)
+        if rows <= 192:
+            # Consumer gathers benefit from one stage; source layers keep the
+            # contiguous-prefix pipeline. Ratio-2 layers need fewer KV CTAs.
+            # Only static metadata selects the launch, including during capture.
+            if candidates is not None and ratio == 1:
+                stages = 1
+            elif candidates is None and ratio == 2:
+                tiles = min(triton.cdiv(width, 64), 16)
     _prefix_logits[(rows, tiles)](
         q,
         weights,
@@ -248,7 +279,9 @@ def prefix_logits(
         candidates is not None,
         candidates.block_size if candidates is not None else 1,
         FALLBACK=_fallback,
+        FAST_DECODE=fast_decode,
         num_warps=4,
+        num_stages=stages,
     )
     return out
 

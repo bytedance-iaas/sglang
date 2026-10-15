@@ -20,13 +20,15 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 class _Layer:
     engram = None
+    hc_cfg = None
 
     def __init__(self):
         self.calls = []
 
     def forward_hc_pre_from_prev(self, **kwargs):
         self.calls.append(kwargs)
-        return kwargs["hidden_states"] + 1, kwargs["prev_pre"] + 1
+        state = kwargs["state"]
+        return deepseek_v4.mhc.HcState(state.residual + 1, state.pre + 1)
 
 
 class _ReqToTokenTable:
@@ -115,7 +117,9 @@ class TestDeepSeekV41PP(unittest.TestCase):
         receiver_metadata = SimpleNamespace(core_metadata=core, candidate_metadata=None)
         model = SimpleNamespace(
             end_layer=1,
-            config=SimpleNamespace(compress_ratios=[0, 0]),
+            config=SimpleNamespace(
+                compress_ratios=[0, 0], candidate_source_layer_id=None
+            ),
             _pp_attention_metadata=lambda tail: sender_metadata,
         )
         tensors = {}
@@ -232,7 +236,7 @@ class TestDeepSeekV41PP(unittest.TestCase):
             inherit_full_state=False,
         )
         backend.exit_late_layer_tail.assert_called_once()
-        self.assertTrue(torch.equal(layer.calls[0]["hidden_states"], hidden_states))
+        self.assertTrue(torch.equal(layer.calls[0]["state"].residual, hidden_states))
         self.assertTrue(
             torch.equal(layer.calls[0]["input_ids"], torch.tensor([12, 13]))
         )
@@ -325,7 +329,7 @@ class TestDeepSeekV41PP(unittest.TestCase):
             reorder.call_args.args[0], torch.tensor([4, 5, 6, 7])
         )
         self.assertIs(reorder.call_args.args[1].attn_cp_metadata, tail_cp_metadata)
-        torch.testing.assert_close(layer.calls[0]["hidden_states"], hidden_states)
+        torch.testing.assert_close(layer.calls[0]["state"].residual, hidden_states)
         torch.testing.assert_close(
             layer.calls[0]["input_ids_global"], tail_global_input_ids
         )

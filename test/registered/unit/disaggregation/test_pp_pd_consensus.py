@@ -19,7 +19,7 @@ from sglang.srt.managers.schedule_batch import FINISH_ABORT  # noqa: E402
 from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
     _pp_merge_transfer_status,
 )
-from sglang.srt.runtime_context import get_context  # noqa: E402
+from sglang.srt.runtime_context import get_context, get_parallel  # noqa: E402
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -258,6 +258,7 @@ class TestPPPDConsensus(CustomTestCase):
                     "sglang.srt.disaggregation.prefill.setup_state_kv_args",
                 ),
                 get_context().override_server_args(disaggregation_ib_device=None),
+                get_parallel().override(dp_rank=0),
             ):
                 manager = queue._init_kv_manager()
             layer_ids_by_rank.append(manager.kv_args.kv_layer_ids)

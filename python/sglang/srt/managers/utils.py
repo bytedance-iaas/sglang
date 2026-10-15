@@ -21,27 +21,30 @@ from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.runtime_context import get_spec, max_speculative_num_draft_tokens
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
+from sglang.srt.utils.common import async_d2h as _async_d2h
 
 if TYPE_CHECKING:
     from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
     from sglang.srt.managers.scheduler import GenerationBatchResult
+    from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
     from sglang.srt.speculative.spec_info import SpecInput
 
 
 logger = logging.getLogger(__name__)
 
 
-def _async_d2h(t: torch.Tensor) -> torch.Tensor:
-    """Async D2H copy for overlap scheduling. On CUDA the dest is pinned (a D2H
-    to pageable host memory blocks the caller until done) and record_stream keeps
-    the source alive until the copy stream drains, so the caching allocator can't
-    recycle it early. Non-CUDA falls back to a plain copy."""
-    if not t.is_cuda:
-        return t.to("cpu", non_blocking=True)
-    cpu_t = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
-    cpu_t.copy_(t, non_blocking=True)
-    t.record_stream(torch.cuda.current_stream(t.device))
-    return cpu_t
+def allocate_distinct_stream(device_module, avoid_streams):
+    """Draw a stream that aliases none of ``avoid_streams``.
+
+    CUDA/HIP streams come from a fixed round-robin pool, so a fresh ``Stream()``
+    may hand back one that is already in use.
+    """
+    avoid = {stream.cuda_stream for stream in avoid_streams}
+    for _ in range(65):
+        stream = device_module.Stream(priority=0)
+        if stream.cuda_stream not in avoid:
+            return stream
+    raise RuntimeError("Unable to allocate a distinct stream")
 
 
 @dataclasses.dataclass
@@ -74,6 +77,12 @@ class GenerationBatchResult:
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
+    # Folded speculative epilogues return views into graph-owned persistent
+    # buffers. The owner records a narrow event after those views are copied
+    # to host, then gates only the next replay that can overwrite them.
+    persistent_result_copy_owner: Optional[Any] = dataclasses.field(
+        default=None, repr=False, compare=False
+    )
     # Padded row width in flattened speculative output. Existing algorithms
     # default to speculative_num_draft_tokens; linear UNO emits F + 1 columns.
     speculative_output_stride: Optional[int] = None
@@ -116,10 +125,18 @@ class GenerationBatchResult:
     # until the accepted path comes back over the relay.
     spec_verify_out_cache_loc: Optional[torch.Tensor] = None
 
+    # The plan the forward wrote its KV through, when the caller asked for it
+    # (`return_kv_loc_plan`): a speculative worker's own writes into the same
+    # slots take their ids from it.
+    kv_loc_plan: Optional[KVLocPlan] = None
+
     # PP+spec: [bs, spec_steps + 1] global node indices of the accepted path.
     # Every stage holds the KV for its own layers, so every stage has to compact
     # that path into its committed prefix; only the last stage can compute it.
     accept_index: Optional[torch.Tensor] = None
+    prepared_draft_extend_inputs: Optional[
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ] = None
 
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
@@ -154,6 +171,16 @@ class GenerationBatchResult:
         Only the tensors which are needed for processing results are copied,
         e.g., next_token_ids, logits outputs
         """
+        owner = self.persistent_result_copy_owner
+        if owner is not None:
+            # A folded graph may reuse these buffers on the next target replay.
+            # Copy them before optional outputs so the narrow reuse fence does
+            # not wait for unrelated D2H traffic.
+            self._copy_token_results_to_cpu()
+            owner.record_result_copy_done()
+            # Avoid retaining the model and graph through the result queue.
+            self.persistent_result_copy_owner = None
+
         if self.logits_output is not None and return_logprob:
             if self.logits_output.next_token_logprobs is not None:
                 self.logits_output.next_token_logprobs = _async_d2h(
@@ -186,18 +213,9 @@ class GenerationBatchResult:
             self.logits_output.hidden_states = _async_d2h(
                 self.logits_output.hidden_states
             )
-        if self.next_token_ids is not None:
-            self.next_token_ids = _async_d2h(self.next_token_ids)
-
-        if self.accept_lens is not None:
-            self.accept_lens = _async_d2h(self.accept_lens)
-
-        if self.block_accept_lens is not None:
-            self.block_accept_lens = _async_d2h(self.block_accept_lens)
-
-        if self.cap_lens is not None:
-            self.cap_lens = _async_d2h(self.cap_lens)
-
+        if owner is None:
+            # Preserve the established copy order for non-persistent results.
+            self._copy_token_results_to_cpu()
         # Sub-objects only declare their device fields; the single copy+safety
         # primitive (_async_d2h: pinned D2H + record_stream) is injected here so
         # all device->host copying and lifetime safety lives in one place.
@@ -218,6 +236,19 @@ class GenerationBatchResult:
         self.copy_auxiliary_output_to_cpu()
 
         self.copy_done.record()
+
+    def _copy_token_results_to_cpu(self) -> None:
+        if self.next_token_ids is not None:
+            self.next_token_ids = _async_d2h(self.next_token_ids)
+
+        if self.accept_lens is not None:
+            self.accept_lens = _async_d2h(self.accept_lens)
+
+        if self.block_accept_lens is not None:
+            self.block_accept_lens = _async_d2h(self.block_accept_lens)
+
+        if self.cap_lens is not None:
+            self.cap_lens = _async_d2h(self.cap_lens)
 
     def copy_auxiliary_output_to_cpu(self) -> None:
         if self.logits_output is None or self.auxiliary_host_output is not None:
@@ -283,6 +314,9 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
 
     logits_output = result.logits_output
     assert logits_output is not None
+    # Nested pinned CPU tensors are serialized as Python metadata by PP, so
+    # their forward-stream copies must be complete before pickling starts.
+    logits_output.finalize_input_logprobs()
     sampling_mask_output = logits_output.sampling_mask_output
 
     return {
@@ -304,8 +338,18 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
             if sampling_mask_output is None
             else sampling_mask_output.selected_logprobs
         ),
+        "sampling_mask_support_logprobs": (
+            None
+            if sampling_mask_output is None
+            else sampling_mask_output.support_logprobs
+        ),
         "sampling_mask_statuses": (
             None if sampling_mask_output is None else sampling_mask_output.statuses
+        ),
+        "sampling_mask_num_accept_tokens": (
+            None
+            if sampling_mask_output is None
+            else sampling_mask_output.num_accept_tokens
         ),
         "input_token_logprobs": result.logits_output.input_token_logprobs,
         "input_top_logprobs_val": result.logits_output.input_top_logprobs_val,
@@ -325,7 +369,9 @@ def get_logprob_from_pp_outputs(
             token_ids=next_pp_outputs["sampling_mask_token_ids"],
             lengths=next_pp_outputs["sampling_mask_lengths"],
             selected_logprobs=next_pp_outputs["sampling_mask_selected_logprobs"],
+            support_logprobs=next_pp_outputs["sampling_mask_support_logprobs"],
             statuses=next_pp_outputs["sampling_mask_statuses"],
+            num_accept_tokens=next_pp_outputs["sampling_mask_num_accept_tokens"],
         )
     logits_output = LogitsProcessorOutput(
         # Do not send logits and hidden states because they are large

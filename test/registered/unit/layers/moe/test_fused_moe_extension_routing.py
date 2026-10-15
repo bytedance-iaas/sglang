@@ -66,7 +66,7 @@ class TestFusedMoEExtensionRouting(unittest.TestCase):
         )
         x = torch.empty((3, 512), dtype=torch.bfloat16)
         ids = torch.tensor([10, 99, 99])
-        batch = SimpleNamespace(num_token_non_padded=torch.tensor(2))
+        batch = SimpleNamespace(moe_num_token_non_padded=lambda: torch.tensor(2))
         with (
             patch.object(vl_routing, "is_cuda", return_value=False),
             patch.object(topk_module, "_is_cuda", False),

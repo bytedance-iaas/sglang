@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+import os
 from functools import cache
 from pathlib import Path
 
 import torch
 
 _original_sm90_generator = None
+_DSV41_EP4_PROFILE_IDS = {
+    256: (56, 241),
+    8192: (20, 153),
+}
+
+
+@cache
+def _use_tuned_dsv41_ep4_tactics() -> bool:
+    return os.environ.get("SGLANG_DSV41_SM90_MOE_EP4_PREFILL_TACTICS", "0") == "1"
 
 
 def _replace_once(source: str, old: str, new: str) -> str:
@@ -166,6 +176,22 @@ def cutlass_fused_moe_deferred(
     )
 
     install_sm90_deferred_overlay()
+    if (
+        _use_tuned_dsv41_ep4_tactics()
+        and hidden_size == 5120
+        and top_k == 6
+        and kwargs.get("tp_size") == 1
+        and kwargs.get("ep_size") == 4
+        and kwargs.get("use_wfp4afp8_humming", False)
+        and tuple(kwargs["fc1_expert_weights"].shape) == (96, 4608, 2560)
+        and tuple(kwargs["fc2_expert_weights"].shape) == (96, 5120, 1152)
+        and "profile_ids" not in kwargs
+    ):
+        import flashinfer
+
+        profile_ids = _DSV41_EP4_PROFILE_IDS.get(kwargs.get("tune_max_num_tokens"))
+        if flashinfer.__version__ == "0.6.18" and profile_ids is not None:
+            kwargs["profile_ids"] = list(profile_ids)
     expanded_rows = num_tokens * top_k
     gemm2_numel = expanded_rows * hidden_size
     # The C++ overlay writes int32 routing indices into this BF16 storage tail.

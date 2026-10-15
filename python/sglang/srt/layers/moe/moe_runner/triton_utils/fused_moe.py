@@ -22,14 +22,13 @@ from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
     support_tensor_descriptor,
 )
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_padding_size, get_moe_runner_backend
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -59,11 +58,16 @@ _is_musa = is_musa()
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
 
-    from sglang.kernels.ops.activation.activation import gelu_and_mul, silu_and_mul
+    from sglang.kernels.ops.activation.activation import (
+        gelu_and_mul,
+        gelu_tanh_and_mul,
+        silu_and_mul,
+        silu_and_mul_with_activation_rounding,
+    )
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
-    from sgl_kernel import gelu_and_mul, silu_and_mul
+    from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 
     if _use_aiter:
         try:
@@ -183,6 +187,7 @@ def inplace_fused_experts(
         a2_scale,
         block_shape,
         False,
+        False,
         routed_scaling_factor,
         gemm1_alpha,
         gemm1_limit,
@@ -219,6 +224,7 @@ def outplace_fused_experts(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
+    no_topk_reduce: bool = False,
     routed_scaling_factor: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
@@ -253,6 +259,7 @@ def outplace_fused_experts(
         a2_scale,
         block_shape,
         no_combine=no_combine,
+        no_topk_reduce=no_topk_reduce,
         routed_scaling_factor=routed_scaling_factor,
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
@@ -292,6 +299,48 @@ def fused_experts(
         moe_runner_config.num_experts is None
         or moe_runner_config.num_experts != moe_runner_config.num_local_experts
     )
+    from sglang.srt.distributed import get_tp_group, model_parallel_is_initialized
+
+    comm = (
+        get_tp_group().torch_symm_mem_comm if model_parallel_is_initialized() else None
+    )
+    fused_topk_reduce_rs = (
+        comm is not None and not comm.disabled and comm.use_cp_fused_symm_mem
+    )
+    if fused_topk_reduce_rs:
+        return outplace_fused_experts(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            b1,
+            b2,
+            moe_runner_config.activation,
+            moe_runner_config.is_gated,
+            moe_runner_config.apply_router_weight_on_input,
+            use_fp8_w8a8,
+            use_int8_w8a8,
+            use_int8_w8a16,
+            use_int4_w4a16,
+            per_channel_quant,
+            w1_scale,
+            w2_scale,
+            w1_zp,
+            w2_zp,
+            a1_scale,
+            a2_scale,
+            block_shape,
+            no_topk_reduce=True,
+            routed_scaling_factor=moe_runner_config.routed_scaling_factor,
+            gemm1_alpha=moe_runner_config.gemm1_alpha,
+            gemm1_limit=moe_runner_config.gemm1_clamp_limit,
+            filter_expert=filter_expert,
+            swiglu_limit=moe_runner_config.swiglu_limit,
+            gate_up_interleaved=moe_runner_config.gate_up_interleaved,
+            a1_q=a1_q,
+            fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+        )
     if moe_runner_config.inplace:
         assert not moe_runner_config.no_combine, "no combine + inplace makes no sense"
         inplace_fused_experts(
@@ -510,6 +559,7 @@ def _fused_moe_kernel_sequence(
     activation: str,
     is_gated: bool,
     no_combine: bool,
+    no_topk_reduce: bool,
     inplace: bool,
     apply_router_weight_on_input: bool,
     routed_scaling_factor: Optional[float],
@@ -563,7 +613,7 @@ def _fused_moe_kernel_sequence(
     )
     total_tokens = num_tokens * topk + padded_tokens
 
-    if no_combine:
+    if no_combine or no_topk_reduce:
         assert not inplace
         out_hidden_states = torch.empty(
             (num_tokens, topk, w2.shape[1]),
@@ -578,7 +628,7 @@ def _fused_moe_kernel_sequence(
         # symmetric path. Only this output enters the pool; the intermediate caches
         # below stay on the default allocator to bound pool occupancy.
         with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
         ):
             out_hidden_states = torch.empty_like(hidden_states)
 
@@ -670,6 +720,14 @@ def _fused_moe_kernel_sequence(
     if fuse_swiglu_interleaved:
         # silu(gate) * up was already applied by the up-GEMM epilogue.
         pass
+    elif activation == "silu_rounded" and is_gated:
+        if _is_cuda:
+            silu_and_mul_with_activation_rounding(
+                intermediate_cache1.view(-1, N), intermediate_cache2
+            )
+        else:
+            gate, up = intermediate_cache1.view(-1, N).chunk(2, dim=-1)
+            intermediate_cache2.copy_(F.silu(gate) * up)
     elif activation == "silu" and is_gated:
         # - gemm1_alpha != None: GPT-OSS-style swiglu(alpha, limit)
         # - gemm1_alpha == None and gemm1_limit != None: silu+clamp+mul(limit-only)
@@ -716,7 +774,7 @@ def _fused_moe_kernel_sequence(
 
             if not filter_expert:
                 if swiglu_limit_for_silu_and_mul_clamp is not None:
-                    from sglang.kernels.ops.attention.dsv4 import silu_and_mul_clamp
+                    from sglang.kernels.ops.moe.dsv4 import silu_and_mul_clamp
 
                     silu_and_mul_clamp(
                         intermediate_cache1.view(-1, N),
@@ -771,29 +829,38 @@ def _fused_moe_kernel_sequence(
         if situ_linear_beta is not None:
             up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
         intermediate_cache2.copy_((gate * up).to(intermediate_cache1.dtype))
-    elif activation == "gelu" and is_gated:
+    elif activation in ("gelu", "gelu_tanh") and is_gated:
         assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
         assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
         if _is_cuda or _is_hip:
+            activation_fn = (
+                gelu_tanh_and_mul if activation == "gelu_tanh" else gelu_and_mul
+            )
             if filter_expert and _is_cuda:
-                gelu_and_mul(
+                activation_fn(
                     intermediate_cache1.view(-1, N),
                     intermediate_cache2,
                     expert_ids=(expert_ids if down_moe_use_tma else topk_ids.view(-1)),
                     expert_step=(config["BLOCK_SIZE_M"] if down_moe_use_tma else 1),
                 )
             else:
-                gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+                activation_fn(intermediate_cache1.view(-1, N), intermediate_cache2)
         else:
             if _has_vllm_ops:
-                vllm_ops.gelu_and_mul(
+                getattr(vllm_ops, f"{activation}_and_mul")(
                     intermediate_cache2, intermediate_cache1.view(-1, N)
                 )
             else:
                 # Fallback: native PyTorch gelu_and_mul
                 x = intermediate_cache1.view(-1, N)
                 d = x.shape[-1] // 2
-                intermediate_cache2.copy_(F.gelu(x[..., :d]) * x[..., d:])
+                intermediate_cache2.copy_(
+                    F.gelu(
+                        x[..., :d],
+                        approximate="tanh" if activation == "gelu_tanh" else "none",
+                    )
+                    * x[..., d:]
+                )
     # Activation function without multiplication
     elif activation == "silu" and not is_gated:
         intermediate_cache2 = F.silu(intermediate_cache1.view(-1, N))
@@ -812,9 +879,15 @@ def _fused_moe_kernel_sequence(
         dtype=hidden_states.dtype,
     )
 
-    # LoRA hooks force the second kernel to write to intermediate_cache3 so
-    # hooks.after_down can inspect/modify it before reduction.
-    _use_intermediate = not no_combine and (topk != 1 or hooks)
+    # Hooks (after_down) and non-unit routed scaling (the reduction applies
+    # it) both need intermediate_cache3. no_topk_reduce bypasses it: the
+    # caller's fused symm-mem topk-reduce reads per-expert out_hidden_states
+    # and applies routed scaling itself.
+    _use_intermediate = (
+        not no_combine
+        and not no_topk_reduce
+        and (topk != 1 or hooks or routed_scaling_factor not in (None, 1.0))
+    )
 
     out_slice = None
     if use_fused_moe_sum_all_reduce:
@@ -869,7 +942,7 @@ def _fused_moe_kernel_sequence(
     if routed_scaling_factor is None:
         routed_scaling_factor = 1.0
 
-    if no_combine:
+    if no_combine or no_topk_reduce:
         pass
     elif _is_cuda or _is_musa:
         if use_fused_moe_sum_all_reduce:
@@ -980,6 +1053,7 @@ def fused_experts_impl(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
+    no_topk_reduce: bool = False,
     routed_scaling_factor: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
@@ -1057,6 +1131,7 @@ def fused_experts_impl(
         activation=activation,
         is_gated=is_gated,
         no_combine=no_combine,
+        no_topk_reduce=no_topk_reduce,
         inplace=inplace,
         apply_router_weight_on_input=apply_router_weight_on_input,
         routed_scaling_factor=routed_scaling_factor,

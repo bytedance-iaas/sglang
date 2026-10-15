@@ -21,6 +21,7 @@ from sglang.srt.layers.attention.dsv4.late_layer import (
     scatter_tail_rows,
     select_tail_rows,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -41,33 +42,18 @@ def _batch(dp_size, rank, mode, non_padded=512):
 
 
 class TestLateLayerRows(CustomTestCase):
-    def test_tail_layout_reuses_device_length_tensors(self):
-        extend_lens = torch.tensor([200, 0, 50], dtype=torch.int32)
-        seq_lens = torch.tensor([300, 10, 80], dtype=torch.int32)
-
-        with patch.object(
-            torch,
-            "tensor",
-            side_effect=AssertionError("unexpected host-to-device tensor creation"),
-        ):
-            token_indices, tail_lens_cpu, tail_lens, replay_start = (
-                late_layer_tail_layout(
-                    extend_lens=extend_lens,
-                    extend_lens_cpu=[200, 0, 50],
-                    seq_lens=seq_lens,
-                    seq_lens_cpu=[300, 10, 80],
-                    tail_len=128,
-                )
-            )
-
+    def test_tail_layout_preserves_request_boundaries(self):
+        token_indices, tail_lens_cpu, replay_start = late_layer_tail_layout(
+            extend_lens_cpu=[200, 0, 50],
+            seq_lens_cpu=[300, 10, 80],
+            tail_len=128,
+            device=torch.device("cpu"),
+        )
         torch.testing.assert_close(
             token_indices,
             torch.cat((torch.arange(72, 200), torch.arange(200, 250))),
         )
         self.assertEqual(tail_lens_cpu, [128, 0, 50])
-        torch.testing.assert_close(
-            tail_lens, torch.tensor([128, 0, 50], dtype=torch.int32)
-        )
         torch.testing.assert_close(
             replay_start,
             torch.cat(
@@ -135,6 +121,7 @@ class TestLateLayerRows(CustomTestCase):
             )
 
     def test_model_forward_pads_only_moe_and_restores_residual_rows(self):
+        from sglang.srt.models import deepseek_v4_mhc as mhc
         from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
 
         for n in (0, 1, 129):
@@ -148,7 +135,6 @@ class TestLateLayerRows(CustomTestCase):
                 ids = torch.arange(n, dtype=torch.int32)
                 global_ids = torch.arange(sum(layout.counts), dtype=ids.dtype)
                 stats = torch.ones(n, 4)
-                precomputed = object()
 
                 def attention(*, x, **kwargs):
                     self.assertEqual(x.shape[0], n)
@@ -157,7 +143,7 @@ class TestLateLayerRows(CustomTestCase):
                     )
                     return x + 1
 
-                def moe(x, forward_batch, *, input_ids, input_ids_global):
+                def moe(x, forward_batch, *, input_ids, input_ids_global, **kwargs):
                     self.assertEqual(x.shape[0], 130)
                     self.assertEqual(dp.get_global_dp_buffer_len(), 260)
                     self.assertIs(forward_batch.global_num_tokens_cpu, layout.counts)
@@ -165,13 +151,13 @@ class TestLateLayerRows(CustomTestCase):
                     torch.testing.assert_close(input_ids[:n], ids)
                     return x * 2 + input_ids[:, None]
 
-                def post(x, residual, post, comb):
+                def post(hc, x, residual, **kwargs):
                     self.assertEqual(x.shape[0], n)
                     self.assertEqual(residual.shape, hidden.shape)
                     self.assertIs(
                         batch.global_num_tokens_cpu, old["global_num_tokens_cpu"]
                     )
-                    return residual + x[:, None]
+                    return mhc.HcState(residual + x[:, None], stats)
 
                 attn = Mock(side_effect=attention)
                 attn.accepts_mxfp8_swizzled_input.return_value = False
@@ -179,47 +165,48 @@ class TestLateLayerRows(CustomTestCase):
                 layer = SimpleNamespace(
                     config=SimpleNamespace(model_type="deepseek_v41"),
                     self_attn=attn,
-                    input_layernorm=None,
-                    post_attention_layernorm=None,
-                    hc_attn_fn=None,
-                    hc_attn_scale=None,
-                    hc_attn_base=None,
-                    hc_ffn_fn=None,
-                    hc_ffn_scale=None,
-                    hc_ffn_base=None,
-                    _get_hc_stats_stream=lambda *_: None,
-                    _hc_mix_stats=Mock(return_value=(stats, stats, stats)),
-                    _hc_combine=Mock(side_effect=lambda x, **_: x[:, 0]),
+                    _init_boundaries=lambda: None,
+                    hc_cfg=SimpleNamespace(hidden=3),
+                    attn_hc=object(),
+                    ffn_hc=object(),
+                    local_boundary=None,
+                    next_boundary=None,
+                    _can_fuse_attn_mhc=False,
+                    _can_fuse_ffn_mhc=False,
+                    mlp=SimpleNamespace(tp_size=1),
                     _run_moe_ffn_dp_sync=moe,
-                    hc_post=post,
                 )
-                with dp.dp_buffer_size_scope(
-                    1024,
-                    512,
-                    True,
-                    old["global_num_tokens_cpu"],
-                    old["global_num_tokens_gpu"],
+                with (
+                    patch.object(mhc, "use_stats_stream", return_value=False),
+                    patch.object(
+                        mhc,
+                        "combine",
+                        side_effect=lambda hc, state, *args: state.residual[:, 0],
+                    ),
+                    patch.object(mhc, "run_attn_post", side_effect=post),
+                    patch.object(mhc, "run_moe_post", side_effect=post),
+                    dp.dp_buffer_size_scope(
+                        1024,
+                        512,
+                        True,
+                        old["global_num_tokens_cpu"],
+                        old["global_num_tokens_gpu"],
+                    ),
                 ):
-                    output, next_pre = DeepseekV4DecoderLayer.forward_hc_pre_from_prev(
+                    output = DeepseekV4DecoderLayer.forward_hc_pre_from_prev(
                         layer,
                         positions=ids,
-                        hidden_states=hidden,
+                        state=mhc.HcState(hidden),
                         input_ids=ids,
                         forward_batch=batch,
                         input_ids_global=global_ids,
-                        prev_pre=None,
-                        precomputed_attn=precomputed,
                         late_dp_layout=layout,
                     )
                     self.assertEqual(dp.get_global_dp_buffer_len(), 1024)
                 after_attn = hidden + (hidden[:, 0] + 1)[:, None]
                 expected = after_attn + (after_attn[:, 0] * 2 + ids[:, None])[:, None]
-                torch.testing.assert_close(output, expected)
-                self.assertIs(next_pre, stats)
-                self.assertIs(
-                    layer._hc_combine.call_args_list[0].kwargs["precomputed"],
-                    precomputed,
-                )
+                torch.testing.assert_close(output.residual, expected)
+                self.assertIs(output.pre, stats)
                 for name, value in old.items():
                     self.assertIs(getattr(batch, name), value, name)
 
@@ -288,6 +275,8 @@ class TestLateLayerRows(CustomTestCase):
             enable_encoder_swa_bounded_replay=False,
             enable_decoder_swa_bounded_replay=True,
             enable_dp_attention=True,
+            attn_dp_size=1,
+            ep_join_mode=None,
             speculative_algorithm=None,
             enable_hisparse=False,
             dsv4_attn_backend="auto",
@@ -362,13 +351,6 @@ def _distributed_worker(rank, world_size, rendezvous):
                     attn_group = _GlooGroup(group, attn_rank, attn_tp_size)
             with ExitStack() as stack:
                 for name, value in dict(
-                    get_attention_dp_rank=lambda: dp_rank,
-                    get_attention_dp_size=lambda: dp_size,
-                    get_attn_tensor_model_parallel_rank=lambda: attn_rank,
-                    get_attn_tensor_model_parallel_world_size=lambda: attn_tp_size,
-                    get_tensor_model_parallel_world_size=lambda: world_size,
-                    get_tp_group=lambda: tp_group,
-                    get_attn_tp_group=lambda: attn_group,
                     world_dp_gather_enabled=lambda: False,
                     tensor_model_parallel_all_reduce=_all_reduce,
                     memcpy_func=dp.memcpy_cpu,
@@ -385,9 +367,17 @@ def _distributed_worker(rank, world_size, rendezvous):
                     )
                 )
                 stack.enter_context(
-                    patch(
-                        "sglang.srt.runtime_context.get_parallel",
-                        return_value=SimpleNamespace(attn_tp_size=attn_tp_size),
+                    get_parallel().override(
+                        attn_dp_size=dp_size,
+                        attn_dp_rank=dp_rank,
+                        attn_tp_size=attn_tp_size,
+                        attn_tp_rank=attn_rank,
+                        attn_cp_size=1,
+                        attn_cp_rank=0,
+                        tp_size=world_size,
+                        tp_rank=rank,
+                        tp_group=tp_group,
+                        attn_tp_group=attn_group,
                     )
                 )
                 scenarios = (

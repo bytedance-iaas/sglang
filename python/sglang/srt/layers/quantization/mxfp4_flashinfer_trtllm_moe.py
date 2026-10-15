@@ -7,7 +7,6 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -15,6 +14,7 @@ from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.runtime_context import (
     get_exec,
+    get_parallel,
     get_platform,
 )
 from sglang.srt.utils import (
@@ -416,9 +416,12 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         # triple instead of the finalized [T, hidden] tensor.
         defer_finalize = is_deferred_finalize_enabled()
         symm_output = None
-        if not defer_finalize:
+        # Preserve the ordinary output shape in the medium-batch autotuner
+        # cache key. The deferred ABI ignores this allocation and returns the
+        # expanded GEMM output for the separate fused finalize epilogue.
+        if not defer_finalize or 96 < num_tokens <= 384:
             with use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
+                get_parallel().tp_group, disabled=not is_allocation_symmetric()
             ):
                 out_hidden_size = (
                     x_quant.shape[-1] * 2
@@ -516,56 +519,43 @@ def maybe_fuse_routed_scale_and_shared_add(
     return routed
 
 
-# Fused finalize + shared add + TP all-reduce
-_fused_finalize_all_reduce_world_size: Optional[int] = None
-_fused_finalize_all_reduce_probed = False
+# Fused finalize + shared add + TP all-reduce, staged through the TP group's own
+# CustomAllReduceV2 push plane (tiny batches only; no dedicated workspace).
 
 
-def _fused_finalize_all_reduce_comm_world_size() -> Optional[int]:
-    global _fused_finalize_all_reduce_world_size, _fused_finalize_all_reduce_probed
-    if not _fused_finalize_all_reduce_probed:
-        _fused_finalize_all_reduce_probed = True
-        from sglang.kernels.ops.communication import all_reduce_fusion
-        from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-            CustomAllReduceV2,
+def register_fused_all_reduce_comm() -> None:
+    """Hand the TP group's push plane to the fusion kernels, once per process.
+    Must run before graph capture; unregistered means everything runs unfused."""
+    from sglang.kernels.ops.communication import all_reduce_fusion
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+        CustomAllReduceV2,
+    )
+
+    ca_comm = get_parallel().tp_group.ca_comm
+    if isinstance(ca_comm, CustomAllReduceV2) and not ca_comm.disabled:
+        all_reduce_fusion.register_comm(ca_comm.obj)
+    else:
+        log_info_on_rank0(
+            logger,
+            "Fused MoE finalize: TP group has no "
+            "CustomAllReduceV2 push plane; keeping the unfused finalize path",
         )
 
-        ca_comm = get_tp_group().ca_comm
-        if isinstance(ca_comm, CustomAllReduceV2) and not ca_comm.disabled:
-            all_reduce_fusion.register_comm(ca_comm.obj)
-            _fused_finalize_all_reduce_world_size = ca_comm.world_size
-        else:
-            log_info_on_rank0(
-                logger,
-                "Fused MoE finalize: TP group has no "
-                "CustomAllReduceV2 push plane; keeping the unfused finalize path",
-            )
-    return _fused_finalize_all_reduce_world_size
 
+def can_fuse_all_reduce(num_tokens: int, hidden_dim: int) -> bool:
+    """Whether the registered push plane can stage ``[num_tokens, hidden_dim]``
+    BF16 rows: one slot holds them and each row owns a push phase counter. The
+    384 ceiling is the bench-validated range of the fused collective family.
 
-def should_use_fuse_finalize_all_reduce(
-    experts, num_tokens: int, hidden_dim: int
-) -> bool:
-    """Capability only; the batch-size policy cap lives at the call site. The
-    kernel never rescales, so the expert weights must carry the routed scaling."""
-    if not isinstance(experts.quant_method, Mxfp4FlashinferTrtllmMoEMethod):
-        return False
-    if experts.quant_method.flashinfer_mxfp4_moe_precision != "default":
-        return False
-    if not experts.should_fuse_routed_scaling_factor_in_topk:
-        return False
-    if num_tokens <= 0:
-        return False
+    The deferred-finalize handle type carries its own numeric contract (every
+    producer folds the routed scaling; no consumer rescales)."""
     from sglang.kernels.ops.communication import all_reduce_fusion
 
-    if not all_reduce_fusion.valid_cluster_sizes(hidden_dim):
+    if all_reduce_fusion.get_registered_comm(get_parallel().tp_size) is None:
         return False
-    tp_group = get_tp_group()
-    if _fused_finalize_all_reduce_comm_world_size() != tp_group.world_size:
-        return False
-    # one push phase counter per row (the plane has num_sm of them)
-    if num_tokens > tp_group.ca_comm.config.num_push_blocks:
-        return False
-    return all_reduce_fusion.fits_push_slot(
-        tp_group.ca_comm.max_push_size, num_tokens, hidden_dim
+    comm = get_parallel().tp_group.ca_comm
+    return (
+        num_tokens <= 384
+        and num_tokens <= comm.config.num_push_blocks
+        and all_reduce_fusion.fits_push_slot(comm.max_push_size, num_tokens, hidden_dim)
     )
