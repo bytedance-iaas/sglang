@@ -97,10 +97,14 @@ class TestSm90LengthAwareIndexer(CustomTestCase):
                         self.assertGreaterEqual(topk.call_count, 2)
                     else:
                         self.assertEqual(topk.call_count, 0)
-                    self.check_outputs(x, source, "source")
-                    self.check_outputs(
-                        x, consumer, "consumer", published_masks(candidates).mask
-                    )
+                    if grouped:
+                        self.check_outputs(x, source, "source")
+                        self.check_outputs(
+                            x, consumer, "consumer", published_masks(candidates).mask
+                        )
+                    else:
+                        source.state.decode_candidates.publish_decode.assert_called_once()
+                        consumer.state.decode_candidates.consume_decode.assert_called_once()
 
     def check_outputs(self, x, case, role="none", input_mask=None, k=512, has_raw=True):
         scores = self.fixture.reference(x)
