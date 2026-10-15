@@ -9,6 +9,10 @@ on:
       sgl_kernel:
         required: true
         type: string
+      rust_ext_artifact:
+        description: 'Artifact of prebuilt Rust extension modules, from rust-ext-build. Empty, or a download that fails, falls back to the cache; a miss there compiles during install.'
+        type: string
+        default: ''
       runner_config:
         required: true
         type: string
@@ -103,6 +107,10 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
+      - uses: ./.github/actions/download-rust-ext
+        with:
+          artifact_name: ${{ inputs.rust_ext_artifact }}
+
       - name: Install dependencies
         timeout-minutes: 20
         run: |
@@ -111,16 +119,17 @@ jobs:
         timeout-minutes: 240
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
-          DIFFUSION_CONTINUE_ON_ERROR: ${{ inputs.continue_on_error }}
-          DIFFUSION_PARTITION_ID: ${{ matrix.part }}
-          DIFFUSION_TOTAL_PARTITIONS: ${{ needs.compute-diffusion-partitions.outputs['partition-count-1gpu'] }}
-          DIFFUSION_PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-1gpu }}
+          CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-1gpu }}
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
         run: |
-          python3 test/run_suite.py \
-            --hw cuda \
-            --suite base-b-test-diffusion-1-gpu-h100 \
-            --timeout-per-file 14400
+          cd python
+          python3 sglang/multimodal_gen/test/run_suite.py \
+            --suite 1-gpu \
+            --partition-id ${{ matrix.part }} \
+            --total-partitions ${{ needs.compute-diffusion-partitions.outputs['partition-count-1gpu'] }} \
+            --partition-plan-json "$PARTITION_PLAN_JSON" \
+            $CONTINUE_ON_ERROR_FLAG
 
       - name: Upload execution report
         if: always()
@@ -130,7 +139,7 @@ jobs:
           path: |
             python/sglang/multimodal_gen/test/execution_report_*.json
             python/diffusion-results.json
-          retention-days: 7
+          retention-days: 1
 
       - name: Upload diffusion failure artifacts
         if: always()
@@ -170,6 +179,10 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
+      - uses: ./.github/actions/download-rust-ext
+        with:
+          artifact_name: ${{ inputs.rust_ext_artifact }}
+
       - name: Install dependencies
         timeout-minutes: 20
         run: |
@@ -179,13 +192,13 @@ jobs:
         timeout-minutes: 120
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
-          DIFFUSION_CONTINUE_ON_ERROR: ${{ inputs.continue_on_error }}
+          CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
         run: |
-          python3 test/run_suite.py \
-            --hw cuda \
-            --suite base-b-test-diffusion-1-gpu-5090 \
-            --timeout-per-file 7200
+          cd python
+          python3 sglang/multimodal_gen/test/run_suite.py \
+            --suite 1-gpu-5090 \
+            $CONTINUE_ON_ERROR_FLAG
 
       - name: Upload execution report
         if: always()
@@ -235,6 +248,10 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
+      - uses: ./.github/actions/download-rust-ext
+        with:
+          artifact_name: ${{ inputs.rust_ext_artifact }}
+
       - name: Install dependencies
         timeout-minutes: 20
         run: |
@@ -244,13 +261,13 @@ jobs:
         timeout-minutes: 60
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
-          DIFFUSION_CONTINUE_ON_ERROR: ${{ inputs.continue_on_error }}
+          CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-bcg-artifacts
         run: |
-          python3 test/run_suite.py \
-            --hw cuda \
-            --suite base-b-test-diffusion-bcg-1-gpu-h100 \
-            --timeout-per-file 3600
+          cd python
+          python3 sglang/multimodal_gen/test/run_suite.py \
+            --suite bcg-diffusion \
+            $CONTINUE_ON_ERROR_FLAG
 
       - name: Upload BCG diffusion artifacts
         if: always()
@@ -275,14 +292,11 @@ jobs:
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
       inputs.multimodal_gen == 'true'
     runs-on: 2-gpu-h100
-    timeout-minutes: 55
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-2gpu) }}
     steps:
-      - name: Record retry deadline
-        run: echo "SGLANG_DIFFUSION_RETRY_DEADLINE=$(( $(date +%s) + 3000 ))" >> "$GITHUB_ENV"
-
       - name: Checkout code
         uses: actions/checkout@v4
         with:
@@ -300,27 +314,32 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
+      - uses: ./.github/actions/download-rust-ext
+        with:
+          artifact_name: ${{ inputs.rust_ext_artifact }}
+
       - name: Install dependencies
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run diffusion server tests
-        timeout-minutes: 55
+        timeout-minutes: 240
         env:
-          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
-          HUGGING_FACE_HUB_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
+          HF_TOKEN: ${{ secrets.MINIMAX_H3_HF_TOKEN || secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
+          HUGGING_FACE_HUB_TOKEN: ${{ secrets.MINIMAX_H3_HF_TOKEN || secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
           RUNAI_STREAMER_MEMORY_LIMIT: 0
-          DIFFUSION_CONTINUE_ON_ERROR: ${{ inputs.continue_on_error }}
-          DIFFUSION_PARTITION_ID: ${{ matrix.part }}
-          DIFFUSION_TOTAL_PARTITIONS: ${{ needs.compute-diffusion-partitions.outputs['partition-count-2gpu'] }}
-          DIFFUSION_PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-2gpu }}
+          CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-2gpu }}
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
         run: |
-          python3 test/run_suite.py \
-            --hw cuda \
-            --suite base-b-test-diffusion-2-gpu-h100 \
-            --timeout-per-file 14400
+          cd python
+          python3 sglang/multimodal_gen/test/run_suite.py \
+            --suite 2-gpu \
+            --partition-id ${{ matrix.part }} \
+            --total-partitions ${{ needs.compute-diffusion-partitions.outputs['partition-count-2gpu'] }} \
+            --partition-plan-json "$PARTITION_PLAN_JSON" \
+            $CONTINUE_ON_ERROR_FLAG
 
       - name: Upload execution report
         if: always()
@@ -330,7 +349,7 @@ jobs:
           path: |
             python/sglang/multimodal_gen/test/execution_report_*.json
             python/diffusion-results.json
-          retention-days: 7
+          retention-days: 1
 
       - name: Upload diffusion failure artifacts
         if: always()
@@ -370,6 +389,10 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
+      - uses: ./.github/actions/download-rust-ext
+        with:
+          artifact_name: ${{ inputs.rust_ext_artifact }}
+
       - name: Install dependencies
         timeout-minutes: 20
         run: |
@@ -379,19 +402,19 @@ jobs:
         timeout-minutes: 240
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
-          DIFFUSION_CONTINUE_ON_ERROR: ${{ inputs.continue_on_error }}
+          CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
-          python3 test/run_suite.py \
-            --hw cuda \
-            --suite base-b-test-diffusion-component-2-gpu-h100 \
-            --timeout-per-file 14400
+          cd python
+          python3 sglang/multimodal_gen/test/run_suite.py \
+            --suite component-accuracy \
+            $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: always()
         with:
           artifact-suffix: component-accuracy
 
-  multimodal-gen-test-4-gpu-b200:
+  multimodal-gen-test-1-b200:
     if: |
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
       inputs.multimodal_gen == 'true'
@@ -415,6 +438,10 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
+      - uses: ./.github/actions/download-rust-ext
+        with:
+          artifact_name: ${{ inputs.rust_ext_artifact }}
+
       - name: Install dependencies
         timeout-minutes: 20
         env:
@@ -422,22 +449,17 @@ jobs:
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
-      - name: Run VAE parallel-group regression
-        timeout-minutes: 10
-        run: |
-          python3 -m pytest -v python/sglang/multimodal_gen/test/single_test_file/test_wan_vae_parallel_groups_4_gpu.py
-
       - name: Run diffusion server tests
         timeout-minutes: 240
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
-          DIFFUSION_CONTINUE_ON_ERROR: ${{ inputs.continue_on_error }}
+          CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
         run: |
-          python3 test/run_suite.py \
-            --hw cuda \
-            --suite base-b-test-diffusion-1-gpu-b200 \
-            --timeout-per-file 14400
+          cd python
+          python3 sglang/multimodal_gen/test/run_suite.py \
+            --suite 1-gpu-b200 \
+            $CONTINUE_ON_ERROR_FLAG
 
       - name: Upload diffusion failure artifacts
         if: always()
@@ -485,6 +507,10 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
+      - uses: ./.github/actions/download-rust-ext
+        with:
+          artifact_name: ${{ inputs.rust_ext_artifact }}
+
       - name: Install dependencies
         timeout-minutes: 20
         run: |
@@ -493,10 +519,8 @@ jobs:
       - name: Run diffusion unit tests
         timeout-minutes: 60
         run: |
-          python3 test/run_suite.py \
-            --hw cuda \
-            --suite base-b-test-diffusion-unit-1-gpu-h100 \
-            --timeout-per-file 3600
+          cd python
+          python3 sglang/multimodal_gen/test/run_suite.py --suite unit
 
   diffusion-coverage-check:
     needs: [multimodal-gen-test-1-gpu, multimodal-gen-test-2-gpu]

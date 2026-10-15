@@ -1,14 +1,10 @@
-name: Nightly Test Miles (AMD ROCm 10 MI30X)
+name: Nightly Test Miles (AMD ROCm 7.2)
 
 on:
-  schedule:
-    # Runs after the 12:00 UTC miles image build has pushed the dated image,
-    # and after the 17:30 UTC sglang MI300 nightly has claimed its runners.
-    - cron: "0 21 * * *"
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "Override miles image tag (e.g. miles-rocm10-mi30x-20260930); empty = newest by date"
+        description: "Override miles image tag (e.g. miles-rocm720-mi35x-20260621); empty = newest by date"
         required: false
         type: string
         default: ""
@@ -23,30 +19,19 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  test-miles-mi30x:
+  test-miles-mi35x:
     if: github.repository == 'sgl-project/sglang'
     strategy:
       fail-fast: false
       matrix:
-        # Miles registers its ROCm nightly suites under the MI350 names; run the same suites on MI300.
-        # skip_tests: files left out on MI300, which they cannot run on or do not finish on.
         include:
           - suite: nightly-stage-c-2-gpu-mi350
-            runner: linux-mi300-2gpu-sglang
-            timeout: 180
-            # Single-request decode of Qwen3.8-27B-FP8 runs at ~20 tok/s on MI300X, so long
-            # generations outlast the test client's 180 s request timeout.
-            skip_tests: tests/e2e/sglang/test_session_server_multi_role/test_qwen38small.py
-          # The 4- and 8-GPU suites run past 180 min on MI300X; they take ~155 and ~112 min on MI355X.
+            runner: linux-mi35x-gpu-2
+          # Use 8-GPU MI35X pool for 4-GPU suite.
           - suite: nightly-stage-c-4-gpu-mi350
-            runner: linux-mi300-4gpu-sglang
-            timeout: 300
-            # Its tilelang indexer kernel needs 98 KiB of LDS per block; gfx942 has 64 KiB.
-            skip_tests: tests/e2e/megatron/model_scripts/test_glm5_2_744b_a40b_5layer_ci.py
+            runner: linux-mi35x-gpu-8
           - suite: nightly-stage-c-8-gpu-mi350
-            runner: linux-mi300-8gpu-sglang
-            timeout: 300
-            skip_tests: ""
+            runner: linux-mi35x-gpu-8
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout code
@@ -58,10 +43,10 @@ jobs:
           username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
           password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
-      - name: Resolve newest miles ROCm 10 MI30X image
+      - name: Resolve newest miles ROCm 7.2 image
         run: |
           repo="rocm/sgl-dev"
-          base="miles-rocm10-mi30x"
+          base="miles-rocm720-mi35x"
           tag="${{ inputs.image_tag }}"
           if [ -z "${tag}" ]; then
             # Walk back from today; the build job pushes a dated tag at 12:00 UTC.
@@ -91,12 +76,8 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Skip tests left out on MI300
-        if: matrix.skip_tests != ''
-        run: bash scripts/ci/amd/amd_ci_exec.sh -w /root/miles rm -v ${{ matrix.skip_tests }}
-
       - name: Run miles CI suite ${{ matrix.suite }}
-        timeout-minutes: ${{ matrix.timeout }}
+        timeout-minutes: 180
         run: |
           touch "${GITHUB_WORKSPACE}/github_summary.md"
           TEST_EXIT_CODE=0
