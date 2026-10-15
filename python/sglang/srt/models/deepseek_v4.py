@@ -80,6 +80,7 @@ from sglang.srt.layers.cp.utils import (
     cp_materialize_global_token_order,
     cp_shard_hidden_states,
     dsa_prefill_cp_fused_symm_mem,
+    dsa_prefill_cp_fused_symm_mem_for_rows,
     dsa_prefill_cp_moe_gather,
     is_cp_active,
 )
@@ -4434,7 +4435,14 @@ class DeepseekV4Model(nn.Module):
                 if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
-            with ctx:
+            streams = state.streams
+            assert streams is not None
+            layer_rows = (
+                streams.rows.shape[0]
+                if isinstance(streams, mhc.HcPending)
+                else streams.shape[0]
+            )
+            with ctx, dsa_prefill_cp_fused_symm_mem_for_rows(layer_rows):
                 if (
                     _is_hip
                     and self.layers[i].hc_boundary_fused
