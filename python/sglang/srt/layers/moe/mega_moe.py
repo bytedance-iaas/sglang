@@ -233,7 +233,9 @@ def forward_mega_moe(
     else:
         mega_stream_ctx = nullcontext()
 
-    shared_output = None if fused_shared else moe._forward_shared_experts(hidden_states)
+    shared_output = None
+    if not fused_shared:
+        _, shared_output = moe._forward_shared_experts(hidden_states)
 
     with mega_stream_ctx:
         y = _run_mega_routed(
