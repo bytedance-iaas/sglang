@@ -339,7 +339,7 @@ struct TopKConfig {
       uint32_t count = 0, inc = 0;
       if (tx < kRadixSize) {
         count = smem->histogram[0][tx];
-        inc = warp_inclusive_sum(lane, count);
+        inc = warp::inclusive_sum(count, lane);
         if (lane == kWarpSize - 1) smem->warp_sum[warp_id] = inc;
       }
       __syncthreads();
