@@ -291,6 +291,7 @@ jobs:
           BUILD_TREE="$(git rev-parse HEAD^{tree})"
           PYTHON_MANIFEST_SHA256="$(python3 - <<'PY'
           import hashlib
+          import os
           import subprocess
 
           paths = subprocess.check_output(
@@ -300,8 +301,13 @@ jobs:
           for raw_path in sorted(path for path in paths if path):
               digest.update(raw_path)
               digest.update(b"\0")
-              with open(raw_path, "rb") as source_file:
-                  digest.update(hashlib.sha256(source_file.read()).digest())
+              if os.path.islink(raw_path):
+                  # Git stores the link target, not the contents behind it.
+                  contents = os.readlink(raw_path)
+              else:
+                  with open(raw_path, "rb") as source_file:
+                      contents = source_file.read()
+              digest.update(hashlib.sha256(contents).digest())
           print(digest.hexdigest())
           PY
           )"
