@@ -19,6 +19,7 @@ from sglang.srt.layers import layer_boundary as comm
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.cp import interleave as dsa_cp
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
+from sglang.srt.layers.layer_boundary.residual.mhc import MHCState
 from sglang.test.boundary_fixtures import finish_exit, make_test_stages, prepare_input
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
@@ -97,7 +98,9 @@ class TestAttentionCpBoundary(CustomTestCase):
             attn_cp_size=CP_SIZE,
             attn_cp_rank=cp,
             enable_prefill_cp=True,
-            moe_dense_tp_size=1 if getattr(self, "sparse", True) else None,
+            moe_dense_tp_size=getattr(
+                self, "dense_tp_size", 1 if getattr(self, "sparse", True) else None
+            ),
             moe_dp_size=1,
             moe_ep_size=1,
             moe_tp_size=moe_tp_size,
@@ -166,6 +169,10 @@ class TestAttentionCpBoundary(CustomTestCase):
                     if target[0] is comm
                     else patch.object(*target, value)
                 )
+            if "attn_reduce" in collectives:
+                stack.enter_context(
+                    patch_communicator("attn_tp_all_reduce", collectives["attn_reduce"])
+                )
             yield SimpleNamespace(parallel=parallel, flags=flags)
 
     def build(self, use_reduce_scatter):
@@ -194,6 +201,158 @@ class TestAttentionCpBoundary(CustomTestCase):
         return SimpleNamespace(
             forward_mode=SimpleNamespace(is_context_parallel_extend=lambda: True)
         )
+
+    def test_mhc_keeps_coefficients_and_residual_on_the_context_shard(self):
+        """Read/normalize each completed shard before gathering FFN inputs.
+
+        The FFN sum is returned to that shard before its nonlinear MHC update;
+        h_res/h_post must not be gathered or used on another shard's rows.
+        """
+        self.attn_tp_size = 2  # L05: TP4 / CP2 / attention-TP2.
+        # Interleave leaves this unset: dense FFNs use the full TP group.
+        # Dense-TP1 would introduce a different, unsupported MHC residual gather.
+        self.dense_tp_size = None
+
+        class Norm:
+            weight = torch.ones(HIDDEN)
+            variance_epsilon = 1e-6
+
+            def __call__(self, x):
+                return x / (x.square().mean(-1, keepdim=True) + 1).sqrt()
+
+        norm = Norm()
+
+        def pre(packed, weight, eps):
+            streams = packed.view(-1, 2, HIDDEN)
+            h_res = (
+                torch.eye(2, dtype=packed.dtype).expand(packed.shape[0], -1, -1).clone()
+            )
+            # Binary, row-dependent coefficients reveal rank/row swaps.
+            gate = (streams[:, 0, 0].abs().remainder(4) + 1) / 4
+            h_post = torch.stack((gate, gate / 2), -1)
+            return streams[:, 0] / 4 + streams[:, 1] * 3 / 4, h_res, h_post, False
+
+        def post(hidden, packed, h_res, h_post):
+            streams = packed.view(-1, 2, HIDDEN)
+            return (
+                torch.einsum("nij,njh->nih", h_res, streams)
+                + hidden[:, None] * h_post[:, :, None]
+            ).flatten(1)
+
+        packed = [torch.cat((r, r + 2), -1) for r in self.residuals]
+        states, ops, stages, handed = {}, {}, {}, {}
+        completed = []
+
+        def complete_attention(hidden, forward_batch, *, may_quantize):
+            self.assertFalse(may_quantize)  # MHC sums must stay in full precision.
+            completed.append(hidden.clone())
+            # The other attention-TP lane contributes 3/4 of each output.
+            return hidden * 4
+
+        def build_mhc(residual):
+            with patch_communicator(
+                "get_exec",
+                lambda: SimpleNamespace(
+                    comm=SimpleNamespace(boundary_reduction="ar"),
+                    overlap=SimpleNamespace(enable_two_batch_overlap=False),
+                ),
+            ):
+                return make_test_stages(
+                    first=False,
+                    last=False,
+                    sparse=getattr(self, "sparse", True),
+                    previous_sparse=False,
+                    next_layer_sparse=False,
+                    attention_norm=norm,
+                    ffn_norm=norm,
+                    residual=residual,
+                )
+
+        def unused(*args):
+            raise AssertionError("MHC does not use a CP reduce-scatter for this TP sum")
+
+        for cp in range(CP_SIZE):
+            with self.as_rank(
+                cp,
+                dict(
+                    gather=lambda out, x, cp=cp: handed.__setitem__(cp, x.clone()),
+                    reduce_scatter=unused,
+                    attn_reduce=complete_attention,
+                ),
+            ):
+                states[cp] = MHCState(2, pre, pre, post)
+                states[cp].read_attn_input(packed[cp], norm)
+                ops[cp] = states[cp].residual_ops()
+                stages[cp] = build_mhc(ops[cp])
+                prepare_input(
+                    stages[cp].ffn,
+                    self.values[cp] / 4,
+                    packed[cp],
+                    self.cp_extend(),
+                    update=ops[cp].attn_update,
+                )
+
+        all_rows = torch.cat([handed[cp] for cp in range(CP_SIZE)])
+        full_ffn = all_rows.square() / 2 + all_rows
+        for cp in range(CP_SIZE):
+            with self.as_rank(
+                cp,
+                dict(
+                    gather=lambda out, x: out.copy_(all_rows),
+                    reduce_scatter=unused,
+                    attn_reduce=complete_attention,
+                ),
+            ):
+                state = MHCState(2, pre, pre, post)
+                state.read_attn_input(packed[cp], norm)
+                residual_ops = state.residual_ops()
+                stage = build_mhc(residual_ops)
+                gathered, stream = prepare_input(
+                    stage.ffn,
+                    self.values[cp] / 4,
+                    packed[cp],
+                    self.cp_extend(),
+                    update=residual_ops.attn_update,
+                )
+                torch.testing.assert_close(gathered, all_rows, rtol=0, atol=0)
+                expected = post(
+                    full_ffn.tensor_split(CP_SIZE)[cp],
+                    stream.residual,
+                    state.h_res.clone(),
+                    state.h_post.clone(),
+                )
+                with patch_communicator("sum_output", lambda *args, **kwargs: full_ffn):
+                    with stage.ffn.plan.output.ffn_exit(
+                        self.cp_extend(), stream=stream
+                    ) as scope:
+                        output, _ = finish_exit(scope, full_ffn / CP_SIZE, stream)
+                torch.testing.assert_close(output, expected, rtol=0, atol=0)
+                self.assertIsNone(state.h_res)
+                self.assertIsNone(state.h_post)
+        self.assertEqual(len(completed), 2 * CP_SIZE)
+
+    def test_mhc_dense_ffn_keeps_coefficients_on_the_context_shard(self):
+        self.sparse = False
+        self.test_mhc_keeps_coefficients_and_residual_on_the_context_shard()
+
+    def test_other_cp_gathers_keep_the_mhc_construction_guard(self):
+        from sglang.srt.layers.layer_boundary import construction
+        from sglang.srt.layers.layer_boundary.layout import TokenAxis
+
+        declaration = SimpleNamespace(update=SimpleNamespace(applied_at_exit=True))
+        edge = SimpleNamespace(
+            produced=SimpleNamespace(
+                layout=SimpleNamespace(sharded=frozenset({TokenAxis.ATTN_CP}))
+            ),
+            need=SimpleNamespace(layout=SimpleNamespace(sharded=frozenset())),
+        )
+        incoming = SimpleNamespace(consumer=declaration, entries={"cp": edge})
+        outgoing = SimpleNamespace(producer=declaration, exits={"cp": None})
+        with patch.object(construction, "_cp_gathers_over_attn_cp", return_value=False):
+            with self.assertRaisesRegex(
+                NotImplementedError, "MHC with a gather over attention CP"
+            ):
+                construction._bind_stage(declaration, None, incoming, outgoing)
 
     def run_ranks(self, use_reduce_scatter):
         """Gather on each rank, run an FFN that leaves its partial sum, finish
