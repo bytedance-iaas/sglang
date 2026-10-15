@@ -1,6 +1,10 @@
+import hashlib
 import importlib.util
 import json
 import subprocess
+import sys
+import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -29,7 +33,7 @@ def _load_module(name, path):
 
 
 register_cpu_ci = _load_module("ci_register", CI_REGISTER_PATH).register_cpu_ci
-register_cpu_ci(est_time=0, suite="base-a-test-cpu")
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestDockerBuildMetadataArgs(unittest.TestCase):
@@ -269,6 +273,92 @@ class TestDockerBuildMetadataArgs(unittest.TestCase):
         )
         self.assertIn("mapfile -t METADATA_ARGS", workflow)
         self.assertIn('"${METADATA_ARGS[@]}"', workflow)
+
+    def run_python_manifest(self, repo):
+        workflow = WORKFLOW_PATH.read_text()
+        script = workflow.split("PYTHON_MANIFEST_SHA256=\"$(python3 - <<'PY'\n", 1)[
+            1
+        ].split("\n          PY\n", 1)[0]
+        return subprocess.check_output(
+            [sys.executable, "-c", textwrap.dedent(script)],
+            cwd=repo,
+            text=True,
+            stderr=subprocess.PIPE,
+        ).strip()
+
+    def manifest_git(self, repo, *args):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+
+    def test_python_manifest_preserves_regular_file_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            self.manifest_git(repo, "init", "-q")
+            source = repo / "python" / "model.py"
+            source.parent.mkdir()
+            content = b"print('model')\n"
+            source.write_bytes(content)
+            self.manifest_git(repo, "add", "python")
+            expected = hashlib.sha256(
+                b"python/model.py\0" + hashlib.sha256(content).digest()
+            ).hexdigest()
+            self.assertEqual(self.run_python_manifest(repo), expected)
+            source.write_bytes(b"print('updated model')\n")
+            self.assertNotEqual(self.run_python_manifest(repo), expected)
+
+    def test_python_manifest_supports_symbolic_links(self):
+        for kind in ("directory", "file", "dangling", "loop"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                repo = Path(directory)
+                self.manifest_git(repo, "init", "-q")
+                relative = "python/sglang/multimodal_gen/.claude/skills"
+                link = repo / relative
+                link.parent.mkdir(parents=True)
+                target = link.parent.parent / ".agents" / "skills"
+                if kind == "directory":
+                    target.mkdir(parents=True)
+                elif kind == "file":
+                    target.parent.mkdir(parents=True)
+                    target.write_bytes(b"skill contents")
+                link_target = "skills" if kind == "loop" else "../.agents/skills"
+                link.symlink_to(link_target)
+                self.manifest_git(repo, "add", relative)
+                expected = hashlib.sha256(
+                    relative.encode()
+                    + b"\0"
+                    + hashlib.sha256(link_target.encode()).digest()
+                ).hexdigest()
+                self.assertEqual(self.run_python_manifest(repo), expected)
+
+    def test_python_manifest_hashes_link_target_without_following_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            self.manifest_git(repo, "init", "-q")
+            (repo / "python").mkdir()
+            first_target = repo / "first"
+            first_target.write_bytes(b"contents")
+            (repo / "second").write_bytes(b"contents")
+            link = repo / "python" / "skill"
+            link.symlink_to("../first")
+            self.manifest_git(repo, "add", "python")
+            initial = self.run_python_manifest(repo)
+            first_target.write_bytes(b"untracked target changed")
+            self.assertEqual(self.run_python_manifest(repo), initial)
+            link.unlink()
+            link.symlink_to("../second")
+            self.assertNotEqual(self.run_python_manifest(repo), initial)
+
+    def test_python_manifest_still_rejects_missing_regular_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            self.manifest_git(repo, "init", "-q")
+            source = repo / "python" / "model.py"
+            source.parent.mkdir()
+            source.write_bytes(b"model")
+            self.manifest_git(repo, "add", "python")
+            source.unlink()
+            with self.assertRaises(subprocess.CalledProcessError) as raised:
+                self.run_python_manifest(repo)
+            self.assertIn("FileNotFoundError", raised.exception.stderr)
 
     def test_dev_build_is_split_across_runner_lifetimes(self):
         warm_workflow = WARM_CACHE_WORKFLOW_PATH.read_text()
