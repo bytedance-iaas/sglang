@@ -2883,9 +2883,10 @@ class DeepseekV4AttnBackend(
         if run_indexer and layer.indexer is not None:
             # Torch scoring needs request IDs for the rank's interleaved rows.
             # DeepGEMM uses rows_per_request and ignores these IDs.
+            local_req_counts = async_h2d(q_lens_cpu, dtype=torch.int64, device=x.device)
             local_req = torch.repeat_interleave(
                 forward_batch.req_pool_indices.to(torch.int64),
-                torch.tensor(q_lens_cpu, dtype=torch.int64, device=x.device),
+                local_req_counts,
                 output_size=num_local,
             )
             self._low_ratio_index_topk(

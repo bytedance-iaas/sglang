@@ -54,8 +54,13 @@ def get_flashinfer_autotune_skip_ops(model_runner: ModelRunner) -> set[str]:
 
 
 def _is_dsv41_pp(model_runner: ModelRunner) -> bool:
+    try:
+        pp_size = get_parallel().pp_size
+    except ValueError:
+        # Lightweight tests may construct a runner before publishing runtime config.
+        pp_size = model_runner.ps.pp_size
     return (
-        model_runner.ps.pp_size > 1
+        pp_size > 1
         and getattr(model_runner.model_config.hf_config, "model_type", None)
         == "deepseek_v41"
     )
