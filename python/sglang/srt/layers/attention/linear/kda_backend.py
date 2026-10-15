@@ -19,6 +19,11 @@ from sglang.srt.layers.attention.linear.utils import (
     build_verify_intermediate_state_indices,
     select_verify_intermediate_state_indices,
 )
+from sglang.srt.layers.cp.utils import (
+    cp_materialize_global_token_order,
+    cp_shard_hidden_states,
+    is_cp_active,
+)
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
 from sglang.srt.utils.common import is_gfx95_supported, rank0_log
@@ -817,6 +822,41 @@ class KDAAttnBackend(MambaAttnBackendBase):
         ).transpose(0, 1)
 
     def forward_extend(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        a: torch.Tensor,
+        b: torch.Tensor,
+        **kwargs,
+    ):
+        if not is_cp_active(forward_batch):
+            return self._forward_extend_full_sequence(
+                layer, forward_batch, mixed_qkv, a, b, **kwargs
+            )
+
+        # Interleaved rows are not a causal sequence. Keep convolution history,
+        # the FP32 recurrence and named prefix checkpoints on the global token
+        # order; only the output is localized again. Heads remain sharded over
+        # attention-TP and replicated over CP. This is a correctness bridge,
+        # not a parallel KDA scan or a claim of reduced recurrence work.
+        if not isinstance(mixed_qkv, torch.Tensor):
+            raise ValueError("KDA prefill CP requires a packed QKV tensor")
+        if a.shape[0] != 1 or b.shape[0] != 1:
+            raise ValueError("KDA prefill CP expects gates with one packed batch axis")
+        full_qkv = cp_materialize_global_token_order(mixed_qkv, forward_batch)
+        full_a = cp_materialize_global_token_order(
+            a.movedim(1, 0).contiguous(), forward_batch
+        ).movedim(0, 1)
+        full_b = cp_materialize_global_token_order(
+            b.movedim(1, 0).contiguous(), forward_batch
+        ).movedim(0, 1)
+        output = self._forward_extend_full_sequence(
+            layer, forward_batch, full_qkv, full_a, full_b, **kwargs
+        )
+        return cp_shard_hidden_states(output.movedim(1, 0), forward_batch).movedim(0, 1)
+
+    def _forward_extend_full_sequence(
         self,
         layer: RadixLinearAttention,
         forward_batch: ForwardBatch,
