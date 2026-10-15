@@ -65,6 +65,21 @@ def build_vision(model, use_data_parallel=False, width=32, quant_config=None):
             **options,
         )
         layers = (module.qkv_proj, module.proj)
+    elif model == "glm5_next_block":
+        from sglang.srt.models.glm5_next import Glm5NextVisionBlock
+
+        module = Glm5NextVisionBlock(width, 2 * width, 8, 7.0, **options)
+        layers = (
+            module.attn.qkv_proj,
+            module.attn.proj,
+            module.mlp.gate_up_proj,
+            module.mlp.down_proj,
+        )
+    elif model == "glm5_next_merger":
+        from sglang.srt.models.glm5_next import Glm5NextVisionPatchMerger
+
+        module = Glm5NextVisionPatchMerger(width, 2 * width, 7.0, bias=True, **options)
+        layers = (module.gate_up_proj, module.down_proj)
     elif model in ("glm4v_mlp", "glm4v_merger"):
         from sglang.srt.models.glm4v import Glm4vPatchMerger, Glm4vVisionMLP
 
@@ -152,7 +167,7 @@ def load_projection(layer):
             / 128
         ).to(dtype)
 
-    with parallel_scope(tp_rank=0, attn_dp_rank=0, attn_tp_rank=0):
+    with parallel_scope(tp_rank=0, attn_dp_rank=0, attn_cp_rank=0, attn_tp_rank=0):
         if isinstance(layer, QKVParallelLinear):
             weights, biases = [], []
             for offset, shard_id in enumerate(("q", "k", "v")):
@@ -211,6 +226,87 @@ class TestVisionParallelGroups(CustomTestCase):
         reset_context()
         self.addCleanup(reset_context)
 
+    def test_glm_cp_uses_one_attention_tp_lane_for_shards_and_reduction(self):
+        from sglang.srt.models.glm4v import glm4v_vision_reduces_over_attn_tp
+
+        for cp_size in (1, 2, 4):
+            args = ServerArgs(
+                model_path="dummy",
+                device="cpu",
+                tp_size=4,
+                attn_cp_size=cp_size,
+                enable_prefill_cp=cp_size > 1,
+                cp_strategy="interleave",
+                mm_attention_backend="sdpa",
+            )
+            publish(args, role="test", ranks=SpawnRanks(world_rank=3))
+            initialize_dp_attention_flags(args)
+            for replicated in (False, True):
+                self.assertEqual(
+                    glm4v_vision_reduces_over_attn_tp(replicated),
+                    cp_size > 1 and not replicated,
+                )
+                for model in (
+                    "glm4v_mlp",
+                    "glm4v_merger",
+                    "glm5_next_block",
+                    "glm5_next_merger",
+                ):
+                    with self.subTest(cp=cp_size, model=model, replicated=replicated):
+                        _, layers = build_vision(model, replicated)
+                        size = 1 if replicated else 4 // cp_size
+                        rank = 0 if replicated else 3 % size
+                        tp, attn = Mock(), Mock()
+                        tp.all_reduce.side_effect = lambda x: x * 4
+                        attn.all_reduce.side_effect = lambda x, size=size: x * size
+                        for layer in layers:
+                            self.assertEqual(rank_size(layer), (rank, size))
+                            shard, bias = load_projection(layer)
+                            torch.testing.assert_close(layer.weight, shard)
+                            row = isinstance(layer, RowParallelLinear)
+                            inputs = (
+                                torch.arange(
+                                    2 * shard.shape[1], dtype=shard.dtype
+                                ).reshape(2, -1)
+                                / 128
+                            )
+                            expected = F.linear(
+                                inputs, shard, bias if not row or rank == 0 else None
+                            )
+                            if row and size > 1:
+                                expected *= size
+                            tp.all_reduce.reset_mock()
+                            attn.all_reduce.reset_mock()
+                            with (
+                                parallel_scope(tp_group=tp, attn_tp_group=attn),
+                                patch(
+                                    "sglang.srt.layers.linear.is_allocation_symmetric",
+                                    return_value=False,
+                                ),
+                                patch(
+                                    "sglang.srt.layers.linear.use_symmetric_memory",
+                                    return_value=nullcontext(),
+                                ),
+                            ):
+                                torch.testing.assert_close(layer(inputs)[0], expected)
+                            if row:
+                                reduction = (
+                                    attn if layer.use_dp_attention_reduce else tp
+                                )
+                                self.assertEqual(
+                                    reduction.all_reduce.call_count, int(size > 1)
+                                )
+                                self.assertEqual(
+                                    (
+                                        tp if reduction is attn else attn
+                                    ).all_reduce.call_count,
+                                    0,
+                                )
+                                if cp_size > 1 and not replicated:
+                                    self.assertTrue(layer.use_dp_attention_reduce)
+                                    self.assertEqual(rank_size(layer)[1], size)
+            reset_context()
+
     def test_projection_layout_reload_and_row_policy(self):
         for dp_size in (1, 2):
             publish(
@@ -257,6 +353,10 @@ class TestVisionParallelGroups(CustomTestCase):
                             )
                             else "attn_tp"
                         )
+                        # GLM's owning helper selects attention TP for DP;
+                        # the legacy full-TP expectation did not match the module.
+                        if dp_size > 1 and model in ("glm4v_mlp", "glm4v_merger"):
+                            group = "attn_tp"
                         rank, size = (
                             (0, 1)
                             if replicated

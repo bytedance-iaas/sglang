@@ -77,7 +77,11 @@ class Glm4vRMSNorm(RMSNorm):
 
 
 def glm4v_vision_reduces_over_attn_tp(use_data_parallel: bool) -> bool:
-    return is_dp_attention_enabled() and not use_data_parallel
+    # Vision inputs are replicated across CP lanes. Their attention-head
+    # shards must not be summed again across those replicated lanes.
+    return (
+        is_dp_attention_enabled() or get_parallel().attn_cp_size > 1
+    ) and not use_data_parallel
 
 
 def _glm4v_vision_parallel_group(use_data_parallel: bool) -> str:

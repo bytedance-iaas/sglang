@@ -253,7 +253,9 @@ class TestAttentionCpBoundary(CustomTestCase):
             with patch_communicator(
                 "get_exec",
                 lambda: SimpleNamespace(
-                    comm=SimpleNamespace(boundary_reduction="ar"),
+                    comm=SimpleNamespace(
+                        boundary_reduction=getattr(self, "mhc_reduction", "ar")
+                    ),
                     overlap=SimpleNamespace(enable_two_batch_overlap=False),
                 ),
             ):
@@ -334,6 +336,13 @@ class TestAttentionCpBoundary(CustomTestCase):
     def test_mhc_dense_ffn_keeps_coefficients_on_the_context_shard(self):
         self.sparse = False
         self.test_mhc_keeps_coefficients_and_residual_on_the_context_shard()
+
+    def test_mhc_under_runtime_reduce_scatter_policy(self):
+        self.mhc_reduction = "rs+rsv"
+        for sparse in (False, True):
+            with self.subTest(sparse=sparse):
+                self.sparse = sparse
+                self.test_mhc_keeps_coefficients_and_residual_on_the_context_shard()
 
     def test_other_cp_gathers_keep_the_mhc_construction_guard(self):
         from sglang.srt.layers.layer_boundary import construction
