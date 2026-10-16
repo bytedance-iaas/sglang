@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 import sys
 import tempfile
 import types
@@ -18,18 +19,34 @@ class TestIaasKernelsImage(unittest.TestCase):
             Path(__file__).resolve().parents[2] / "docker/iaas-kernels.lock.json"
         )
         self.lock = checks.load_lock(self.lock_path)
+        self.torch_version = f"{self.lock['torch']}+cu130"
         self.info = dict(
-            torch="2.13.0+cu130",
+            torch=self.torch_version,
             cuda="13.0",
             cxx11_abi=True,
             checkout=self.lock["revision"],
         )
 
     def test_matching_abi(self):
-        checks.check_abi(self.lock, self.info, "2.13.0+cu130", "13.0", True)
+        checks.check_abi(self.lock, self.info, self.torch_version, "13.0", True)
+
+    def test_lock_matches_sglang_torch_pins(self):
+        project = self.lock_path.parents[1] / "python/pyproject.toml"
+        # Check both build-system and runtime pins without requiring Torch or
+        # third-party TOML parsers on the CPU-only workflow runner.
+        pins = re.findall(r'^\s*"torch==([^"\n]+)"', project.read_text(), re.MULTILINE)
+        self.assertEqual(len(pins), 2, "Expected build-system and runtime Torch pins")
+        for version in pins:
+            with self.subTest(version=version):
+                self.assertEqual(version, self.lock["torch"])
 
     def test_reject_incompatible_image(self):
-        for torch, cuda in [("2.15.0+cu134", "13.4"), ("2.13.0+cu129", "12.9")]:
+        for torch, cuda in [
+            ("2.13.0+cu130", "13.0"),
+            ("2.14.0+cu130", "13.0"),
+            ("2.15.0+cu130", "13.0"),
+            (self.torch_version, "12.9"),
+        ]:
             with (
                 self.subTest(torch=torch),
                 self.assertRaisesRegex(RuntimeError, "Unsupported image ABI"),
@@ -38,7 +55,8 @@ class TestIaasKernelsImage(unittest.TestCase):
 
     def test_reject_stale_wheel(self):
         for key, value in [
-            ("torch", "2.13.0a0+git123"),
+            ("torch", "2.13.0+cu130"),
+            ("torch", "2.14.1a0+git123"),
             ("cuda", "12.9"),
             ("cxx11_abi", False),
             ("checkout", "f" * 40),
@@ -47,7 +65,7 @@ class TestIaasKernelsImage(unittest.TestCase):
                 checks.check_abi(
                     self.lock,
                     dict(self.info, **{key: value}),
-                    "2.13.0+cu130",
+                    self.torch_version,
                     "13.0",
                     True,
                 )
