@@ -21,6 +21,9 @@ limitations under the License.
 namespace sglang {
 
 struct Sm90Fp4GroupedIndexerParams {
+  int32_t* fallback = nullptr;
+  bool paired_heads = false;
+  int prefix_grid_ctas = 64;
   int batch_size;
   int width;
   int group_size;

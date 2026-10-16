@@ -91,9 +91,13 @@ def _prefix_logits(
     HAS_MASK: tl.constexpr,
     HAS_BLOCKS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    FALLBACK=None,
     FAST_DECODE: tl.constexpr = False,
 ):
     row = tl.program_id(0)
+    if FALLBACK is not None:
+        if tl.load(FALLBACK + row) == 0:
+            return
     n = tl.load(LENS + row)
     request = tl.load(REQ + row).to(tl.int64)
     h = tl.arange(0, 32)
@@ -190,6 +194,9 @@ def prefix_logits(
     *,
     candidates=None,
     visible=None,
+    group_size=1,
+    _fallback=None,
+    _out=None,
 ):
     """Return partially initialized scores, bounded by int32 device lengths.
 
@@ -197,9 +204,39 @@ def prefix_logits(
     original prefix length and lens bounds the compact candidate positions.
     """
     assert candidates is None or (visible is not None and mask is None)
+    if _fallback is None:
+        if (
+            group_size in (4, 6)
+            and q.shape[0] % 2 == 0
+            and q.is_contiguous()
+            and weights.is_contiguous()
+            and q.shape[0] > 0
+            and width > 0
+        ):
+            from .sm90_paired_indexer import paired_prefix_logits
+
+            return paired_prefix_logits(
+                q,
+                weights,
+                mapping,
+                req,
+                lens,
+                table,
+                page,
+                ratio,
+                width,
+                mask,
+                candidates=candidates,
+                visible=visible,
+                group_size=group_size,
+            )
     rows = q.shape[0]
     stride = triton.cdiv(width, 4) * 4
-    out = torch.empty((rows, stride), dtype=torch.float32, device=q.device)
+    out = (
+        _out
+        if _out is not None
+        else torch.empty((rows, stride), dtype=torch.float32, device=q.device)
+    )
     sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
     tiles = min(
         triton.cdiv(width, 64),
@@ -241,6 +278,7 @@ def prefix_logits(
         mask is not None,
         candidates is not None,
         candidates.block_size if candidates is not None else 1,
+        FALLBACK=_fallback,
         FAST_DECODE=fast_decode,
         num_warps=4,
         num_stages=stages,

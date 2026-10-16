@@ -1,6 +1,9 @@
 """Prefix-only score storage and exact-by-value TopK on Hopper."""
 
+import os
 import unittest
+from contextlib import ExitStack
+from itertools import product
 from unittest.mock import patch
 
 import test_sm90_fp4_grouped_indexer as fixtures
@@ -14,6 +17,7 @@ from sglang.kernels.ops.attention.dsv4.sm90_length_aware_indexer import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     CandidateBlocks,
+    CandidateMasks,
     published_masks,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -36,6 +40,71 @@ class TestSm90LengthAwareIndexer(CustomTestCase):
             envs.SGLANG_OPT_DSV41_SM90_LENGTH_AWARE_INDEXER.override(True),
         ):
             case.run()
+
+    def test_existing_flags_control_verify_optimizations(self):
+        from sglang.kernels.ops.attention.dsv4 import (
+            sm90_length_aware_indexer as prefix,
+        )
+        from sglang.kernels.ops.attention.dsv4 import sm90_paired_indexer as paired
+
+        names = (
+            "SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER",
+            "SGLANG_OPT_DSV41_SM90_LENGTH_AWARE_INDEXER",
+            "SGLANG_OPT_DSV41_SM90_COMPACT_CANDIDATES",
+        )
+        # Exercise normal static VERIFY dispatch with defaults and every legacy
+        # flag combination. Paired scoring adds no configuration of its own.
+        for group in (4, 6):
+            for flags in (None, *product((False, True), repeat=3)):
+                with self.subTest(group=group, flags=flags), ExitStack() as stack:
+                    stack.enter_context(patch.dict(os.environ))
+                    for name in (*names, "SGLANG_RAGGED_VERIFY_MODE"):
+                        os.environ.pop(name, None)
+                    if flags is not None:
+                        for name, enabled in zip(names, flags):
+                            stack.enter_context(getattr(envs, name).override(enabled))
+                    grouped, length_aware, compact = flags or (False, False, False)
+                    use_prefix = grouped and length_aware
+                    x = self.fixture.make_inputs(
+                        rows=12, width=8192, heads=32, group=group
+                    )
+                    source = self.fixture.make_backend_case(x, "source", 512)
+                    consumer = self.fixture.make_backend_case(x, "consumer", 512)
+                    with (
+                        patch.object(
+                            paired,
+                            "paired_prefix_logits",
+                            wraps=paired.paired_prefix_logits,
+                        ) as score,
+                        patch.object(
+                            prefix,
+                            "select_prefix_topk",
+                            wraps=prefix.select_prefix_topk,
+                        ) as topk,
+                    ):
+                        source.run_verify()
+                        candidates = source.state.forward_metadata.candidate_metadata
+                        expected_type = (
+                            CandidateBlocks
+                            if use_prefix and compact
+                            else CandidateMasks
+                        )
+                        self.assertIsInstance(candidates, expected_type)
+                        consumer.state.forward_metadata.candidate_metadata = candidates
+                        consumer.run_verify()
+                    self.assertEqual(score.call_count, 2 if use_prefix else 0)
+                    if use_prefix:
+                        self.assertGreaterEqual(topk.call_count, 2)
+                    else:
+                        self.assertEqual(topk.call_count, 0)
+                    if grouped:
+                        self.check_outputs(x, source, "source")
+                        self.check_outputs(
+                            x, consumer, "consumer", published_masks(candidates).mask
+                        )
+                    else:
+                        source.state.decode_candidates.publish_decode.assert_called_once()
+                        consumer.state.decode_candidates.consume_decode.assert_called_once()
 
     def check_outputs(self, x, case, role="none", input_mask=None, k=512, has_raw=True):
         scores = self.fixture.reference(x)

@@ -12,7 +12,13 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
 
 @triton.jit
 def _pack_queries(
-    x, payload, scales, N, HEADS_PER_CTA: tl.constexpr, SCALE_FLOOR: tl.constexpr
+    x,
+    payload,
+    scales,
+    N,
+    HEADS_PER_CTA: tl.constexpr,
+    SCALE_FLOOR: tl.constexpr,
+    clear_flags=None,
 ):
     heads = tl.program_id(0) * HEADS_PER_CTA + tl.arange(0, HEADS_PER_CTA)
     d = tl.arange(0, 128)
@@ -33,9 +39,11 @@ def _pack_queries(
     )
     sf = tl.sum(exponent.to(tl.uint32) << (tl.arange(0, 4)[None, :] * 8), axis=1)
     tl.store(scales + heads, sf, heads < N)
+    if clear_flags is not None:
+        tl.store(clear_flags + heads // 32, 0, (heads < N) & (heads % 32 == 0))
 
 
-def pack_queries(x):
+def pack_queries(x, clear_flags=None):
     heads_per_cta = 8
     assert x.shape[-1] == 128 and x.dtype == torch.bfloat16
     x = x.contiguous().view(-1, 128)
@@ -49,6 +57,7 @@ def pack_queries(x):
             x.shape[0],
             HEADS_PER_CTA=heads_per_cta,
             SCALE_FLOOR=2.0**-126,
+            clear_flags=clear_flags,
             num_warps=4,
         )
     return payload, sf

@@ -18,6 +18,18 @@ An additional, separately gated 32-head optimization is described under
 **Length-aware 32-head indexer** below. The original grouped/mapped path's
 full-width logits and PyTorch TopK contracts apply when that second flag is off.
 
+## Existing configuration and automatic kernel selection
+
+The existing `GROUPED_INDEXER`, `LENGTH_AWARE_INDEXER`, and `COMPACT_CANDIDATES`
+settings (all prefixed with `SGLANG_OPT_DSV41_SM90_`) retain their original
+names, default-off values, and dependencies. Enable the existing settings
+before server startup / CUDA Graph capture as described below.
+
+Paired scoring is selected automatically for supported groups within the
+existing length-aware path; it has no additional environment switch. Turning
+off the existing grouped or length-aware setting prevents entry to paired
+scoring. Turning off compact candidates retains mask publication/consumption.
+
 ## Supported contract
 
 - Contiguous BF16, already fake-FP4 query `[rows, 32 or 64, 128]` and BF16 head

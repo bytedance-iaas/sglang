@@ -103,7 +103,7 @@ __device__ __forceinline__ bf16 decode_bf16(uint8_t code, uint8_t exponent) {
 template <typename Kernel>
 __global__ void fp4_grouped_indexer_kernel(__grid_constant__ const Sm90Fp4GroupedIndexerParams params);
 
-template <int TILES_PER_CTA = 1, int Q_ROWS = 4, bool ALIGNED = true, bool SPECIALIZED = true>
+template <int TILES_PER_CTA = 1, int Q_ROWS = 4, bool ALIGNED = true, bool SPECIALIZED = true, bool PAIRED = false>
 struct Sm90Fp4GroupedIndexerKernel {
   static constexpr int HEADS = 64;
   static constexpr int HEAD_DIM = 128;
@@ -139,6 +139,7 @@ struct Sm90Fp4GroupedIndexerKernel {
     int32_t slots[BLOCK_L];
     uint8_t k_exponents[SCALE_GROUPS][BLOCK_L];
     float k_scales[BLOCK_L];
+    bool k_zero[BLOCK_L];
     float q_scales[Q_ROWS][HEADS];
     volatile int tile_starts[TILES_PER_CTA];
   };
@@ -311,16 +312,18 @@ struct Sm90Fp4GroupedIndexerKernel {
     const int64_t* lens = reinterpret_cast<const int64_t*>(p.lens);
     const int32_t* req_to_token = reinterpret_cast<const int32_t*>(p.req_to_token);
     const uint8_t* table = reinterpret_cast<const uint8_t*>(p.table);
-    const int64_t request = req[b0];
+    const int64_t request = req[b0 * (PAIRED ? 2 : 1)];
 
     // Uniform CTA decision: do not decode Q/K or issue MMA for a fully masked chunk.
     int max_visible = 0;
     for (int row = 0; row < group_rows; ++row) {
-      max_visible = max(max_visible, static_cast<int>(min(int64_t(p.width), lens[b0 + row])));
+      const int64_t visible = PAIRED ? max(lens[2 * (b0 + row)], lens[2 * (b0 + row) + 1]) : lens[b0 + row];
+      max_visible = max(max_visible, static_cast<int>(min(int64_t(p.width), visible)));
     }
     // The zero-length case needs only contiguous output stores.
     if constexpr (TILES_PER_CTA > 1) {
       if (max_visible == 0) {
+        if (PAIRED) return;
         float* out = reinterpret_cast<float*>(p.out);
         for (int i = tid; i < group_rows * BLOCK_L * TILES_PER_CTA; i += NUM_THREADS) {
           const int row = i / (BLOCK_L * TILES_PER_CTA);
@@ -330,7 +333,7 @@ struct Sm90Fp4GroupedIndexerKernel {
         return;
       }
     }
-    {
+    if (!PAIRED) {
       // This is a bijection of the fixed capture grid's tiles. Materialize
       // the per-CTA schedule in shared memory so shifts and masks are not live
       // across conversion/MMA. The existing q_wide reduction publishes it.
@@ -368,12 +371,15 @@ struct Sm90Fp4GroupedIndexerKernel {
     for (int i = tid; i < group_rows * HEADS; i += NUM_THREADS)
       q_wide |= needs_bf16(query_scales[int64_t(b0 + i / HEADS) * p.q_scale_stride_b + i % HEADS]);
     q_wide = __syncthreads_or(q_wide);
+
     bool resident_valid = false;
 
-    for (int tile = 0; tile < TILES_PER_CTA; ++tile) {
-      const int l0 = TILES_PER_CTA > 1 ? ss.tile_starts[tile] : blockIdx.x * BLOCK_L;
+    for (int tile = 0; tile < (PAIRED ? ceil_div(max_visible, BLOCK_L * gridDim.x) : TILES_PER_CTA); ++tile) {
+      const int l0 = PAIRED ? (blockIdx.x + tile * gridDim.x) * BLOCK_L
+                            : (TILES_PER_CTA > 1 ? ss.tile_starts[tile] : blockIdx.x * BLOCK_L);
       if (l0 >= p.width) break;
       if (l0 >= max_visible) {
+        if (PAIRED) continue;
         float* out = reinterpret_cast<float*>(p.out);
         for (int i = tid; i < group_rows * BLOCK_L; i += NUM_THREADS) {
           const int row = i / BLOCK_L;
@@ -383,6 +389,7 @@ struct Sm90Fp4GroupedIndexerKernel {
         continue;
       }
       bool k_wide = false;
+      bool zero_column = false;
       if (tid < BLOCK_L) {
         const int col = tid;
         const int position = l0 + col;
@@ -406,12 +413,45 @@ struct Sm90Fp4GroupedIndexerKernel {
           ss.k_exponents[g][col] = exponent;
           max_exponent = max(max_exponent, exponent);
         }
+        k_wide = l0 + col < max_visible && needs_bf16(packed_scale);
+        // A zero vector is exactly representable in FP8 regardless of its
+        // finite block exponents. Validate payload bytes; never infer zero
+        // values from the exponent alone (including the UE8M0 subnormal).
+        if (PAIRED && k_wide && max_exponent < 255) {
+          uint32_t nonzero = 0;
+          CUTE_UNROLL
+          for (int word = 0; word < 16; ++word)
+            nonzero |= load_word(table + int64_t(page) * p.table_stride + off * 64 + word * 4);
+          zero_column = (nonzero & 0x77777777u) == 0;
+          if (zero_column) {
+            k_wide = false;
+            max_exponent = 127;
+            CUTE_UNROLL
+            for (int g = 0; g < SCALE_GROUPS; ++g)
+              ss.k_exponents[g][col] = 127;
+          }
+        }
+        ss.k_zero[col] = zero_column;
         const uint8_t common_exponent = max(static_cast<int>(max_exponent) - 12, 1);
         ss.k_scales[col] = ue8m0_to_f32(common_exponent);
-        k_wide = l0 + col < max_visible && needs_bf16(packed_scale);
       }
+      const int zero_columns = PAIRED ? __syncthreads_count(zero_column) : 0;
       k_wide = __syncthreads_or(k_wide);
+      if (PAIRED && zero_columns == min(BLOCK_L, max_visible - l0)) {
+        float* out = reinterpret_cast<float*>(p.out);
+        for (int i = tid; i < 2 * group_rows * BLOCK_L; i += NUM_THREADS) {
+          const int row = 2 * b0 + i / BLOCK_L;
+          const int position = l0 + i % BLOCK_L;
+          if (position < p.out_stride)
+            out[int64_t(row) * p.out_stride + position] = position < lens[row] ? 0.f : -INFINITY;
+        }
+        continue;
+      }
       if (q_wide || k_wide) {
+        if (PAIRED) {
+          if (tid < 2 * group_rows) atomicExch(p.fallback + 2 * b0 + tid, 1);
+          continue;
+        }
         bf16_tile(p, ss, b0, group_rows, l0, max_visible);
         resident_valid = false;
         continue;
@@ -439,7 +479,7 @@ struct Sm90Fp4GroupedIndexerKernel {
         const int off = slot - page * page_size;
         const int packed_col = d / 2;
         const uint32_t packed =
-            l0 + col < max_visible
+            l0 + col < max_visible && !(PAIRED && ss.k_zero[col])
                 ? load_word(table + static_cast<int64_t>(page) * p.table_stride + off * 64 + packed_col)
                 : 0;
         const int common_exponent = (__float_as_uint(ss.k_scales[col]) >> 23) & 0xff;
@@ -516,12 +556,22 @@ struct Sm90Fp4GroupedIndexerKernel {
         }
 
         if (active && wg_tid < BLOCK_L) {
-          const float sum = (ss.warp_sums[warpgroup][wg_tid] + ss.warp_sums[warpgroup][2 * BLOCK_L + wg_tid]) +
-                            (ss.warp_sums[warpgroup][BLOCK_L + wg_tid] + ss.warp_sums[warpgroup][3 * BLOCK_L + wg_tid]);
           const int position = l0 + wg_tid;
-          if (position < p.width) {
-            const bool valid = position < lens[b];
-            out[static_cast<int64_t>(b) * p.out_stride + position] = valid ? static_cast<float>(bf16(sum)) : -INFINITY;
+          if (position < (PAIRED ? p.out_stride : p.width)) {
+            if (PAIRED) {
+              for (int half = 0; half < 2; ++half) {
+                const float sum = ss.warp_sums[warpgroup][half * 2 * BLOCK_L + wg_tid] +
+                                  ss.warp_sums[warpgroup][(half * 2 + 1) * BLOCK_L + wg_tid];
+                const int output_row = 2 * b + half;
+                out[int64_t(output_row) * p.out_stride + position] =
+                    position < lens[output_row] ? float(bf16(sum)) : -INFINITY;
+              }
+            } else {
+              const float sum =
+                  (ss.warp_sums[warpgroup][wg_tid] + ss.warp_sums[warpgroup][2 * BLOCK_L + wg_tid]) +
+                  (ss.warp_sums[warpgroup][BLOCK_L + wg_tid] + ss.warp_sums[warpgroup][3 * BLOCK_L + wg_tid]);
+              out[int64_t(b) * p.out_stride + position] = position < lens[b] ? float(bf16(sum)) : -INFINITY;
+            }
           }
         }
         if constexpr (RESIDENT_Q) {
@@ -550,7 +600,11 @@ struct Sm90Fp4GroupedIndexerKernel {
       return true;
     }();
     (void)attr_set;
-    dim3 grid(ceil_div(p.width, BLOCK_L * TILES_PER_CTA), ceil_div(p.batch_size, p.group_size), 1);
+    dim3 grid(
+        PAIRED ? min(p.prefix_grid_ctas, ceil_div(p.width, BLOCK_L * TILES_PER_CTA))
+               : ceil_div(p.width, BLOCK_L * TILES_PER_CTA),
+        ceil_div(p.batch_size, p.group_size),
+        1);
     host::LaunchKernel(grid, NUM_THREADS, p.stream, smem_size)(kernel, p);
   }
 };
@@ -565,16 +619,28 @@ template <bool ALIGNED, bool SPECIALIZED>
 inline void dispatch_layout(const Sm90Fp4GroupedIndexerParams& p, int tiles_per_cta) {
   switch (tiles_per_cta) {
     case 1:
-      Sm90Fp4GroupedIndexerKernel<1, 4, ALIGNED, SPECIALIZED>::run(p);
+      if (p.paired_heads)
+        Sm90Fp4GroupedIndexerKernel<1, 4, ALIGNED, SPECIALIZED, true>::run(p);
+      else
+        Sm90Fp4GroupedIndexerKernel<1, 4, ALIGNED, SPECIALIZED>::run(p);
       break;
     case 2:
-      Sm90Fp4GroupedIndexerKernel<2, 6, ALIGNED, SPECIALIZED>::run(p);
+      if (p.paired_heads)
+        Sm90Fp4GroupedIndexerKernel<2, 4, ALIGNED, SPECIALIZED, true>::run(p);
+      else
+        Sm90Fp4GroupedIndexerKernel<2, 6, ALIGNED, SPECIALIZED>::run(p);
       break;
     case 4:
-      Sm90Fp4GroupedIndexerKernel<4, 6, ALIGNED, SPECIALIZED>::run(p);
+      if (p.paired_heads)
+        Sm90Fp4GroupedIndexerKernel<4, 4, ALIGNED, SPECIALIZED, true>::run(p);
+      else
+        Sm90Fp4GroupedIndexerKernel<4, 6, ALIGNED, SPECIALIZED>::run(p);
       break;
     case 8:
-      Sm90Fp4GroupedIndexerKernel<8, 6, ALIGNED, SPECIALIZED>::run(p);
+      if (p.paired_heads)
+        Sm90Fp4GroupedIndexerKernel<8, 4, ALIGNED, SPECIALIZED, true>::run(p);
+      else
+        Sm90Fp4GroupedIndexerKernel<8, 6, ALIGNED, SPECIALIZED>::run(p);
       break;
     default:
       host::Panic("Unsupported tiles_per_cta: ", tiles_per_cta);

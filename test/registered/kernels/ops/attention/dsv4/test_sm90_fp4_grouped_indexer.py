@@ -378,6 +378,19 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
         with self.assertRaises(ValueError):
             self.run_public(x)
 
+    @staticmethod
+    def mock_default_decode(state):
+        # The default path now delegates to V4.1 indexer providers. These mocks
+        # check routing only; SM90 kernel cases below still execute real kernels.
+        state._use_sm90_fp8_prefill_indexer = Mock(return_value=False)
+        state._make_low_ratio_decode_indexer_inputs = Mock()
+        state.full_topk_indexer = SimpleNamespace(topk_decode=Mock())
+        state.decode_candidates = SimpleNamespace(
+            publish_decode=Mock(return_value=state.forward_metadata.candidate_metadata),
+            consume_decode=Mock(),
+        )
+        state._publish_candidate_metadata = Mock()
+
     def test_backend_dispatch_guards(self):
         from sglang.srt.environ import envs
         from sglang.srt.layers.attention import deepseek_v4_backend as backend
@@ -402,8 +415,17 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
                 state = SimpleNamespace(
                     is_dspark_draft=draft,
                     speculative_num_draft_tokens=6,
-                    forward_metadata=SimpleNamespace(late_layer_tail=tail),
+                    forward_metadata=SimpleNamespace(
+                        late_layer_tail=tail, candidate_metadata=None
+                    ),
                     _low_ratio_index_topk_sm90_decode=Mock(),
+                )
+                self.mock_default_decode(state)
+                layer = SimpleNamespace(
+                    compress_ratio=1,
+                    indexer=SimpleNamespace(
+                        is_candidate_source=False, uses_candidates=False
+                    ),
                 )
                 batch = SimpleNamespace(
                     forward_mode=mode,
@@ -417,12 +439,19 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
                     patch.object(backend, "_is_sm100_or_newer", return_value=False),
                 ):
                     backend.DeepseekV4AttnBackend._low_ratio_index_topk(
-                        state, None, tensor, tensor, tensor, tensor, batch
+                        state, layer, tensor, tensor, tensor, tensor, batch
                     )
-                self.assertEqual(
-                    state._low_ratio_index_topk_sm90_decode.call_args.kwargs,
-                    {"group_size": expected},
-                )
+                if enabled:
+                    self.assertEqual(
+                        state._low_ratio_index_topk_sm90_decode.call_args.kwargs,
+                        {"group_size": expected},
+                    )
+                    state.full_topk_indexer.topk_decode.assert_not_called()
+                else:
+                    state._low_ratio_index_topk_sm90_decode.assert_not_called()
+                    state.full_topk_indexer.topk_decode.assert_called_once_with(
+                        state._make_low_ratio_decode_indexer_inputs.return_value
+                    )
 
     def make_backend_case(self, x, role="none", topk=32):
         from sglang.srt.layers.attention import deepseek_v4_backend as backend
@@ -450,6 +479,7 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
                 candidate_metadata=backend.CandidateMasks(mask=candidate_mask),
             ),
         )
+        self.mock_default_decode(state)
         layer = SimpleNamespace(
             layer_id=0,
             compress_ratio=x.ratio,
@@ -471,8 +501,32 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
                 state, layer, x.weights, x.q, x.req, pos, group_size=group_size
             )
 
+        def run_verify():
+            from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+            state.is_dspark_draft = False
+            state.speculative_num_draft_tokens = x.group
+            state.forward_metadata.late_layer_tail = None
+            state._low_ratio_index_topk_sm90_decode = lambda *args, group_size: run(
+                group_size
+            )
+            batch = SimpleNamespace(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                batch_size=rows // x.group,
+                spec_info=SimpleNamespace(draft_token_num=x.group),
+            )
+            backend.DeepseekV4AttnBackend._low_ratio_index_topk(
+                state, layer, x.weights, x.q, x.req, pos, batch
+            )
+
         return SimpleNamespace(
-            run=run, state=state, pages=pages, raw=raw, pos=pos, layer=layer
+            run=run,
+            run_verify=run_verify,
+            state=state,
+            pages=pages,
+            raw=raw,
+            pos=pos,
+            layer=layer,
         )
 
     def test_backend_topk_and_candidate_masks(self):
