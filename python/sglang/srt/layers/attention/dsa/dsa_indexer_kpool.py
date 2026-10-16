@@ -29,6 +29,7 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_rows_per_chunk,
     mqa_logits_should_chunk,
 )
+from sglang.srt.layers.cp.interleave_kpool import materialize_compression_inputs
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.utils import add_prefix, ceil_align, ceil_div, is_cuda, is_hip, is_npu
@@ -651,6 +652,10 @@ class IndexerKPool(MultiPlatformOp):
 
         if gate_score is None:
             gate_score = F.linear(x, self.index_kpool_compress_gate)
+
+        key, gate_score, positions = materialize_compression_inputs(
+            key, gate_score, positions, forward_batch
+        )
 
         if forward_batch.forward_mode.is_decode_or_idle():
             self._compress_write_decode(

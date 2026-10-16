@@ -78,6 +78,12 @@ class InterleaveContextParallelMetadata(BaseContextParallelMetadata):
     moe_local_token_count: Optional[torch.Tensor] = None
 
 
+def is_interleave_extend(forward_batch):
+    return forward_batch.forward_mode.is_context_parallel_extend() and isinstance(
+        getattr(forward_batch, "attn_cp_metadata", None), InterleaveContextParallelMetadata
+    )
+
+
 class InterleaveCPStrategy(ContextParallelStrategy):
     name = "interleave"
     kind = ContextParallelStrategyKind.INTERLEAVE
