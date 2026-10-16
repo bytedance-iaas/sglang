@@ -90,6 +90,27 @@ class DeepseekSparseAttnBackendKPoolMixin:
             return "tilelang"
         return dsa_impl
 
+    def _resolve_kpool_tail_backend_for_query_rows(
+        self,
+        topk_indices: Optional[torch.Tensor],
+        dsa_impl: _DSA_IMPL_T,
+        query_rows: int,
+    ) -> _DSA_IMPL_T:
+        """Apply the optional native-consumer size gate after capability routing."""
+
+        resolved = self._resolve_kpool_tail_backend(topk_indices, dsa_impl)
+        min_query_rows = (
+            envs.SGLANG_EXPERIMENTAL_DSA_KPOOL_FLASHMLA_V32_MIN_QUERY_ROWS.get()
+        )
+        if (
+            resolved == "flashmla_kv"
+            and self._use_kpool_flashmla_v32(resolved)
+            and min_query_rows > 0
+            and query_rows < min_query_rows
+        ):
+            return "tilelang"
+        return resolved
+
     def _kpool_index_page_size(self) -> int:
         return self.token_to_kv_pool.index_page_size
 

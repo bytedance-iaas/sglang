@@ -14,12 +14,18 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 def _backend(*, sm=9, fp8=True, rope=0, kpool=4):
-    return SimpleNamespace(
+    backend = SimpleNamespace(
         device_sm_major=sm,
         dsa_kv_cache_store_fp8=fp8,
         qk_rope_head_dim=rope,
         dsa_index_kpool=kpool,
     )
+    backend._use_kpool_flashmla_v32 = lambda dsa_impl: (
+        DeepseekSparseAttnBackendKPoolMixin._use_kpool_flashmla_v32(
+            backend, dsa_impl
+        )
+    )
+    return backend
 
 
 class TestKPoolTailBackendResolution(CustomTestCase):

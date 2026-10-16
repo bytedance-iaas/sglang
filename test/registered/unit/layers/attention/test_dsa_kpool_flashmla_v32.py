@@ -40,6 +40,11 @@ def _backend(**overrides):
     backend._use_kpool_flashmla_v32 = lambda dsa_impl: (
         DeepseekSparseAttnBackendKPoolMixin._use_kpool_flashmla_v32(backend, dsa_impl)
     )
+    backend._resolve_kpool_tail_backend = lambda topk_indices, dsa_impl: (
+        DeepseekSparseAttnBackendKPoolMixin._resolve_kpool_tail_backend(
+            backend, topk_indices, dsa_impl
+        )
+    )
     return backend
 
 
@@ -179,6 +184,53 @@ class TestDSAKPoolFlashMLAV32(unittest.TestCase):
                                     expected,
                                     "decode",
                                 )
+
+    def test_query_row_threshold_routes_small_batches_to_tilelang(self):
+        backend = _backend()
+        indices = torch.zeros((1, 2051), dtype=torch.int32)
+        with (
+            patch.object(
+                envs.SGLANG_EXPERIMENTAL_DSA_KPOOL_FLASHMLA_V32,
+                "get",
+                return_value=True,
+            ),
+            patch.object(
+                envs.SGLANG_EXPERIMENTAL_DSA_KPOOL_FLASHMLA_V32_MIN_QUERY_ROWS,
+                "get",
+                return_value=1024,
+            ),
+        ):
+            self.assertEqual(
+                DeepseekSparseAttnBackendKPoolMixin._resolve_kpool_tail_backend_for_query_rows(
+                    backend, indices, "flashmla_kv", 256
+                ),
+                "tilelang",
+            )
+            self.assertEqual(
+                DeepseekSparseAttnBackendKPoolMixin._resolve_kpool_tail_backend_for_query_rows(
+                    backend, indices, "flashmla_kv", 1024
+                ),
+                "flashmla_kv",
+            )
+
+        with (
+            patch.object(
+                envs.SGLANG_EXPERIMENTAL_DSA_KPOOL_FLASHMLA_V32,
+                "get",
+                return_value=True,
+            ),
+            patch.object(
+                envs.SGLANG_EXPERIMENTAL_DSA_KPOOL_FLASHMLA_V32_MIN_QUERY_ROWS,
+                "get",
+                return_value=0,
+            ),
+        ):
+            self.assertEqual(
+                DeepseekSparseAttnBackendKPoolMixin._resolve_kpool_tail_backend_for_query_rows(
+                    backend, indices, "flashmla_kv", 1
+                ),
+                "flashmla_kv",
+            )
 
     def test_native_path_pads_sentinel_and_reuses_scheduler(self):
         captured = []

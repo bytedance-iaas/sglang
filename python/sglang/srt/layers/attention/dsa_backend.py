@@ -2066,7 +2066,9 @@ class DeepseekSparseAttnBackend(
             )
             else "prefill"
         )
-        dsa_impl = self._resolve_kpool_tail_backend(topk_indices, dsa_impl)
+        dsa_impl = self._resolve_kpool_tail_backend_for_query_rows(
+            topk_indices, dsa_impl, q.shape[0]
+        )
         self._check_kpool_tail_backend(topk_indices, dsa_impl, phase)
 
         if dsa_impl == "trtllm" and not self.use_mha:
@@ -2401,7 +2403,9 @@ class DeepseekSparseAttnBackend(
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
 
-        dsa_impl = self._resolve_kpool_tail_backend(topk_indices, self.dsa_decode_impl)
+        dsa_impl = self._resolve_kpool_tail_backend_for_query_rows(
+            topk_indices, self.dsa_decode_impl, q.shape[0]
+        )
         self._check_kpool_tail_backend(topk_indices, dsa_impl, "decode")
 
         if attn_sink is not None and dsa_impl != "flashmla_sparse":

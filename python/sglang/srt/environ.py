@@ -1335,6 +1335,11 @@ class Envs:
     # V3.2 does not support dynamic topk_length, so the consumer pads the fixed
     # Graph width to a 64-column multiple and marks invalid columns with -1.
     SGLANG_EXPERIMENTAL_DSA_KPOOL_FLASHMLA_V32 = EnvBool(False)
+    # Optional local-query-row threshold for the native KPool consumer.  Zero
+    # preserves the all-query-shapes behavior.  A positive value lets Prefill
+    # keep long queries native while routing small cache-hit residuals back to
+    # the existing TileLang path.
+    SGLANG_EXPERIMENTAL_DSA_KPOOL_FLASHMLA_V32_MIN_QUERY_ROWS = EnvInt(0)
     SGLANG_EXPERIMENTAL_DSA_KPOOL_MTP_QUERY6 = EnvBool(False)
     SGLANG_EXPERIMENTAL_DSA_KPOOL_FUSED_SENTINEL_PAD = EnvBool(False)
 
