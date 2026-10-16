@@ -3589,7 +3589,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 hidden_states,
             )
             if _do_shared_local and local_hidden_states.shape[0] > 0:
-                _shared_local = self.mlp._forward_shared_experts(local_hidden_states)
+                _, _shared_local = self.mlp._forward_shared_experts(local_hidden_states)
             # self_attn has already reduced across attention TP, so these hidden
             # states are replicated and must not be summed by a partial gather.
             dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
@@ -3872,11 +3872,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             and getattr(self.mlp, "_shared_expert_tp1", False)
         )
         state.do_shared_local = do_shared_local
-        state.shared_local = (
-            self.mlp._forward_shared_experts(local)
-            if (do_shared_local and local.shape[0] > 0)
-            else None
-        )
+        state.shared_local = None
+        if do_shared_local and local.shape[0] > 0:
+            _, state.shared_local = self.mlp._forward_shared_experts(local)
         # Persistent grow-only scratch (keyed per ubatch) instead of a fresh
         # torch.empty each layer -> stops the allocator's `reserved` from
         # ballooning at large prefill chunks. input_ids_global is gathered ONCE
