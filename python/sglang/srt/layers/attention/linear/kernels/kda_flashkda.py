@@ -6,12 +6,15 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
 
-# FlashKDA chunk size. Sequences shorter than this fall back to Triton.
-_FLASHKDA_CHUNK_SIZE = 64
+# FlashKDA's kernel tile is 16 tokens, but keep the existing 64-token minimum
+# routing threshold: shorter sequences are better served by Triton.
+_FLASHKDA_CHUNK_SIZE = 16
+_FLASHKDA_MIN_SEQ_LEN = 64
 
-# FlashKDA's max sequence length, Batches whose longest sequence exceeds this
-# fall back to Triton for the whole batch.
-_FLASHKDA_MAX_SEQ_LEN = 2048
+# Validated coverage cap for this integration. The fixed FlashKDA source also
+# supports longer sequences, but this backend only opts in through the longest
+# shape covered by its correctness/performance suite.
+_FLASHKDA_MAX_SEQ_LEN = 8192
 
 
 def _load_flash_kda():
@@ -87,8 +90,9 @@ class FlashKDAKernel(LinearAttnKernelBase):
     Requires an SM90+ GPU with the ``flash_kda`` package.
     """
 
-    # Tracked batches always take the Triton fallback, which forwards the
-    # fp32 snapshot arguments (see _triton_fallback).
+    # Interior tracked snapshots take the Triton fallback, which forwards the
+    # fp32 snapshot arguments (see _triton_fallback). Aligned/final-only
+    # tracking can use FlashKDA's final_state output directly.
     supports_track_state_snapshot: bool = True
 
     def decode(
@@ -128,11 +132,12 @@ class FlashKDAKernel(LinearAttnKernelBase):
         return_intermediate_states: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        # The fused kernel cannot expose per-chunk states (h), which the mamba
-        # radix extra_buffer track path needs; route tracked batches through
-        # the Triton chunk_kda fallback instead of silently skipping the
-        # snapshot (that would corrupt prefix-cache restores).
-        if return_intermediate_states or self._should_fall_back(
+        # The fused kernel cannot expose per-chunk states (h). Only batches
+        # carrying the fp32 track snapshot buffer need such an interior state;
+        # aligned/final-only tracking reads the committed final state and can
+        # stay on FlashKDA (the caller accepts h=None for that case).
+        needs_interior_snapshot = kwargs.get("track_state") is not None
+        if needs_interior_snapshot or self._should_fall_back(
             lower_bound, is_spec_decode, query_start_loc, extend_seq_lens_cpu
         ):
             return _triton_fallback(
@@ -205,7 +210,7 @@ class FlashKDAKernel(LinearAttnKernelBase):
             seq_lens = query_start_loc[1:] - query_start_loc[:-1]
             lo_t, hi_t = torch.aminmax(seq_lens)
             lo, hi = int(lo_t), int(hi_t)
-        return lo < _FLASHKDA_CHUNK_SIZE or hi > _FLASHKDA_MAX_SEQ_LEN
+        return lo < _FLASHKDA_MIN_SEQ_LEN or hi > _FLASHKDA_MAX_SEQ_LEN
 
     def _flashkda_extend(
         self,
