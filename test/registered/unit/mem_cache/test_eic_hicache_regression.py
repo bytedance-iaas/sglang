@@ -93,7 +93,10 @@ class TestEICHiCacheRegression(unittest.TestCase):
         match.i = 0
         cache._match_for_remote_fetch = match
         cache.cache_controller = mock.Mock()
-        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [8]
+        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = (
+            [8],
+            True,
+        )
         reqs = [
             mock.Mock(
                 rid=r, origin_input_ids=list(range(8)), output_ids=[9], extra_key=None
@@ -1517,10 +1520,10 @@ class TestEICHiCacheRegression(unittest.TestCase):
         cache = self._remote_cache()
         node = SimpleNamespace(id=1, content_hash=None)
         cache._match_for_remote_fetch = lambda root, key: (0, node)
-        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [
-            256,
-            256,
-        ]
+        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = (
+            [256, 256],
+            True,
+        )
         reqs = [
             mock.Mock(
                 rid=r, origin_input_ids=list(range(n)), output_ids=[9], extra_key=None
@@ -1548,16 +1551,24 @@ class TestEICHiCacheRegression(unittest.TestCase):
             return_value=False,
         )
 
-        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [0]
+        # First round: data plane faults, so the probe enters cooldown and
+        # the miss is not admitted.
+        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = (
+            [0],
+            False,
+        )
         with patch_hash:
             EICPagedHiRadixCache.match_from_remote(cache, [req])
         cache._insert_remote_node.assert_not_called()
         self.assertEqual(cache.match_req_set, {})
 
-        # The miss is retried once the probe backoff from the wholesale
-        # miss expires (the write may have landed in the meantime).
+        # The miss is retried once the cooldown expires (the write may
+        # have landed in the meantime).
         cache._probe_backoff_until = 0.0
-        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [768]
+        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = (
+            [768],
+            True,
+        )
         with patch_hash:
             EICPagedHiRadixCache.match_from_remote(cache, [req])
         key = cache._insert_remote_node.call_args[0][1]
@@ -1583,10 +1594,10 @@ class TestEICHiCacheRegression(unittest.TestCase):
             cache.pp_group = object()
             node = SimpleNamespace(id=1, content_hash=None)
             cache._match_for_remote_fetch = lambda root, key: (0, node)
-            cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [
-                256,
-                256,
-            ]
+            cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = (
+                [256, 256],
+                True,
+            )
             shapes = []
 
             def fake_reduce(t):
@@ -1688,7 +1699,10 @@ class TestEICHiCacheRegression(unittest.TestCase):
         node = SimpleNamespace(id=1, content_hash=None)
         cache._match_for_remote_fetch = lambda root, key: (0, node)
         cache.cache_controller = mock.Mock()
-        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [0, 0]
+        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = (
+            [0, 0],
+            True,
+        )
 
         reqs = [
             mock.Mock(
@@ -1789,32 +1803,58 @@ class TestEICHiCacheRegression(unittest.TestCase):
             },
         )
         self.assertFalse(cache._probe_in_backoff())
-        # First wholesale failure already backs off for the base cooldown.
-        cache._note_probe_result([0, 0])
+        # First data-plane fault already backs off for the base cooldown.
+        cache._note_probe_result([0, 0], plane_ok=False)
         self.assertTrue(cache._probe_in_backoff())
         self.assertAlmostEqual(
             cache._probe_backoff_until - time.monotonic(), 10.0, delta=1.0
         )
-        # Next failure after expiry doubles the cooldown.
+        # Next fault after expiry doubles the cooldown.
         cache._probe_backoff_until = 0.0
-        cache._note_probe_result([0])
+        cache._note_probe_result([0], plane_ok=False)
         self.assertAlmostEqual(
             cache._probe_backoff_until - time.monotonic(), 20.0, delta=1.0
         )
         # Growth is capped.
         cache._probe_backoff_until = 0.0
-        cache._note_probe_result([0])
+        cache._note_probe_result([0], plane_ok=False)
         self.assertAlmostEqual(
             cache._probe_backoff_until - time.monotonic(), 25.0, delta=1.0
         )
         # A hit clears both the level and an active backoff, so the next
-        # failure starts from the base cooldown again.
+        # fault starts from the base cooldown again.
         cache._note_probe_result([4])
         self.assertFalse(cache._probe_in_backoff())
-        cache._note_probe_result([0])
+        cache._note_probe_result([0], plane_ok=False)
         self.assertAlmostEqual(
             cache._probe_backoff_until - time.monotonic(), 10.0, delta=1.0
         )
+
+    def test_probe_cold_cache_miss_does_not_backoff(self):
+        # A healthy cold-cache round (mexist answers SUCCESS but each key
+        # returns KEY_NOT_EXIST) must not enter cooldown. The probe keeps
+        # running on each loop so the cache can warm as writes land.
+        from sglang.srt.mem_cache.eic_hiradix_cache import EICHiRadixCache
+
+        cache = object.__new__(EICHiRadixCache)
+        EICHiRadixCache.init_hyper_params(
+            cache,
+            {
+                "save_decode_cache": True,
+                "load_back_threshold": 10,
+                "eic_probe_backoff_seconds": 10.0,
+                "eic_probe_backoff_max_seconds": 25.0,
+            },
+        )
+        # Repeated healthy cold rounds still leave the plane un-backoffed.
+        cache._note_probe_result([0, 0], plane_ok=True)
+        self.assertFalse(cache._probe_in_backoff())
+        cache._note_probe_result([0], plane_ok=True)
+        self.assertFalse(cache._probe_in_backoff())
+        self.assertEqual(getattr(cache, "_probe_fail_level", 0), 0)
+        # A fault right after a cold round still enters the base cooldown.
+        cache._note_probe_result([0], plane_ok=False)
+        self.assertTrue(cache._probe_in_backoff())
 
     def test_match_from_remote_canary_probes_one_request_after_failure(self):
         # While recovering from a wholesale probe failure, a probe
@@ -1825,7 +1865,10 @@ class TestEICHiCacheRegression(unittest.TestCase):
         cache._probe_backoff_until = 0.0
         node = SimpleNamespace(id=1, content_hash=None)
         cache._match_for_remote_fetch = lambda root, key: (512, node)
-        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [0]
+        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = (
+            [0],
+            False,
+        )
         reqs = [
             mock.Mock(
                 rid=r,

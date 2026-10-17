@@ -508,8 +508,8 @@ class EICCacheController(HiCacheController):
             prompt_key_offset.append(len(content_hash) + prompt_key_offset[-1])
             content_hashes.extend(content_hash)
         if len(content_hashes) == 0:
-            return []
-        exist_result = self.mem_pool_host.batch_exist_page(content_hashes)
+            return [], True
+        exist_result, plane_ok = self.mem_pool_host.batch_exist_page(content_hashes)
         for i in range(len(prompts)):
             count = 0
             for res in exist_result[prompt_key_offset[i] : prompt_key_offset[i + 1]]:
@@ -518,7 +518,7 @@ class EICCacheController(HiCacheController):
                 count += 1
             eic_prefix_len.append(count * self.page_size)
 
-        return eic_prefix_len
+        return eic_prefix_len, plane_ok
 
     def write(
         self,
