@@ -5,6 +5,7 @@ import torch
 from sglang.kernels.ops.attention.fla.l2norm import (
     gdn_prefill_qkv_prepare_fwd,
     l2norm_fwd,
+    prefill_qkv_l2norm_prepare_fwd,
 )
 from sglang.kernels.ops.attention.fla.layernorm_gated import rms_norm_gated
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
@@ -84,6 +85,54 @@ class TestGdnPrefillLayout(unittest.TestCase):
                 self.assertEqual(q_out.dtype, dtype)
                 self.assertEqual(k_out.dtype, dtype)
                 self.assertEqual(v_out.dtype, dtype)
+                torch.testing.assert_close(
+                    q_out, l2norm_fwd(q.contiguous()), rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    k_out, l2norm_fwd(k.contiguous()), rtol=0, atol=0
+                )
+                torch.testing.assert_close(v_out, v.contiguous(), rtol=0, atol=0)
+
+    def test_shared_qkv_prepare_matches_materialized_path(self):
+        _, (mixed_qkv, _, _, _) = self._projection_views(torch.bfloat16)
+        q_dim = self.NUM_QK_HEADS * self.HEAD_DIM
+        v_dim = self.NUM_V_HEADS * self.HEAD_DIM
+        q = mixed_qkv[:, :q_dim].view(
+            self.TOKENS, self.NUM_QK_HEADS, self.HEAD_DIM
+        )
+        k = mixed_qkv[:, q_dim : 2 * q_dim].view(
+            self.TOKENS, self.NUM_QK_HEADS, self.HEAD_DIM
+        )
+        v = mixed_qkv[:, 2 * q_dim : 2 * q_dim + v_dim].view(
+            self.TOKENS, self.NUM_V_HEADS, self.HEAD_DIM
+        )
+
+        q_out, k_out, v_out = prefill_qkv_l2norm_prepare_fwd(q, k, v)
+
+        self.assertTrue(q_out.is_contiguous())
+        self.assertTrue(k_out.is_contiguous())
+        self.assertTrue(v_out.is_contiguous())
+        torch.testing.assert_close(q_out, l2norm_fwd(q.contiguous()), rtol=0, atol=0)
+        torch.testing.assert_close(k_out, l2norm_fwd(k.contiguous()), rtol=0, atol=0)
+        torch.testing.assert_close(v_out, v.contiguous(), rtol=0, atol=0)
+
+    def test_shared_qkv_prepare_matches_glm53_target_shape_and_tail(self):
+        heads = 32
+        head_dim = 128
+        for tokens in (8192, 8191):
+            with self.subTest(tokens=tokens):
+                packed = torch.randn(
+                    tokens,
+                    3 * heads * head_dim,
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                )
+                q, k, v = (
+                    tensor.view(tokens, heads, head_dim)
+                    for tensor in packed.split(heads * head_dim, dim=-1)
+                )
+                q_out, k_out, v_out = prefill_qkv_l2norm_prepare_fwd(q, k, v)
+
                 torch.testing.assert_close(
                     q_out, l2norm_fwd(q.contiguous()), rtol=0, atol=0
                 )

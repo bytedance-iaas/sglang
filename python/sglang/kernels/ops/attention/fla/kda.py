@@ -23,7 +23,10 @@ from sglang.kernels.ops.attention.fla.fused_recurrent import (
 from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,
 )
-from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
+from sglang.kernels.ops.attention.fla.l2norm import (
+    l2norm_fwd,
+    prefill_qkv_l2norm_prepare_fwd,
+)
 from sglang.kernels.ops.attention.fla.op import exp, exp2, log
 from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
@@ -1277,8 +1280,24 @@ def chunk_kda(
         scale = k.shape[-1] ** -0.5
 
     if use_qk_l2norm_in_kernel:
-        q = l2norm_fwd(q.contiguous())
-        k = l2norm_fwd(k.contiguous())
+        if (
+            q.ndim == 4
+            and q.shape[0] == 1
+            and k.shape == q.shape
+            and v.ndim == 4
+            and v.shape[0] == 1
+            and v.shape[1] == q.shape[1]
+            and v.shape[-1] == q.shape[-1]
+            and q.dtype == k.dtype == v.dtype
+            and q.device == k.device == v.device
+            and q.shape[-1] <= 512
+            and not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous())
+        ):
+            q, k, v = prefill_qkv_l2norm_prepare_fwd(q[0], k[0], v[0])
+            q, k, v = q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
+        else:
+            q = l2norm_fwd(q.contiguous())
+            k = l2norm_fwd(k.contiguous())
 
     # Returns o [B, T, H, V] when output_intermediate_states=False, or (o, h [B, NT, H, V, K]) when output_intermediate_states=True.
     return chunk_kda_fwd(
