@@ -561,13 +561,20 @@ class EICKVClient:
         status_code, exist_outcome = self.connection.mexist(keys_vec, exist_option)
         if status_code == eic.StatusCode.SUCCESS:
             stats.record_rpc("mexist", time.perf_counter() - _t0, "SUCCESS", len(keys))
-            return [c == eic.StatusCode.SUCCESS for c in exist_outcome.status_codes]
+            return (
+                [c == eic.StatusCode.SUCCESS for c in exist_outcome.status_codes],
+                True,
+            )
+        # KEY_NOT_EXIST at the top level is a healthy cold miss, not a fault.
+        if status_code == eic.StatusCode.KEY_NOT_EXIST:
+            stats.record_rpc("mexist", time.perf_counter() - _t0, "SUCCESS", len(keys))
+            return [False] * len(keys), True
         if status_code != eic.StatusCode.PARTIAL_FAILED:
             logger.error(f"eic exists {len(keys)} failed, status_code {status_code}")
             stats.record_rpc(
                 "mexist", time.perf_counter() - _t0, "FAILED", len(keys), len(keys)
             )
-            return [False] * len(keys)
+            return [False] * len(keys), False
 
         codes = list(exist_outcome.status_codes)
         codes += [None] * (len(keys) - len(codes))
@@ -578,14 +585,23 @@ class EICKVClient:
             retry_keys.append(keys[i])
         retry_status, retry_outcome = self.connection.mexist(retry_keys, exist_option)
         retry_codes = list(retry_outcome.status_codes)
+        retry_codes += [None] * (len(failed) - len(retry_codes))
         still_failed = 0
+        # The retry response is only a data-plane fault when some key failed
+        # for a transport/server reason. A key that returns KEY_NOT_EXIST is
+        # a normal cold miss and must not drive the probe backoff.
+        plane_error = retry_status not in (
+            eic.StatusCode.SUCCESS,
+            eic.StatusCode.PARTIAL_FAILED,
+        )
         for j, i in enumerate(failed):
-            if retry_status == eic.StatusCode.SUCCESS or (
-                j < len(retry_codes) and retry_codes[j] == eic.StatusCode.SUCCESS
-            ):
+            rc = retry_codes[j] if j < len(retry_codes) else None
+            if rc == eic.StatusCode.SUCCESS:
                 codes[i] = eic.StatusCode.SUCCESS
             else:
                 still_failed += 1
+                if rc != eic.StatusCode.KEY_NOT_EXIST:
+                    plane_error = True
         stats.record_rpc(
             "mexist",
             time.perf_counter() - _t0,
@@ -593,7 +609,7 @@ class EICKVClient:
             len(keys),
             still_failed,
         )
-        return [c == eic.StatusCode.SUCCESS for c in codes]
+        return [c == eic.StatusCode.SUCCESS for c in codes], not plane_error
 
     def allocate_eic_read_buffer(self, count):
         registered = True
@@ -1036,16 +1052,25 @@ class EICBaseTokenToKVPoolHost:
 
     def batch_exist_page(self, content_hashes):
         """
-        for multi prompt detect prefix key
+        for multi prompt detect prefix key.
+
+        Returns (exist_result, plane_ok): plane_ok is False only when one or
+        more RPC batches hit a transport/server-level fault; a cold-cache
+        KEY_NOT_EXIST round keeps plane_ok True.
         """
         batch_size = self.eic_client.eic_check_bs
         keys = self._encode_key_shared(content_hashes)
 
         exist_result = []
+        plane_ok = True
         for i in range(0, len(keys), batch_size):
-            batch_ret = self.eic_client.exists_batch(keys[i : i + batch_size])
+            batch_ret, batch_plane = self.eic_client.exists_batch(
+                keys[i : i + batch_size]
+            )
             exist_result.extend(batch_ret)
-        return exist_result
+            if not batch_plane:
+                plane_ok = False
+        return exist_result, plane_ok
 
     def get_flat_data_direct(self, keys, device_indices=None):
         bs = G_GDRBounceTensorCount // 2
@@ -2049,22 +2074,26 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
 
     def batch_exist_page(self, content_hashes):
         if len(content_hashes) == 0:
-            return []
+            return [], True
 
         chunk_keys = self._encode_page_chunk_keys(content_hashes)
         batch_size = self.eic_client.eic_check_bs
         chunk_exists = []
+        plane_ok = True
         for i in range(0, len(chunk_keys), batch_size):
-            chunk_exists.extend(
-                self.eic_client.exists_batch(chunk_keys[i : i + batch_size])
+            ret, batch_plane = self.eic_client.exists_batch(
+                chunk_keys[i : i + batch_size]
             )
+            chunk_exists.extend(ret)
+            if not batch_plane:
+                plane_ok = False
 
         page_exists = []
         for page_id in range(len(content_hashes)):
             start = page_id * self.page_chunk_count
             end = start + self.page_chunk_count
             page_exists.append(all(chunk_exists[start:end]))
-        return page_exists
+        return page_exists, plane_ok
 
     def device_backup(
         self, device_indices: torch.Tensor, dst_tensors: List[torch.Tensor]

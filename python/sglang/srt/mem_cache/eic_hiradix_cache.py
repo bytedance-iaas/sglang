@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.storage.eic.eic_env_config import load_fixed_config
+from sglang.srt.runtime_context import get_memory
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -214,8 +215,8 @@ class EICHiRadixCache(RadixCache):
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = EICMHATokenToKVPoolHost(
                 self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
+                get_memory().hicache_ratio,
+                get_memory().hicache_size,
                 "cpu",
                 params.page_size,
                 self.rank,
@@ -226,8 +227,8 @@ class EICHiRadixCache(RadixCache):
         elif isinstance(self.kv_cache, NSATokenToKVPool):
             self.token_to_kv_pool_host = EICNSATokenToKVPoolHost(
                 self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
+                get_memory().hicache_ratio,
+                get_memory().hicache_size,
                 "cpu",
                 params.page_size,
                 self.rank,
@@ -238,8 +239,8 @@ class EICHiRadixCache(RadixCache):
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = EICMLATokenToKVPoolHost(
                 self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
+                get_memory().hicache_ratio,
+                get_memory().hicache_size,
                 "cpu",
                 params.page_size,
                 self.rank,
@@ -250,8 +251,8 @@ class EICHiRadixCache(RadixCache):
         elif isinstance(self.kv_cache, DeepSeekV4TokenToKVPool):
             self.token_to_kv_pool_host = EICDeepSeekV4TokenToKVPoolHost(
                 self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
+                get_memory().hicache_ratio,
+                get_memory().hicache_size,
                 "cpu",
                 params.page_size,
                 self.rank,
@@ -360,19 +361,29 @@ class EICHiRadixCache(RadixCache):
     def _probe_in_backoff(self) -> bool:
         return time.monotonic() < getattr(self, "_probe_backoff_until", 0.0)
 
-    def _note_probe_result(self, lens) -> None:
-        # A wholesale-miss round means the data plane is failing (or the
-        # cache is cold). The first one already enters a long cooldown:
-        # each probe round costs an RPC timeout on the scheduler thread,
-        # and data-plane recovery is an operator-timescale event, so
-        # retrying every few seconds only stalls scheduling. The
-        # cooldown doubles per consecutive wholesale failure up to a
-        # cap; any hit clears the state immediately.
+    def _note_probe_result(self, lens, plane_ok: bool = True) -> None:
+        # A wholesale-miss round has two causes that must not be conflated:
+        #  (1) the data plane is failing (RPC timeout / network / server
+        #      error), in which case every probe round costs an RPC timeout
+        #      on the scheduler thread and a long cooldown is warranted;
+        #  (2) the cache is cold (RPC answers SUCCESS but each key returns
+        #      KEY_NOT_EXIST), which is the normal state at cold start and
+        #      must keep probing each loop instead of entering cooldown.
+        # plane_ok carries the RPC-level answer: True when the probe round
+        # got a response, False when the transport/server reported a fault.
+        # Cooldown doubles per consecutive fault up to a cap; any hit or
+        # any healthy round clears the state immediately.
         if any(n > 0 for n in lens):
             self._probe_fail_level = 0
             self._probe_backoff_until = 0.0
             return
         if not lens:
+            return
+        if plane_ok:
+            # Healthy cold cache: the RPCs answered, keys are simply absent.
+            # Clear any stale fault and continue probing on the next loop.
+            self._probe_fail_level = 0
+            self._probe_backoff_until = 0.0
             return
         level = getattr(self, "_probe_fail_level", 0)
         seconds = self._backoff_cooldown(level)
@@ -1864,10 +1875,10 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         # the radix tree -- is identical on every stage.
         len_tensor = torch.zeros(num_ready, dtype=torch.int64, device="cpu")
         if fetches:
-            lens = self.cache_controller.batch_find_longest_prefix_in_eic(
+            lens, plane_ok = self.cache_controller.batch_find_longest_prefix_in_eic(
                 [f[2] for f in fetches], [f[3] for f in fetches]
             )
-            self._note_probe_result(lens)
+            self._note_probe_result(lens, plane_ok)
             if len(lens) == len(fetches):
                 for (slot, *_), n in zip(fetches, lens):
                     len_tensor[slot] = n
@@ -2011,7 +2022,7 @@ class EICPagedHiRadixCache(EICHiRadixCache):
             check_keys = host_content_hash[
                 : self.load_back_threshold // self.page_size + 1
             ]
-            mask = self.cache_controller.mem_pool_host.batch_exist_page(check_keys)
+            mask, _ = self.cache_controller.mem_pool_host.batch_exist_page(check_keys)
             check_ret = all(mask)
             if self.tp_size > 1:
                 # gloo (cpu_group) has no ReduceOp.SUM for bool; use int32.
