@@ -685,6 +685,26 @@ class TestLoadBalanceMethod(unittest.TestCase):
             resolution_result(server_args, "load_balance_method"), "round_robin"
         )
 
+    def test_prefix_aware_requires_decode_radix(self):
+        for mode, radix in (("null", False), ("prefill", True), ("decode", False)):
+            with self.subTest(mode=mode, radix=radix):
+                args = ServerArgs(
+                    model_path="dummy",
+                    disaggregation_mode=mode,
+                    disaggregation_decode_enable_radix_cache=radix,
+                    load_balance_method="prefix_aware",
+                )
+                with self.assertRaisesRegex(ValueError, "requires PD decode radix"):
+                    handle_load_balance_method(args)
+
+    def test_prefix_aware_is_explicit_not_an_auto_default(self):
+        args = self._load_balance_args(
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            load_balance_method="prefix_aware",
+        )
+        self.assertEqual(resolution_result(args, "load_balance_method"), "prefix_aware")
+
     def test_pd_prefill_dcp_warns_about_performance(self):
         server_args = ServerArgs(
             model_path="dummy",

@@ -712,6 +712,22 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             ["batch_0", "batch_1", "batch_2", "batch_3"],
         )
 
+    def test_parallel_sampling_preserves_transfer_epoch_per_item(self):
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            bootstrap_room=[10, 20],
+            pd_transfer_epoch=[2, 4],
+            sampling_params={"n": 2},
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(req.pd_transfer_epoch, [2, 4, 2, 4])
+        self.assertEqual([req[i].pd_transfer_epoch for i in range(4)], [2, 4, 2, 4])
+
+        defaulted = GenerateReqInput(text=["A", "B"])
+        defaulted.normalize_batch_and_arguments()
+        self.assertEqual(defaulted.pd_transfer_epoch, [0, 0])
+
     def test_audio_data_handling(self):
         """Test handling of audio_data."""
         req = copy.deepcopy(self.base_req)

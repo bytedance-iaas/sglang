@@ -510,9 +510,10 @@ def handle_staging_rsp(msg_parts, transfer_infos: dict) -> None:
     stg_round = int(msg_parts[4].decode("ascii"))
     stg_end = int(msg_parts[5].decode("ascii"))
     stg_session = msg_parts[6].decode("ascii")
+    transfer_epoch = int(msg_parts[7].decode("ascii")) if len(msg_parts) > 7 else 0
     room_infos = transfer_infos.get(stg_room, {})
     tinfo = room_infos.get(stg_session)
-    if tinfo is not None:
+    if tinfo is not None and getattr(tinfo, "transfer_epoch", 0) == transfer_epoch:
         if tinfo.staging is None:
             tinfo.staging = StagingTransferInfo()
         tinfo.staging.set_chunk(stg_chunk_idx, stg_offset, stg_round, stg_end)
@@ -780,7 +781,8 @@ def handle_staging_req(
     chunk_idx = int(msg[2].decode("ascii"))
     chunk_num_pages = int(msg[3].decode("ascii"))
     session_id = msg[4].decode("ascii")
-    requester_pp_rank = int(msg[5].decode("ascii")) if len(msg) > 5 else None
+    requester_pp_rank = int(msg[5].decode("ascii")) if len(msg) > 5 and msg[5] else None
+    transfer_epoch = int(msg[6].decode("ascii")) if len(msg) > 6 else 0
 
     if staging_allocator is None:
         logger.warning(
@@ -877,6 +879,7 @@ def handle_staging_req(
                             str(rnd).encode("ascii"),
                             str(end).encode("ascii"),
                             session_id.encode("ascii"),
+                            str(transfer_epoch).encode("ascii"),
                         ]
                     )
             except Exception:
@@ -911,6 +914,16 @@ class StagingManagerMixin:
                 room,
             )
             return
+        transfer_epoch = int(msg[6].decode("ascii")) if len(msg) > 6 else 0
+        active_epoch = getattr(decode_req.kv_receiver, "transfer_epoch", 0)
+        if transfer_epoch != active_epoch:
+            logger.warning(
+                "STAGING_REQ ignored for stale attempt room=%s epoch=%s active=%s",
+                room,
+                transfer_epoch,
+                active_epoch,
+            )
+            return
         prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
         handle_staging_req(
             msg,
@@ -936,6 +949,7 @@ def prefetch_staging_reqs(
     staging_requested: set,
     prefetch_sockets: dict,
     requester_pp_rank: Optional[int] = None,
+    transfer_epoch: int = 0,
 ) -> None:
     """Send STAGING_REQ for all chunks before the prefill forward starts.
 
@@ -965,7 +979,7 @@ def prefetch_staging_reqs(
         num_chunks = (total_pages + full_chunk_pages - 1) // full_chunk_pages
 
         for chunk_idx in range(num_chunks):
-            stg_key = (room, chunk_idx, session_id)
+            stg_key = (room, transfer_epoch, chunk_idx, session_id)
             if stg_key in staging_requested:
                 continue
             staging_requested.add(stg_key)
@@ -987,9 +1001,13 @@ def prefetch_staging_reqs(
                     str(chunk_idx).encode("ascii"),
                     str(chunk_pages).encode("ascii"),
                     session_id.encode("ascii"),
+                    (
+                        str(requester_pp_rank).encode("ascii")
+                        if requester_pp_rank is not None
+                        else b""
+                    ),
+                    str(transfer_epoch).encode("ascii"),
                 ]
-                if requester_pp_rank is not None:
-                    request.append(str(requester_pp_rank).encode("ascii"))
                 prefetch_sockets[ep].send_multipart(request)
             except Exception:
                 staging_requested.discard(stg_key)

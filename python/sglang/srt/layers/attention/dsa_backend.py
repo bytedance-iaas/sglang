@@ -1278,6 +1278,34 @@ class DeepseekSparseAttnBackend(
             ),
         }
 
+        self._reserve_cuda_graph_counter(max_bs, max_num_tokens)
+
+    def _reserve_cuda_graph_counter(self, max_bs: int, max_num_tokens: int) -> None:
+        # TRTLLM writes this scratch buffer during forward. Never share it across
+        # draft steps, or grow/rebind it after a graph has captured its address.
+        if getattr(self, "_multi_ctas_kv_counter_buffer", None) is not None:
+            self._multi_ctas_kv_counter_buffer = (
+                grow_multi_ctas_kv_counter_buffer_if_needed(
+                    self._multi_ctas_kv_counter_buffer,
+                    torch.device(self.device),
+                    self.num_q_heads,
+                    max(max_bs, max_num_tokens),
+                )
+            )
+
+    def _init_cuda_graph_state_shared(self, max_bs: int, max_num_tokens: int) -> None:
+        # Only step 0 owns the backing metadata allocation. Each sibling keeps
+        # its own tier map and the counter allocated by its constructor.
+        self.decode_cuda_graph_metadata = {}
+        self._reserve_cuda_graph_counter(max_bs, max_num_tokens)
+
+    def _share_cuda_graph_metadata(self, src: DeepseekSparseAttnBackend, bs: int):
+        self.set_dsa_prefill_impl(forward_batch=None)
+        self.dsa_drop_wide_page_table = src.dsa_drop_wide_page_table
+        metadata = src.decode_cuda_graph_metadata[bs]
+        self.decode_cuda_graph_metadata[bs] = metadata
+        self.forward_metadata = metadata
+
     def _build_forward_metadata_cuda_graph(
         self,
         bs: int,
@@ -3509,6 +3537,14 @@ class DeepseekSparseAttnMultiStepBackend:
             self.attn_backends[i].init_forward_metadata(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        # The CUDA draft forward consumes metadata read-only. HIP retains its
+        # existing per-step preparation; do not extend CUDA aliasing to an
+        # unvalidated backend. Eager initialization also stays per-step.
+        if is_cuda() and not _is_hip and self.attn_backends:
+            self.attn_backends[0].init_cuda_graph_state(max_bs, max_num_tokens)
+            for backend in self.attn_backends[1:]:
+                backend._init_cuda_graph_state_shared(max_bs, max_num_tokens)
+            return
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
 
@@ -3518,6 +3554,32 @@ class DeepseekSparseAttnMultiStepBackend:
         in_capture: bool = False,
     ):
         from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
+
+        if is_cuda() and not _is_hip and self.attn_backends:
+            bs = forward_batch.batch_size
+            first = self.attn_backends[0]
+            if in_capture:
+                inner_fb = build_inner_fb_view(
+                    forward_batch, bs=bs, forward_mode=ForwardMode.DECODE
+                )
+                first.init_forward_metadata_out_graph(inner_fb, in_capture=True)
+            else:
+                precomputed = first._precompute_replay_metadata(
+                    bs=bs,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    seq_lens=forward_batch.seq_lens,
+                    seq_lens_cpu=forward_batch.seq_lens_cpu,
+                    forward_mode=ForwardMode.DECODE,
+                )
+                first.init_forward_metadata_replay_cuda_graph_from_precomputed(
+                    bs=bs, precomputed=precomputed, forward_mode=ForwardMode.DECODE
+                )
+            # Refresh page tables and derived MQA/TopK plans once per replay.
+            # KV write locations, draft tokens/hidden state and TopK carry live
+            # outside DSAMetadata and remain step-local. See SGLang #44358.
+            for backend in self.attn_backends[1:]:
+                backend._share_cuda_graph_metadata(src=first, bs=bs)
+            return
 
         if in_capture:
             inner_fb = build_inner_fb_view(

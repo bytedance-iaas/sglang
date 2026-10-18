@@ -197,9 +197,54 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
 
     @staticmethod
     def _start_writing(controller):
+        controller.load_fence_stream = None
         with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
             controller.l2_transfer_engine = L2TransferEngine("kernel")
             controller.start_writing()
+
+    def test_write_waits_for_forward_before_submitting_copy(self):
+        for fenced in (True, False):
+            with self.subTest(fenced=fenced):
+                events = []
+                controller = HiCacheController.__new__(HiCacheController)
+                op = CacheOperation(_indices(0, 4), _indices(4, 8), 1)
+                controller.write_queue = [op]
+                controller.ack_write_queue = []
+                controller._move_write_operation = lambda op: (
+                    op.host_indices,
+                    op.device_indices,
+                    op.pool_transfers,
+                )
+                controller._l2_transfers = lambda *args: []
+                controller._num_tokens_by_pool = lambda op: {}
+                controller._transfer_num_bytes = lambda op: 0
+                forward = object()
+                controller.load_fence_stream = forward if fenced else None
+                stream = mock.Mock()
+                stream.wait_stream.side_effect = (
+                    lambda other, events=events: events.append(("wait", other))
+                )
+                completion = SimpleNamespace(
+                    start_event=None, finish_event=None, timing_enabled=False
+                )
+                engine = mock.Mock()
+                engine.device_to_host_stream = stream
+                engine.submit_device_to_host.side_effect = (
+                    lambda transfers, events=events, completion=completion: events.append(
+                        ("submit", transfers)
+                    )
+                    or completion
+                )
+                controller.l2_transfer_engine = engine
+                controller.start_writing()
+                self.assertEqual(
+                    [kind for kind, _ in events],
+                    ["wait", "submit"] if fenced else ["submit"],
+                )
+                if fenced:
+                    self.assertIs(events[0][1], forward)
+                self.assertEqual(controller.ack_write_queue[0].node_ids, [1])
+                self.assertEqual(controller.write_queue, [])
 
     def test_hybrid_load_forwards_merged_pool_transfers(self):
         transfer = PoolTransfer(

@@ -27,6 +27,10 @@ register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 class _FakeTransferQueue:
     def __init__(self):
         self.queue: List[object] = []
+        self.deferred_releases = []
+
+    def has_pending_deferred_releases(self):
+        return bool(self.deferred_releases)
 
 
 class _FakePreallocQueue:
@@ -54,11 +58,21 @@ class _FakeScheduler:
         self.chunked_req: Optional[object] = None
         self.disagg_prefill_inflight_queue: List[object] = []
         self.disagg_prefill_pending_chunk_rids: Set[str] = set()
+        self.disagg_prefill_drain_releases = []
         self.disagg_decode_transfer_queue = _FakeTransferQueue()
         self.disagg_decode_prealloc_queue = _FakePreallocQueue()
 
 
 class TestDecodeMoveGate(CustomTestCase):
+    def test_failed_destination_hold_blocks_compaction_after_queue_removal(self):
+        scheduler = _FakeScheduler(DisaggregationMode.DECODE)
+        gate = unified_memory_disagg_move_gate(scheduler)
+        scheduler.disagg_decode_transfer_queue.deferred_releases.append(object())
+        self.assertFalse(scheduler.disagg_decode_transfer_queue.queue)
+        self.assertFalse(gate())
+        scheduler.disagg_decode_transfer_queue.deferred_releases.clear()
+        self.assertTrue(gate())
+
     def test_closed_while_destination_published_but_not_queued(self):
         """`pop_preallocated` publishes request A's destination addresses via
         `send_metadata`, then keeps allocating for request B in the same loop;
@@ -85,6 +99,14 @@ class TestDecodeMoveGate(CustomTestCase):
 
 
 class TestPrefillMoveGate(CustomTestCase):
+    def test_retired_source_hold_keeps_compaction_closed(self):
+        scheduler = _FakeScheduler(DisaggregationMode.PREFILL)
+        gate = unified_memory_disagg_move_gate(scheduler)
+        scheduler.disagg_prefill_drain_releases.append((object(), False))
+        self.assertFalse(gate(), "source pages still leased after request retirement")
+        scheduler.disagg_prefill_drain_releases.clear()
+        self.assertTrue(gate())
+
     def test_closed_after_final_chunk_clears_chunked_req(self):
         """Scheduling the final chunk clears `scheduler.chunked_req`, but the
         request only reaches `disagg_prefill_inflight_queue` later in the result

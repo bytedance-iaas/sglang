@@ -296,6 +296,15 @@ class DecodeRequest:
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
     is_rebootstrap: bool = False
+    abort_drain_timeout_reported: bool = False
+    abort_release_failed: bool = False
+    # Deferred-release phase completed count. Data-owner phases (0..4) are
+    # never replayed after an exception with ambiguous side effects. Once phase
+    # 5 is reached, all reusable destination memory has been freed and only
+    # idempotent control-plane cleanup remains; those phases may be retried.
+    abort_release_phase: int = 0
+    abort_release_failed_phase: Optional[str] = None
+    abort_release_control_retry_at: float = 0.0
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -629,6 +638,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
+        if is_rebootstrap:
+            bound_rank = getattr(req, "pd_bound_prefill_dp_rank", None)
+            if type(bound_rank) is not int or bound_rank < 0:
+                message = f"PD rebootstrap has no initialized prefill DP binding for {req.rid}"
+                prepare_abort(
+                    req, message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+                )
+                self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+                return
+
         if is_retracted:
             req.retraction_mb_id = None
             self.retracted_queue.append(req)
@@ -639,14 +658,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             # NOTE: fake transfer does not need to resolve prefill dp rank in the pending queue
             if _is_fake_transfer(req):
-                decode_req.kv_receiver.init(0)
+                self._init_receiver(decode_req, 0)
                 return
 
             # Fast path: cache-only lookup, no network calls
-            prefill_dp_rank = self._resolve_prefill_dp_rank(req)
+            prefill_dp_rank = (
+                req.pd_bound_prefill_dp_rank
+                if is_rebootstrap
+                else self._resolve_prefill_dp_rank(req)
+            )
             logger.debug(f"prefill_dp_rank: {prefill_dp_rank}")
             if prefill_dp_rank is not None:
-                decode_req.kv_receiver.init(prefill_dp_rank)
+                self._init_receiver(decode_req, prefill_dp_rank)
                 return
 
             self.pending_reqs.append(decode_req)
@@ -670,6 +693,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return self._build_decode_prefix_match(req, result)
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
+        if getattr(req, "pd_rebootstrap_in_progress", False):
+            # A recompute must target the actual original binding. A client
+            # hint, room modulo, or a fresh load-aware lookup is not equivalent.
+            return getattr(req, "pd_bound_prefill_dp_rank", None)
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
         # If None, it will go to the slow path and resolve prefill_info by _ensure_prefill_info then cache it
         if prefill_info is None:
@@ -689,6 +716,26 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         return None
 
+    def _init_receiver(self, decode_req: DecodeRequest, prefill_dp_rank: int) -> None:
+        if isinstance(prefill_dp_rank, (bool, np.bool_)) or not isinstance(
+            prefill_dp_rank, (int, np.integer)
+        ):
+            raise ValueError("PD receiver prefill DP binding must be an integer")
+        prefill_dp_rank = int(prefill_dp_rank)
+        if prefill_dp_rank < 0:
+            raise ValueError("PD receiver prefill DP binding must be nonnegative")
+        receiver = decode_req.kv_receiver
+        receiver.init(prefill_dp_rank)
+        # Fake/other backend receivers need not expose prefill_dp_rank, but
+        # init still binds to this exact argument. Common/NIXL expose it.
+        bound_rank = getattr(receiver, "prefill_dp_rank", prefill_dp_rank)
+        if (
+            receiver.conclude_state != KVPoll.Failed
+            and type(bound_rank) is int
+            and bound_rank >= 0
+        ):
+            decode_req.req.pd_bound_prefill_dp_rank = bound_rank
+
     def _create_receiver_and_enqueue(
         self, req: Req, is_rebootstrap: bool = False
     ) -> DecodeRequest:
@@ -702,6 +749,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             bootstrap_addr=_bootstrap_addr(req),
             bootstrap_room=req.bootstrap_room,
         )
+        kv_receiver.transfer_epoch = req.pd_transfer_epoch
 
         decode_req = DecodeRequest(
             req=req, kv_receiver=kv_receiver, is_rebootstrap=is_rebootstrap
@@ -785,6 +833,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.add(req, is_retracted=is_retracted)
 
     def release_memory_occupation(self):
+        # This callback can run before the transfer queue's own callback. Do
+        # not deregister the shared pool while a retired destination is leased.
+        if (
+            self.transfer_queue.queue
+            or self.transfer_queue.has_pending_deferred_releases()
+            or self.has_published_destinations
+        ):
+            raise RuntimeError(
+                "Cannot deregister decode buffers while transfer destinations remain owned"
+            )
         self._cancel_prefill_dp_rank_queries()
         self.queue.clear()
         for req in self.retracted_queue:
@@ -1075,7 +1133,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.pending_reqs = remaining
 
         for decode_req, prefill_dp_rank in resolved:
-            decode_req.kv_receiver.init(prefill_dp_rank)
+            self._init_receiver(decode_req, prefill_dp_rank)
 
     def pop_preallocated(
         self,
@@ -2042,8 +2100,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.deferred_kv_release_timeout = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT.get()
         )
-        # Aborted-mid-transfer requests whose KV pages/slot are held until drained
-        # or timed out. Entries: (decode_req, deadline, metadata_idx, required_acks).
+        # Failed requests hold destinations until drain proof. The deadline is
+        # a recovery alert, never permission to reuse an unproven write target.
+        # Entries: (decode_req, deadline, metadata_idx, required_acks).
         self._deferred_releases: List[Tuple[DecodeRequest, float, int, int]] = []
 
     def add(self, decode_req: DecodeRequest) -> None:
@@ -2077,6 +2136,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
         # Validate bootstrap_room to detect context corruption
         actual_room = output_bootstrap_room[0].item()
+        actual_epoch = output_bootstrap_room[1].item()
         expected_room = (
             decode_req.req.bootstrap_room
             if decode_req.req.bootstrap_room is not None
@@ -2098,6 +2158,23 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 decode_req.req,
                 "Metadata unexpectedly not ready after readiness gate "
                 "(bootstrap_room=0)",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            decode_req.kv_receiver.clear()
+            decode_req.kv_receiver = None
+            return
+        elif actual_epoch != getattr(decode_req.req, "pd_transfer_epoch", 0):
+            error_msg = (
+                f"Stale metadata detected: Request {decode_req.req.rid} "
+                f"(bootstrap_room={expected_room}, epoch="
+                f"{getattr(decode_req.req, 'pd_transfer_epoch', 0)}) "
+                f"received epoch={actual_epoch}. "
+                f"Metadata buffer index: {idx}."
+            )
+            logger.error(error_msg)
+            prepare_abort(
+                decode_req.req,
+                "Metadata transfer epoch mismatch",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
             decode_req.kv_receiver.clear()
@@ -2285,7 +2362,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     except Exception as e:
                         error_message += f" with exception {e}"
                         is_propagated = getattr(e, "is_from_another_rank", False)
-                self._clean_hicache_prefetch_resources(decode_req)
                 # Mute error message for propagated exceptions to avoid duplicate logging
                 if is_propagated:
                     logger.debug(error_message)
@@ -2300,20 +2376,27 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     [decode_req.req],
                     decode_req.req.return_logprob,
                 )
-                if self.scheduler.enable_hisparse:
-                    self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
-                if (
+                receiver = decode_req.kv_receiver
+                requires_drain = (
                     self.enable_deferred_kv_release
-                    and decode_req.kv_receiver.abort_notified
-                ):
-                    # Decode-initiated abort: a prefill write may still target
-                    # these pages, so hold them until the drain ack or timeout.
-                    # (A prefill-initiated failure has already stopped writing ->
-                    # immediate release below.)
+                    and getattr(
+                        receiver.kv_mgr, "enable_deferred_decode_kv_release", False
+                    )
+                    and receiver.requires_abort_drain()
+                )
+                if requires_drain:
+                    # P/transport/restore failures can leave sibling writes in
+                    # flight too. Notification failure never proves quiescence.
+                    receiver.ensure_abort_notified(force_arm=True)
                     self._defer_release(decode_req)
                     deferred_indices.add(i)
                     indices_to_remove.add(i)
                 else:
+                    self._clean_hicache_prefetch_resources(decode_req)
+                    if self.scheduler.enable_hisparse:
+                        self.scheduler.hisparse_coordinator.request_finished(
+                            decode_req.req
+                        )
                     # release pre-allocated kv cache, but don't insert into the tree since it's failed
                     release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                     decode_req.kv_receiver.clear()
@@ -2382,63 +2465,173 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         deadline = time.monotonic() + self.deferred_kv_release_timeout
         # Require an ack from every notified prefill rank (dummy-proof). Snapshot
         # now -- the receiver may be cleared by resolve time.
-        required_acks = len(decode_req.kv_receiver.bootstrap_infos)
+        # Missing notification targets must not make zero ACKs prove safety.
+        required_acks = max(
+            1, len(getattr(decode_req.kv_receiver, "bootstrap_infos", None) or ())
+        )
         self._deferred_releases.append(
             (decode_req, deadline, decode_req.metadata_buffer_index, required_acks)
         )
 
     def _do_release(self, decode_req: DecodeRequest, idx: int) -> None:
         room = decode_req.req.bootstrap_room
-        if self.enable_staging and self.staging_handler.is_staging_room(room):
-            self.staging_handler.unregister_decode_req(room)
-        # release pre-allocated kv cache, but don't insert into the tree since it's failed
-        release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
-        self.metadata_buffers.bootstrap_room[idx] = 0
-        self.req_to_metadata_buffer_idx_allocator.free(idx)
-        decode_req.kv_receiver.kv_mgr.clear_deferred_abort_state(room)
-        decode_req.kv_receiver.clear()
-        decode_req.kv_receiver = None
+        phase = getattr(decode_req, "abort_release_phase", 0)
+
+        if phase == 0:
+            if self.enable_staging and self.staging_handler.is_staging_room(room):
+                self.staging_handler.unregister_decode_req(room)
+            decode_req.abort_release_phase = phase = 1
+
+        if phase == 1:
+            self._clean_hicache_prefetch_resources(decode_req)
+            decode_req.abort_release_phase = phase = 2
+
+        if phase == 2:
+            if self.scheduler.enable_hisparse:
+                self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
+            decode_req.abort_release_phase = phase = 3
+
+        if phase == 3:
+            # Release pre-allocated KV without inserting it into the tree. The
+            # Req's holds_kv/is_kv_released state is the postcondition, but an
+            # exception before that postcondition is ambiguous and quarantined.
+            release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+            decode_req.abort_release_phase = phase = 4
+
+        if phase == 4:
+            self.metadata_buffers.bootstrap_room[idx] = 0
+            self.req_to_metadata_buffer_idx_allocator.free(idx)
+            decode_req.abort_release_phase = phase = 5
+
+        # Phase >=5: reusable data destinations are already released. The
+        # remaining operations only retire protocol state and are designed to
+        # be idempotent, so a later exception resumes here, never at KV free.
+        receiver = decode_req.kv_receiver
+        if phase == 5:
+            notify_released = getattr(
+                receiver.kv_mgr, "register_abort_released_notice", None
+            )
+            if callable(notify_released):
+                notify_released(receiver)
+            decode_req.abort_release_phase = phase = 6
+
+        if phase == 6:
+            receiver.kv_mgr.clear_deferred_abort_state(
+                room,
+                generation=getattr(receiver, "_abort_generation", None),
+                transfer_epoch=getattr(receiver, "transfer_epoch", 0),
+            )
+            decode_req.abort_release_phase = phase = 7
+
+        if phase == 7:
+            receiver.clear()
+            decode_req.abort_release_phase = 8
+            decode_req.abort_release_failed_phase = None
+            decode_req.abort_release_control_retry_at = 0.0
+            decode_req.kv_receiver = None
 
     def has_pending_deferred_releases(self) -> bool:
         return bool(self._deferred_releases)
 
     def resolve_deferred_releases(self) -> None:
-        """Release held requests once every prefill rank acks the drain, or the
-        hold times out."""
+        """Release on drain proof; a deadline reports failure, not inert writes."""
+        prealloc_queue = getattr(self.scheduler, "disagg_decode_prealloc_queue", None)
+        retry_released = getattr(
+            getattr(prealloc_queue, "kv_manager", None),
+            "retry_abort_released_notices",
+            None,
+        )
+        if callable(retry_released):
+            retry_released()
         if not self._deferred_releases:
             return
         now = time.monotonic()
         still_held = []
         to_release = []
         for decode_req, deadline, idx, required_acks in self._deferred_releases:
+            if decode_req.abort_release_failed:
+                # An earlier release raised after an unknown subset of frees.
+                # Preserve the owner record, but do not blindly replay frees.
+                still_held.append((decode_req, deadline, idx, required_acks))
+                continue
+            phase = getattr(decode_req, "abort_release_phase", 0)
+            if phase >= 5:
+                if now < getattr(decode_req, "abort_release_control_retry_at", 0.0):
+                    still_held.append((decode_req, deadline, idx, required_acks))
+                else:
+                    to_release.append(
+                        (
+                            decode_req,
+                            deadline,
+                            idx,
+                            required_acks,
+                            decode_req.req.bootstrap_room,
+                        )
+                    )
+                continue
             room = decode_req.req.bootstrap_room
             kv_mgr = decode_req.kv_receiver.kv_mgr
-            drained = kv_mgr.is_abort_release_safe(room, required_acks)
-            if not drained and now < deadline:
+            drained = kv_mgr.is_abort_release_safe(
+                room,
+                required_acks,
+                generation=getattr(decode_req.kv_receiver, "_abort_generation", None),
+                transfer_epoch=getattr(decode_req.kv_receiver, "transfer_epoch", 0),
+            )
+            if not drained:
                 still_held.append((decode_req, deadline, idx, required_acks))
+                if now >= deadline and not decode_req.abort_drain_timeout_reported:
+                    decode_req.abort_drain_timeout_reported = True
+                    logger.error(
+                        "Deferred KV release timed out without drain proof "
+                        "room=%s timeout=%ss; retaining destinations until "
+                        "transport-backed recovery (elapsed time is not quiescence)",
+                        room,
+                        self.deferred_kv_release_timeout,
+                    )
             else:
-                to_release.append((decode_req, idx, room, drained))
+                to_release.append((decode_req, deadline, idx, required_acks, room))
         # Commit the survivors before releasing so a _do_release exception can't
         # leave a released entry in the list (double-free / None receiver on retry).
         self._deferred_releases = still_held
-        for decode_req, idx, room, drained in to_release:
-            if not drained:
-                logger.warning(
-                    f"Deferred KV release for room {room} timed out after "
-                    f"{self.deferred_kv_release_timeout}s without a full drain "
-                    f"ack from prefill; releasing anyway."
-                )
+        for decode_req, deadline, idx, required_acks, room in to_release:
             try:
                 self._do_release(decode_req, idx)
             except Exception:
-                # Isolate a failed release so the rest still run; entry already dropped.
-                logger.exception(f"Deferred KV release failed for room {room}")
+                phase = getattr(decode_req, "abort_release_phase", 0)
+                phase_names = (
+                    "staging",
+                    "hicache",
+                    "hisparse",
+                    "kv",
+                    "metadata",
+                    "release_notice",
+                    "abort_tracker",
+                    "receiver",
+                )
+                decode_req.abort_release_failed_phase = phase_names[min(phase, 7)]
+                # Data-owner steps can have unknown side effects on exception;
+                # quarantine and never replay them. Control-only cleanup begins
+                # after metadata phase 5 and is safe to retry from its checkpoint.
+                decode_req.abort_release_failed = phase < 5
+                if not decode_req.abort_release_failed:
+                    decode_req.abort_release_control_retry_at = time.monotonic() + 1.0
+                self._deferred_releases.append(
+                    (decode_req, deadline, idx, required_acks)
+                )
+                logger.exception(
+                    "Deferred KV release failed room=%s phase=%s retryable=%s",
+                    room,
+                    decode_req.abort_release_failed_phase,
+                    not decode_req.abort_release_failed,
+                )
 
     def release_memory_occupation(self):
         """Clean up in-flight transfers before releasing GPU memory."""
-        self.queue.clear()
-        # Pool is being torn down; drop held entries without per-request release.
-        self._deferred_releases.clear()
+        if self.queue or self._deferred_releases:
+            raise RuntimeError(
+                "Cannot release decode memory while transfer destinations remain owned"
+            )
+        # No destination owner remains; empty queues need no per-request free.
 
     def resume_memory_occupation(self):
         """Queues are already cleared on release; new transfers can be accepted."""
@@ -2459,6 +2652,7 @@ class SchedulerDisaggregationDecodeMixin:
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                self.disagg_decode_transfer_queue.resolve_deferred_releases()
                 continue
             self.process_decode_queue()
 
@@ -2502,6 +2696,7 @@ class SchedulerDisaggregationDecodeMixin:
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                self.disagg_decode_transfer_queue.resolve_deferred_releases()
                 continue
             self.process_decode_queue()
 
@@ -2671,8 +2866,8 @@ class SchedulerDisaggregationDecodeMixin:
         if get_disagg().disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.check_offload_progress()
 
-        # Resolve held releases every iteration (before the retraction/polling
-        # gates below) so their timeouts fire under memory pressure.
+        # Resolve held releases before retraction/polling even under memory
+        # pressure. Expired holds report failure; only drain proof frees pages.
         self.disagg_decode_transfer_queue.resolve_deferred_releases()
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps

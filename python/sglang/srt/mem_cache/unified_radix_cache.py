@@ -990,18 +990,21 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params.value = values
         result = self.insert(insert_params)
 
-        # Match prefix. SWA insertion retains one extra window before the
-        # page-aligned boundary, so the normal match remains safe to repoint.
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key, req=req))
-        new_indices = match_result.device_indices
-        new_last_node = match_result.last_device_node
+        # The insert result owns the whole page-aligned path. A normal match
+        # can stop earlier (SWA's live tail or a session answer), leaving rows
+        # tree-owned but request-unprotected. Repoint from the canonical insert
+        # path instead; see SGLang #40857.
+        new_last_node = result.last_device_node
+        new_indices = self.tree_core.collect_full_device_indices(
+            new_last_node, self.root_node_handle()
+        )
         new_prefix_len = result.prefix_len
         assert (
             req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1
         ), f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
-        assert new_prefix_len <= len(
-            new_indices
-        ), f"{new_prefix_len=}, {len(new_indices)=}"
+        assert (
+            new_prefix_len <= len(new_indices) and len(new_indices) == page_aligned_len
+        ), f"{new_prefix_len=}, {len(new_indices)=}, {page_aligned_len=}"
         self.req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
             new_indices[req.kv.cache_protected_len :],
@@ -1035,7 +1038,7 @@ class UnifiedRadixCache(BasePrefixCache):
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
         # carry the skip set so this node's dec releases only what we locked
         req.skip_lock_node_ids = lock_result.skip_lock_node_ids
-        # The rematch acquired a new SWA prefix lock.
+        # The canonical inserted path acquired a new SWA prefix lock.
         req.swa_prefix_lock_released = False
 
         # cleanup

@@ -100,6 +100,19 @@ def _nixl_device_id(mem_kind: str, gpu_id: int) -> int:
     return gpu_id if mem_kind == "VRAM" else 0
 
 
+def _wire_attempt(room: int, transfer_epoch: int) -> str:
+    return f"{room}:{transfer_epoch}"
+
+
+def _parse_wire_attempt(value: str) -> Tuple[int, int]:
+    room_text, separator, epoch_text = value.partition(":")
+    room = int(room_text)
+    transfer_epoch = int(epoch_text) if separator else 0
+    if room < 0 or transfer_epoch < 0:
+        raise ValueError("Negative NIXL notification attempt")
+    return room, transfer_epoch
+
+
 def _homogeneous_kv_mem_kind(kinds: List[str], context: str) -> str:
     unique = set(kinds)
     if len(unique) != 1:
@@ -165,6 +178,7 @@ class TransferInfo:
     dst_state_indices: List[List[int]]
     decode_prefix_len: Optional[int] = None  # for decode radix cache
     is_dummy_rank: Optional[bool] = None
+    transfer_epoch: int = 0
     # NOTE: optional staging field; populated via STAGING_RSP. Keep at the
     # end so positional construction in from_zmq() continues to work.
     staging: Optional[StagingTransferInfo] = None
@@ -203,7 +217,20 @@ class TransferInfo:
                 if len(msg) > 9 and msg[9] != b""
                 else None
             ),
+            transfer_epoch=(
+                int(msg[10].decode("ascii")) if len(msg) > 10 and msg[10] != b"" else 0
+            ),
         )
+
+
+@dataclasses.dataclass
+class NixlTransferKVChunk(TransferKVChunk):
+    # Capture the destination objects when the source lease is enqueued.
+    # GUARD may replace the room map before a worker dequeues or retries this
+    # chunk. Keep the old objects (including their live staging allocation),
+    # never retarget old source pages through the current room map.
+    transfer_infos: Optional[Tuple[TransferInfo, ...]] = None
+    transfer_epoch: int = 0
 
 
 @dataclasses.dataclass
@@ -377,6 +404,15 @@ class TransferStatus:
     received_kv_parts_per_pp: Optional[Dict[Tuple[int, int], Set[int]]] = None
     expected_kv_parts_per_pp: Optional[Dict[Tuple[int, int], int]] = None
 
+
+@dataclasses.dataclass
+class AbortReleaseNotice:
+    generation: str
+    decode_ip: str
+    decode_port: int
+    targets: Dict[int, Dict]
+    received: Set[int] = dataclasses.field(default_factory=set)
+
     def is_done(self):
         if self.num_pp_ranks_expected is None or not self.received_aux:
             return False
@@ -404,6 +440,25 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ):
+        self._source_lease_lock = threading.RLock()
+        # Keep generation-aware ACK state separate from the legacy common
+        # protocol. Do not clear source handles/counts on a new room lifecycle.
+        self._generation_ack_targets: Dict[
+            Tuple[int, int], Dict[Tuple[str, int], str]
+        ] = {}
+        self._abort_generations: Dict[
+            Tuple[int, int], Tuple[str, Set[int], Optional[frozenset[int]]]
+        ] = {}
+        # Decode metadata may arrive before its matching prefill sender. Keep
+        # attempts separate until the sender activates the exact epoch.
+        self._transfer_infos_by_attempt: Dict[
+            Tuple[int, int], Dict[str, TransferInfo]
+        ] = {}
+        self._active_transfer_epochs: Dict[int, int] = {}
+        self._decode_transfer_epochs: Dict[int, int] = {}
+        self._aborted_transfer_attempts: Dict[Tuple[int, int], Set[str]] = {}
+        self._released_transfer_attempts: Dict[Tuple[int, int], Set[str]] = {}
+        self._abort_release_notices: Dict[Tuple[int, int], AbortReleaseNotice] = {}
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.transfer_source_rank = (
             self.kv_args.pp_rank * get_parallel().tp_size + self.kv_args.engine_rank
@@ -493,6 +548,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             # Per-room count of chunks not yet transferred; teardown waits for
             # zero so a deferred chunk is not dropped by an early conclude.
             self._staging_outstanding = defaultdict(int)
+            # ERR is not a transport-quiescence proof. Keep handles alive and
+            # their group counted until reclamation has an explicit proof.
+            # SGLang #36707; do not release an unresolved NIXL handle here.
+            self._failed_transfer_handles: Dict[int, List[Any]] = defaultdict(list)
+            # Each transfer worker owns its posting lease; helpers may raise
+            # before returning a handle, including halfway through a mixed send.
+            self._transfer_worker_context = threading.local()
+            self._source_buffer_quarantined_workers: Set[int] = set()
             # Mirror mooncake: one staging buffer per worker queue, all
             # built before workers spawn so each worker owns a private
             # buffer (no cross-worker contention on the staging ring).
@@ -599,12 +662,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 if msg[0] == b"STAGING_REQ":
                     self._handle_staging_req(msg)
                     continue
-                if msg[0] == b"ABORT_ACK":
-                    # Drain ack for an aborted room; aggregate per prefill rank.
-                    if len(msg) >= 3:
-                        self.note_abort_ack(
-                            int(msg[1].decode("ascii")), int(msg[2].decode("ascii"))
-                        )
+                if self.handle_abort_ack_message(msg):
+                    continue
+                if self.handle_abort_released_ack_message(msg):
                     continue
                 logger.warning(
                     "decode_listener_thread: unexpected message tag %s",
@@ -613,7 +673,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
         threading.Thread(target=decode_listener_thread, daemon=True).start()
 
-    def _prefetch_staging_reqs(self, room: int):
+    def _prefetch_staging_reqs(self, room: int, transfer_epoch: int = 0):
         """Send STAGING_REQ for all chunks before the prefill forward starts.
 
         Idempotent per room: the first call for a given room does the full
@@ -623,7 +683,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         """
         if not self.enable_staging or self.kv_buffer_tensors is None:
             return
-        if room in self._staging_ctx.prefetched_rooms:
+        attempt = self._attempt_key(room, transfer_epoch)
+        if attempt in self._staging_ctx.prefetched_rooms:
             return
 
         room_infos = self.transfer_infos.get(room, {})
@@ -636,7 +697,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not needs_staging:
             # Mark anyway so we don't re-evaluate the predicate every chunk.
-            self._staging_ctx.prefetched_rooms.add(room)
+            self._staging_ctx.prefetched_rooms.add(attempt)
             return
 
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -650,17 +711,19 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             get_schedule().chunked_prefill_size,
             self._staging_ctx.prefetch_requested,
             self._staging_ctx.prefetch_sockets,
+            transfer_epoch=transfer_epoch,
         )
-        self._staging_ctx.prefetched_rooms.add(room)
+        self._staging_ctx.prefetched_rooms.add(attempt)
 
     def check_status(self, bootstrap_room: int):
         return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
         # Keep Failed sticky until the sender clears the room.
-        if self.request_status.get(bootstrap_room) == KVPoll.Failed:
-            return
-        super().update_status(bootstrap_room, status)
+        with self._source_lease_lock:
+            if self.request_status.get(bootstrap_room) == KVPoll.Failed:
+                return
+            super().update_status(bootstrap_room, status)
 
     def _prep_equal_tp_dlist(
         self,
@@ -1079,6 +1142,429 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 dst_mem_kind=dst_mem_kind,
             )
 
+    def has_pending_source_reads(
+        self, room: int, transfer_epoch: Optional[int] = None
+    ) -> bool:
+        # Failed groups remain counted: an ERR is not proof of an inert read.
+        with self._source_lease_lock:
+            if transfer_epoch is not None:
+                keys = (self._attempt_key(room, transfer_epoch),)
+                if transfer_epoch == 0 and room not in getattr(
+                    self, "_active_transfer_epochs", {}
+                ):
+                    keys += (room,)
+            else:
+                keys = tuple(
+                    key
+                    for key in set(self._staging_outstanding)
+                    | set(self._failed_transfer_handles)
+                    if key == room
+                    or (isinstance(key, tuple) and len(key) == 2 and key[0] == room)
+                )
+            return any(
+                self._staging_outstanding.get(key, 0) > 0
+                or bool(self._failed_transfer_handles.get(key))
+                for key in keys
+            )
+
+    @staticmethod
+    def _attempt_key(room: int, transfer_epoch: int) -> Tuple[int, int]:
+        if type(room) is not int or type(transfer_epoch) is not int:
+            raise ValueError("NIXL transfer attempt coordinates must be integers")
+        if room < 0 or transfer_epoch < 0:
+            raise ValueError("NIXL transfer attempt coordinates must be nonnegative")
+        return room, transfer_epoch
+
+    def activate_transfer_attempt(self, room: int, transfer_epoch: int) -> bool:
+        """Bind a prefill sender to only its matching early/late GUARD set."""
+        attempt = self._attempt_key(room, transfer_epoch)
+        with self._source_lease_lock:
+            active_epochs = getattr(self, "_active_transfer_epochs", None)
+            if active_epochs is None:
+                active_epochs = self._active_transfer_epochs = {}
+            attempt_infos_table = getattr(self, "_transfer_infos_by_attempt", None)
+            if attempt_infos_table is None:
+                attempt_infos_table = self._transfer_infos_by_attempt = {}
+            aborted_attempts = getattr(self, "_aborted_transfer_attempts", None)
+            if aborted_attempts is None:
+                aborted_attempts = self._aborted_transfer_attempts = {}
+            if attempt in aborted_attempts:
+                attempt_infos_table.pop(attempt, None)
+                self.record_failure(
+                    room,
+                    f"NIXL transfer attempt room={room} epoch={transfer_epoch} "
+                    "was aborted before sender activation",
+                )
+                self.update_status(room, KVPoll.Failed)
+                return False
+            active_epoch = active_epochs.get(room)
+            if active_epoch is not None and active_epoch != transfer_epoch:
+                if transfer_epoch < active_epoch:
+                    # A delayed recompute/request cannot roll the room view
+                    # back after a newer incarnation became active. Reject only
+                    # this stale sender; do not poison the current room status.
+                    logger.warning(
+                        "Rejecting stale NIXL sender room=%s epoch=%s active=%s",
+                        room,
+                        transfer_epoch,
+                        active_epoch,
+                    )
+                    return False
+                active_attempt = self._attempt_key(room, active_epoch)
+                if self._staging_outstanding.get(active_attempt, 0) > 0 or bool(
+                    self._failed_transfer_handles.get(active_attempt)
+                ):
+                    self.record_failure(
+                        room,
+                        f"NIXL transfer epoch {transfer_epoch} cannot replace live "
+                        f"epoch {active_epoch} for room {room}",
+                    )
+                    self.update_status(room, KVPoll.Failed)
+                    return False
+                # The old attempt is quiescent. Detach its room-level view
+                # before the new sender can observe it; the attempt table owns
+                # the old descriptors until its sender clears them.
+                self.transfer_infos.pop(room, None)
+                self.req_to_decode_prefix_len.pop(room, None)
+                self.request_status[room] = KVPoll.Bootstrapping
+                attempt_infos_table.pop(active_attempt, None)
+            active_epochs[room] = transfer_epoch
+            for key in tuple(aborted_attempts):
+                if key[0] == room and key[1] < transfer_epoch:
+                    aborted_attempts.pop(key, None)
+            released_attempts = getattr(self, "_released_transfer_attempts", {})
+            for key in tuple(released_attempts):
+                if key[0] == room and key[1] < transfer_epoch:
+                    released_attempts.pop(key, None)
+            infos = attempt_infos_table.get(attempt)
+            if infos:
+                self.transfer_infos[room] = infos
+                required = next(iter(infos.values())).required_dst_info_num
+                if len(infos) == required:
+                    self.resolve_kv_replica_factor(infos)
+                    self.req_to_decode_prefix_len[room] = next(
+                        (
+                            info.decode_prefix_len
+                            for info in infos.values()
+                            if info.decode_prefix_len is not None
+                        ),
+                        0,
+                    )
+                    self.update_status(room, KVPoll.WaitingForInput)
+            return True
+
+    def register_deferred_abort_room(
+        self,
+        bootstrap_room: int,
+        expected_ranks: Optional[Set[int]] = None,
+        transfer_epoch: int = 0,
+    ) -> str:
+        attempt = self._attempt_key(bootstrap_room, transfer_epoch)
+        with self._source_lease_lock:
+            if attempt in self._abort_generations:
+                # A different receiver cannot replace a live room hold, even
+                # when its ACK set is complete but owner release is unfinished.
+                raise RuntimeError(
+                    f"NIXL abort room already has a destination owner room={bootstrap_room}"
+                )
+            # Decimal wire form remains parseable by upstream's integer
+            # generation codec. A fresh UUID also separates manager restarts.
+            generation = str(uuid.uuid4().int)
+            expected = (
+                frozenset(expected_ranks)
+                if expected_ranks
+                and all(type(rank) is int and rank >= 0 for rank in expected_ranks)
+                else None
+            )
+            self._abort_generations[attempt] = (generation, set(), expected)
+            return generation
+
+    def note_abort_ack(
+        self,
+        bootstrap_room: int,
+        prefill_rank: int,
+        generation: Optional[str] = None,
+        transfer_epoch: int = 0,
+    ) -> None:
+        attempt = self._attempt_key(bootstrap_room, transfer_epoch)
+        with self._source_lease_lock:
+            state = self._abort_generations.get(attempt)
+            if (
+                type(prefill_rank) is int
+                and prefill_rank >= 0
+                and generation is not None
+                and state is not None
+                and state[0] == generation
+                and state[2] is not None
+                and prefill_rank in state[2]
+            ):
+                state[1].add(prefill_rank)
+
+    def is_abort_release_safe(
+        self,
+        bootstrap_room: int,
+        required_acks: int,
+        generation: Optional[str] = None,
+        transfer_epoch: int = 0,
+    ) -> bool:
+        attempt = self._attempt_key(bootstrap_room, transfer_epoch)
+        with self._source_lease_lock:
+            state = self._abort_generations.get(attempt)
+            return bool(
+                generation is not None
+                and state is not None
+                and state[0] == generation
+                and state[2] is not None
+                and required_acks == len(state[2]) > 0
+                and state[2].issubset(state[1])
+            )
+
+    def clear_deferred_abort_state(
+        self,
+        bootstrap_room: int,
+        generation: Optional[str] = None,
+        transfer_epoch: int = 0,
+    ) -> None:
+        attempt = self._attempt_key(bootstrap_room, transfer_epoch)
+        with self._source_lease_lock:
+            state = self._abort_generations.get(attempt)
+            if state is not None and generation is not None and state[0] == generation:
+                self._abort_generations.pop(attempt)
+
+    def handle_abort_ack_message(self, msg: List[bytes]) -> bool:
+        if not msg or msg[0] != b"ABORT_ACK":
+            return False
+        if not self.enable_deferred_decode_kv_release:
+            return True
+        # Generation-less peers cannot prove this receiver's pages safe. Keep
+        # the hold; never fall back to the old count or timeout-based release.
+        if len(msg) not in (4, 5):
+            return True
+        try:
+            room, rank = int(msg[1].decode("ascii")), int(msg[2].decode("ascii"))
+            generation = msg[3].decode("ascii")
+            transfer_epoch = int(msg[4].decode("ascii")) if len(msg) == 5 else 0
+            if not generation.isdecimal() or len(generation) > 39:
+                return True
+        except (ValueError, UnicodeDecodeError):
+            return True
+        if rank >= 0:
+            self.note_abort_ack(room, rank, generation, transfer_epoch)
+        return True
+
+    def handle_abort_released_ack_message(self, msg: List[bytes]) -> bool:
+        if not msg or msg[0] != b"ABORT_RELEASED_ACK":
+            return False
+        if len(msg) != 5:
+            return True
+        try:
+            room = int(msg[1].decode("ascii"))
+            rank = int(msg[2].decode("ascii"))
+            generation = msg[3].decode("ascii")
+            transfer_epoch = int(msg[4].decode("ascii"))
+            attempt = self._attempt_key(room, transfer_epoch)
+        except (ValueError, UnicodeDecodeError):
+            return True
+        with self._source_lease_lock:
+            notice = self._abort_release_notices.get(attempt)
+            if (
+                notice is not None
+                and notice.generation == generation
+                and rank in notice.targets
+            ):
+                notice.received.add(rank)
+                if notice.received.issuperset(notice.targets):
+                    self._abort_release_notices.pop(attempt, None)
+        return True
+
+    def register_abort_released_notice(self, receiver) -> None:
+        generation = getattr(receiver, "_abort_generation", None)
+        if generation is None:
+            return
+        targets: Dict[int, Dict] = {}
+        for info in getattr(receiver, "bootstrap_infos", None) or ():
+            rank = info.get("abort_ack_rank")
+            if type(rank) is not int or rank < 0 or rank in targets:
+                logger.error(
+                    "Cannot confirm ABORT_RELEASED without unique sender ranks "
+                    "room=%s epoch=%s",
+                    receiver.bootstrap_room,
+                    receiver.transfer_epoch,
+                )
+                return
+            targets[rank] = info
+        if not targets:
+            return
+        attempt = self._attempt_key(receiver.bootstrap_room, receiver.transfer_epoch)
+        with self._source_lease_lock:
+            existing = self._abort_release_notices.get(attempt)
+            if existing is not None and existing.generation != generation:
+                logger.error(
+                    "Conflicting ABORT_RELEASED generation attempt=%s", attempt
+                )
+                return
+            self._abort_release_notices[attempt] = AbortReleaseNotice(
+                generation=generation,
+                decode_ip=self.local_ip,
+                decode_port=self.rank_port,
+                targets=targets,
+                received=(existing.received if existing is not None else set()),
+            )
+        self.retry_abort_released_notices()
+
+    def retry_abort_released_notices(self) -> None:
+        with self._source_lease_lock:
+            notices = list(self._abort_release_notices.items())
+        for (room, transfer_epoch), notice in notices:
+            for rank, info in notice.targets.items():
+                if rank in notice.received:
+                    continue
+                try:
+                    sock, lock = CommonKVReceiver._connect_to_bootstrap_server(info)
+                    with lock:
+                        sock.send_multipart(
+                            [
+                                b"ABORT_RELEASED",
+                                str(room).encode("ascii"),
+                                notice.decode_ip.encode("ascii"),
+                                str(notice.decode_port).encode("ascii"),
+                                notice.generation.encode("ascii"),
+                                str(transfer_epoch).encode("ascii"),
+                            ]
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "ABORT_RELEASED send failed room=%s epoch=%s rank=%s: %s",
+                        room,
+                        transfer_epoch,
+                        rank,
+                        e,
+                    )
+
+    def _send_generation_abort_ack(
+        self,
+        decode_ip: str,
+        decode_port: int,
+        room: int,
+        generation: str,
+        transfer_epoch: int,
+    ) -> None:
+        from sglang.srt.utils.network import NetworkAddress
+
+        na = NetworkAddress(decode_ip, decode_port)
+        self._send_multipart_locked(
+            na.to_tcp(),
+            [
+                b"ABORT_ACK",
+                str(room).encode("ascii"),
+                str(self._prefill_unique_rank()).encode("ascii"),
+                generation.encode("ascii"),
+                str(transfer_epoch).encode("ascii"),
+            ],
+            is_ipv6=na.is_ipv6,
+        )
+
+    def retry_drained_abort_acks(self) -> None:
+        # Called from the P scheduler, including paused/idle hold resolution.
+        # A successful transport send can still be lost; this only retries
+        # sends that raised, not a claim of reliable ACK delivery.
+        with self._source_lease_lock:
+            for room, transfer_epoch in list(self._generation_ack_targets):
+                self._maybe_ack_drained_abort(room, transfer_epoch)
+
+    def _maybe_ack_drained_abort(self, room: int, transfer_epoch: int = 0) -> None:
+        # A skipped/requeued chunk cannot turn a retained ERR/unknown handle
+        # into proof of quiescence merely by decrementing the room counter.
+        with self._source_lease_lock:
+            if self.has_pending_source_reads(room, transfer_epoch):
+                return
+            if transfer_epoch == 0:
+                super()._maybe_ack_drained_abort(room)
+            # Iterate a snapshot. Remove each target only after its send
+            # succeeds; one failed endpoint must not discard its siblings.
+            attempt = self._attempt_key(room, transfer_epoch)
+            targets = self._generation_ack_targets.get(attempt, {})
+            for endpoint, generation in list(targets.items()):
+                try:
+                    self._send_generation_abort_ack(
+                        *endpoint, room, generation, transfer_epoch
+                    )
+                except Exception as e:
+                    logger.warning("NIXL drain ACK send failed room=%s: %s", room, e)
+                else:
+                    targets.pop(endpoint, None)
+            if not targets:
+                self._generation_ack_targets.pop(attempt, None)
+
+    def register_deferred_ack_target(
+        self,
+        room: int,
+        decode_ip: str,
+        decode_port: int,
+        generation: Optional[str] = None,
+        transfer_epoch: int = 0,
+    ) -> None:
+        with self._source_lease_lock:
+            if generation is None:
+                super().register_deferred_ack_target(room, decode_ip, decode_port)
+            else:
+                attempt = self._attempt_key(room, transfer_epoch)
+                targets = self._generation_ack_targets.setdefault(attempt, {})
+                endpoint = (decode_ip, decode_port)
+                previous = targets.get(endpoint)
+                if previous is not None and previous != generation:
+                    # No ordered source lifecycle accompanies these tokens.
+                    # Refuse ambiguous replacement rather than echo a stale
+                    # ABORT as proof for a new destination owner.
+                    raise RuntimeError(f"NIXL conflicting abort generation room={room}")
+                targets[endpoint] = generation
+
+    def _post_transfer(self, handle):
+        context = getattr(self, "_transfer_worker_context", None)
+        posted = getattr(context, "posted_handles", None)
+        if posted is not None:
+            # Keep ownership before the backend call, which may partially post
+            # then raise. Neither an exception nor ERR proves quiescence.
+            posted.append(handle)
+        status = self.agent.transfer(handle)
+        if status == "DONE" and posted is not None:
+            context.done_handles.append(handle)
+        return status
+
+    def _count_source_chunk(self, chunk: TransferKVChunk) -> None:
+        with self._source_lease_lock:
+            if not chunk.staging_counted:
+                key = self._chunk_attempt_key(chunk)
+                self._staging_outstanding[key] += 1
+                chunk.staging_counted = True
+
+    def _finish_counted_chunk(self, chunk: TransferKVChunk) -> None:
+        """Remove only this chunk's contribution; never erase a live sibling."""
+        with self._source_lease_lock:
+            if not chunk.staging_counted:
+                return
+            key = self._chunk_attempt_key(chunk)
+            count = self._staging_outstanding.get(key, 0)
+            if count <= 0:
+                raise RuntimeError(
+                    f"Missing NIXL chunk accounting room={chunk.room} key={key}"
+                )
+            chunk.staging_counted = False
+            if count == 1:
+                self._staging_outstanding.pop(key, None)
+            else:
+                self._staging_outstanding[key] = count - 1
+
+    def _chunk_attempt_key(self, chunk: TransferKVChunk):
+        # Legacy direct fixtures construct TransferKVChunk and retain the old
+        # room-only accounting. Every production enqueue creates the NIXL
+        # subtype and therefore gets epoch-isolated ownership.
+        if isinstance(chunk, NixlTransferKVChunk) and chunk.room in getattr(
+            self, "_active_transfer_epochs", {}
+        ):
+            return self._attempt_key(chunk.room, chunk.transfer_epoch)
+        return chunk.room
+
     def transfer_worker(self, queue: FastQueue, staging_buffer=None, worker_index=0):
         # Per-worker staging strategy: lazy-created on first chunk so we
         # see kv_buffer_tensors (set by ModelRunner after engine init).
@@ -1088,40 +1574,63 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         while True:
             kv_chunk: TransferKVChunk = queue.get()
             room = kv_chunk.room
+            transfer_epoch = getattr(kv_chunk, "transfer_epoch", 0)
+            wire_attempt = _wire_attempt(room, transfer_epoch)
             handles: List[Any] = []
+            done_handles: List[Any] = []
+            posted_handles: List[Any] = []
+            self._transfer_worker_context.posted_handles = posted_handles
+            self._transfer_worker_context.done_handles = done_handles
             try:
+                # A deferred chunk carries its count across re-enqueue. Count
+                # fresh chunks before every skip, including a cleared room.
+                self._count_source_chunk(kv_chunk)
                 if room not in self.request_status:
                     logger.debug(
                         "Skipping chunk for room %s because it has been cleared",
                         room,
                     )
-                    self._staging_outstanding.pop(room, None)
+                    self._finish_counted_chunk(kv_chunk)
+                    if self.enable_deferred_decode_kv_release:
+                        self._maybe_ack_drained_abort(room, transfer_epoch)
                     continue
 
-                # Counted at dequeue, before the status check, so
-                # `outstanding == 0` means nothing is dequeued or in flight --
-                # the predicate the abort ack relies on. The flag survives
-                # re-enqueue on defer.
-                if not kv_chunk.staging_counted:
-                    self._staging_outstanding[room] += 1
-                    kv_chunk.staging_counted = True
-
+                # Counted before enqueue (or above for legacy direct fixtures),
+                # so zero excludes queued and posted work. Defer keeps the same
+                # contribution until the chunk drains or is skipped.
                 if self.check_status(room) == KVPoll.Failed:
-                    self._staging_outstanding.pop(room, None)
+                    self._finish_counted_chunk(kv_chunk)
                     if self.enable_deferred_decode_kv_release:
                         # Skipped => nothing written for this aborted room; ack.
-                        self._maybe_ack_drained_abort(room)
+                        self._maybe_ack_drained_abort(room, transfer_epoch)
                     continue
 
-                room_transfer_infos = self.transfer_infos.get(room)
-                if room_transfer_infos is None:
+                reqs_to_be_processed = getattr(kv_chunk, "transfer_infos", None)
+                if reqs_to_be_processed is None:
+                    # Compatibility with legacy direct worker fixtures. All
+                    # production NIXL enqueue paths supply the bound snapshot.
+                    room_transfer_infos = self.transfer_infos.get(room)
+                    reqs_to_be_processed = (
+                        tuple(room_transfer_infos.values())
+                        if room_transfer_infos is not None
+                        else None
+                    )
+                if reqs_to_be_processed is None:
                     logger.debug(
                         "Skipping chunk for room %s because its transfer metadata "
                         "has been cleared",
                         room,
                     )
-                    self._staging_outstanding.pop(room, None)
+                    self._finish_counted_chunk(kv_chunk)
+                    if self.enable_deferred_decode_kv_release:
+                        self._maybe_ack_drained_abort(room, transfer_epoch)
                     continue
+
+                if worker_index in self._source_buffer_quarantined_workers:
+                    raise RuntimeError(
+                        f"NIXL worker source buffer is quarantined worker={worker_index}; "
+                        "refusing reuse while previous transfers remain unproven"
+                    )
 
                 # Lazily build a per-worker staging strategy bound to this
                 # worker's private staging buffer (matches mooncake).
@@ -1134,7 +1643,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
                 self.update_status(room, KVPoll.Transferring)
 
-                reqs_to_be_processed = list(room_transfer_infos.values())
                 # Note(kpham-sgl): Pack each DCP rank once into its fixed region.
                 # NIXL reads regions asynchronously; the chunk barrier prevents
                 # reuse until every transfer completes.
@@ -1187,7 +1695,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         src_prefill_kv_indices = kv_chunk.prefill_kv_indices
 
                         notif = (
-                            f"{req.room}_kv_{kv_chunk.chunk_id}"
+                            f"{wire_attempt}_kv_{kv_chunk.chunk_id}"
                             f"_{int(kv_chunk.is_last_chunk)}_{self.transfer_source_rank}"
                         )
 
@@ -1310,7 +1818,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_info.dst_state_data_ptrs,
                                 req.dst_state_indices,
                                 dst_info.gpu_id,
-                                f"{req.room}_state_{self.transfer_source_rank}",
+                                f"{wire_attempt}_state_{self.transfer_source_rank}",
                                 decode_tp_size,
                                 decode_tp_rank=dst_info.decode_tp_rank,
                                 dst_state_item_lens=dst_info.dst_state_item_lens,
@@ -1326,7 +1834,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         # A no-KV notification still identifies its PP source.
                         # Empty non-final chunks do not consume chunk IDs, so a
                         # final no-KV chunk_id equals the prior KV chunk count.
-                        aux_notif = f"{req.room}_aux"
+                        aux_notif = f"{wire_attempt}_aux"
                         if (
                             len(kv_chunk.prefill_kv_indices) == 0
                             or not self.kv_args.kv_data_ptrs
@@ -1346,27 +1854,54 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
                 if staging_deferred:
                     # Chunk has been re-enqueued; do not advance status.
+                    if posted_handles or handles:
+                        # The requeued copy will release its original queue
+                        # contribution when skipped. Give the submitted group
+                        # a separate retained contribution, so that skip cannot
+                        # erase the live-read count or permit buffer reuse.
+                        if any(
+                            handle not in done_handles
+                            for handle in posted_handles + handles
+                        ):
+                            with self._source_lease_lock:
+                                self._staging_outstanding[
+                                    self._chunk_attempt_key(kv_chunk)
+                                ] += 1
+                        # A later peer deferred after an earlier peer posted.
+                        # Returning would reuse source staging/pack memory while
+                        # the earlier read is live. Keep the lease in the error
+                        # path; the requeued chunk then skips the Failed room.
+                        raise RuntimeError(
+                            f"NIXL partial send cannot defer after posting room={room}"
+                        )
                     continue
 
                 while handles:
                     all_done = True
+                    saw_error = False
                     for handle in handles:
+                        if handle in done_handles:
+                            continue
                         state = self.agent.check_xfer_state(handle)
                         if state == "ERR":
-                            raise RuntimeError(
-                                f"NIXL transfer encountered ERR room={room}"
-                            )
+                            saw_error = True
+                        if state == "DONE":
+                            done_handles.append(handle)
                         if state != "DONE":
                             all_done = False
+                    # Poll the complete group before failing, so a DONE sibling
+                    # is not retained and an unresolved sibling is not lost.
+                    if saw_error:
+                        raise RuntimeError(f"NIXL transfer encountered ERR room={room}")
                     if all_done:
                         break
                     time.sleep(0)
 
-                self._staging_outstanding[room] -= 1
+                self._finish_counted_chunk(kv_chunk)
                 if self.enable_deferred_decode_kv_release:
                     # Handles all DONE => this room's writes landed; ack if it
                     # was aborted and nothing else is outstanding.
-                    self._maybe_ack_drained_abort(room)
+                    self._maybe_ack_drained_abort(room, transfer_epoch)
                 if kv_chunk.is_last_chunk:
                     self.update_status(room, KVPoll.Success)
                 elif self.check_status(room) != KVPoll.Success:
@@ -1378,23 +1913,61 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # the room has concluded: Success, or a Failed *last* chunk. A
                 # non-last Failed chunk keeps the room (more chunks may follow); a
                 # late chunk for an already-Failed room is skipped at loop top.
-                if self._staging_outstanding.get(room, 0) <= 0 and (
-                    self.check_status(room) == KVPoll.Success
-                    or (
-                        kv_chunk.is_last_chunk
-                        and self.check_status(room) == KVPoll.Failed
+                with self._source_lease_lock:
+                    current_infos = self.transfer_infos.get(room)
+                    same_destinations = current_infos is not None and (
+                        len(current_infos) == len(reqs_to_be_processed)
+                        and all(
+                            current_infos.get(info.agent_name) is info
+                            for info in reqs_to_be_processed
+                        )
                     )
-                ):
-                    self._staging_outstanding.pop(room, None)
-                    self.transfer_infos.pop(room, None)
-                    self.req_to_decode_prefix_len.pop(room, None)
-                    if self.enable_staging and self._staging_ctx is not None:
-                        self._staging_ctx.prefetched_rooms.discard(room)
-                        # Snapshot first: the scheduler thread adds concurrently.
-                        for k in list(self._staging_ctx.prefetch_requested):
-                            if k[0] == room:
-                                self._staging_ctx.prefetch_requested.discard(k)
+                    # A late GUARD can install another destination object.
+                    # Completion of this old snapshot must not erase that map.
+                    # Status/ABORT still need full wire-incarnation fencing.
+                    if (
+                        same_destinations
+                        and self._staging_outstanding.get(
+                            self._chunk_attempt_key(kv_chunk), 0
+                        )
+                        <= 0
+                        and (
+                            self.check_status(room) == KVPoll.Success
+                            or (
+                                kv_chunk.is_last_chunk
+                                and self.check_status(room) == KVPoll.Failed
+                            )
+                        )
+                    ):
+                        self.transfer_infos.pop(room, None)
+                        self.req_to_decode_prefix_len.pop(room, None)
+                        if self.enable_staging and self._staging_ctx is not None:
+                            self._staging_ctx.prefetched_rooms.discard(
+                                self._chunk_attempt_key(kv_chunk)
+                            )
+                            # Snapshot first: scheduler adds concurrently.
+                            for k in list(self._staging_ctx.prefetch_requested):
+                                if k[0] == room:
+                                    self._staging_ctx.prefetch_requested.discard(k)
             except Exception as e:
+                # Setup/post/poll errors may occur after earlier handles were
+                # submitted. Retain every handle not proven DONE, not just the
+                # first ERR; do not decrement this group's count or send ACK.
+                retained = self._failed_transfer_handles[
+                    self._chunk_attempt_key(kv_chunk)
+                ]
+                unproven_handles = []
+                for handle in posted_handles + handles:
+                    if handle not in done_handles:
+                        unproven_handles.append(handle)
+                        if not any(handle is previous for previous in retained):
+                            retained.append(handle)
+                if retained and (staging_buffer is not None or self._dcp_pack_buffers):
+                    # These allocations survive the worker loop, but the next
+                    # gather/pack would overwrite them. Quarantine this worker's
+                    # shared source buffers; only transport-backed recovery or
+                    # process teardown may make them reusable.
+                    self._source_buffer_quarantined_workers.add(worker_index)
                 # Catch all exceptions to prevent silently killing this
                 # worker thread, but still propagate via failure_exception().
                 if isinstance(e, _NIXL_TRANSPORT_ERRORS):
@@ -1406,8 +1979,18 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 self.exceptions[room] = e
                 self.record_failure(room, str(e))
                 self.update_status(room, KVPoll.Failed)
-                # No ack here on purpose: the DONE barrier bails on the first
-                # ERR, so siblings may still be writing; fall back to the timeout.
+                if not unproven_handles:
+                    # No unresolved backend call for this chunk: setup failure
+                    # after synchronous DONE also needs no lease. Other groups
+                    # remain counted, including earlier failed transfers.
+                    self._finish_counted_chunk(kv_chunk)
+                    if self.enable_deferred_decode_kv_release:
+                        self._maybe_ack_drained_abort(room, transfer_epoch)
+                # No ACK here: ERR or a polling exception does not prove the
+                # submitted writes are inert. Timeout safety is a separate gate.
+            finally:
+                del self._transfer_worker_context.posted_handles
+                del self._transfer_worker_context.done_handles
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
@@ -1539,7 +2122,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             if not xfer_handle:
                 raise Exception("KVSender failed to create prepped transfer")
-            state = self.agent.transfer(xfer_handle)
+            state = self._post_transfer(xfer_handle)
             if state == "ERR":
                 raise Exception("KVSender failed to post prepped transfer")
             return xfer_handle
@@ -1671,7 +2254,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
-        state = self.agent.transfer(xfer_handle)
+        state = self._post_transfer(xfer_handle)
         if state == "ERR":
             raise Exception("KVSender failed to post transfer")
         return xfer_handle
@@ -1809,7 +2392,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             if not xfer_handle:
                 raise Exception("KVSender failed to create mixed prepped transfer")
-            state = self.agent.transfer(xfer_handle)
+            state = self._post_transfer(xfer_handle)
             if state == "ERR":
                 raise Exception("KVSender failed to post mixed prepped transfer")
             handles.append(xfer_handle)
@@ -1856,7 +2439,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create prepped slice transfer")
-        state = self.agent.transfer(xfer_handle)
+        state = self._post_transfer(xfer_handle)
         if state == "ERR":
             raise Exception("KVSender failed to post prepped slice transfer")
         return xfer_handle
@@ -1968,7 +2551,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 f"(src=0x{staging_buffer.get_ptr():x}, dst=0x{dst_write_ptr:x}, "
                 f"size={per_rank_bytes})"
             )
-        state = self.agent.transfer(xfer_handle)
+        state = self._post_transfer(xfer_handle)
         if state == "ERR":
             raise RuntimeError("[Staging] NIXL bulk transfer failed to post")
         return xfer_handle
@@ -2103,7 +2686,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
-        state = self.agent.transfer(xfer_handle)
+        state = self._post_transfer(xfer_handle)
         if state == "ERR":
             raise Exception("KVSender failed to post transfer")
         return xfer_handle
@@ -2159,7 +2742,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("Failed to create Mamba state transfer")
-        state = self.agent.transfer(xfer_handle)
+        state = self._post_transfer(xfer_handle)
         if state == "ERR":
             raise Exception("Failed to post Mamba state transfer")
         return xfer_handle
@@ -2288,7 +2871,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("Failed to create Mamba state slice transfer")
-        state = self.agent.transfer(xfer_handle)
+        state = self._post_transfer(xfer_handle)
         if state == "ERR":
             raise Exception("Failed to post Mamba state slice transfer")
         return xfer_handle
@@ -2472,6 +3055,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
+        transfer_epoch: int = 0,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -2481,20 +3065,36 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # chunk. Internally a no-op when staging is disabled or no peer
         # in this room needs heterogeneous-TP staging.
         if self.enable_staging:
-            self._prefetch_staging_reqs(bootstrap_room)
+            self._prefetch_staging_reqs(bootstrap_room, transfer_epoch)
 
-        if bootstrap_room not in self.transfer_infos:
-            # Dummy rank or already cleared; nothing to enqueue.
-            return None
-
-        # Shard by destination (mirror mooncake): same dst endpoint(s) -> same
-        # worker, keeping a room's chunks on one private staging buffer.
-        session_port_sum = sum(
-            info.dst_port for info in self.transfer_infos[bootstrap_room].values()
-        )
-        shard_idx = session_port_sum % len(self.transfer_queues)
-        self.transfer_queues[shard_idx].put(
-            TransferKVChunk(
+        # The scheduler can retire this request before its worker dequeues the
+        # chunk. Bind destinations and acquire the source lease atomically with
+        # GUARD updates/clear before publishing into the queue.
+        with self._source_lease_lock:
+            if (
+                bootstrap_room not in self.request_status
+                or self.check_status(bootstrap_room) == KVPoll.Failed
+            ):
+                return None
+            active_epochs = getattr(self, "_active_transfer_epochs", {})
+            active_epoch = active_epochs.get(bootstrap_room, 0)
+            if active_epoch != transfer_epoch:
+                return None
+            attempt = self._attempt_key(bootstrap_room, transfer_epoch)
+            attempt_infos_table = getattr(self, "_transfer_infos_by_attempt", {})
+            room_infos = attempt_infos_table.get(attempt)
+            if room_infos is None and transfer_epoch == 0:
+                # Compatibility for direct unit fixtures and old metadata
+                # objects constructed before attempt indexing.
+                room_infos = self.transfer_infos.get(bootstrap_room)
+            if room_infos is None:
+                # Dummy rank or already cleared; nothing to enqueue.
+                return None
+            transfer_infos = tuple(room_infos.values())
+            # Shard using the same snapshot the worker will consume.
+            session_port_sum = sum(info.dst_port for info in transfer_infos)
+            shard_idx = session_port_sum % len(self.transfer_queues)
+            chunk = NixlTransferKVChunk(
                 room=bootstrap_room,
                 prefill_kv_indices=kv_indices,
                 index_slice=index_slice,
@@ -2503,8 +3103,15 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
+                transfer_infos=transfer_infos,
+                transfer_epoch=transfer_epoch,
             )
-        )
+            self._count_source_chunk(chunk)
+            try:
+                self.transfer_queues[shard_idx].put(chunk)
+            except Exception:
+                self._finish_counted_chunk(chunk)
+                raise
         return None
 
     def update_transfer_status(self):
@@ -2523,7 +3130,16 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # last component, so agent_name (which may itself contain
                 # underscores) lands intact in components[8] for the stg path.
                 components = msg.decode("ascii").split("_", 8)
-                room = int(components[0])
+                room, transfer_epoch = _parse_wire_attempt(components[0])
+                active_epoch = getattr(self, "_decode_transfer_epochs", {}).get(room, 0)
+                if transfer_epoch != active_epoch:
+                    logger.warning(
+                        "Ignoring stale NIXL notification room=%s epoch=%s active=%s",
+                        room,
+                        transfer_epoch,
+                        active_epoch,
+                    )
+                    continue
                 tag = components[1]
                 if tag == "kv":
                     chunk_id = int(components[2])
@@ -2703,45 +3319,142 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             room_to_be_aborted = int(msg[1].decode("ascii"))
             decode_ip = msg[2].decode("ascii") if len(msg) > 2 else None
             decode_port = int(msg[3].decode("ascii")) if len(msg) > 3 else None
+            generation = msg[4].decode("ascii") if len(msg) >= 5 else None
+            transfer_epoch = int(msg[5].decode("ascii")) if len(msg) == 6 else 0
+            if (
+                len(msg) > 6
+                or (
+                    generation is not None
+                    and (not generation.isdecimal() or len(generation) > 39)
+                )
+                or transfer_epoch < 0
+            ):
+                raise ValueError("Invalid NIXL abort generation")
         except Exception as e:
             logger.debug(f"Ignoring malformed abort notification: {e}")
             return True
 
-        room_active = (
-            room_to_be_aborted in self.request_status
-            and self.check_status(room_to_be_aborted) != KVPoll.Success
-        )
-        if room_active:
-            self.record_failure(
-                room_to_be_aborted,
-                "Aborted by decode-side abort notification.",
+        # Share the enqueue/count lock: freeze further publication before
+        # registering the ACK destination. Success can precede a deferred
+        # sibling's drain, and clear() can remove the status before ABORT arrives.
+        with self._source_lease_lock:
+            attempt = self._attempt_key(room_to_be_aborted, transfer_epoch)
+            aborted_attempts = getattr(self, "_aborted_transfer_attempts", None)
+            if aborted_attempts is None:
+                aborted_attempts = self._aborted_transfer_attempts = {}
+            if generation is not None:
+                aborted_attempts.setdefault(attempt, set()).add(generation)
+            pending = (
+                self.has_pending_source_reads(room_to_be_aborted, transfer_epoch)
+                if self.enable_deferred_decode_kv_release
+                else False
             )
-            self.update_status(room_to_be_aborted, KVPoll.Failed)
-            logger.debug(
-                f"Received abort notification for room {room_to_be_aborted}, "
-                f"marked as Failed"
+            active_epoch = getattr(self, "_active_transfer_epochs", {}).get(
+                room_to_be_aborted, 0
             )
-        else:
-            logger.debug(
-                f"Received abort notification for room {room_to_be_aborted}, "
-                f"ignoring (already completed or unknown)"
+            room_active = (
+                active_epoch == transfer_epoch
+                and (room_to_be_aborted in self.request_status)
+                and (self.check_status(room_to_be_aborted) != KVPoll.Success or pending)
             )
-
-        # Deferred KV release: register only after the status flip above (see
-        # register_deferred_ack_target), then try once -- the room may already be
-        # quiescent and never revisited by the worker. A concluded/unknown room is
-        # acked only when nothing is still counted for it: the ERR path abandons
-        # sibling handles that may still be writing and clear() then drops the
-        # room, so "unknown" alone does not imply quiescent.
-        if self.enable_deferred_decode_kv_release and decode_port is not None:
             if room_active:
-                self.register_deferred_ack_target(
-                    room_to_be_aborted, decode_ip, decode_port
+                self.record_failure(
+                    room_to_be_aborted,
+                    "Aborted by decode-side abort notification.",
                 )
-                self._maybe_ack_drained_abort(room_to_be_aborted)
-            elif self._staging_outstanding.get(room_to_be_aborted, 0) == 0:
-                self._send_abort_ack(decode_ip, decode_port, room_to_be_aborted)
+                self.update_status(room_to_be_aborted, KVPoll.Failed)
+                logger.debug(
+                    f"Received abort notification for room {room_to_be_aborted}, "
+                    f"marked as Failed"
+                )
+            else:
+                logger.debug(
+                    f"Received abort notification for room {room_to_be_aborted}, "
+                    f"ignoring status (already completed or unknown)"
+                )
 
+            # Always retain a late abort's destination, including cleared rooms.
+            # The common helper ACKs immediately only when the source is drained;
+            # retained ERR/unknown handles continue to block it.
+            if self.enable_deferred_decode_kv_release and decode_port is not None:
+                try:
+                    self.register_deferred_ack_target(
+                        room_to_be_aborted,
+                        decode_ip,
+                        decode_port,
+                        generation,
+                        transfer_epoch,
+                    )
+                except RuntimeError as e:
+                    logger.error("NIXL abort generation conflict: %s", e)
+                    return True
+                self._maybe_ack_drained_abort(room_to_be_aborted, transfer_epoch)
+
+        return True
+
+    def _handle_abort_released_notification(self, msg: List[bytes]) -> bool:
+        if not msg or msg[0] != b"ABORT_RELEASED":
+            return False
+        if len(msg) != 6:
+            return True
+        try:
+            room = int(msg[1].decode("ascii"))
+            decode_ip = msg[2].decode("ascii")
+            decode_port = int(msg[3].decode("ascii"))
+            generation = msg[4].decode("ascii")
+            transfer_epoch = int(msg[5].decode("ascii"))
+            attempt = self._attempt_key(room, transfer_epoch)
+        except (ValueError, UnicodeDecodeError):
+            return True
+        with self._source_lease_lock:
+            generations = getattr(self, "_aborted_transfer_attempts", {}).get(attempt)
+            released_attempts = getattr(self, "_released_transfer_attempts", None)
+            if released_attempts is None:
+                released_attempts = self._released_transfer_attempts = {}
+            released = released_attempts.get(attempt, set())
+            if generations is not None and generation in generations:
+                generations.discard(generation)
+                released_attempts.setdefault(attempt, set()).add(generation)
+                if not generations:
+                    self._aborted_transfer_attempts.pop(attempt, None)
+                    if not self.has_pending_source_reads(room, transfer_epoch):
+                        if self._active_transfer_epochs.get(room) != transfer_epoch:
+                            self._transfer_infos_by_attempt.pop(attempt, None)
+                targets = self._generation_ack_targets.get(attempt, {})
+                for endpoint, target_generation in tuple(targets.items()):
+                    if target_generation == generation:
+                        targets.pop(endpoint, None)
+                if not targets:
+                    self._generation_ack_targets.pop(attempt, None)
+            elif generation not in released:
+                logger.warning(
+                    "Ignoring unknown ABORT_RELEASED room=%s epoch=%s",
+                    room,
+                    transfer_epoch,
+                )
+                return True
+        try:
+            from sglang.srt.utils.network import NetworkAddress
+
+            na = NetworkAddress(decode_ip, decode_port)
+            self._send_multipart_locked(
+                na.to_tcp(),
+                [
+                    b"ABORT_RELEASED_ACK",
+                    str(room).encode("ascii"),
+                    str(self._prefill_unique_rank()).encode("ascii"),
+                    generation.encode("ascii"),
+                    str(transfer_epoch).encode("ascii"),
+                ],
+                is_ipv6=na.is_ipv6,
+            )
+        except Exception as e:
+            logger.warning(
+                "ABORT_RELEASED_ACK send failed room=%s epoch=%s: %s",
+                room,
+                transfer_epoch,
+                e,
+            )
         return True
 
     def _start_bootstrap_thread(self):
@@ -2767,6 +3480,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
                 if self._handle_abort_notification(waiting_req_bytes):
                     continue
+                if self._handle_abort_released_notification(waiting_req_bytes):
+                    continue
 
                 assert (
                     waiting_req_bytes[0] == GUARD
@@ -2782,27 +3497,37 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     logger.debug(f"Register KVArgs from {agent_name} successfully")
                     continue
                 room = int(room)
-                if room not in self.transfer_infos:
-                    self.transfer_infos[room] = {}
-                self.transfer_infos[room][agent_name] = TransferInfo.from_zmq(
-                    waiting_req_bytes
-                )
-                required_dst_info_num = self.transfer_infos[room][
-                    agent_name
-                ].required_dst_info_num
-                logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
-                if len(self.transfer_infos[room]) == required_dst_info_num:
-                    self.resolve_kv_replica_factor(self.transfer_infos[room])
-                    self.req_to_decode_prefix_len[room] = next(
-                        (
-                            info.decode_prefix_len
-                            for info in self.transfer_infos[room].values()
-                            if info.decode_prefix_len is not None
-                        ),
-                        0,
+                info = TransferInfo.from_zmq(waiting_req_bytes)
+                attempt = self._attempt_key(room, info.transfer_epoch)
+                with self._source_lease_lock:
+                    attempt_infos = self._transfer_infos_by_attempt.setdefault(
+                        attempt, {}
                     )
-                    logger.debug(f"{room=} is bootstrapped")
-                    self.update_status(room, KVPoll.WaitingForInput)
+                    attempt_infos[agent_name] = info
+                    required_dst_info_num = info.required_dst_info_num
+                    logger.debug(
+                        f"got info {room=} transfer_epoch={info.transfer_epoch} "
+                        f"{agent_name=} {required_dst_info_num=}"
+                    )
+                    if (
+                        len(attempt_infos) == required_dst_info_num
+                        and self._active_transfer_epochs.get(room)
+                        == info.transfer_epoch
+                    ):
+                        self.transfer_infos[room] = attempt_infos
+                        self.resolve_kv_replica_factor(attempt_infos)
+                        self.req_to_decode_prefix_len[room] = next(
+                            (
+                                info.decode_prefix_len
+                                for info in attempt_infos.values()
+                                if info.decode_prefix_len is not None
+                            ),
+                            0,
+                        )
+                        logger.debug(
+                            f"{room=} transfer_epoch={info.transfer_epoch} is bootstrapped"
+                        )
+                        self.update_status(room, KVPoll.WaitingForInput)
 
         threading.Thread(target=bootstrap_thread).start()
 
@@ -2831,6 +3556,13 @@ class NixlKVSender(CommonKVSender):
         self._send_failed = False
         self._send_error: Optional[Exception] = None
         self._transfer_start_time: Optional[float] = None
+        self.transfer_epoch = 0
+
+    def bind_transfer_epoch(self, transfer_epoch: int) -> bool:
+        self.transfer_epoch = transfer_epoch
+        return self.kv_mgr.activate_transfer_attempt(
+            self.bootstrap_room, self.transfer_epoch
+        )
 
     def send(
         self,
@@ -2861,6 +3593,7 @@ class NixlKVSender(CommonKVSender):
             self.aux_index,
             state_indices,
             num_kv_tokens,
+            transfer_epoch=self.transfer_epoch,
         )
         self._record_transfer_indices(kv_indices, state_indices)
         self.chunk_id += 1
@@ -2879,7 +3612,10 @@ class NixlKVSender(CommonKVSender):
         # can still be pending, and concluding now would drop it.
         if (
             status == KVPoll.Success
-            and self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) > 0
+            and self.kv_mgr._staging_outstanding.get(
+                self.kv_mgr._attempt_key(self.bootstrap_room, self.transfer_epoch), 0
+            )
+            > 0
         ):
             return KVPoll.Transferring  # type: ignore
         if (
@@ -2893,14 +3629,49 @@ class NixlKVSender(CommonKVSender):
         return status
 
     def clear(self) -> None:
-        super().clear()
-        if self.kv_mgr.enable_staging and self.kv_mgr._staging_ctx is not None:
-            self.kv_mgr._staging_ctx.prefetched_rooms.discard(self.bootstrap_room)
-            self.kv_mgr._staging_ctx.prefetch_requested = {
-                key
-                for key in self.kv_mgr._staging_ctx.prefetch_requested
-                if key[0] != self.bootstrap_room
-            }
+        with self.kv_mgr._source_lease_lock:
+            transfer_epoch = getattr(self, "transfer_epoch", 0)
+            active_epochs = getattr(self.kv_mgr, "_active_transfer_epochs", None)
+            attempt_table = getattr(self.kv_mgr, "_transfer_infos_by_attempt", None)
+            if active_epochs is None or attempt_table is None:
+                super().clear()
+                active_matches = True
+            else:
+                attempt = self.kv_mgr._attempt_key(self.bootstrap_room, transfer_epoch)
+                active_matches = (
+                    active_epochs.get(self.bootstrap_room) == transfer_epoch
+                )
+                attempt_infos = attempt_table.get(attempt)
+                if active_matches:
+                    self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+                    self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
+                    if (
+                        self.kv_mgr.transfer_infos.get(self.bootstrap_room)
+                        is attempt_infos
+                    ):
+                        self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
+                    active_epochs.pop(self.bootstrap_room, None)
+                if not self.kv_mgr.has_pending_source_reads(
+                    self.bootstrap_room, transfer_epoch
+                ):
+                    attempt_table.pop(attempt, None)
+                self.kv_mgr._maybe_ack_drained_abort(
+                    self.bootstrap_room, transfer_epoch
+                )
+            if (
+                active_matches
+                and self.kv_mgr.enable_staging
+                and self.kv_mgr._staging_ctx is not None
+            ):
+                self.kv_mgr._staging_ctx.prefetched_rooms.discard(
+                    self.kv_mgr._attempt_key(self.bootstrap_room, transfer_epoch)
+                )
+                self.kv_mgr._staging_ctx.prefetched_rooms.discard(self.bootstrap_room)
+                self.kv_mgr._staging_ctx.prefetch_requested = {
+                    key
+                    for key in self.kv_mgr._staging_ctx.prefetch_requested
+                    if key[0] != self.bootstrap_room
+                }
 
     def failure_exception(self):
         exc = self.kv_mgr.exceptions.pop(self.bootstrap_room, None)
@@ -2934,6 +3705,8 @@ class NixlKVReceiver(CommonKVReceiver):
         self.started_transfer = False
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
         self.init_time = None
+        self.destination_metadata_published = False
+        self.transfer_epoch = 0
 
     def send_metadata(
         self,
@@ -2948,6 +3721,14 @@ class NixlKVReceiver(CommonKVReceiver):
             )
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             return
+
+        decode_epochs = getattr(self.kv_mgr, "_decode_transfer_epochs", None)
+        if decode_epochs is None:
+            decode_epochs = self.kv_mgr._decode_transfer_epochs = {}
+        prior_epoch = decode_epochs.get(self.bootstrap_room)
+        if prior_epoch is not None and prior_epoch != self.transfer_epoch:
+            self.kv_mgr.transfer_statuses[self.bootstrap_room] = TransferStatus()
+        decode_epochs[self.bootstrap_room] = self.transfer_epoch
 
         # Register staging room bootstrap info for staging handler
         self.chunk_staging_infos = []
@@ -2977,6 +3758,9 @@ class NixlKVReceiver(CommonKVReceiver):
             try:
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
                 with lock:
+                    # Set before the call: a send error is not proof that no
+                    # destination descriptor reached this or an earlier rank.
+                    self.destination_metadata_published = True
                     sock.send_multipart(
                         [
                             GUARD,
@@ -2990,6 +3774,7 @@ class NixlKVReceiver(CommonKVReceiver):
                             packed_state_indices,
                             str(decode_prefix_len or 0).encode("ascii"),
                             str(int(is_dummy)).encode("ascii"),
+                            str(self.transfer_epoch).encode("ascii"),
                         ]
                     )
             except zmq.ZMQError:
@@ -3011,6 +3796,12 @@ class NixlKVReceiver(CommonKVReceiver):
 
         self.started_transfer = True
         self.init_time = time.time()
+
+    def clear(self) -> None:
+        super().clear()
+        decode_epochs = getattr(self.kv_mgr, "_decode_transfer_epochs", {})
+        if decode_epochs.get(self.bootstrap_room) == getattr(self, "transfer_epoch", 0):
+            decode_epochs.pop(self.bootstrap_room, None)
 
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:

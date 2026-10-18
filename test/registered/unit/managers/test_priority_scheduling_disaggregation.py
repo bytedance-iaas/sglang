@@ -256,6 +256,8 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
             cache_salt=None,
             routing_key=None,
             disagg_prefill_dp_rank=None,
+            pd_bound_prefill_dp_rank=0,
+            pd_transfer_epoch=0,
         )
 
     def test_build_rebootstrap_payload_converts_numpy_ids_to_json_lists(self):
@@ -270,6 +272,7 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
         self.assertTrue(all(type(x) is int for x in payload["input_ids"]))
         self.assertEqual(payload["sampling_params"]["max_new_tokens"], 1)
         self.assertEqual(payload["bootstrap_room"], 7)
+        self.assertEqual(payload["pd_transfer_epoch"], 0)
         self.assertIsNone(payload["cache_salt"])
         # The prefill /generate URL is derived from bootstrap info on the decode
         # side, not sent in the payload; and the boundary token is replayed via

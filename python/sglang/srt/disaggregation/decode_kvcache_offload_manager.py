@@ -126,7 +126,7 @@ class DecodeKVCacheOffloadManager:
         if self.cache_controller is None or self.decode_host_mem_pool is None:
             return False
 
-        if req.kv.req_pool_idx == -1 or len(req.output_ids) == 0:
+        if req.kv.req_pool_idx in (None, -1) or len(req.output_ids) == 0:
             return False
 
         token_indices = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx]
@@ -134,7 +134,12 @@ class DecodeKVCacheOffloadManager:
             return False
 
         # Prefill side offloads page-aligned origin_input_ids, decode side offloads the incremental part
-        all_tokens = req.origin_input_ids + req.output_ids[:-1]
+        # Output bookkeeping can lead the settled KV under speculation. Never
+        # copy or publish a row beyond the owner's committed boundary, including
+        # the intentional strip-thinking-cache boundary.
+        all_tokens = (req.origin_input_ids + req.output_ids[:-1])[
+            : req.effective_kv_committed_len()
+        ]
         prefill_offloaded_len = self._prefill_offloaded_len(req)
         state = self.offloaded_state.get(req)
         if state is None:
@@ -148,12 +153,11 @@ class DecodeKVCacheOffloadManager:
             self.offloaded_state[req] = state
         incremental_total = len(all_tokens) - prefill_offloaded_len
         incremental_new = incremental_total - state.inc_len
+        if incremental_new < self.offload_stride:
+            return False
         incremental_aligned_len = (
             incremental_new // self.offload_stride * self.offload_stride
         )
-
-        if incremental_aligned_len == 0:
-            return False
 
         # Extract incremental tokens and indices for the newly available chunk
         start = prefill_offloaded_len + state.inc_len
@@ -208,6 +212,35 @@ class DecodeKVCacheOffloadManager:
         self._check_offload_progress(n_write)
         self._check_backup_progress(n_backup)
 
+    def drain_before_retraction(self):
+        """Drain D2H before returning its source pages to the allocator.
+
+        All ranks must join the check even if no copy is tracked locally. The
+        ordinary MIN drain can leave asymmetric acknowledgements pending.
+        Host-to-storage backups do not read device pages and need not block.
+        Adapted from SGLang #30899.
+        """
+        self.check_offload_progress()
+        pending = torch.tensor(
+            [
+                bool(
+                    self.cache_controller.ack_write_queue
+                    or self.ongoing_offload
+                    or self.offload_inflight
+                )
+            ],
+            dtype=torch.int,
+        )
+        if self.tp_world_size > 1:
+            torch.distributed.all_reduce(
+                pending, op=torch.distributed.ReduceOp.MAX, group=self.tp_group
+            )
+        if pending.item():
+            raise RuntimeError(
+                "Decode KV offload copies are still pending on some rank; "
+                "refusing to retract before source pages are safe to release."
+            )
+
     def _check_offload_progress(self, finish_count):
         """Check the progress of offload from device to host."""
         while finish_count > 0:
@@ -238,11 +271,26 @@ class DecodeKVCacheOffloadManager:
             finish_count -= 1
 
     def _release_finished_req(self, req: Req):
+        # Every entry point, including a direct finalize call, must wait for
+        # the last D2H copy. A finished HTTP response does not end buffer use.
+        if not req.finished() or self._has_inflight_offload(req):
+            return
         # Defensive guard: ReqToTokenPool.free sets req_pool_idx to None,
         # so a previously-released request must be skipped here to avoid
         # non-idempotent side effects (e.g. tree_cache.protected_size_
         # double-decrement, host pool double-free).
         if req.kv.req_pool_idx is None or req.kv.req_pool_idx == -1:
+            return
+
+        if not self.tree_cache.is_chunk_cache():
+            # The cache owns canonical prefix rows and balances its locks.
+            # Raw row frees would release those rows a second time. Reuse the
+            # same committed/duplicate/spec-tail release as normal decode;
+            # skip_radix_cache_insert and session cleanup are handled there.
+            from sglang.srt.mem_cache.common import release_kv_cache
+
+            release_kv_cache(req, self.tree_cache, is_insert=True)
+            self.offloaded_state.pop(req, None)
             return
 
         kv_committed_len = req.effective_kv_committed_len()
@@ -267,7 +315,6 @@ class DecodeKVCacheOffloadManager:
 
         self.req_to_token_pool.free(req)
         req.kv.mark_kv_released()
-        self.tree_cache.protected_size_ -= len(req.prefix_indices)
         self.offloaded_state.pop(req, None)
 
     def _check_backup_progress(self, finish_count):

@@ -197,6 +197,14 @@ def handle_load_balance_method(server_args: Any):
     if cfg.disaggregation_mode not in ("null", "prefill", "decode"):
         raise ValueError(f"Invalid disaggregation_mode={cfg.disaggregation_mode!r}")
 
+    if cfg.load_balance_method == "prefix_aware" and not (
+        cfg.disaggregation_mode == "decode"
+        and cfg.disaggregation_decode_enable_radix_cache
+    ):
+        raise ValueError(
+            "--load-balance-method prefix_aware requires PD decode radix caching"
+        )
+
     if cfg.load_balance_method == "auto":
         # Default behavior:
         # - non-PD: round_robin

@@ -124,6 +124,10 @@ def maybe_release_metadata_buffer(
         req: The request object that may have a metadata_buffer_index allocated
         allocator: The ReqToMetadataIdxAllocator instance to free the index
     """
+    if getattr(req, "disagg_prefill_release_deferred", False):
+        # Aux and request-scoped state can still be read by the same transfer
+        # that holds KV. Releasing only KV safely is not sufficient.
+        return
     if req.metadata_buffer_index >= 0:
         allocator.free(req.metadata_buffer_index)
         req.metadata_buffer_index = -1
@@ -346,6 +350,10 @@ class PrefillBootstrapQueue:
             pp_rank=self.pp_rank,
             req_has_disagg_prefill_dp_rank=req.disagg_prefill_dp_rank is not None,
         )
+        bind_epoch = getattr(req.disagg_kv_sender, "bind_transfer_epoch", None)
+        if callable(bind_epoch) and not bind_epoch(req.pd_transfer_epoch):
+            return False
+        req.disagg_kv_sender.transfer_epoch = req.pd_transfer_epoch
         self._process_req(req)
         req.pending_bootstrap = True
         return True
@@ -599,6 +607,7 @@ class SchedulerDisaggregationPrefillMixin:
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                self.resolve_prefill_drain_releases()
                 continue
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
@@ -638,6 +647,7 @@ class SchedulerDisaggregationPrefillMixin:
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                self.resolve_prefill_drain_releases()
                 continue
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
@@ -749,6 +759,27 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
+            if is_aborted(req):
+                # A retired overlapped result must not re-cache, re-send or
+                # rewrite aux after cancellation. Its GPU work is complete
+                # (copy_done above); source slots are still held by the drainer.
+                if req.inflight_middle_chunks > 0:
+                    req.inflight_middle_chunks -= 1
+                self.clear_pending_chunk_send(req)
+                already_reported = isinstance(req.finished_reason, FINISH_ABORT)
+                if not already_reported:
+                    prepare_abort(req, "Aborted")
+                    req.to_finish = None
+                req.disagg_kv_sender.abort()
+                self.release_prefill_kv_after_drain(req, is_insert=False)
+                req.disagg_kv_sender.clear()
+                maybe_release_metadata_buffer(
+                    req, self.req_to_metadata_buffer_idx_allocator
+                )
+                if not already_reported:
+                    self.output_streamer.stream_output([req], req.return_logprob)
+                advance_logprob_pt(i, req)
+                continue
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
 
@@ -880,6 +911,7 @@ class SchedulerDisaggregationPrefillMixin:
         Poll the requests in the middle of transfer. If done, return the request.
         rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
         """
+        self.resolve_prefill_drain_releases()
         if len(self.disagg_prefill_inflight_queue) == 0:
             return []
 
@@ -929,7 +961,7 @@ class SchedulerDisaggregationPrefillMixin:
             elif poll == KVPoll.Success:  # transfer done
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finished_reason = FINISH_LENGTH(length=0)
-                release_kv_cache(req, self.tree_cache)  # unlock the tree
+                self.release_prefill_kv_after_drain(req)
                 # FIXME: clean up req's data in transfer engine
                 req.disagg_kv_sender.clear()
                 done_reqs.append(req)
@@ -1000,7 +1032,7 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-        release_kv_cache(req, self.tree_cache)  # unlock the tree
+        self.release_prefill_kv_after_drain(req)
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
@@ -1008,6 +1040,68 @@ class SchedulerDisaggregationPrefillMixin:
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
         return exc
+
+    def release_prefill_kv_after_drain(
+        self: Scheduler, req: Req, is_insert: bool = True
+    ) -> bool:
+        """Retire a request without recycling source KV/state/aux under NIXL.
+
+        Adapted from #38961. A local hold is separate from the TP-consensus
+        inflight queue. No timeout substitutes for transport quiescence.
+        """
+        manager = getattr(req.disagg_kv_sender, "kv_mgr", None)
+        pending = getattr(manager, "has_pending_source_reads", None)
+        # A previously retired request has one release owner, even when its
+        # last read completed between the duplicate retirement and the drain.
+        for i, (held, insert) in enumerate(self.disagg_prefill_drain_releases):
+            if held is req:
+                self.disagg_prefill_drain_releases[i] = (req, insert and is_insert)
+                return False
+        forward_done = req.disagg_prefill_forward_done
+        if (
+            (forward_done is not None and not forward_done.query())
+            or req.inflight_middle_chunks > 0
+            or (callable(pending) and pending(req.bootstrap_room))
+        ):
+            req.disagg_prefill_release_deferred = True
+            self.disagg_prefill_drain_releases.append((req, is_insert))
+            return False
+        if getattr(req, "disagg_prefill_release_deferred", False):
+            # The existing hold owns the release even if the last read just
+            # completed; resolve it in one place.
+            return False
+        if req.kv.holds_kv or req.kv.holds_mamba:
+            release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+        return True
+
+    def resolve_prefill_drain_releases(self: Scheduler) -> None:
+        manager = self.disagg_prefill_bootstrap_queue.kv_manager
+        retry_acks = getattr(manager, "retry_drained_abort_acks", None)
+        if callable(retry_acks):
+            retry_acks()
+        for req, is_insert in list(self.disagg_prefill_drain_releases):
+            manager = req.disagg_kv_sender.kv_mgr
+            pending = getattr(manager, "has_pending_source_reads", None)
+            forward_done = req.disagg_prefill_forward_done
+            if (
+                (forward_done is not None and not forward_done.query())
+                or req.inflight_middle_chunks > 0
+                or (callable(pending) and pending(req.bootstrap_room))
+            ):
+                continue
+            # A failed free must remain visible; metadata stays protected until
+            # the KV owner has completed its release.
+            if req.kv.holds_kv or req.kv.holds_mamba:
+                release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+            req.disagg_prefill_release_deferred = False
+            maybe_release_metadata_buffer(
+                req, self.req_to_metadata_buffer_idx_allocator
+            )
+            self.disagg_prefill_drain_releases = [
+                entry
+                for entry in self.disagg_prefill_drain_releases
+                if entry[0] is not req
+            ]
 
     def clear_pending_chunk_send(self: Scheduler, req: Req) -> None:
         """Drop `req` from the sent-but-unconcluded chunk set.
@@ -1037,7 +1131,7 @@ class SchedulerDisaggregationPrefillMixin:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache)
+            self.release_prefill_kv_after_drain(req)
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
         prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -1352,6 +1446,19 @@ class SchedulerDisaggregationPrefillMixin:
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""
         max_attempts = get_disagg().optimistic_prefill_attempts
+        manager = getattr(req.disagg_kv_sender, "kv_mgr", None)
+        pending = getattr(manager, "has_pending_source_reads", None)
+        if req.disagg_prefill_release_deferred or (
+            callable(pending) and pending(req.bootstrap_room)
+        ):
+            # Optimistic retry is valid before bootstrap publishes any source
+            # work. A violated lease cannot be discarded by free/reset/requeue.
+            raise RuntimeError(
+                "Optimistic prefill retry still owns transfer source leases"
+            )
+        if req.disagg_prefill_forward_done is not None:
+            req.disagg_prefill_forward_done.synchronize()
+            req.disagg_prefill_forward_done = None
         maybe_cache_unfinished_req(req, self.tree_cache)
         release_kv_cache(req, self.tree_cache)
         req.reset_for_retract()

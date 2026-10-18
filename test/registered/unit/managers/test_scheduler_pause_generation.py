@@ -68,6 +68,7 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         )
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.hisparse_coordinator = None
+        scheduler.decode_offload_manager = None
         scheduler.server_args = MagicMock()
         scheduler.waiting_queue = []
         # pause_generation zeros gen_throughput and flushes KV events.
@@ -455,6 +456,7 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         req = SimpleNamespace(
             finished=lambda: False,
             output_ids=[10, 11, 12],
+            pd_transfer_epoch=2,
             time_stats=MagicMock(),
         )
         scheduler.running_batch.reqs = [req]
@@ -468,11 +470,69 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         )
         self.assertEqual(req.output_ids, [10, 11])
         self.assertEqual(req.pd_rebootstrap_forced_output_id, 12)
+        self.assertEqual(req.pd_transfer_epoch, 3)
         self.assertTrue(req.pd_rebootstrap_in_progress)
         # Rebootstrap recomputes the KV from the prefill, so the retract must skip
         # the device->host KV offload rather than offload-then-delete it.
         mock_retract_all.assert_called_once()
         self.assertEqual(mock_retract_all.call_args.kwargs["offload_kv"], False)
+
+    def test_retraction_entrypoints_drain_before_release(self):
+        for entrypoint in ("pause", "kv_full"):
+            with self.subTest(entrypoint=entrypoint):
+                scheduler = self._new_scheduler()
+                scheduler.decode_offload_manager = MagicMock()
+                order = []
+                scheduler.decode_offload_manager.drain_before_retraction.side_effect = (
+                    lambda log=order: log.append("drain")
+                )
+                req = self._make_req("running")
+                scheduler.running_batch.reqs = [req]
+                if entrypoint == "pause":
+                    with patch(
+                        "sglang.srt.managers.scheduler.retract_all",
+                        side_effect=lambda log=order, **kwargs: log.append("release"),
+                    ):
+                        scheduler.pause_generation(
+                            PauseGenerationReqInput(mode="retract")
+                        )
+                else:
+                    batch = MagicMock()
+                    batch.batch_size.return_value = 1
+                    batch.is_empty.return_value = False
+                    batch.check_decode_mem.return_value = False
+                    batch.retract_decode.side_effect = lambda log=order: (
+                        log.append("release") or [],
+                        1.0,
+                        [],
+                    )
+                    scheduler.new_token_ratio_tracker = SimpleNamespace(current=1.0)
+                    scheduler.update_running_batch(batch)
+                self.assertEqual(order[:2], ["drain", "release"])
+
+    def test_retraction_entrypoints_do_not_release_on_drain_refusal(self):
+        for entrypoint in ("pause", "kv_full"):
+            with self.subTest(entrypoint=entrypoint):
+                scheduler = self._new_scheduler()
+                scheduler.decode_offload_manager = MagicMock()
+                scheduler.decode_offload_manager.drain_before_retraction.side_effect = (
+                    RuntimeError("refusing to retract")
+                )
+                scheduler.running_batch.reqs = [self._make_req("running")]
+                with patch("sglang.srt.managers.scheduler.retract_all") as release:
+                    batch = MagicMock()
+                    batch.batch_size.return_value = 1
+                    batch.is_empty.return_value = False
+                    batch.check_decode_mem.return_value = False
+                    with self.assertRaisesRegex(RuntimeError, "refusing to retract"):
+                        if entrypoint == "pause":
+                            scheduler.pause_generation(
+                                PauseGenerationReqInput(mode="retract")
+                            )
+                        else:
+                            scheduler.update_running_batch(batch)
+                    release.assert_not_called()
+                    batch.retract_decode.assert_not_called()
 
     def test_pd_decode_continue_releases_held_rebootstrap(self):
         """continue_generation must enqueue staged rebootstrap reqs on resume."""

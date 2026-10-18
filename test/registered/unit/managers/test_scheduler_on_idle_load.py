@@ -22,6 +22,7 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 class TestOnIdleStallPublish(CustomTestCase):
     def _stalled_scheduler(self) -> Scheduler:
         s = Scheduler.__new__(Scheduler)
+        s.disaggregation_mode = None
         s.maybe_send_health_check_signal = MagicMock()
         s.is_fully_idle = MagicMock(return_value=False)  # stalled, not idle
         s.publish_load_snapshot = MagicMock(return_value=None)
@@ -46,6 +47,19 @@ class TestOnIdleStallPublish(CustomTestCase):
             mono.return_value = 100.10  # > LOAD_STALL_REFRESH_S
             s.on_idle()
         self.assertEqual(s.publish_load_snapshot.call_count, 2)
+
+    def test_prefill_source_holds_progress_before_idle_gate(self):
+        from sglang.srt.disaggregation.utils import DisaggregationMode
+
+        s = self._stalled_scheduler()
+        s.disaggregation_mode = DisaggregationMode.PREFILL
+        order = []
+        s.resolve_prefill_drain_releases = MagicMock(
+            side_effect=lambda: order.append("drain")
+        )
+        s.is_fully_idle.side_effect = lambda: order.append("idle") or False
+        s.on_idle()
+        self.assertEqual(order[:2], ["drain", "idle"])
 
 
 if __name__ == "__main__":

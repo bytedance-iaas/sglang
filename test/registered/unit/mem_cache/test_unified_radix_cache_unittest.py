@@ -11,6 +11,7 @@ from collections import defaultdict
 from dataclasses import dataclass, replace
 from typing import Optional
 from unittest import mock
+from unittest.mock import patch
 
 import torch
 from unified_tree_core_inspection_interface import UnifiedTreeCoreInspectionInterface
@@ -1674,6 +1675,85 @@ class UnifiedRadixCacheSuite:
             DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
         )
         cache.sanity_check()
+
+    def test_unfinished_req_uses_canonical_insert_not_match(self):
+        if self.cfg.has_mamba or self.cfg.has_swa:
+            self.skipTest("full-only canonical ownership; SWA tested separately")
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        req = self._make_req(req_to_token_pool)
+        tokens = self._make_seq(1, 3)
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(0, len(tokens))
+        indices = self._alloc(allocator, len(tokens))
+        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, len(tokens))), indices)
+        req.kv.kv_committed_len = len(tokens)
+        req.last_node = cache.root_node_handle()
+        req.kv.cache_protected_len = 0
+        req.swa_uuid_for_lock = None
+        req.extra_key = None
+        # Matching is a read/admission policy, not an ownership oracle after
+        # insertion. Neither a session answer nor a short match may repoint KV.
+        with patch.object(cache, "match_prefix", side_effect=AssertionError("rematch")):
+            cache.cache_unfinished_req(req)
+        inserted = len(
+            RadixKey(array("q", tokens), is_bigram=self.cfg.is_eagle).page_aligned(
+                self.cfg.page_size
+            )
+        )
+        self.assertEqual(req.kv.cache_protected_len, inserted)
+        torch.testing.assert_close(
+            req_to_token_pool.req_to_token[req.kv.req_pool_idx, : len(tokens)],
+            indices,
+            check_dtype=False,
+        )
+        cache.cache_finished_req(req, kv_len_to_handle=len(tokens))
+        req_to_token_pool.free(req)
+        req.kv.mark_kv_released()
+        cache.sanity_check()
+
+    def test_swa_unfinished_req_repoints_whole_insert_below_window(self):
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires SWA without Mamba")
+        if self.cfg.page_size != 1 or self.cfg.sliding_window_size != 4:
+            self.skipTest("requires page_size=1, sliding_window_size=4")
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        full_avail = allocator.full_attn_allocator.available_size()
+        swa_avail = allocator.swa_attn_allocator.available_size()
+        req = self._make_req(req_to_token_pool)
+        tokens = self._make_seq(1, 8)
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(0, len(tokens))
+        indices = self._alloc(allocator, len(tokens))
+        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, len(tokens))), indices)
+        req.kv.kv_committed_len = len(tokens)
+        req.last_node = cache.root_node_handle()
+        req.kv.cache_protected_len = 0
+        req.swa_uuid_for_lock = None
+        req.extra_key = None
+        allocator.free_swa(indices[:6])
+        req.kv.swa_evicted_seqlen = 6
+        cache.cache_unfinished_req(req)
+        inserted = len(tokens) - (1 if self.cfg.is_eagle else 0)
+        self.assertEqual(req.kv.cache_protected_len, inserted)
+        fresh = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        self.assertEqual(len(fresh.device_indices), 0)
+        cache.cache_finished_req(req, kv_len_to_handle=len(tokens))
+        req_to_token_pool.free(req)
+        req.kv.mark_kv_released()
+        cache.sanity_check()
+        self.assertEqual(
+            allocator.full_attn_allocator.available_size()
+            + cache.full_evictable_size(),
+            full_avail,
+        )
+        self.assertEqual(
+            allocator.swa_attn_allocator.available_size() + cache.swa_evictable_size(),
+            swa_avail,
+        )
 
     def test_swa_unfinished_req_preserves_existing_eviction_boundary(self):
         if not self.cfg.has_swa or self.cfg.has_mamba:

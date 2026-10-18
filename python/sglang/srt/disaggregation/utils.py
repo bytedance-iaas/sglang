@@ -137,6 +137,7 @@ def unified_memory_disagg_move_gate(scheduler):
             return not (
                 scheduler.disagg_prefill_inflight_queue
                 or scheduler.disagg_prefill_pending_chunk_rids
+                or scheduler.disagg_prefill_drain_releases
             )
 
         return prefill_gate
@@ -146,6 +147,7 @@ def unified_memory_disagg_move_gate(scheduler):
         def decode_gate() -> bool:
             return not (
                 scheduler.disagg_decode_transfer_queue.queue
+                or scheduler.disagg_decode_transfer_queue.has_pending_deferred_releases()
                 or scheduler.disagg_decode_prealloc_queue.has_published_destinations
             )
 
@@ -192,7 +194,12 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
             actual_room = metadata_buffers.bootstrap_room[
                 decode_req.metadata_buffer_index, 0
             ].item()
-            if actual_room == 0:
+            actual_epoch = metadata_buffers.bootstrap_room[
+                decode_req.metadata_buffer_index, 1
+            ].item()
+            if actual_room == 0 or actual_epoch != getattr(
+                decode_req.req, "pd_transfer_epoch", 0
+            ):
                 polls[i] = int(KVPoll.Transferring)
 
 
@@ -566,6 +573,9 @@ class MetadataBuffers:
         # Store bootstrap_room for validation on decode side
         self.bootstrap_room[req.metadata_buffer_index, 0] = (
             req.bootstrap_room if req.bootstrap_room is not None else 0
+        )
+        self.bootstrap_room[req.metadata_buffer_index, 1] = getattr(
+            req, "pd_transfer_epoch", 0
         )
 
 

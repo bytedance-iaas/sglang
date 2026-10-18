@@ -1516,6 +1516,7 @@ class Scheduler(
             self.disagg_prefill_inflight_queue: List[Req] = []
             # Requests with a sent chunk that are not yet on the inflight queue.
             self.disagg_prefill_pending_chunk_rids: Set[str] = set()
+            self.disagg_prefill_drain_releases: List[Tuple[Req, bool]] = []
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
@@ -2652,6 +2653,8 @@ class Scheduler(
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
+                bootstrap_pair_key=recv_req.bootstrap_pair_key,
+                pd_transfer_epoch=recv_req.pd_transfer_epoch,
                 disagg_mode=self.disaggregation_mode,
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
@@ -3297,13 +3300,15 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.clear_pending_chunk_send(req)
             req.disagg_kv_sender.abort()
+            self.release_prefill_kv_after_drain(req, is_insert=False)
             maybe_release_metadata_buffer(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
             req.pending_bootstrap = False
         if self.enable_hicache_storage:
             self.tree_cache.release_aborted_request(req.rid)
-        release_kv_cache(req, self.tree_cache, is_insert=False)
+        if self.disaggregation_mode != DisaggregationMode.PREFILL:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
@@ -3930,6 +3935,8 @@ class Scheduler(
         if (kv_full_retract_flag := not batch.check_decode_mem()) or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
+            if self.decode_offload_manager is not None:
+                self.decode_offload_manager.drain_before_retraction()
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio_tracker.current
             mamba_allocator = getattr(
@@ -4286,6 +4293,21 @@ class Scheduler(
                     can_run_cuda_graph=can_run_cuda_graph,
                 )
 
+        if self.disaggregation_mode == DisaggregationMode.PREFILL and not use_mlx():
+            # A cancelled request's previous result may be processed while the
+            # next overlap forward still writes its KV. Preserve that producer
+            # event with the source lease, not only the CPU result counter.
+            forward_done = self.device_module.Event()
+            forward_done.record(
+                stream=(
+                    self.forward_stream
+                    if self.enable_overlap
+                    else self.device_module.current_stream()
+                )
+            )
+            for req in batch.reqs:
+                req.disagg_prefill_forward_done = forward_done
+
         self._maybe_report_active_ranks()
 
         return ret
@@ -4533,6 +4555,10 @@ class Scheduler(
 
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # Local source holds can outlive the PP transfer microbatch that
+            # retired them. They must progress even when no new batch arrives.
+            self.resolve_prefill_drain_releases()
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 
@@ -4639,6 +4665,7 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
+                idle &= len(self.disagg_prefill_drain_releases) == 0
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
@@ -5053,22 +5080,18 @@ class Scheduler(
                 release_kv_cache(req, self.tree_cache)
             # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                bootstrap_pending = req.pending_bootstrap
+                if req.disagg_kv_sender is not None:
+                    req.disagg_kv_sender.abort()
+                    self.release_prefill_kv_after_drain(req, is_insert=False)
+                    req.disagg_kv_sender.clear()
                 maybe_release_metadata_buffer(
                     req, self.req_to_metadata_buffer_idx_allocator
                 )
-                if (
-                    bootstrap_pending
-                    and hasattr(req, "disagg_kv_sender")
-                    and req.disagg_kv_sender is not None
-                ):
-                    if hasattr(req.disagg_kv_sender, "abort"):
-                        req.disagg_kv_sender.abort()
 
             # For mamba radix cache
-            if (
-                req.kv.holds_mamba
-                and self.disaggregation_mode != DisaggregationMode.DECODE
+            if req.kv.holds_mamba and self.disaggregation_mode not in (
+                DisaggregationMode.DECODE,
+                DisaggregationMode.PREFILL,
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
@@ -5126,21 +5149,9 @@ class Scheduler(
             for decode_req in self.disagg_decode_transfer_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
-                    receiver = decode_req.kv_receiver
-                    receiver.abort()
-                    # Arm drain-ack accounting once the ABORT is sent, so acks
-                    # arriving before this req is deferred (e.g. during the next
-                    # forward step) are captured. A fresh set also drops stale acks
-                    # from a prior request that reused this bootstrap_room. A
-                    # redundant abort only re-wipes -- holds longer, never releases
-                    # early -- so no transition guard is needed.
-                    if (
-                        receiver.kv_mgr.enable_deferred_decode_kv_release
-                        and receiver.abort_notified
-                    ):
-                        receiver.kv_mgr.register_deferred_abort_room(
-                            decode_req.req.bootstrap_room
-                        )
+                    # The receiver arms before publishing ABORT. A redundant
+                    # abort must not reset ACKs already received for this hold.
+                    decode_req.kv_receiver.abort()
 
             # Abort requests whose KV is already backed up for retraction.
             if self.disagg_decode_prealloc_queue.retracted_queue:
@@ -5215,6 +5226,9 @@ class Scheduler(
         self.last_batch = None
         self.cur_batch_for_debug = None
 
+        if self.decode_offload_manager is not None:
+            # The paused event loop will not drain these copies after release.
+            self.decode_offload_manager.drain_before_retraction()
         if retract_reqs:
             # Decode-side retract always rebootstraps (recomputes the KV from
             # the prefill), so skip the device->host KV offload that release_req
@@ -5233,6 +5247,7 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 if req.output_ids:
                     req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
+                req.pd_transfer_epoch = getattr(req, "pd_transfer_epoch", 0) + 1
                 req.pd_rebootstrap_in_progress = True
                 req.time_stats.set_retract_time()
                 self.disagg_decode_prealloc_queue.hold_rebootstrap(req)

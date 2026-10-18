@@ -137,10 +137,31 @@ class PrefillServerInfo:
 class PrefillRankInfo:
     rank_ip: str
     rank_port: int
+    abort_ack_rank: Optional[int] = None
 
     def __post_init__(self):
         self.rank_ip = str(self.rank_ip)
         self.rank_port = int(self.rank_port)
+        if self.abort_ack_rank is not None:
+            self.abort_ack_rank = int(self.abort_ack_rank)
+            if self.abort_ack_rank < 0:
+                raise ValueError("Negative prefill abort ACK rank")
+
+
+def prefill_abort_ack_rank(
+    tp_rank: int, cp_rank: int, pp_rank: int, cp_size: int, pp_size: int
+) -> int:
+    """Shared registered/sent rank namespace, independent of endpoint order."""
+    if any(
+        type(value) is not int
+        for value in (tp_rank, cp_rank, pp_rank, cp_size, pp_size)
+    ):
+        raise ValueError("Prefill abort ACK coordinates must be integers")
+    if tp_rank < 0 or cp_size <= 0 or pp_size <= 0:
+        raise ValueError("Invalid prefill abort ACK topology")
+    if not (0 <= cp_rank < cp_size and 0 <= pp_rank < pp_size):
+        raise ValueError("Prefill abort ACK rank is outside registered topology")
+    return tp_rank * (pp_size * cp_size) + pp_rank * cp_size + cp_rank
 
 
 class CommonKVManager(BaseKVManager):
@@ -383,7 +404,12 @@ class CommonKVManager(BaseKVManager):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
 
-    def register_deferred_abort_room(self, bootstrap_room: int) -> None:
+    def register_deferred_abort_room(
+        self,
+        bootstrap_room: int,
+        expected_ranks: Optional[Set[int]] = None,
+        transfer_epoch: int = 0,
+    ) -> Optional[str]:
         """Arm drain-ack accounting for a held room; a fresh set wipes stale acks
         from a prior request that reused this bootstrap_room."""
         self._deferred_abort_ack_tracker[bootstrap_room] = set()
@@ -395,22 +421,35 @@ class CommonKVManager(BaseKVManager):
         if acks is not None:
             acks.add(prefill_rank)
 
-    def is_abort_release_safe(self, bootstrap_room: int, required_acks: int) -> bool:
+    def is_abort_release_safe(
+        self,
+        bootstrap_room: int,
+        required_acks: int,
+        generation: Optional[str] = None,
+        transfer_epoch: int = 0,
+    ) -> bool:
         """True once every prefill rank that could still write these pages has acked."""
         return (
             len(self._deferred_abort_ack_tracker.get(bootstrap_room, ()))
             >= required_acks
         )
 
-    def clear_deferred_abort_state(self, bootstrap_room: int) -> None:
+    def clear_deferred_abort_state(
+        self,
+        bootstrap_room: int,
+        generation: Optional[str] = None,
+        transfer_epoch: int = 0,
+    ) -> None:
         self._deferred_abort_ack_tracker.pop(bootstrap_room, None)
 
     def _prefill_unique_rank(self) -> int:
         """Stable per-sender id, matching what the transfer worker syncs on Success."""
-        return (
-            self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
-            + self.pp_rank * self.attn_cp_size
-            + self.attn_cp_rank
+        return prefill_abort_ack_rank(
+            self.attn_tp_rank,
+            self.attn_cp_rank,
+            self.pp_rank,
+            self.attn_cp_size,
+            self.pp_size,
         )
 
     def _send_abort_ack(self, decode_ip: str, decode_port: int, room: int) -> None:
@@ -552,6 +591,21 @@ class CommonKVManager(BaseKVManager):
         """
         if self.attn_tp_rank != 0 or self.attn_cp_rank != 0 or self.pp_rank != 0:
             return
+        bound_rank = getattr(kv_receiver, "prefill_dp_rank", None)
+        if type(bound_rank) is not int or bound_rank < 0:
+            self._fail_prefill_recompute(
+                kv_receiver,
+                "PD recompute receiver has no initialized prefill DP binding.",
+            )
+            return
+        # Bind the dispatched POST to the same receiver that published the
+        # destination metadata, independent of a caller's stale routing hints.
+        # Copy: executor handoff must not mutate the scheduler's payload.
+        payload = {
+            **payload,
+            "routed_dp_rank": bound_rank,
+            "disagg_prefill_dp_rank": bound_rank,
+        }
         prefill_url = self._resolve_rebootstrap_prefill_url(kv_receiver)
         if not prefill_url:
             logger.error(
@@ -1343,9 +1397,13 @@ class CommonKVSender(BaseKVSender):
         if hasattr(self.kv_mgr, "transfer_infos"):
             self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "_deferred_ack_targets"):
-            # Drop a held ack target if the room concluded without draining
-            # (e.g. aborted before any chunk enqueued); else it leaks on prefill.
-            self.kv_mgr._deferred_ack_targets.pop(self.bootstrap_room, None)
+            if hasattr(self.kv_mgr, "_staging_outstanding"):
+                # The scheduler may clear a failed room before its submitted
+                # writes drain. Keep the ACK target until the worker completes;
+                # an already quiescent room is acked here. SGLang #40645.
+                self.kv_mgr._maybe_ack_drained_abort(self.bootstrap_room)
+            else:
+                self.kv_mgr._deferred_ack_targets.pop(self.bootstrap_room, None)
 
     def abort(self):
         self.kv_mgr.record_failure(
@@ -1376,6 +1434,12 @@ class CommonKVReceiver(BaseKVReceiver):
         self.require_staging: bool = False
         self.init_time: Optional[float] = None
         self.abort_notified: bool = False
+        self._abort_tracker_armed = False
+        self._abort_generation: Optional[str] = None
+        # None: this backend has no per-send publication instrumentation.
+        # A completed init_time still proves publication; partial publication
+        # must be treated conservatively by transfer-queue failure handling.
+        self.destination_metadata_published: Optional[bool] = None
         self._connection_pool_entries: Dict[str, List[Dict]] = {}
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
@@ -1609,13 +1673,7 @@ class CommonKVReceiver(BaseKVReceiver):
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.invalidate_cached_bootstrap_infos()
-        if (
-            not self.abort_notified
-            and hasattr(self, "bootstrap_infos")
-            and self.bootstrap_infos is not None
-        ):
-            self._send_abort_notification()
-            self.abort_notified = True
+        self.ensure_abort_notified()
         return KVPoll.Failed
 
     def clear(self) -> None:
@@ -1630,28 +1688,79 @@ class CommonKVReceiver(BaseKVReceiver):
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
+        self.ensure_abort_notified()
+
+    def requires_abort_drain(self) -> bool:
+        """Whether a transfer-queue failure may leave writes to its destinations.
+
+        Only an instrumented backend's explicit False rules out publication.
+        init_time alone cannot exclude a partially successful metadata loop.
+        """
+        return self.init_time is not None or (
+            getattr(self, "destination_metadata_published", None) is not False
+        )
+
+    def ensure_abort_notified(self, *, force_arm: bool = False) -> None:
+        """Notify without overwriting the original failure, arm before sending.
+
+        force_arm handles partial publication, including an earlier prealloc
+        abort whose notification was sent before the transfer hold was armed.
+        Re-arming must not reset ACKs collected by this receiver.
+        """
+        arm = self.kv_mgr.enable_deferred_decode_kv_release and (
+            force_arm or self.init_time is not None
+        )
+        newly_armed = arm and not getattr(self, "_abort_tracker_armed", False)
+        if newly_armed:
+            self._abort_generation = self.kv_mgr.register_deferred_abort_room(
+                self.bootstrap_room,
+                expected_ranks=self.expected_abort_ack_ranks(),
+                transfer_epoch=getattr(self, "transfer_epoch", 0),
+            )
+            self._abort_tracker_armed = True
         if (
-            not self.abort_notified
+            (not self.abort_notified or newly_armed)
             and hasattr(self, "bootstrap_infos")
-            and self.bootstrap_infos is not None
+            and self.bootstrap_infos
         ):
             self._send_abort_notification()
             self.abort_notified = True
 
     def _send_abort_notification(self):
+        # Published destination metadata allows prefill to write already. Arm
+        # before the first message so even an immediate drained ACK is counted.
+        # abort_notified gates this call per receiver; prealloc-only receivers
+        # stay unarmed because they never enter the deferred-release cleanup.
+        # SGLang #41402/#41404; direct calls also obey arm-before-send.
+        if (
+            self.kv_mgr.enable_deferred_decode_kv_release
+            and self.init_time is not None
+            and not getattr(self, "_abort_tracker_armed", False)
+        ):
+            self._abort_generation = self.kv_mgr.register_deferred_abort_room(
+                self.bootstrap_room,
+                expected_ranks=self.expected_abort_ack_ranks(),
+                transfer_epoch=getattr(self, "transfer_epoch", 0),
+            )
+            self._abort_tracker_armed = True
         for bootstrap_info in self.bootstrap_infos:
             # Best-effort notification to prefill side that this request was aborted.
             try:
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
-                with lock:
-                    sock.send_multipart(
-                        [
-                            b"ABORT",
-                            str(self.bootstrap_room).encode("ascii"),
-                            self.kv_mgr.local_ip.encode("ascii"),
-                            str(self.kv_mgr.rank_port).encode("ascii"),
-                        ]
+                frames = [
+                    b"ABORT",
+                    str(self.bootstrap_room).encode("ascii"),
+                    self.kv_mgr.local_ip.encode("ascii"),
+                    str(self.kv_mgr.rank_port).encode("ascii"),
+                ]
+                generation = getattr(self, "_abort_generation", None)
+                if generation is not None:
+                    frames.append(generation.encode("ascii"))
+                    frames.append(
+                        str(getattr(self, "transfer_epoch", 0)).encode("ascii")
                     )
+                with lock:
+                    sock.send_multipart(frames)
                 logger.debug(
                     f"Sent abort notification for room {self.bootstrap_room} "
                     f"to {bootstrap_info.get('rank_ip', 'unknown')}:{bootstrap_info.get('rank_port', 'unknown')}"
@@ -1660,6 +1769,28 @@ class CommonKVReceiver(BaseKVReceiver):
                 logger.debug(
                     f"Failed to send abort notification for room {self.bootstrap_room}: {e}"
                 )
+
+    def expected_abort_ack_ranks(self) -> Optional[Set[int]]:
+        """Freeze the registered identities of every notified rank, dummy included.
+
+        Missing or ambiguous provider identities are not a safe count-only
+        fallback. NIXL keeps such a hold unproven until recovery.
+        """
+        infos = getattr(self, "bootstrap_infos", None)
+        if not infos:
+            return None
+        ranks: Set[int] = set()
+        endpoints = set()
+        for info in infos:
+            rank = info.get("abort_ack_rank")
+            if type(rank) is not int or rank < 0 or rank in ranks:
+                return None
+            endpoint = (info.get("rank_ip"), info.get("rank_port"))
+            if endpoint in endpoints or None in endpoint:
+                return None
+            ranks.add(rank)
+            endpoints.add(endpoint)
+        return ranks
 
 
 class CommonKVBootstrapServer(BaseKVBootstrapServer):
@@ -1796,6 +1927,15 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             tp_group_table[pp_rank] = PrefillRankInfo(
                 rank_ip=rank_ip,
                 rank_port=rank_port,
+                # Same per-sender identity as CommonKVManager._prefill_unique_rank.
+                # Publish it rather than infer rank IDs from target list length.
+                abort_ack_rank=prefill_abort_ack_rank(
+                    int(attn_tp_rank),
+                    int(attn_cp_rank),
+                    int(pp_rank),
+                    int(attn_cp_size),
+                    int(pp_size),
+                ),
             )
 
             self._registered_count += 1

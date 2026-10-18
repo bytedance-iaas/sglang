@@ -13,7 +13,7 @@ is exercised as the real method, no mock.
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import msgspec.structs
 
@@ -233,6 +233,96 @@ class TestFollowBootstrapRoomScheduler(CustomTestCase):
         ctl.follow_bootstrap_room_scheduler(_req(routed_dp_rank=3, bootstrap_room=1))
         ctl.workers[3].send_pyobj.assert_called_once()
         ctl.workers[1].send_pyobj.assert_not_called()
+
+
+class TestPrefixAwareScheduler(CustomTestCase):
+    def _fresh(self, ctl, now=100.0):
+        ctl.dp_budget.last_timestamp = [now] * len(ctl.workers)
+        ctl.dp_budget.max_requests = [40] * len(ctl.workers)
+
+    def test_repeated_prefix_affinity_with_changed_suffix_and_low_load(self):
+        ctl = _make_controller(4)
+        self._fresh(ctl)
+        with patch(
+            "sglang.srt.managers.data_parallel_controller.time.time", return_value=100.0
+        ):
+            ctl.prefix_aware_scheduler(_req(input_ids=list(range(4096)) + [1000]))
+            ctl.dp_budget.total_requests = [0] * 4
+            ctl.prefix_aware_scheduler(_req(input_ids=list(range(4096)) + [2000]))
+        counts = [worker.send_pyobj.call_count for worker in ctl.workers]
+        self.assertEqual(sorted(counts), [0, 0, 0, 2])
+
+    def test_hot_prefix_spills_instead_of_pin_entire_burst(self):
+        ctl = _make_controller(4)
+        self._fresh(ctl)
+        with patch(
+            "sglang.srt.managers.data_parallel_controller.time.time", return_value=100.0
+        ):
+            for _ in range(32):
+                ctl.prefix_aware_scheduler(_req(input_ids=list(range(256))))
+        self.assertLessEqual(
+            max(ctl.dp_budget.total_requests) - min(ctl.dp_budget.total_requests), 3
+        )
+        self.assertTrue(all(worker.send_pyobj.call_count > 0 for worker in ctl.workers))
+
+    def test_stale_snapshot_falls_back_to_health_aware_round_robin(self):
+        ctl = _make_controller(4)
+        self._fresh(ctl)
+        ctl.dp_budget.last_timestamp[2] = 90.0
+        ctl.status[0] = False
+        with patch(
+            "sglang.srt.managers.data_parallel_controller.time.time", return_value=100.0
+        ):
+            ctl.prefix_aware_scheduler(_req(input_ids=[1, 2, 3]))
+        ctl.workers[1].send_pyobj.assert_called_once()
+        ctl.workers[0].send_pyobj.assert_not_called()
+
+    def test_external_rank_is_not_rewritten_or_charged(self):
+        ctl = _make_controller(4)
+        ctl.prefix_aware_scheduler(_req(routed_dp_rank=3))
+        ctl.workers[3].send_pyobj.assert_called_once()
+        self.assertEqual(ctl.dp_budget.total_requests, [0] * 4)
+
+    def test_multimodal_payload_skips_token_only_affinity(self):
+        ctl = _make_controller(4)
+        self._fresh(ctl)
+        req = _req(input_ids=[1, 2])
+        req.mm_inputs = object()
+        with patch.object(
+            ctl.dp_budget,
+            "dispatch_prefix",
+            side_effect=AssertionError("token-only key"),
+        ):
+            ctl.prefix_aware_scheduler(req)
+        ctl.workers[0].send_pyobj.assert_called_once()
+
+    def test_namespace_and_routing_key_are_part_of_affinity_identity(self):
+        ctl = _make_controller(4)
+        keys = []
+        with patch.object(
+            ctl.dp_budget,
+            "dispatch_prefix",
+            side_effect=lambda key, active, now: keys.append(key) or 0,
+        ):
+            for salt, adapter, route in (
+                ("a", None, None),
+                ("b", None, None),
+                ("a", "adapter", None),
+                ("a", None, "session"),
+            ):
+                req = _req(input_ids=[1, 2, 3])
+                req.cache_salt, req.lora_id, req.routing_key = salt, adapter, route
+                ctl.prefix_aware_scheduler(req)
+        self.assertEqual(len(set(keys)), 4)
+
+    def test_full_rank_is_not_selected(self):
+        budget = DPBudget(4)
+        budget.last_timestamp = [100.0] * 4
+        budget.max_requests = [40] * 4
+        preferred = budget.dispatch_prefix(b"prefix", list(range(4)), 100.0)
+        budget.total_requests[preferred] = 40
+        selected = budget.dispatch_prefix(b"prefix", list(range(4)), 100.0)
+        self.assertNotEqual(selected, preferred)
 
 
 class TestTotalRequestsScheduler(CustomTestCase):

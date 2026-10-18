@@ -14,6 +14,8 @@
 """A controller that dispatches requests to multiple data parallel workers."""
 
 import faulthandler
+import hashlib
+import json
 import logging
 import multiprocessing as mp
 import signal
@@ -89,6 +91,7 @@ class LoadBalanceMethod(Enum):
     FOLLOW_BOOTSTRAP_ROOM = auto()
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
+    PREFIX_AWARE = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -105,6 +108,7 @@ class DPBudget:
         self.total_requests = [0] * dp_size
         self.total_tokens = [0] * dp_size
         self.last_timestamp = [0.0] * dp_size
+        self.max_requests = [0] * dp_size
 
     def update_budget(self, loads):
         """Update budget from shm snapshots, skipping stale reads."""
@@ -116,6 +120,53 @@ class DPBudget:
                 load.num_running_reqs + load.num_waiting_reqs
             )
             self.total_tokens[load.dp_rank] = load.num_total_tokens
+            self.max_requests[load.dp_rank] = load.max_running_requests
+
+    def dispatch_prefix(self, key: bytes, active: list[int], now: float) -> int | None:
+        """Bounded affinity, not a cache-hit oracle or an admission controller.
+
+        Snapshots include running, prealloc and transfer queues. Optimistic
+        increments keep a burst from pinning a hot prefix before the next
+        snapshot arrives. No cached-token state is assumed from a hash match.
+        """
+        fresh = [
+            rank
+            for rank in active
+            if 0 <= rank < self.dp_size
+            and 0 < self.last_timestamp[rank]
+            and 0 <= now - self.last_timestamp[rank] <= 1.0
+            and self.max_requests[rank] > 0
+        ]
+        if len(fresh) != len(active):
+            # The caller retains health-aware round robin when load is unknown.
+            return None
+        eligible = [
+            rank
+            for rank in fresh
+            if self.total_requests[rank] < self.max_requests[rank]
+        ]
+        if not eligible:
+            return None
+        preferred = max(
+            active,
+            key=lambda rank: hashlib.blake2b(
+                key + rank.to_bytes(4, "little"), digest_size=8
+            ).digest(),
+        )
+        least = min(
+            eligible,
+            key=lambda rank: (self.total_requests[rank], self.total_tokens[rank], rank),
+        )
+        rank = (
+            preferred
+            if preferred in eligible
+            and self.total_requests[preferred] <= self.total_requests[least] + 2
+            else least
+        )
+        self.total_requests[rank] += 1
+        # Token capacity/admission remains scheduler-owned; do not charge a
+        # whole repeated prefix here as if it necessarily missed in the cache.
+        return rank
 
     def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
@@ -166,11 +217,13 @@ class DataParallelController:
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
+            LoadBalanceMethod.PREFIX_AWARE: self.prefix_aware_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
             LoadBalanceMethod.TOTAL_REQUESTS,
             LoadBalanceMethod.TOTAL_TOKENS,
+            LoadBalanceMethod.PREFIX_AWARE,
         )
 
         self.launch_dp_size: int = get_parallel().dp_size
@@ -787,6 +840,52 @@ class DataParallelController:
         )
         target_rank = req.bootstrap_room % len(self.workers)
         sock_send(self.workers[target_rank], req)
+
+    def prefix_aware_scheduler(self, req: Req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
+        active = [
+            rank
+            for rank in self._active_workers
+            if self.status[rank] and self.workers[rank] is not None
+        ]
+        if not active:
+            raise RuntimeError("No active DP workers are available for routing.")
+        # Only text requests have token-only KV identity. Multimodal/embedding
+        # overrides keep the existing dispatch rather than guessing affinity.
+        if (
+            getattr(req, "mm_inputs", None) is not None
+            or getattr(req, "multimodal_inputs", None) is not None
+            or getattr(req, "input_embeds", None) is not None
+            or getattr(req, "positional_embed_overrides", None) is not None
+            or not req.input_ids
+        ):
+            self.round_robin_scheduler(req)
+            return
+        routing_key = getattr(req, "routing_key", None)
+        namespace = (
+            getattr(req, "lora_id", None),
+            getattr(req, "extra_key", None),
+            getattr(req, "cache_salt", None),
+        )
+        # A bounded leading window is an affinity heuristic, not a promise of
+        # the longest match. Include more than the shared chat-template header.
+        prefix = (
+            ("route", routing_key)
+            if routing_key
+            else ("tokens", list(req.input_ids[:4096]))
+        )
+        key = hashlib.blake2b(
+            json.dumps(
+                (namespace, prefix), ensure_ascii=False, separators=(",", ":")
+            ).encode(),
+            digest_size=16,
+        ).digest()
+        rank = self.dp_budget.dispatch_prefix(key, active, time.time())
+        if rank is None:
+            self.round_robin_scheduler(req)
+            return
+        sock_send(self.workers[rank], req)
 
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):

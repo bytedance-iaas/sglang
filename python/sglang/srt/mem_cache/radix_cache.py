@@ -549,11 +549,18 @@ class RadixCache(BasePrefixCache):
             start_pos=req.kv.cache_protected_len,
         )
 
-        # The prefix indices could be updated, reuse it
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
-        new_indices, new_last_node = (
-            match_result.device_indices,
-            match_result.last_device_node,
+        # Repoint from the canonical insertion path, not a second admission
+        # match. The latter must not change which tree-owned rows we protect.
+        new_last_node = result.last_device_node
+        node = new_last_node
+        chunks = []
+        while node is not self.root_node:
+            chunks.append(node.value)
+            node = node.parent
+        new_indices = (
+            torch.cat(chunks[::-1])
+            if chunks
+            else self._empty_match_result.device_indices
         )
         assert len(new_indices) == len(
             radix_key

@@ -933,6 +933,8 @@ class Req(ReqDllmMixin):
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
+        bootstrap_pair_key: Optional[str] = None,
+        pd_transfer_epoch: int = 0,
         disagg_mode: Optional[DisaggregationMode] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
@@ -1237,6 +1239,10 @@ class Req(ReqDllmMixin):
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
+        self.bootstrap_pair_key: Optional[str] = bootstrap_pair_key
+        if type(pd_transfer_epoch) is not int or pd_transfer_epoch < 0:
+            raise ValueError("PD transfer epoch must be a nonnegative integer")
+        self.pd_transfer_epoch = pd_transfer_epoch
         # Decode-local: the already-emitted boundary token to replay when a
         # retracted request is rebootstrapped. Set in pause_generation(retract)
         # and consumed in the decode transfer commit; never plumbed to prefill.
@@ -1246,6 +1252,9 @@ class Req(ReqDllmMixin):
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank
+        # Decode-local binding selected by receiver.init(), not a client hint.
+        # Preserve it across true retraction and receiver reconstruction.
+        self.pd_bound_prefill_dp_rank: Optional[int] = None
 
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.
@@ -1266,6 +1275,9 @@ class Req(ReqDllmMixin):
         # first prefill batch; the cached-prefix early-send never goes past it.
         self.early_send_prefix_end: Optional[int] = None
         self.metadata_buffer_index: int = -1
+        # A retired prefill request may still own KV/state/aux source slots.
+        self.disagg_prefill_release_deferred: bool = False
+        self.disagg_prefill_forward_done = None
         # Used in overlap sequence to signal that an optimistic request should
         # abort chunking. Set in create_sender, consumed in process_batch_result.
         self.pending_bootstrap = False
@@ -1871,6 +1883,9 @@ class Req(ReqDllmMixin):
         # carries token ``input_ids`` and drops any image/audio/video inputs, so
         # the rebootstrap recompute would not reproduce the original prefix KV
         # for multi-modal requests. Add multi-modal support before enabling it.
+        bound_rank = self.pd_bound_prefill_dp_rank
+        if type(bound_rank) is not int or bound_rank < 0:
+            raise ValueError("PD recompute requires an initialized prefill DP binding")
         sp = self.sampling_params
         return {
             "input_ids": [int(x) for x in self.origin_input_ids]
@@ -1895,11 +1910,17 @@ class Req(ReqDllmMixin):
             "bootstrap_host": self.bootstrap_host,
             "bootstrap_port": self.bootstrap_port,
             "bootstrap_room": self.bootstrap_room,
+            "bootstrap_pair_key": self.bootstrap_pair_key,
+            "pd_transfer_epoch": self.pd_transfer_epoch,
             "priority": self.priority,
             "extra_key": self.extra_key,
             "cache_salt": self.cache_salt,
             "routing_key": self.routing_key,
-            "disagg_prefill_dp_rank": self.disagg_prefill_dp_rank,
+            # The prefill controller dispatches via routed_dp_rank, whereas
+            # disagg_prefill_dp_rank suppresses redundant bootstrap discovery.
+            # Never copy the decode's routed_dp_rank into this prefill POST.
+            "routed_dp_rank": bound_rank,
+            "disagg_prefill_dp_rank": bound_rank,
         }
 
     def log_time_stats(self):

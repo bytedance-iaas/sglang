@@ -280,6 +280,10 @@ class GenerateReqInput:
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_pair_key: Optional[Union[List[Optional[str]], str]] = None
+    # Transfer incarnation within one bootstrap_room. The router-originated
+    # request starts at 0; decode true-retraction increments it before the
+    # recompute request is dispatched back to prefill.
+    pd_transfer_epoch: Optional[Union[List[int], int]] = None
     decode_tp_size: Optional[Union[List[Optional[int]], int]] = None
 
     # For DP routing — external router assigns a specific DP worker
@@ -855,6 +859,15 @@ class GenerateReqInput:
         elif isinstance(self.bootstrap_pair_key, list):
             self.bootstrap_pair_key = self.bootstrap_pair_key * self.parallel_sample_num
 
+        # Normalize transfer epoch. Both P and D receive the same router body,
+        # so a missing initial value is deterministically epoch 0.
+        if self.pd_transfer_epoch is None:
+            self.pd_transfer_epoch = [0] * num
+        elif not isinstance(self.pd_transfer_epoch, list):
+            self.pd_transfer_epoch = [self.pd_transfer_epoch] * num
+        else:
+            self.pd_transfer_epoch = self.pd_transfer_epoch * self.parallel_sample_num
+
         # Normalize decode_tp_size
         if self.decode_tp_size is None:
             self.decode_tp_size = [None] * num
@@ -939,6 +952,9 @@ class GenerateReqInput:
                 self.bootstrap_pair_key[i]
                 if self.bootstrap_pair_key is not None
                 else None
+            ),
+            pd_transfer_epoch=(
+                self.pd_transfer_epoch[i] if self.pd_transfer_epoch is not None else 0
             ),
             decode_tp_size=(
                 self.decode_tp_size[i] if self.decode_tp_size is not None else None
@@ -1025,6 +1041,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
     bootstrap_pair_key: Optional[str] = None
+    pd_transfer_epoch: int = 0
     decode_tp_size: Optional[int] = None
 
     # For DP routing

@@ -1393,6 +1393,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=bootstrap_room,
+                bootstrap_pair_key=obj.bootstrap_pair_key,
+                pd_transfer_epoch=(
+                    0 if obj.pd_transfer_epoch is None else obj.pd_transfer_epoch
+                ),
                 lora_id=obj.lora_id,
                 input_embeds=input_embeds,
                 positional_embed_overrides=obj.positional_embed_overrides,

@@ -27,7 +27,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -451,6 +451,30 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         self.assertFalse(req.swa_prefix_lock_released)
         queue._swa_tail_len.assert_called_once_with(8)
         queue._allocatable_token_budgets.assert_called_once()
+
+    def test_eagle_canonical_insert_repoints_without_admission_rematch(self):
+        for page_size in (1, 4):
+            with self.subTest(page_size=page_size):
+                cache, row = _make_cache_with_pools(page_size=page_size)
+                cache.is_eagle = True
+                tokens = list(range(13))
+                values = torch.arange(100, 113, dtype=torch.int64)
+                row[0, :13] = values
+                req = _make_req(tokens, last_node=cache.root_node)
+                with patch.object(
+                    cache,
+                    "match_prefix",
+                    side_effect=AssertionError("post-insert rematch"),
+                ):
+                    cache.cache_unfinished_req(req)
+                expected_len = len(
+                    RadixKey(array("q", tokens), is_bigram=True).page_aligned(page_size)
+                )
+                self.assertEqual(req.kv.cache_protected_len, expected_len)
+                torch.testing.assert_close(row[0, :13], values)
+                cache.cache_finished_req(req, kv_len_to_handle=13)
+                self.assertEqual(cache.protected_size(), 0)
+                self.assertEqual(cache.root_node.lock_ref, 1)
 
     def test_repeated_incremental_no_leak(self):
         """Multiple incremental transfers shouldn't leak lock_refs."""

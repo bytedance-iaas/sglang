@@ -32,6 +32,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
 )
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
+    _apply_metadata_gate,
     build_state_transfer_entry_pairs,
     get_dsv4_c128_state_indices,
     setup_state_kv_args,
@@ -48,6 +49,28 @@ from sglang.srt.speculative.eagle_disaggregation import (
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+
+class TestMetadataAttemptGate(unittest.TestCase):
+    def test_same_room_old_epoch_stays_transferring(self):
+        metadata = SimpleNamespace(
+            bootstrap_room=torch.tensor([[7, 1, 0, 0]], dtype=torch.uint64)
+        )
+        decode_req = SimpleNamespace(
+            metadata_buffer_index=0,
+            req=SimpleNamespace(
+                bootstrap_host="real", bootstrap_room=7, pd_transfer_epoch=2
+            ),
+        )
+        polls = [4]
+
+        _apply_metadata_gate(polls, [decode_req], metadata)
+        self.assertEqual(polls, [3])
+
+        metadata.bootstrap_room[0, 1] = 2
+        polls = [4]
+        _apply_metadata_gate(polls, [decode_req], metadata)
+        self.assertEqual(polls, [4])
 
 
 class TestDisaggregationWire(unittest.TestCase):
@@ -389,6 +412,7 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             output_topk_index=torch.tensor([7]),
             output_dsa_topk_indices=seed,
             bootstrap_room=9,
+            pd_transfer_epoch=3,
         )
 
     def test_metadata_buffer_copies_seed_and_uses_invalid_sentinel(self):
@@ -404,6 +428,7 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
 
         self.assertTrue(torch.equal(buffers.output_dsa_topk_indices[0], seed))
         self.assertEqual(buffers.output_dsa_topk_indices[1].tolist(), [-1, -1, -1])
+        self.assertEqual(buffers.bootstrap_room[0, :2].tolist(), [9, 3])
         ptrs, data_lens, item_lens = buffers.get_buf_infos()
         self.assertEqual(ptrs[-2], buffers.output_dsa_topk_indices.data_ptr())
         self.assertEqual(data_lens[-2], buffers.output_dsa_topk_indices.nbytes)
