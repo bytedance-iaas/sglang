@@ -246,7 +246,10 @@ def cutlass_fused_moe_deferred(
         import flashinfer
 
         profile_ids = _DSV41_EP4_PROFILE_IDS.get(kwargs.get("tune_max_num_tokens"))
-        if flashinfer.__version__ == "0.6.18" and profile_ids is not None:
+        if (
+            flashinfer.__version__ in ("0.6.18", "0.7.0.post1")
+            and profile_ids is not None
+        ):
             kwargs["profile_ids"] = list(profile_ids)
     expanded_rows = num_tokens * top_k
     gemm2_numel = expanded_rows * hidden_size
