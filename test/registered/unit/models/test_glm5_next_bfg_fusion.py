@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 
 import torch
 import torch.nn.functional as F
+
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
@@ -314,6 +315,10 @@ class TestGlm5NextLinearAttentionOnormHandoff(CustomTestCase):
             prefix=PREFIX,
         )
         attention.do_fuse_qkvbfg = False
+        # This branch keeps the finer-grained fusion selector introduced by
+        # the local GLM projection path; disable its first-stage route too so
+        # the test's injected forward_qkvbfg fixture owns the gate tensor.
+        attention.fuse_qkvbfg_a = False
         attention.forward_qkvbfg = lambda *_: (
             torch.zeros(tokens, 3 * heads * head_dim),
             torch.zeros(tokens, heads),
