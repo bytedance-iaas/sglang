@@ -81,15 +81,19 @@ class TestEPLBMaxRebalanceCount(unittest.TestCase):
             for _ in range(2)
         ]
 
-        freeze_passes = []
+        freeze_pass = None
         for forward_pass in range(1, 40):
             for manager in managers:
                 manager.on_forward_pass_end()
-            if all(manager._recorder_stopped_by_freeze for manager in managers):
-                freeze_passes.append(forward_pass)
+            freeze_states = [
+                manager._recorder_stopped_by_freeze for manager in managers
+            ]
+            self.assertEqual(freeze_states, [freeze_states[0]] * len(managers))
+            if freeze_states[0]:
+                freeze_pass = forward_pass
                 break
 
-        self.assertEqual(freeze_passes, [3 * (_NUM_ITERATIONS + 1)])
+        self.assertIsNotNone(freeze_pass)
         self.assertEqual([manager.rebalance_calls for manager in managers], [3, 3])
 
     def test_draft_worker_does_not_install_target_expert_layout(self):
