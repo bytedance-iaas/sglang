@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from sglang.srt.eplb.eplb_manager import EPLBManager
+from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -73,6 +74,34 @@ class TestEPLBMaxRebalanceCount(unittest.TestCase):
         self._run_windows(manager, num_windows=3)
         self.assertEqual(manager.rebalance_calls, 2)
         self.assertEqual(self.recorder.stop_record.call_count, 2)
+
+    def test_lockstep_managers_freeze_on_the_same_forward_pass(self):
+        managers = [
+            self._make_manager(max_count=2, outcomes=[False, True, True])
+            for _ in range(2)
+        ]
+
+        freeze_passes = []
+        for forward_pass in range(1, 40):
+            for manager in managers:
+                manager.on_forward_pass_end()
+            if all(manager._recorder_stopped_by_freeze for manager in managers):
+                freeze_passes.append(forward_pass)
+                break
+
+        self.assertEqual(freeze_passes, [3 * (_NUM_ITERATIONS + 1)])
+        self.assertEqual([manager.rebalance_calls for manager in managers], [3, 3])
+
+    def test_draft_worker_does_not_install_target_expert_layout(self):
+        runner = ModelRunner.__new__(ModelRunner)
+        runner.is_draft_worker = True
+
+        with patch(
+            "sglang.srt.model_executor.model_runner.set_global_expert_location_metadata"
+        ) as set_location:
+            runner.maybe_init_expert_location_metadata()
+
+        set_location.assert_not_called()
 
 
 if __name__ == "__main__":
