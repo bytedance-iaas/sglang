@@ -2057,11 +2057,7 @@ class Scheduler(
         for prev_batch, prev_result in self.result_queue:
             self.batch_result_processor.advance_grammar_fsm(prev_result, prev_batch)
 
-    def ingest_requests(
-        self,
-        stop_at_pause: bool = False,
-        defer_pp_collective_control: bool = False,
-    ) -> List:
+    def ingest_requests(self, stop_at_pause: bool = False) -> List:
         """Receive and broadcast input, then dispatch queued requests in order.
 
         With stop_at_pause, retain the first pause and all following inputs
@@ -2097,25 +2093,8 @@ class Scheduler(
         if recv_reqs:
             # Count successful receive/broadcast time as active; empty polls stay idle.
             self.metrics_reporter.record_scheduler_active(recv_start_ns)
-        if not (
-            defer_pp_collective_control
-            and self._has_pp_collective_control_request(recv_reqs)
-        ):
-            self.process_input_requests(recv_reqs)
+        self.process_input_requests(recv_reqs)
         return recv_reqs
-
-    @staticmethod
-    def _has_pp_collective_control_request(recv_reqs: List) -> bool:
-        """Return whether local dispatch can enter a PP-wide collective.
-
-        PP event loops defer these requests until their existing request relay has
-        completed. This preserves the ordering of the other PP point-to-point streams.
-        """
-        return any(
-            isinstance(req, ExpertDistributionReq)
-            and req.action == ExpertDistributionReqType.DUMP_RECORD
-            for req in recv_reqs
-        )
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_REQUESTS)
     def process_input_requests(self, recv_reqs: List):
@@ -5762,8 +5741,6 @@ class Scheduler(
         elif action == ExpertDistributionReqType.STOP_RECORD:
             get_global_expert_distribution_recorder().stop_record()
         elif action == ExpertDistributionReqType.DUMP_RECORD:
-            if get_parallel().pp_size > 1:
-                torch.distributed.barrier(group=self.world_group.cpu_group)
             get_global_expert_distribution_recorder().dump_record()
         else:
             raise ValueError(f"Unrecognized ExpertDistributionReq value: {recv_req=}")

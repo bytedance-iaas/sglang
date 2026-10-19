@@ -133,8 +133,7 @@ class SchedulerPPMixin:
                 ) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
                 with torch.profiler.record_function("recv_requests"):
-                    recv_reqs = self.ingest_requests(defer_pp_collective_control=True)
-                deferred_control = self._has_pp_collective_control_request(recv_reqs)
+                    recv_reqs = self.ingest_requests()
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
@@ -142,10 +141,6 @@ class SchedulerPPMixin:
                             recv_reqs,
                             async_send=True,
                         )
-                    if deferred_control:
-                        self._pp_commit_comm_work(self.send_req_work)
-                if deferred_control:
-                    self.process_input_requests(recv_reqs)
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     plan = self.get_next_batch_to_run(
                         running_batch=self.running_batch, last_batch=self.last_batch
@@ -282,8 +277,7 @@ class SchedulerPPMixin:
                 d2h_event = None
                 next_batch_result = None
 
-                recv_reqs = self.ingest_requests(defer_pp_collective_control=True)
-                deferred_control = self._has_pp_collective_control_request(recv_reqs)
+                recv_reqs = self.ingest_requests()
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
@@ -378,8 +372,6 @@ class SchedulerPPMixin:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
                     )
-                    if deferred_control:
-                        self._pp_commit_comm_work(self.send_req_work)
                     send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
                         bootstrapped_rids, async_send=True
                     )
@@ -388,8 +380,6 @@ class SchedulerPPMixin:
                     )
                     if cur_batch:
                         self._pp_send_proxy_to_next_stage(result)
-                if deferred_control:
-                    self.process_input_requests(recv_reqs)
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
@@ -438,8 +428,7 @@ class SchedulerPPMixin:
                 d2h_event = None
                 next_batch_result = None
 
-                recv_reqs = self.ingest_requests(defer_pp_collective_control=True)
-                deferred_control = self._has_pp_collective_control_request(recv_reqs)
+                recv_reqs = self.ingest_requests()
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
@@ -565,8 +554,6 @@ class SchedulerPPMixin:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
                     )
-                    if deferred_control:
-                        self._pp_commit_comm_work(self.send_req_work)
                     send_retract_work = self._pp_send_pyobj_to_next_stage(
                         retract_rids, async_send=True
                     )
@@ -578,8 +565,6 @@ class SchedulerPPMixin:
                     )
                     if cur_batch and not cur_batch.forward_mode.is_prebuilt():
                         self._pp_send_proxy_to_next_stage(result)
-                if deferred_control:
-                    self.process_input_requests(recv_reqs)
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
