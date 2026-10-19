@@ -304,7 +304,14 @@ def cp_shard_model_inputs(
 
     had_input_ids_global = hasattr(forward_batch, "input_ids_global")
     input_ids_global_backup = getattr(forward_batch, "input_ids_global", None)
+    had_model_input_ids_global = hasattr(forward_batch, "model_input_ids_global")
+    model_input_ids_global_backup = getattr(
+        forward_batch, "model_input_ids_global", None
+    )
     if complete_input_ids is not None:
+        # Keep scheduler hash IDs on forward_batch.input_ids, while model-side
+        # consumers that need full token order use the canonical IDs.
+        forward_batch.model_input_ids_global = complete_input_ids
         forward_batch.input_ids_global = cp_interleave_input_ids(
             complete_input_ids, forward_batch
         )
@@ -331,6 +338,10 @@ def cp_shard_model_inputs(
             forward_batch.input_ids_global = input_ids_global_backup
         elif hasattr(forward_batch, "input_ids_global"):
             delattr(forward_batch, "input_ids_global")
+        if had_model_input_ids_global:
+            forward_batch.model_input_ids_global = model_input_ids_global_backup
+        elif hasattr(forward_batch, "model_input_ids_global"):
+            delattr(forward_batch, "model_input_ids_global")
 
 
 def _to_int_list(values) -> Optional[list[int]]:
