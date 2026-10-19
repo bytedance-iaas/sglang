@@ -87,7 +87,7 @@ class TestEicEnvConfig(CustomTestCase):
         self.assertEqual(cfg.source, "env")
         self.assertEqual(cfg.instance_id, VALID_ID)
         self.assertEqual(cfg.endpoints, ["1.2.3.4:12500"])
-        self.assertEqual(cfg.fixed["eic_log_dir"], "/tmp/eic-client-log")
+        self.assertEqual(cfg.fixed["eic_log_dir"], "/sgl-workspace/log")
 
     def test_u11_enabled_without_url_fails(self):
         env = {"EnableEicCache": "True", "EicInstanceId": VALID_ID}
@@ -235,6 +235,130 @@ class TestEicEnvConfig(CustomTestCase):
         )
         self.assertFalse(cfg.enabled)
         self.assertEqual(cfg.source, "env")
+
+    def test_u26_env_only_defaults_match_rdma_template(self):
+        # No yaml mounted: built-in defaults must equal the servingkit
+        # SGLang + RDMA ConfigMap template, except NIC affinity.
+        env = {
+            "EnableEicCache": "True",
+            "EicRemoteUrl": VALID_URL,
+            "EicInstanceId": VALID_ID,
+        }
+        cfg = load_eic_config(environ=env, config_file="/nonexistent/eic.yaml")
+        expected = {
+            "eic_namespace": "",
+            "eic_thread_num": 2,
+            "eic_log_dir": "/sgl-workspace/log",
+            "eic_log_level": 2,
+            "save_decode_cache": False,
+            "enable_kvset_gpu_direct": False,
+            "eic_direct_backup": False,
+            "eic_direct_writeback": False,
+            "gdr_bounce_buffer_size": 2147483648,
+            "load_back_check": True,
+            "load_back_threshold": 100,
+            "enable_gpu_nic_affinity": False,
+        }
+        for key, value in expected.items():
+            self.assertEqual(cfg.fixed[key], value, key)
+        # No flag file mounted: RDMA would run GDR reads with CRC on and
+        # crash, so the default falls back to GDR transport (3).
+        self.assertIsNone(cfg.fixed["eic_flag_file"])
+        self.assertEqual(cfg.fixed["eic_trans_type"], 3)
+
+    def test_u30_flag_file_keeps_rdma_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            flag = os.path.join(tmp, "eic_flag_file")
+            with open(flag, "w") as fout:
+                fout.write("--eic_client_kv_get_check_crc_type=0\n")
+            path = _write_yaml(
+                tmp,
+                {
+                    "remote_url": VALID_URL,
+                    "eic_instance_id": VALID_ID,
+                    "eic_flag_file": flag,
+                },
+            )
+            cfg = load_eic_config(cli_enabled=True, environ={}, config_file=path)
+        self.assertEqual(cfg.fixed["eic_trans_type"], 2)
+
+    def test_u31_explicit_yaml_trans_type_is_kept(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_yaml(
+                tmp,
+                {
+                    "remote_url": VALID_URL,
+                    "eic_instance_id": VALID_ID,
+                    "eic_trans_type": 2,
+                },
+            )
+            cfg = load_eic_config(cli_enabled=True, environ={}, config_file=path)
+        self.assertEqual(cfg.fixed["eic_trans_type"], 2)
+
+    def test_u27_legacy_yaml_full_template_still_loads(self):
+        # Old ConfigMap (TCP template) keeps working; its values win.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_yaml(
+                tmp,
+                {
+                    "remote_url": "eic://192.168.30.90:12500;192.168.30.91:12500",
+                    "eic_instance_id": VALID_ID,
+                    "eic_namespace": "",
+                    "eic_thread_num": 2,
+                    "eic_trans_type": 0,
+                    "eic_flag_file": "/sgl-workspace/config/eic_flag_file",
+                    "save_decode_cache": False,
+                    "enable_gpu_nic_affinity": False,
+                    "load_back_check": True,
+                    "load_remote_threshold": 400,
+                },
+            )
+            cfg = load_eic_config(cli_enabled=True, environ={}, config_file=path)
+        self.assertTrue(cfg.enabled)
+        self.assertEqual(cfg.source, "yaml")
+        self.assertEqual(cfg.endpoint, "192.168.30.90:12500;192.168.30.91:12500")
+        self.assertEqual(cfg.fixed["eic_trans_type"], 0)
+        self.assertEqual(
+            cfg.fixed["eic_flag_file"], "/sgl-workspace/config/eic_flag_file"
+        )
+        self.assertEqual(cfg.fixed["load_back_threshold"], 400)
+
+    def test_u28_new_threshold_key_wins_over_legacy_alias(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_yaml(
+                tmp,
+                {
+                    "remote_url": VALID_URL,
+                    "eic_instance_id": VALID_ID,
+                    "load_remote_threshold": 400,
+                    "load_back_threshold": 64,
+                },
+            )
+            cfg = load_eic_config(cli_enabled=True, environ={}, config_file=path)
+        self.assertEqual(cfg.fixed["load_back_threshold"], 64)
+
+    def test_u29_env_overrides_legacy_yaml_endpoint_and_id(self):
+        # Mixed deployment: old ConfigMap mounted, new env injected.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_yaml(
+                tmp,
+                {
+                    "remote_url": "eic://10.0.0.1:12500",
+                    "eic_instance_id": "old-instance",
+                    "eic_trans_type": 0,
+                },
+            )
+            env = {
+                "EnableEicCache": "True",
+                "EicRemoteUrl": "eic://192.168.0.53:10000;192.168.0.54:10000",
+                "EicInstanceId": VALID_ID,
+            }
+            cfg = load_eic_config(environ=env, config_file=path)
+        self.assertEqual(cfg.source, "env")
+        self.assertEqual(cfg.endpoints, ["192.168.0.53:10000", "192.168.0.54:10000"])
+        self.assertEqual(cfg.instance_id, VALID_ID)
+        # Fixed parameters still come from the mounted yaml.
+        self.assertEqual(cfg.fixed["eic_trans_type"], 0)
 
 
 if __name__ == "__main__":

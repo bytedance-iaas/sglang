@@ -27,21 +27,44 @@ ENV_REMOTE_EIC_YAML = "REMOTE_EIC_YAML"
 
 EIC_URL_PREFIX = "eic://"
 DEFAULT_CONFIG_FILE = "/sgl-workspace/config/remote-eic.yaml"
+DEFAULT_FLAG_FILE = "/sgl-workspace/config/eic_flag_file"
+RDMA_TRANS_TYPE = 2
+NO_FLAG_FILE_TRANS_TYPE = 3
 
-# Built-in defaults, aligned with the current remote-eic.yaml values.
+# Built-in defaults, aligned with the servingkit SGLang + RDMA ConfigMap
+# template ("ServingKit对接EIC configmap标准化"). They apply when the pod has
+# no remote-eic.yaml, i.e. the env-only path. A mounted yaml overrides
+# every key it sets.
+#
+# enable_gpu_nic_affinity stays False here: the template sets it True, but
+# the affinity map depends on the node topology, so only a ConfigMap
+# written for that node may turn it on.
 DEFAULT_FIXED_CONFIG = {
-    "eic_log_dir": "/tmp/eic-client-log",
+    "eic_log_dir": "/sgl-workspace/log",
     "eic_log_level": 2,
-    "eic_trans_type": 3,
-    "eic_thread_num": 1,
+    "eic_trans_type": 2,
+    "eic_thread_num": 2,
     "eic_flag_file": None,
     "eic_namespace": "",
     "enable_gpu_nic_affinity": False,
-    "save_decode_cache": True,
-    "load_back_threshold": 10,
+    "enable_kvset_gpu_direct": False,
+    "eic_direct_backup": False,
+    "eic_direct_writeback": False,
+    "gdr_bounce_buffer_size": 2 * 1024 * 1024 * 1024,
+    "save_decode_cache": False,
+    "load_back_check": True,
+    "load_back_threshold": 100,
     "eic_probe_backoff_seconds": 30.0,
     "eic_probe_backoff_max_seconds": 300.0,
     "eic_probe_backoff_write_failures": 3,
+}
+
+# Template keys that the code reads under another name. The template key
+# applies only when the yaml does not also set the new key.
+LEGACY_KEY_ALIASES = {
+    # Template: skip the remote load when fewer tokens can load from EIC.
+    # The same rule is load_back_threshold (miss.below_threshold).
+    "load_remote_threshold": "load_back_threshold",
 }
 
 
@@ -156,12 +179,37 @@ def load_fixed_config(
     An explicit null in yaml counts as missing for a key that has a
     built-in default, so generated templates that write null
     placeholders do not turn into None values at client construction.
+    Template keys listed in LEGACY_KEY_ALIASES map to the key the code
+    reads. When no flag file is configured and the standard ConfigMap
+    path exists, that flag file is used.
     """
+    yaml_config = load_yaml_config(environ, config_file)
     fixed = dict(DEFAULT_FIXED_CONFIG)
-    fixed.update(load_yaml_config(environ, config_file))
+    fixed.update(yaml_config)
+    for old_key, new_key in LEGACY_KEY_ALIASES.items():
+        if yaml_config.get(old_key) is not None and new_key not in yaml_config:
+            fixed[new_key] = yaml_config[old_key]
     for key, default in DEFAULT_FIXED_CONFIG.items():
         if fixed.get(key) is None and default is not None:
             fixed[key] = default
+    if not fixed.get("eic_flag_file") and os.path.exists(DEFAULT_FLAG_FILE):
+        fixed["eic_flag_file"] = DEFAULT_FLAG_FILE
+    # RDMA (2) forces the GDR read path on. Without a flag file the client
+    # keeps KvGet CRC checks on and computes CRC over device memory, which
+    # segfaults (CalculateKvValueCRCsPerSlice). The template always ships
+    # trans_type 2 with a flag file that sets check_crc_type=0. With no
+    # flag file and no explicit trans_type, use GDR (3).
+    if (
+        not fixed.get("eic_flag_file")
+        and yaml_config.get("eic_trans_type") is None
+        and fixed.get("eic_trans_type") == RDMA_TRANS_TYPE
+    ):
+        fixed["eic_trans_type"] = NO_FLAG_FILE_TRANS_TYPE
+        logger.info(
+            "no eic_flag_file: eic_trans_type defaults to %d instead of %d",
+            NO_FLAG_FILE_TRANS_TYPE,
+            RDMA_TRANS_TYPE,
+        )
     return fixed
 
 

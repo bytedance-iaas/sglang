@@ -143,8 +143,10 @@ not text conflicts but API-contract breaks found by review, all in EIC-owned fil
 
 ## Dead or misleading config keys
 
-- `load_remote_threshold`: removed in #763. The remote probe budget is `eic_check_max_num` (default 2048).
-- `save_decode_cache` in `EICHiRadixCache`: read, never used.
+- `load_remote_threshold`: removed as a separate knob in #763. The servingkit ConfigMap template still sets it (RDMA 100, TCP 400), so `eic_env_config.LEGACY_KEY_ALIASES` maps it to `load_back_threshold`, the same min-loadable-tokens rule. An explicit `load_back_threshold` wins. The remote probe budget is `eic_check_max_num` (default 2048).
+- `save_decode_cache` in `EICHiRadixCache`: read, never used. Default is now False, matching the template.
+- Built-in defaults (`DEFAULT_FIXED_CONFIG`) follow the SGLang + RDMA ConfigMap template, so `--enable-eic-cache` plus `EicRemoteUrl`/`EicInstanceId` start EIC without a yaml. `enable_gpu_nic_affinity` stays False until a node-specific ConfigMap sets it. When no `eic_flag_file` is set and `/sgl-workspace/config/eic_flag_file` exists, that file is used.
+- No flag file means no `eic_trans_type: 2` default. RDMA forces the GDR read path on, and without the template flag file the client keeps KvGet CRC on and computes it over device memory: SIGSEGV in `CalculateKvValueCRCsPerSlice` (reproduced 2026-10-19, n54). The env-only path therefore defaults to `eic_trans_type: 3`. An explicit yaml `eic_trans_type` or any flag file keeps 2.
 - `eic_thread_num`: read, no effect on the client. Set `--eic_client_default_io_thread_num` in `eic_flag_file`.
 - `enable_kvset_gpu_direct`: forced off in `eic_memory_pool.py`, with a warning if a
   ConfigMap still sets it. A CUDA write pool takes the server down: the client
