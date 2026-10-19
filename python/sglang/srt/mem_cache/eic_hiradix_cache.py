@@ -293,7 +293,7 @@ class EICHiRadixCache(RadixCache):
         self.load_back_reserve = (
             server_args.chunked_prefill_size
             if server_args.chunked_prefill_size and server_args.chunked_prefill_size > 0
-            else self.page_size
+            else params.page_size
         )
         if self.pp_size > 1:
             # The verdict protocol assumes lockstep candidate iteration and
