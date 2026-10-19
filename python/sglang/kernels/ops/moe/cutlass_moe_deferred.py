@@ -7,8 +7,10 @@ from pathlib import Path
 import torch
 import triton
 import triton.language as tl
+from packaging.version import Version
 
 _original_sm90_generator = None
+_MIN_DSV41_EP4_TACTICS_FLASHINFER_VERSION = Version("0.6.18")
 _DSV41_EP4_PROFILE_IDS = {
     256: (56, 241),
     8192: (20, 153),
@@ -246,7 +248,10 @@ def cutlass_fused_moe_deferred(
         import flashinfer
 
         profile_ids = _DSV41_EP4_PROFILE_IDS.get(kwargs.get("tune_max_num_tokens"))
-        if flashinfer.__version__ == "0.6.18" and profile_ids is not None:
+        if (
+            Version(flashinfer.__version__) >= _MIN_DSV41_EP4_TACTICS_FLASHINFER_VERSION
+            and profile_ids is not None
+        ):
             kwargs["profile_ids"] = list(profile_ids)
     expanded_rows = num_tokens * top_k
     gemm2_numel = expanded_rows * hidden_size
