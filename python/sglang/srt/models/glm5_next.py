@@ -56,6 +56,12 @@ from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8_utils import cutlass_fp8_supported
+from sglang.srt.layers.quantization.unquant import (
+    Glm53KdaPackedPtpcLinearMethod,
+    Glm53KdaPtpcLinearMethod,
+    UnquantizedLinearMethod,
+)
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -336,6 +342,15 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
         )
 
 
+# The initial SM90 adapter is intentionally restricted to the planned P3 target
+# geometry from this model/configuration. The feature is opt-in and keeps BF16
+# for decode/small M; component measurements must validate or move the
+# provisional crossover before service integration.
+GLM53_KDA_PTPC_MIN_M = 4096
+GLM53_KDA_PTPC_PACKED_LAYOUT = (12288, 32, 256)
+GLM53_KDA_PTPC_ALLOWED_O_PROJ_K = (4096,)
+
+
 class Glm5NextLinearAttention(nn.Module):
     _PACKED_MODULES_MAPPING = {
         "fused_qkvbfg_a_proj": [
@@ -597,6 +612,7 @@ class Glm5NextLinearAttention(nn.Module):
             reduce_results=reduce_results,
             parallel_group="attn_tp",
         )
+        self._configure_ptpc_modules()
 
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
         bias = self.qkv_conv1d.bias
@@ -616,6 +632,77 @@ class Glm5NextLinearAttention(nn.Module):
         )
 
         self.attn.lower_bound = config.linear_attn_config.get("gate_lower_bound", None)
+
+    @staticmethod
+    def _ptpc_backend_supported() -> bool:
+        return _is_cuda and _device_sm == 90 and cutlass_fp8_supported()
+
+    def _configure_ptpc_modules(self) -> None:
+        ptpc_modules = set(envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.get())
+        supported_ptpc_modules = {"qkv_proj", "f_a_proj", "g_a_proj", "o_proj"}
+        unknown_ptpc_modules = ptpc_modules - supported_ptpc_modules
+        if unknown_ptpc_modules:
+            raise ValueError(
+                "Unsupported GLM-5.3-Flash KDA PTPC modules: "
+                f"{sorted(unknown_ptpc_modules)}; supported: "
+                f"{sorted(supported_ptpc_modules)}"
+            )
+        if not ptpc_modules:
+            return
+        if not self._ptpc_backend_supported():
+            raise ValueError(
+                "SGLANG_OPT_GLM53_KDA_PTPC_MODULES requires SM90 CUDA "
+                "with CUTLASS FP8 support"
+            )
+
+        shared_input_modules = {"qkv_proj", "f_a_proj", "g_a_proj"}
+        selected_shared_input_modules = ptpc_modules & shared_input_modules
+        if selected_shared_input_modules not in (set(), shared_input_modules):
+            raise ValueError(
+                "GLM-5.3-Flash KDA PTPC requires qkv_proj, f_a_proj, and "
+                "g_a_proj to be selected together"
+            )
+
+        if selected_shared_input_modules:
+            if not self.do_fuse_qkvbfg:
+                raise ValueError(
+                    "SM90 GLM-5.3 KDA PTPC currently requires full packed "
+                    "qkv/beta/f/g projection fusion"
+                )
+            packed_layout = tuple(self.split_sizes)
+            if packed_layout != GLM53_KDA_PTPC_PACKED_LAYOUT:
+                raise ValueError(
+                    "SM90 GLM-5.3 KDA packed PTPC supports layout "
+                    f"{GLM53_KDA_PTPC_PACKED_LAYOUT}, got {packed_layout}"
+                )
+            if not isinstance(
+                self.fused_qkvbfg_a_proj.quant_method, UnquantizedLinearMethod
+            ):
+                raise ValueError(
+                    "GLM-5.3 KDA packed PTPC requires an unquantized BF16 "
+                    "fused projection"
+                )
+            self.fused_qkvbfg_a_proj.quant_method = Glm53KdaPackedPtpcLinearMethod(
+                fp8_min_m=GLM53_KDA_PTPC_MIN_M,
+                qkv_size=self.split_sizes[0],
+                beta_size=self.split_sizes[1],
+                fg_size=self.split_sizes[2],
+            )
+
+        if "o_proj" in ptpc_modules:
+            if self.o_proj.weight.shape[1] not in GLM53_KDA_PTPC_ALLOWED_O_PROJ_K:
+                raise ValueError(
+                    "SM90 GLM-5.3 KDA o_proj PTPC supports local K in "
+                    f"{GLM53_KDA_PTPC_ALLOWED_O_PROJ_K}, got "
+                    f"{self.o_proj.weight.shape[1]}"
+                )
+            if not isinstance(self.o_proj.quant_method, UnquantizedLinearMethod):
+                raise ValueError(
+                    "GLM-5.3 KDA o_proj PTPC requires an unquantized BF16 projection"
+                )
+            self.o_proj.quant_method = Glm53KdaPtpcLinearMethod(
+                module_name="o_proj", fp8_min_m=GLM53_KDA_PTPC_MIN_M
+            )
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -641,9 +728,17 @@ class Glm5NextLinearAttention(nn.Module):
     def forward_qkvbfg_fused(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
-        fused_states = self.fused_qkvbfg_a_proj(hidden_states)
-
-        qkv, beta, fg_a_states = torch.split(fused_states, self.split_sizes, dim=-1)
+        method = self.fused_qkvbfg_a_proj.quant_method
+        num_tokens = hidden_states.numel() // hidden_states.shape[-1]
+        if isinstance(method, Glm53KdaPackedPtpcLinearMethod) and method.is_active(
+            num_tokens
+        ):
+            qkv, beta, fg_a_states = method.apply_ptpc_prefill(
+                self.fused_qkvbfg_a_proj, hidden_states
+            )
+        else:
+            fused_states = self.fused_qkvbfg_a_proj(hidden_states)
+            qkv, beta, fg_a_states = torch.split(fused_states, self.split_sizes, dim=-1)
 
         if self.fuse_fg_b:
             forget_gate, g_proj_states = self.fused_fg_b_proj(

@@ -1046,6 +1046,10 @@ class Envs:
     # GLM NextN (MTP): cast the draft layer's bf16 fused MoE to per-channel FP8
     # on load. Unrelated to the NVFP4 block-FP8 NextN path above.
     SGLANG_GLM_NEXTN_MOE_PTPC = EnvBool(False)
+    # Opt-in SM90 per-token/per-channel FP8 copies for selected BF16
+    # GLM-5.3-Flash KDA projections. Comma-separated module names; empty keeps
+    # the exact BF16 path and allocates no auxiliary weights.
+    SGLANG_OPT_GLM53_KDA_PTPC_MODULES = EnvTuple(tuple())
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
     # HIP: convert only MXFP8 dense linears to block-fp8; fused MoE stays MX 1x32,
     # since the block-scale MoE kernel lacks SwiGLU-OAI

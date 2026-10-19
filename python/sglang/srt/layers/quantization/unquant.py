@@ -613,6 +613,178 @@ class UnquantizedLinearMethod(LinearMethodBase):
         return output
 
 
+def _quantize_glm53_kda_ptpc_weight(
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build the SM90 row-major FP8 copy used by GLM-5.3 KDA PTPC.
+
+    ``apply_fp8_linear`` consumes B as [K, N], with one scale per output
+    channel. The checkpoint/BF16 fallback keeps [N, K], so quantize each row
+    as one group and transpose only the auxiliary FP8 copy. This deliberately
+    does not reuse AITER's shuffled gfx950 layout.
+    """
+    from sglang.kernels.ops.quantization.fp8_kernel import (
+        per_token_group_quant_fp8,
+    )
+    from sglang.srt.layers.quantization.fp8_utils import cutlass_fp8_supported
+
+    if not weight.is_cuda or not cutlass_fp8_supported():
+        raise ValueError("GLM-5.3 KDA PTPC requires CUDA CUTLASS FP8 support")
+    if weight.dtype != torch.bfloat16 or weight.dim() != 2:
+        raise ValueError(
+            "GLM-5.3 KDA PTPC requires a 2-D BF16 weight, got "
+            f"dtype={weight.dtype}, shape={tuple(weight.shape)}"
+        )
+    n, k = weight.shape
+    if n % 16 or k % 16:
+        raise ValueError(
+            "GLM-5.3 KDA PTPC CUTLASS layout requires N and K divisible "
+            f"by 16, got N={n}, K={k}"
+        )
+    qweight, weight_scale = per_token_group_quant_fp8(weight, group_size=k)
+    return qweight.t().contiguous(), weight_scale.t().contiguous()
+
+
+class Glm53KdaPtpcLinearMethod(UnquantizedLinearMethod):
+    """Opt-in SM90 per-token/per-channel FP8 KDA projection.
+
+    The original BF16 parameter remains authoritative and is used below the
+    configured token threshold. ``process_weights_after_loading`` adds a
+    non-persistent FP8 copy, so disabling the feature restores the ordinary
+    BF16 path without changing checkpoint loading.
+    """
+
+    def __init__(self, module_name: str, fp8_min_m: int):
+        super().__init__()
+        self.module_name = module_name
+        self.fp8_min_m = fp8_min_m
+        self._fp8_ptpc_ready = False
+
+    def is_active(self, num_tokens: int) -> bool:
+        return self._fp8_ptpc_ready and num_tokens >= self.fp8_min_m
+
+    def _install_fp8_weight(self, layer: torch.nn.Module, weight: torch.Tensor) -> None:
+        fp8_weight, weight_scale = _quantize_glm53_kda_ptpc_weight(weight)
+        layer.register_buffer("_fp8_ptpc_weight", fp8_weight, persistent=False)
+        layer.register_buffer("_fp8_ptpc_weight_scale", weight_scale, persistent=False)
+        self._fp8_ptpc_ready = True
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self._fp8_ptpc_ready:
+            return
+        weight = layer.weight.data
+        if weight.dtype != torch.bfloat16 or weight.dim() != 2:
+            raise ValueError(
+                f"GLM-5.3 KDA PTPC requires a 2-D BF16 weight for "
+                f"{self.module_name}, got dtype={weight.dtype}, "
+                f"shape={tuple(weight.shape)}"
+            )
+        self.output_size = weight.shape[0]
+        self._install_fp8_weight(layer, weight)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        use_fp8 = not isinstance(x, torch.Tensor)
+        if isinstance(x, torch.Tensor):
+            use_fp8 = self.is_active(x.numel() // x.shape[-1])
+        if not use_fp8:
+            assert isinstance(x, torch.Tensor), (
+                "quantized PTPC input requires the FP8 path to be active"
+            )
+            return super().apply(layer, x, bias)
+
+        assert self._fp8_ptpc_ready, (
+            "quantized PTPC input requires repacked FP8 weights"
+        )
+        from sglang.srt.layers.quantization.fp8_utils import apply_fp8_linear
+
+        input_scale = None
+        output_dtype = None
+        if isinstance(x, tuple):
+            q_input, input_scale = x[:2]
+            output_dtype = x[2] if len(x) > 2 else torch.bfloat16
+        else:
+            q_input = x
+        return apply_fp8_linear(
+            q_input,
+            layer._fp8_ptpc_weight,
+            layer._fp8_ptpc_weight_scale,
+            input_scale=input_scale,
+            bias=bias,
+            cutlass_fp8_supported=True,
+            use_per_token_if_dynamic=True,
+            pre_quant_output_dtype=output_dtype,
+        )
+
+
+class Glm53KdaPackedPtpcLinearMethod(Glm53KdaPtpcLinearMethod):
+    """Packed qkv/f/g FP8 prefill with a separate BF16 beta projection."""
+
+    def __init__(
+        self,
+        fp8_min_m: int,
+        qkv_size: int,
+        beta_size: int,
+        fg_size: int,
+    ):
+        super().__init__("qkv_proj,f_a_proj,g_a_proj", fp8_min_m)
+        self.qkv_size = qkv_size
+        self.beta_size = beta_size
+        self.fg_size = fg_size
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self._fp8_ptpc_ready:
+            return
+        weight = layer.weight.data
+        expected_size = self.qkv_size + self.beta_size + self.fg_size
+        if (
+            weight.dtype != torch.bfloat16
+            or weight.dim() != 2
+            or weight.shape[0] != expected_size
+        ):
+            raise ValueError(
+                "GLM-5.3 KDA packed PTPC requires a 2-D BF16 fused weight "
+                f"with {expected_size} rows, got dtype={weight.dtype}, "
+                f"shape={tuple(weight.shape)}"
+            )
+        packed_weight = torch.cat(
+            (
+                weight[: self.qkv_size],
+                weight[self.qkv_size + self.beta_size :],
+            )
+        )
+        self.output_size = packed_weight.shape[0]
+        self._install_fp8_weight(layer, packed_weight)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # The ordinary fused module remains the exact BF16 fallback. The FP8
+        # route is explicit because its output omits the beta rows.
+        return UnquantizedLinearMethod.apply(self, layer, x, bias)
+
+    def apply_ptpc_prefill(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        assert self.is_active(x.numel() // x.shape[-1]), (
+            "GLM-5.3 KDA packed PTPC prefill requires an active token shape"
+        )
+        packed_output = Glm53KdaPtpcLinearMethod.apply(self, layer, x)
+        qkv, fg_a = torch.split(packed_output, (self.qkv_size, self.fg_size), dim=-1)
+        beta_weight = layer.weight[self.qkv_size : self.qkv_size + self.beta_size]
+        beta = F.linear(x, beta_weight)
+        return qkv, beta, fg_a
+
+
 def _use_xpu_moe_ld_padding(use_triton_kernels: bool) -> bool:
     """Whether MoE expert weights should get a padded row stride for XPU.
 
