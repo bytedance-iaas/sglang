@@ -2093,8 +2093,34 @@ class Scheduler(
         if recv_reqs:
             # Count successful receive/broadcast time as active; empty polls stay idle.
             self.metrics_reporter.record_scheduler_active(recv_start_ns)
+        relay_reqs = self._preforward_pp_collective_control_requests(recv_reqs)
         self.process_input_requests(recv_reqs)
-        return recv_reqs
+        return relay_reqs
+
+    def _preforward_pp_collective_control_requests(self, recv_reqs: List) -> List:
+        """Relay an ordered request batch before a PP-wide collective control.
+
+        Pipeline stages normally relay requests only after local dispatch. A control
+        handler that enters a world-group collective cannot follow that order: the
+        first stage would block before the later stages receive the same request.
+        Pre-forward the whole batch synchronously so every stage observes the same
+        request order, then suppress the regular post-dispatch relay.
+        """
+        if get_parallel().pp_size == 1 or self.pp_group.is_last_rank or not recv_reqs:
+            return recv_reqs
+
+        has_collective_control = any(
+            isinstance(req, ExpertDistributionReq)
+            and req.action == ExpertDistributionReqType.DUMP_RECORD
+            for req in recv_reqs
+        )
+        if not has_collective_control:
+            return recv_reqs
+
+        # Preserve point-to-point ordering with the previous iteration's async relay.
+        self._pp_commit_comm_work(self.send_req_work)
+        self._pp_send_pyobj_to_next_stage(recv_reqs)
+        return []
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_REQUESTS)
     def process_input_requests(self, recv_reqs: List):
