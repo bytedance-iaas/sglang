@@ -12,7 +12,7 @@ import statistics
 import torch
 import torch.nn.functional as F
 
-from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
+from sglang.kernels.ops.attention.fla.fused_norm_gate import layer_norm_gated_fwd
 from sglang.srt.layers.quantization.unquant import (
     Glm53KdaPackedPtpcLinearMethod,
     Glm53KdaPtpcLinearMethod,
@@ -113,8 +113,7 @@ def _bench_o_proj(m: int, warmup: int, iters: int) -> dict:
     k = n = heads * head_dim
     core = torch.randn(1, m, heads, head_dim, device="cuda", dtype=torch.bfloat16)
     gate = torch.randn_like(core)
-    norm = FusedRMSNormGated(head_dim, activation="sigmoid").cuda().bfloat16()
-    norm.weight.fill_(1)
+    norm_weight = torch.ones(head_dim, device="cuda", dtype=torch.bfloat16)
     layer = _BenchLinear(
         torch.randn(n, k, device="cuda", dtype=torch.bfloat16) / k**0.5
     )
@@ -126,7 +125,19 @@ def _bench_o_proj(m: int, warmup: int, iters: int) -> dict:
     fp8_copy_bytes = torch.cuda.memory_allocated() - before_fp8
 
     def norm_input():
-        return norm(core, gate).squeeze(0).flatten(-2)
+        # The public module writes into ``core`` in-place. A benchmark reuses
+        # its fixture across iterations, so request a separate BF16 output to
+        # preserve the same original input for every sample.
+        output, _, _, _ = layer_norm_gated_fwd(
+            x=core.view(-1, head_dim),
+            g=gate.view(-1, head_dim),
+            weight=norm_weight,
+            bias=None,
+            activation="sigmoid",
+            out_dtype=torch.bfloat16,
+            is_rms_norm=True,
+        )
+        return output.view(m, k)
 
     def baseline():
         return F.linear(norm_input(), layer.weight)
