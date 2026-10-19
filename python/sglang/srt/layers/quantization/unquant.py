@@ -616,12 +616,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
 def _quantize_glm53_kda_ptpc_weight(
     weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build the SM90 row-major FP8 copy used by GLM-5.3 KDA PTPC.
+    """Build the SM90 column-major B view used by GLM-5.3 KDA PTPC.
 
     ``apply_fp8_linear`` consumes B as [K, N], with one scale per output
     channel. The checkpoint/BF16 fallback keeps [N, K], so quantize each row
-    as one group and transpose only the auxiliary FP8 copy. This deliberately
-    does not reuse AITER's shuffled gfx950 layout.
+    as one group and expose its transpose without materializing it: CUTLASS
+    requires the resulting [K, N] operand to have column-major strides. This
+    deliberately does not reuse AITER's shuffled gfx950 layout.
     """
     from sglang.kernels.ops.quantization.fp8_kernel import (
         per_token_group_quant_fp8,
@@ -642,7 +643,7 @@ def _quantize_glm53_kda_ptpc_weight(
             f"by 16, got N={n}, K={k}"
         )
     qweight, weight_scale = per_token_group_quant_fp8(weight, group_size=k)
-    return qweight.t().contiguous(), weight_scale.t().contiguous()
+    return qweight.t(), weight_scale.t().contiguous()
 
 
 class Glm53KdaPtpcLinearMethod(UnquantizedLinearMethod):

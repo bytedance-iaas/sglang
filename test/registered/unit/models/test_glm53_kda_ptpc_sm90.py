@@ -29,7 +29,7 @@ class _FakeLinear(torch.nn.Module):
 
 
 def _fake_weight_quant(weight: torch.Tensor):
-    return weight.t().contiguous(), torch.ones(1, weight.shape[0], dtype=torch.float32)
+    return weight.t(), torch.ones(1, weight.shape[0], dtype=torch.float32)
 
 
 class TestGlm53KdaPtpcMethod(unittest.TestCase):
@@ -62,6 +62,7 @@ class TestGlm53KdaPtpcMethod(unittest.TestCase):
         args, kwargs = apply_fp8.call_args
         self.assertIs(args[0], large)
         self.assertEqual(args[1].shape, torch.Size([16, 32]))
+        self.assertEqual(args[1].stride(), (1, 16))
         self.assertEqual(args[2].shape, torch.Size([1, 32]))
         self.assertTrue(kwargs["cutlass_fp8_supported"])
 
