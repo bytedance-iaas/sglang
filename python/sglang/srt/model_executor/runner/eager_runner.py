@@ -394,23 +394,33 @@ class EagerRunner(BaseRunner):
         """
         model = self.model_runner.model
 
+        input_ids = forward_batch.input_ids
         if prepare_inputs := getattr(model, "prepare_cp_inputs", None):
             input_embeds, positions, model_kwargs = prepare_inputs(
                 forward_batch, **kwargs
             )
         else:
             input_embeds = kwargs.get("input_embeds")
-            if input_embeds is None:
-                input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
+            if hasattr(model, "prepare_model_inputs"):
+                # Multimodal offsets are request-global, so merge image features
+                # and canonicalize placeholder IDs before CP shards the rows.
+                input_ids, input_embeds = model.prepare_model_inputs(
+                    input_ids=input_ids,
+                    forward_batch=forward_batch,
+                    input_embeds=input_embeds,
+                )
+            pp_proxy_tensors = kwargs.get("pp_proxy_tensors")
+            if input_embeds is None and pp_proxy_tensors is None:
+                input_embeds = model.get_input_embeddings()(input_ids)
             positions = forward_batch.positions
             model_kwargs = {}
-            if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
+            if pp_proxy_tensors is not None:
                 model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
         with cp_shard_model_inputs(
             input_embeds,
             positions,
             forward_batch,
-            forward_batch.input_ids,
+            input_ids,
         ) as (sharded_input_embeds, sharded_positions, model_input_ids):
             model_kwargs["input_embeds"] = sharded_input_embeds
             hidden_states = model.model(
@@ -473,12 +483,12 @@ class EagerRunner(BaseRunner):
             # DSpark aux capture is on, else it overrides the packed aux.
             if aux_hidden_states is None:
                 logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
-        logits_input_ids = forward_batch.input_ids
+        logits_input_ids = input_ids
         logits_metadata = forward_batch
         if tail is not None:
             from sglang.srt.layers.logits_processor import LogitsMetadata
 
-            logits_input_ids = forward_batch.input_ids[tail.output_token_indices]
+            logits_input_ids = input_ids[tail.output_token_indices]
             logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
             logits_metadata.extend_seq_lens = tail.extend_seq_lens
             logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
