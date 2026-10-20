@@ -314,6 +314,69 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
         scatter.assert_called_once()
         torch.testing.assert_close(scatter.call_args.args[4], batch.req_pool_indices)
 
+    def test_kda_fold_reuses_prepared_commit_indices(self):
+        from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
+
+        target_worker = MagicMock()
+        req_pool = target_worker.model_runner.req_to_token_pool
+        req_pool.mamba_pool.replayssm_spec_fold = True
+        req_pool.mamba_pool.replayssm_is_kda = True
+        req_pool.get_mamba_indices.return_value = torch.tensor(
+            [5, 7], dtype=torch.int32
+        )
+        spec_state = self._spec_state()
+        req_pool.get_speculative_mamba2_params_all_layers.return_value = spec_state
+        batch = MagicMock()
+        batch.forward_mode.is_idle.return_value = False
+        batch.req_pool_indices = torch.tensor([17, 23], dtype=torch.int64)
+        batch.mamba_track_indices = torch.tensor([101, 202], dtype=torch.int64)
+        batch.seq_lens = torch.tensor([253, 128], dtype=torch.int32)
+        accept_lens = torch.tensor([5, 2], dtype=torch.int32)
+        accept_index = torch.tensor(
+            [[0, 1, 2, 3, 4, -1], [6, 7, -1, -1, -1, -1]],
+            dtype=torch.int32,
+        )
+        prepared_last = torch.tensor([4, 1], dtype=torch.int32)
+        prepared_track = torch.tensor([2, -1], dtype=torch.int32)
+
+        with (
+            patch(
+                "sglang.srt.speculative.spec_utils.mambaish_config",
+                return_value={"some": "config"},
+            ),
+            patch(
+                "sglang.srt.speculative.spec_utils.pp_spec_stable_rows_enabled",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.speculative.spec_utils._verify_commit_step_indices"
+            ) as recompute,
+            patch(
+                "sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode."
+                "commit_kda_replayssm_after_verify"
+            ) as commit,
+        ):
+            commit_mamba_states_after_verify(
+                target_worker,
+                batch,
+                accept_lens,
+                accept_index,
+                draft_token_num=6,
+                prepared_step_indices=(prepared_last, prepared_track),
+            )
+
+        recompute.assert_not_called()
+        commit.assert_called_once()
+        call_kwargs = commit.call_args.kwargs
+        self.assertIs(call_kwargs["spec_state"], spec_state)
+        torch.testing.assert_close(
+            call_kwargs["last_correct_step_indices"], prepared_last
+        )
+        torch.testing.assert_close(call_kwargs["mamba_steps_to_track"], prepared_track)
+        torch.testing.assert_close(
+            call_kwargs["mamba_track_indices"], batch.mamba_track_indices
+        )
+
 
 class TestDelayedMambaCommitBatchPairing(CustomTestCase):
     def test_flashinfer_gdn_positional_scratch_moves_to_request_rows(self):
