@@ -87,6 +87,9 @@ class TestIaasKernelsImage(unittest.TestCase):
     def test_reject_unpinned_or_incompatible_nvshmem(self):
         for key, value in [
             ("api_version", 2),
+            ("api_version", 3),
+            ("api_version", 4),
+            ("api_version", 6),
             ("nvshmem_version", "3.5.0"),
             ("nvshmem_revision", "main"),
             ("nvshmem_repository", "https://example.com/nvshmem.git"),
@@ -103,10 +106,13 @@ class TestIaasKernelsImage(unittest.TestCase):
 
     def test_rdma_must_match_single_node_wheel_and_api(self):
         info = dict(self.info, source_tree_sha256="a" * 64)
-        rdma = dict(info, rdma_api_version=3, nvshmem="3.4.5", topology="runtime")
+        rdma = dict(info, rdma_api_version=5, nvshmem="3.4.5", topology="runtime")
         checks.check_rdma_info(self.lock, info, rdma)
         for key, value in [
             ("rdma_api_version", 2),
+            ("rdma_api_version", 3),
+            ("rdma_api_version", 4),
+            ("rdma_api_version", 6),
             ("nvshmem", "3.5.0"),
             ("topology", "fixed"),
             ("source_tree_sha256", "b" * 64),

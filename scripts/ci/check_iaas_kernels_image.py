@@ -34,11 +34,11 @@ def load_lock(path):
     )
     rdma = lock.get("rdma", {})
     require(
-        rdma.get("api_version") == 3
+        rdma.get("api_version") == 5
         and rdma.get("nvshmem_version") == "3.4.5"
         and rdma.get("nvshmem_repository") == "https://github.com/NVIDIA/nvshmem.git"
         and re.fullmatch(r"[0-9a-f]{40}", rdma.get("nvshmem_revision", "")),
-        "RDMA requires API v3 and pinned NVSHMEM 3.4.5 sources",
+        "RDMA requires API v5 and pinned NVSHMEM 3.4.5 sources",
     )
     return lock
 
