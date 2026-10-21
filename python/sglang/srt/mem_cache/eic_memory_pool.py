@@ -567,7 +567,7 @@ class EICKVClient:
             logger.debug(f"eic exists {key} failed, err_code {err_code}")
         return success
 
-    def exists_batch(self, keys: List[str]) -> List[bool]:
+    def exists_batch(self, keys: List[str]) -> Tuple[List[bool], bool]:
         logger.debug(f"eic exists {len(keys)}")
         keys_vec = eic.StringVector()
         for key in keys:
