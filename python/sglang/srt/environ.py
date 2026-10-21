@@ -1344,6 +1344,11 @@ class Envs:
     # keep long queries native while routing small cache-hit residuals back to
     # the existing TileLang path.
     SGLANG_EXPERIMENTAL_DSA_KPOOL_FLASHMLA_V32_MIN_QUERY_ROWS = EnvInt(0)
+    # Opt-in GLM-5.3 prefill path for CP2/attention-TP2. Exchange token rows
+    # for full query heads before native FlashMLA V32, then invert the exchange
+    # before the existing head-sharded consumer. Off by default while the H20
+    # component and service gates are evaluated.
+    SGLANG_EXPERIMENTAL_DSA_ATTN_TP_ROW_HEAD_EXCHANGE = EnvBool(False)
     SGLANG_EXPERIMENTAL_DSA_KPOOL_MTP_QUERY6 = EnvBool(False)
     SGLANG_EXPERIMENTAL_DSA_KPOOL_FUSED_SENTINEL_PAD = EnvBool(False)
 

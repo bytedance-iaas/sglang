@@ -53,6 +53,12 @@ from sglang.srt.layers.attention.dsa.dsa_backend_kpool import (
     DeepseekSparseAttnBackendKPoolMixin,
     _KPoolForwardInputs,
 )
+from sglang.srt.layers.attention.dsa.dsa_attn_tp_row_head import (
+    local_row_slice,
+    plan_dsa_attn_tp_row_head,
+    redistribute_query_heads,
+    restore_output_rows,
+)
 from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     DeepseekSparseAttnBackendMTPPrecomputeMixin,
     PrecomputedMetadata,
@@ -2327,6 +2333,12 @@ class DeepseekSparseAttnBackend(
         elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            use_attn_tp_row_head_exchange = self._use_attn_tp_row_head_exchange(
+                q_all=q_all,
+                page_table_1=page_table_1,
+                layer=layer,
+                forward_batch=forward_batch,
+            )
             return self._forward_flashmla_kv(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -2342,6 +2354,7 @@ class DeepseekSparseAttnBackend(
                     and self.speculative_num_draft_tokens == 6
                     else 1
                 ),
+                attn_tp_row_head_exchange=use_attn_tp_row_head_exchange,
             )
         elif dsa_impl == "fa3":
             return self._forward_fa3(
@@ -3110,15 +3123,37 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         page_table_1,
         query_len: int = 1,
+        attn_tp_row_head_exchange: bool = False,
     ) -> torch.Tensor:
         from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
         cache_seqlens = metadata.dsa_cache_seqlens_int32
         assert metadata.flashmla_metadata is not None
 
-        # Preserve the legacy flattened output/call contract unless the native
-        # MTP experiment explicitly selects a supported grouped query below.
-        q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
+        row_head_plan = None
+        original_num_rows = q_all.shape[0]
+        original_num_heads = layer.tp_q_head_num
+        if attn_tp_row_head_exchange:
+            parallel = get_parallel()
+            row_head_plan = plan_dsa_attn_tp_row_head(
+                original_num_rows,
+                parallel.attn_tp_size,
+                parallel.attn_tp_rank,
+            )
+            if row_head_plan is None:
+                raise RuntimeError(
+                    "DSA attention-TP row/head exchange was selected without an "
+                    "equal non-empty TP2 row plan"
+                )
+            q_all = redistribute_query_heads(
+                q_all.view(original_num_rows, original_num_heads, layer.head_dim),
+                row_head_plan,
+            )
+            page_table_1 = local_row_slice(page_table_1, row_head_plan)
+
+        # Preserve the legacy flattened output/call contract unless an explicit
+        # grouped query or row/head exchange selects a supported shape below.
+        q_all = q_all.view(-1, 1, q_all.shape[-2], layer.head_dim)
         num_q_heads = q_all.shape[2]
         target_q_heads = self.flashmla_kv_num_q_heads
         if target_q_heads != num_q_heads:
@@ -3249,9 +3284,55 @@ class DeepseekSparseAttnBackend(
         if target_q_heads != num_q_heads:
             o = o[:, :, :num_q_heads, :]
 
+        if row_head_plan is not None:
+            o = restore_output_rows(o[:, 0], row_head_plan).unsqueeze(1)
+            assert o.shape[:3] == (
+                original_num_rows,
+                1,
+                original_num_heads,
+            )
+            num_q_heads = original_num_heads
+
         # The owning caller expects token-major rows with a singleton query
         # dimension, including captured padding rows and head-count padding.
         return o.reshape(-1, 1, num_q_heads, v_head_dim)
+
+    def _use_attn_tp_row_head_exchange(
+        self,
+        q_all: torch.Tensor,
+        page_table_1: torch.Tensor,
+        layer,
+        forward_batch: ForwardBatch,
+    ) -> bool:
+        if not envs.SGLANG_EXPERIMENTAL_DSA_ATTN_TP_ROW_HEAD_EXCHANGE.get():
+            return False
+        parallel = get_parallel()
+        plan = plan_dsa_attn_tp_row_head(
+            q_all.shape[0], parallel.attn_tp_size, parallel.attn_tp_rank
+        )
+        supported = (
+            is_cp_active(forward_batch)
+            and parallel.attn_cp_size == 2
+            and plan is not None
+            and layer.tp_q_head_num == 32
+            and layer.head_dim == 512
+            and self.flashmla_kv_num_q_heads == 64
+            and page_table_1 is not None
+            and page_table_1.shape[0] == q_all.shape[0]
+            and self._use_kpool_flashmla_v32("flashmla_kv")
+        )
+        if supported and not getattr(
+            self, "_attn_tp_row_head_exchange_dispatch_logged", False
+        ):
+            logger.info(
+                "Activated experimental DSA attention-TP row/head exchange: "
+                "rows=%d local_heads=%d full_heads=%d",
+                q_all.shape[0],
+                layer.tp_q_head_num,
+                layer.tp_q_head_num * parallel.attn_tp_size,
+            )
+            self._attn_tp_row_head_exchange_dispatch_logged = True
+        return supported
 
     def _forward_standard_mha(
         self,
