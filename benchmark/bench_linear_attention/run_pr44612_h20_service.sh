@@ -212,15 +212,21 @@ run_t6_screen() {
   stop_server
 }
 
-test -s "$DATASET_PATH"
-cp "$DATASET_PATH" "$RESULT_ROOT/workload.json"
-cp /workload/longbench_v2_8k.metadata.json "$RESULT_ROOT/workload.metadata.json"
+main_service_matrix() {
+  test -s "$DATASET_PATH"
+  cp "$DATASET_PATH" "$RESULT_ROOT/workload.json"
+  cp /workload/longbench_v2_8k.metadata.json "$RESULT_ROOT/workload.metadata.json"
 
-run_t4_variant b0a triton yes
-run_t4_variant c0a nv_cutedsl yes
-run_t4_variant b0b triton no
-run_t4_variant c0b nv_cutedsl no
-run_t6_screen b0t6 triton
-run_t6_screen c0t6 nv_cutedsl
+  run_t4_variant b0a triton yes
+  run_t4_variant c0a nv_cutedsl yes
+  run_t4_variant b0b triton no
+  run_t4_variant c0b nv_cutedsl no
+  run_t6_screen b0t6 triton
+  run_t6_screen c0t6 nv_cutedsl
 
-touch "$RESULT_ROOT/matrix-complete"
+  touch "$RESULT_ROOT/matrix-complete"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main_service_matrix
+fi
