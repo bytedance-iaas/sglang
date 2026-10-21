@@ -5,10 +5,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import sglang.srt.layers.quantization.unquant as unquant
 import torch
 import torch.nn.functional as F
-
-import sglang.srt.layers.quantization.unquant as unquant
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.unquant import (
     Glm53KdaPackedPtpcLinearMethod,
@@ -142,7 +141,10 @@ class TestGlm53KdaPtpcSelection(unittest.TestCase):
         else:
             os.environ[self._ptpc_env_name] = self._ptpc_env_value
 
-    def _attention(self, modules: tuple[str, ...]):
+    def _attention(self, modules: tuple[str, ...], *, num_heads: int = 4):
+        primary_layout = (96, 4, 16)
+        decode_layout = (192, 8, 16)
+        allowed_o_k = (32, 64)
         with (
             envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override(",".join(modules)),
             patch.object(
@@ -150,8 +152,13 @@ class TestGlm53KdaPtpcSelection(unittest.TestCase):
                 "_ptpc_backend_supported",
                 return_value=True,
             ),
-            patch.object(glm5_next, "GLM53_KDA_PTPC_PACKED_LAYOUT", (96, 4, 16)),
-            patch.object(glm5_next, "GLM53_KDA_PTPC_ALLOWED_O_PROJ_K", (32,)),
+            patch.object(glm5_next, "GLM53_KDA_PTPC_PACKED_LAYOUT", primary_layout),
+            patch.object(
+                glm5_next,
+                "GLM53_KDA_PTPC_DECODE_PACKED_LAYOUT",
+                decode_layout,
+            ),
+            patch.object(glm5_next, "GLM53_KDA_PTPC_ALLOWED_O_PROJ_K", allowed_o_k),
             get_parallel().override(
                 tp_size=1,
                 tp_rank=0,
@@ -170,7 +177,7 @@ class TestGlm53KdaPtpcSelection(unittest.TestCase):
                 config=SimpleNamespace(
                     linear_attn_config={
                         "head_dim": 8,
-                        "num_heads": 4,
+                        "num_heads": num_heads,
                         "short_conv_kernel_size": 4,
                     }
                 ),
@@ -187,6 +194,17 @@ class TestGlm53KdaPtpcSelection(unittest.TestCase):
 
     def test_target_selection_installs_packed_and_o_methods(self):
         attention = self._attention(("qkv_proj", "f_a_proj", "g_a_proj", "o_proj"))
+        self.assertIsInstance(
+            attention.fused_qkvbfg_a_proj.quant_method,
+            Glm53KdaPackedPtpcLinearMethod,
+        )
+        self.assertIsInstance(attention.o_proj.quant_method, Glm53KdaPtpcLinearMethod)
+
+    def test_decode_h64_layout_is_allowed(self):
+        attention = self._attention(
+            ("qkv_proj", "f_a_proj", "g_a_proj", "o_proj"),
+            num_heads=8,
+        )
         self.assertIsInstance(
             attention.fused_qkvbfg_a_proj.quant_method,
             Glm53KdaPackedPtpcLinearMethod,

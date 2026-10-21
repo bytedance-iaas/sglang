@@ -11,7 +11,6 @@ import statistics
 
 import torch
 import torch.nn.functional as F
-
 from sglang.kernels.ops.attention.fla.fused_norm_gate import layer_norm_gated_fwd
 from sglang.srt.layers.quantization.unquant import (
     Glm53KdaPackedPtpcLinearMethod,
@@ -61,9 +60,9 @@ def _accuracy(actual: torch.Tensor, reference: torch.Tensor) -> dict[str, float]
 
 
 @torch.inference_mode()
-def _bench_packed_first_stage(m: int, warmup: int, iters: int) -> dict:
+def _bench_packed_first_stage(m: int, heads: int, warmup: int, iters: int) -> dict:
     k = 4096
-    qkv_size, beta_size, fg_size = 12288, 32, 256
+    qkv_size, beta_size, fg_size = 3 * heads * 128, heads, 256
     n = qkv_size + beta_size + fg_size
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) / k**0.5
     layer = _BenchLinear(
@@ -108,8 +107,8 @@ def _bench_packed_first_stage(m: int, warmup: int, iters: int) -> dict:
 
 
 @torch.inference_mode()
-def _bench_o_proj(m: int, warmup: int, iters: int) -> dict:
-    heads, head_dim = 32, 128
+def _bench_o_proj(m: int, heads: int, warmup: int, iters: int) -> dict:
+    head_dim = 128
     k = n = heads * head_dim
     core = torch.randn(1, m, heads, head_dim, device="cuda", dtype=torch.bfloat16)
     gate = torch.randn_like(core)
@@ -163,6 +162,7 @@ def _bench_o_proj(m: int, warmup: int, iters: int) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--m", type=int, default=4096)
+    parser.add_argument("--heads", type=int, choices=(32, 64), default=32)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     args = parser.parse_args()
@@ -179,12 +179,13 @@ def main() -> None:
         "device": torch.cuda.get_device_name(),
         "capability": capability,
         "m": args.m,
+        "heads": args.heads,
         "warmup": args.warmup,
         "iters": args.iters,
         "packed_first_stage": _bench_packed_first_stage(
-            args.m, args.warmup, args.iters
+            args.m, args.heads, args.warmup, args.iters
         ),
-        "o_proj_with_norm": _bench_o_proj(args.m, args.warmup, args.iters),
+        "o_proj_with_norm": _bench_o_proj(args.m, args.heads, args.warmup, args.iters),
     }
     print(json.dumps(result, indent=2, sort_keys=True))
 

@@ -348,7 +348,8 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
 # provisional crossover before service integration.
 GLM53_KDA_PTPC_MIN_M = 4096
 GLM53_KDA_PTPC_PACKED_LAYOUT = (12288, 32, 256)
-GLM53_KDA_PTPC_ALLOWED_O_PROJ_K = (4096,)
+GLM53_KDA_PTPC_DECODE_PACKED_LAYOUT = (24576, 64, 256)
+GLM53_KDA_PTPC_ALLOWED_O_PROJ_K = (4096, 8192)
 
 
 class Glm5NextLinearAttention(nn.Module):
@@ -673,10 +674,14 @@ class Glm5NextLinearAttention(nn.Module):
                     "qkv/beta/f/g projection fusion"
                 )
             packed_layout = tuple(self.split_sizes)
-            if packed_layout != GLM53_KDA_PTPC_PACKED_LAYOUT:
+            allowed_packed_layouts = {
+                GLM53_KDA_PTPC_PACKED_LAYOUT,
+                GLM53_KDA_PTPC_DECODE_PACKED_LAYOUT,
+            }
+            if packed_layout not in allowed_packed_layouts:
                 raise ValueError(
-                    "SM90 GLM-5.3 KDA packed PTPC supports layout "
-                    f"{GLM53_KDA_PTPC_PACKED_LAYOUT}, got {packed_layout}"
+                    "SM90 GLM-5.3 KDA packed PTPC supports layouts "
+                    f"{sorted(allowed_packed_layouts)}, got {packed_layout}"
                 )
             if not isinstance(
                 self.fused_qkvbfg_a_proj.quant_method, UnquantizedLinearMethod
