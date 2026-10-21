@@ -42,9 +42,11 @@ def _max_rel_err(actual, expected):
 
 
 class TestKDAFusedVerifyBackend(CustomTestCase):
-    def _make_case(self, batch_size=1, heads=2, v_heads=4, lower_bound=-5.0):
+    def _make_case(
+        self, batch_size=1, heads=2, v_heads=4, lower_bound=-5.0, steps=4
+    ):
         torch.manual_seed(36821)
-        steps, head_dim, num_layers = 4, 128, 2
+        head_dim, num_layers = 128, 2
         num_slots = batch_size + 3
         dim = (2 * heads + v_heads) * head_dim
 
