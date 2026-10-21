@@ -2,7 +2,6 @@ import importlib.util
 from typing import Optional, Tuple, Union
 
 import torch
-
 from sglang.kernels.ops.attention import kda_fused_decode, kda_fused_decode_aiter_hip
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
@@ -10,6 +9,17 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.layers.attention.linear.kda_prefill_cp_head import (
+    KdaPrefillCpHeadPlan,
+    exchange_local_rows_for_owned_heads,
+    gather_full_head_axis,
+    plan_kda_prefill_cp_head,
+    restore_local_rows_from_owned_heads,
+    select_flat_head_range,
+    select_packed_qkv_head_range,
+    write_flat_head_range,
+    write_packed_qkv_head_range,
+)
 from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
     build_fused_accept_indices,
 )
@@ -19,6 +29,7 @@ from sglang.srt.layers.attention.linear.utils import (
     build_verify_intermediate_state_indices,
     select_verify_intermediate_state_indices,
 )
+from sglang.srt.layers.cp.interleave import InterleaveContextParallelMetadata
 from sglang.srt.layers.cp.utils import (
     cp_materialize_global_token_order,
     cp_shard_hidden_states,
@@ -45,6 +56,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_memory,
+    get_parallel,
     get_platform,
     get_spec,
 )
@@ -835,6 +847,20 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 layer, forward_batch, mixed_qkv, a, b, **kwargs
             )
 
+        head_plan = KDAAttnBackend._kda_prefill_cp_head_plan(
+            self, layer, forward_batch, mixed_qkv, a, b
+        )
+        if head_plan is not None:
+            return KDAAttnBackend._forward_extend_cp_head_exchange(
+                self,
+                layer,
+                forward_batch,
+                mixed_qkv,
+                a,
+                b,
+                head_plan,
+            )
+
         # Interleaved rows are not a causal sequence. Keep convolution history,
         # the FP32 recurrence and named prefix checkpoints on the global token
         # order; only the output is localized again. Heads remain sharded over
@@ -855,6 +881,396 @@ class KDAAttnBackend(MambaAttnBackendBase):
             layer, forward_batch, full_qkv, full_a, full_b, **kwargs
         )
         return cp_shard_hidden_states(output.movedim(1, 0), forward_batch).movedim(0, 1)
+
+    def _kda_prefill_cp_head_plan(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        a: torch.Tensor,
+        b: torch.Tensor,
+    ) -> Optional[KdaPrefillCpHeadPlan]:
+        """Select the narrow P2 route without changing the common bridge.
+
+        Selection uses host metadata shared by all CP ranks.  Unsupported or
+        uneven batches therefore fall back before any collective, so ranks
+        cannot disagree about all-to-all participation.
+        """
+
+        if not envs.SGLANG_EXPERIMENTAL_KDA_PREFILL_CP_HEAD_EXCHANGE.get():
+            return None
+        if not is_cuda() or not isinstance(mixed_qkv, torch.Tensor):
+            return None
+        metadata = getattr(forward_batch, "attn_cp_metadata", None)
+        if not isinstance(metadata, InterleaveContextParallelMetadata):
+            return None
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+            or self.accept_lens_pool is not None
+        ):
+            return None
+        # The first implementation is the fixed GLM-5.3 Flash H20 shape.  Keep
+        # other linear-attention layouts on the already-validated bridge.
+        if not (
+            layer.num_q_heads == layer.num_k_heads == layer.num_v_heads == 32
+            and layer.head_q_dim == layer.head_k_dim == layer.head_v_dim == 128
+        ):
+            return None
+        if not isinstance(
+            self.kernel_dispatcher.effective_extend_kernel(layer.lower_bound),
+            TritonKDAKernel,
+        ):
+            return None
+
+        parallel = get_parallel()
+        logical_rows = metadata.per_rank_logical_token or metadata.per_rank_actual_token
+        plan = plan_kda_prefill_cp_head(
+            local_rows=mixed_qkv.shape[0],
+            local_heads=layer.num_q_heads,
+            logical_rank_rows=logical_rows,
+            physical_rank_rows=metadata.per_rank_actual_token,
+            cp_size=parallel.attn_cp_size,
+            cp_rank=parallel.attn_cp_rank,
+        )
+        if plan is None:
+            return None
+        if mixed_qkv.shape[1] != 3 * plan.local_heads * layer.head_q_dim:
+            return None
+        if a.ndim == 3:
+            if a.shape != (1, plan.local_rows, plan.local_heads * layer.head_k_dim):
+                return None
+        elif a.ndim == 4:
+            if a.shape != (
+                1,
+                plan.local_rows,
+                plan.local_heads,
+                layer.head_k_dim,
+            ):
+                return None
+        else:
+            return None
+        if b.shape != (1, plan.local_rows, plan.local_heads):
+            return None
+        if not (mixed_qkv.dtype == a.dtype == b.dtype):
+            return None
+        if (
+            self.forward_metadata.track_ssm_recompute_dst is not None
+            and self.forward_metadata.track_ssm_recompute_dst.numel() > 0
+        ):
+            return None
+        if not getattr(self, "_cp_head_exchange_logged", False):
+            self._cp_head_exchange_logged = True
+            rank0_log(
+                "Activated experimental KDA prefill CP head exchange: "
+                f"CP{plan.cp_size}, H{plan.local_heads}->H{plan.owned_heads}, "
+                f"local_rows={plan.local_rows}, global_rows={plan.global_rows}."
+            )
+        return plan
+
+    @staticmethod
+    def _exchange_kda_prefill_inputs(
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        layer: RadixLinearAttention,
+        plan: KdaPrefillCpHeadPlan,
+    ):
+        qkv = mixed_qkv.reshape(
+            plan.local_rows, 3, plan.local_heads, layer.head_q_dim
+        ).movedim(1, 2)
+        gate_was_flat = a.ndim == 3
+        if gate_was_flat:
+            gate = a.squeeze(0).reshape(
+                plan.local_rows, plan.local_heads, layer.head_k_dim
+            )
+        else:
+            gate = a.squeeze(0)
+        beta = b.squeeze(0).unsqueeze(-1)
+
+        # One collective carries Q/K/V, the KDA gate, and beta.  Keeping these
+        # pieces separate would preserve bytes but add two avoidable A2A launches.
+        packed = torch.cat(
+            (qkv.flatten(-2), gate, beta),
+            dim=-1,
+        )
+        packed = exchange_local_rows_for_owned_heads(packed, plan)
+        qkv_width = 3 * layer.head_q_dim
+        qkv, gate, beta = packed.split((qkv_width, layer.head_k_dim, 1), dim=-1)
+        qkv = (
+            qkv.reshape(plan.global_rows, plan.owned_heads, 3, layer.head_q_dim)
+            .movedim(1, 2)
+            .reshape(plan.global_rows, 3 * plan.owned_heads * layer.head_q_dim)
+        )
+        if gate_was_flat:
+            gate = gate.reshape(plan.global_rows, plan.owned_heads * layer.head_k_dim)
+        gate = gate.unsqueeze(0)
+        beta = beta.squeeze(-1).unsqueeze(0)
+        return qkv, gate, beta, gate_was_flat
+
+    @staticmethod
+    def _write_owned_ssm_rows(
+        pool: torch.Tensor,
+        rows: torch.Tensor,
+        values: torch.Tensor,
+        plan: KdaPrefillCpHeadPlan,
+    ) -> None:
+        if rows.numel() == 0:
+            return
+        selected = pool.index_select(0, rows.to(torch.long))
+        write_flat_head_range(selected, values, plan, head_axis=1)
+        pool.index_copy_(0, rows.to(torch.long), selected)
+
+    @staticmethod
+    def _write_owned_conv_rows(
+        pool: torch.Tensor,
+        rows: torch.Tensor,
+        values: torch.Tensor,
+        plan: KdaPrefillCpHeadPlan,
+        head_dim: int,
+    ) -> None:
+        if rows.numel() == 0:
+            return
+        selected = pool.index_select(0, rows.to(torch.long))
+        write_packed_qkv_head_range(
+            selected,
+            values,
+            plan,
+            head_dim=head_dim,
+            packed_axis=-1,
+        )
+        pool.index_copy_(0, rows.to(torch.long), selected)
+
+    @staticmethod
+    def _sync_owned_ssm_rows(
+        pool: torch.Tensor,
+        rows: torch.Tensor,
+        plan: KdaPrefillCpHeadPlan,
+    ) -> None:
+        if rows.numel() == 0:
+            return
+        rows = torch.unique(rows.to(torch.long), sorted=True)
+        selected = pool.index_select(0, rows)
+        owned = selected[:, plan.head_start : plan.head_end].contiguous()
+        full = gather_full_head_axis(owned, plan, head_axis=1)
+        pool.index_copy_(0, rows, full)
+
+    @staticmethod
+    def _sync_owned_conv_rows(
+        pool: torch.Tensor,
+        rows: torch.Tensor,
+        plan: KdaPrefillCpHeadPlan,
+        head_dim: int,
+    ) -> None:
+        if rows.numel() == 0:
+            return
+        rows = torch.unique(rows.to(torch.long), sorted=True)
+        selected = pool.index_select(0, rows)
+        owned = select_packed_qkv_head_range(
+            selected,
+            plan,
+            head_dim=head_dim,
+            packed_axis=-1,
+        ).reshape(*selected.shape[:-1], 3, plan.owned_heads, head_dim)
+        full = gather_full_head_axis(owned, plan, head_axis=-2)
+        pool.index_copy_(0, rows, full.reshape_as(selected))
+
+    def _forward_extend_cp_head_exchange(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        plan: KdaPrefillCpHeadPlan,
+    ) -> torch.Tensor:
+        """Run one H/2 recurrence owner per CP rank and restore all state.
+
+        Persistent conv/FP32 state pools remain in their original replicated H32
+        layout.  Each rank operates on compact rows for its H16 shard, writes
+        only that shard, then all-gathers every touched final or named-track row
+        so PD handoff, radix restore, and later fallback paths see full H32 state.
+        """
+
+        if forward_batch.extend_prefix_lens is None:
+            raise RuntimeError(
+                "extend_prefix_lens cannot be None in non-TARGET_VERIFY mode."
+            )
+        mixed_qkv, a, b, gate_was_flat = self._exchange_kda_prefill_inputs(
+            mixed_qkv, a, b, layer, plan
+        )
+        query_start_loc = self.forward_metadata.query_start_loc
+        cache_indices = self.forward_metadata.mamba_cache_indices
+        batch_size = query_start_loc.shape[0] - 1
+        cache_slots = cache_indices[:batch_size].to(torch.long)
+        compact_slots = torch.arange(
+            batch_size, dtype=cache_indices.dtype, device=cache_indices.device
+        )
+
+        cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        conv_pool = cache.conv[0]
+        ssm_pool = cache.temporal
+        conv_rows = conv_pool.index_select(0, cache_slots)
+        owned_conv_rows = select_packed_qkv_head_range(
+            conv_rows,
+            plan,
+            head_dim=layer.head_q_dim,
+            packed_axis=-1,
+        )
+        owned_conv_states = owned_conv_rows.transpose(-1, -2).contiguous()
+        owned_ssm_states = ssm_pool.index_select(0, cache_slots)[
+            :, plan.head_start : plan.head_end
+        ].contiguous()
+
+        track_conv_dest = cache_slots.new_empty((0,))
+        if self.forward_metadata.has_mamba_track_mask:
+            track_conv_dest = self.forward_metadata.conv_states_mask_indices.to(
+                torch.long
+            )
+            track_conv_values = mixed_qkv[self.forward_metadata.track_conv_indices]
+            self._write_owned_conv_rows(
+                conv_pool,
+                track_conv_dest,
+                track_conv_values,
+                plan,
+                layer.head_q_dim,
+            )
+
+        conv_weights = select_packed_qkv_head_range(
+            layer.conv_weights,
+            plan,
+            head_dim=layer.head_q_dim,
+            packed_axis=0,
+        )
+        conv_bias = (
+            None
+            if layer.bias is None
+            else select_packed_qkv_head_range(
+                layer.bias,
+                plan,
+                head_dim=layer.head_q_dim,
+                packed_axis=0,
+            )
+        )
+        qkv = causal_conv1d_fn(
+            mixed_qkv.transpose(0, 1),
+            conv_weights,
+            conv_bias,
+            activation="silu",
+            conv_states=owned_conv_states,
+            has_initial_state=forward_batch.extend_prefix_lens > 0,
+            cache_indices=compact_slots,
+            query_start_loc=query_start_loc,
+            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+        ).transpose(0, 1)
+        self._write_owned_conv_rows(
+            conv_pool,
+            cache_slots,
+            owned_conv_states.transpose(-1, -2),
+            plan,
+            layer.head_q_dim,
+        )
+
+        owned_q_dim = plan.owned_heads * layer.head_q_dim
+        q, k, v = qkv.split([owned_q_dim, owned_q_dim, owned_q_dim], dim=-1)
+        q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)
+        k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
+        v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
+        if gate_was_flat:
+            a = a.unflatten(-1, (-1, layer.head_k_dim))
+
+        track_ssm = self.forward_metadata.has_mamba_track_mask
+        track_chunk_idx = self.forward_metadata.track_chunk_idx
+        h_track_buf = None
+        if (
+            track_ssm
+            and track_chunk_idx is not None
+            and self.forward_metadata.track_ssm_h_src.numel() > 0
+        ):
+            h_track_buf = torch.empty(
+                (
+                    track_chunk_idx.shape[0],
+                    plan.owned_heads,
+                    layer.head_v_dim,
+                    layer.head_k_dim,
+                ),
+                dtype=torch.float32,
+                device=ssm_pool.device,
+            )
+
+        core_attn_out = self.kernel_dispatcher.extend(
+            q=q,
+            k=k,
+            v=v,
+            g=a,
+            beta=b,
+            ssm_states=owned_ssm_states,
+            cache_indices=compact_slots,
+            query_start_loc=query_start_loc,
+            A_log=layer.A_log[:, :, plan.head_start : plan.head_end],
+            dt_bias=select_flat_head_range(
+                layer.dt_bias,
+                plan,
+                head_dim=layer.head_k_dim,
+                head_axis=0,
+            ),
+            lower_bound=layer.lower_bound,
+            beta_is_raw=gate_was_flat,
+            extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            extend_prefix_lens=forward_batch.extend_prefix_lens,
+            layer_id=layer.layer_id,
+            is_spec_decode=False,
+            return_intermediate_states=track_ssm,
+            track_ssm_h_src=(
+                self.forward_metadata.track_ssm_h_src if track_ssm else None
+            ),
+            track_state=h_track_buf,
+            track_chunk_idx=(track_chunk_idx if h_track_buf is not None else None),
+        )
+        h = None
+        if track_ssm:
+            core_attn_out, h = core_attn_out
+
+        # Publish this rank's final shard before named-track copies select it.
+        self._write_owned_ssm_rows(ssm_pool, cache_slots, owned_ssm_states, plan)
+        touched_ssm = [cache_slots]
+        if track_ssm:
+            if self.forward_metadata.track_ssm_h_src.numel() > 0:
+                track_dest = self.forward_metadata.track_ssm_h_dst.to(torch.long)
+                if h_track_buf is not None:
+                    track_values = h_track_buf[
+                        self.forward_metadata.track_ssm_h_batch_src
+                    ]
+                else:
+                    assert h is not None
+                    track_values = h.squeeze(0)[
+                        self.forward_metadata.track_ssm_h_src
+                    ].to(torch.float32)
+                self._write_owned_ssm_rows(ssm_pool, track_dest, track_values, plan)
+                touched_ssm.append(track_dest)
+            if self.forward_metadata.track_ssm_final_src.numel() > 0:
+                final_src = self.forward_metadata.track_ssm_final_src.to(torch.long)
+                final_dest = self.forward_metadata.track_ssm_final_dst.to(torch.long)
+                final_values = ssm_pool.index_select(0, final_src)[
+                    :, plan.head_start : plan.head_end
+                ].contiguous()
+                self._write_owned_ssm_rows(ssm_pool, final_dest, final_values, plan)
+                touched_ssm.append(final_dest)
+
+        self._sync_owned_conv_rows(
+            conv_pool,
+            torch.cat((cache_slots, track_conv_dest)),
+            plan,
+            layer.head_q_dim,
+        )
+        self._sync_owned_ssm_rows(
+            ssm_pool,
+            torch.cat(touched_ssm),
+            plan,
+        )
+
+        restored = restore_local_rows_from_owned_heads(core_attn_out.squeeze(0), plan)
+        return restored.unsqueeze(0)
 
     def _forward_extend_full_sequence(
         self,

@@ -5,11 +5,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear import kda_backend
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -17,6 +17,13 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestKDAPrefillCPBridge(unittest.TestCase):
+    def setUp(self):
+        self._head_exchange_env = (
+            envs.SGLANG_EXPERIMENTAL_KDA_PREFILL_CP_HEAD_EXCHANGE.override(False)
+        )
+        self._head_exchange_env.__enter__()
+        self.addCleanup(self._head_exchange_env.__exit__, None, None, None)
+
     def test_non_cp_retains_original_arguments_and_result(self):
         args = [object() for _ in range(5)]
         result = object()
@@ -119,6 +126,33 @@ class TestKDAPrefillCPBridge(unittest.TestCase):
                     torch.empty(1, 3, 4),
                 )
             gather.assert_not_called()
+
+    def test_selected_head_exchange_bypasses_three_gather_bridge(self):
+        result = object()
+        plan = object()
+        backend = SimpleNamespace()
+        args = [object() for _ in range(5)]
+        with (
+            patch.object(kda_backend, "is_cp_active", return_value=True),
+            patch.object(
+                kda_backend.KDAAttnBackend,
+                "_kda_prefill_cp_head_plan",
+                return_value=plan,
+            ) as select,
+            patch.object(
+                kda_backend.KDAAttnBackend,
+                "_forward_extend_cp_head_exchange",
+                return_value=result,
+            ) as exchange,
+            patch.object(kda_backend, "cp_materialize_global_token_order") as gather,
+        ):
+            actual = kda_backend.KDAAttnBackend.forward_extend(
+                backend, *args, test_marker="not_forwarded"
+            )
+        self.assertIs(actual, result)
+        select.assert_called_once_with(backend, *args)
+        exchange.assert_called_once_with(backend, *args, plan)
+        gather.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -1349,6 +1349,7 @@ class Envs:
     # before the existing head-sharded consumer. Off by default while the H20
     # component and service gates are evaluated.
     SGLANG_EXPERIMENTAL_DSA_ATTN_TP_ROW_HEAD_EXCHANGE = EnvBool(False)
+    SGLANG_EXPERIMENTAL_KDA_PREFILL_CP_HEAD_EXCHANGE = EnvBool(False)
     SGLANG_EXPERIMENTAL_DSA_KPOOL_MTP_QUERY6 = EnvBool(False)
     SGLANG_EXPERIMENTAL_DSA_KPOOL_FUSED_SENTINEL_PAD = EnvBool(False)
 
