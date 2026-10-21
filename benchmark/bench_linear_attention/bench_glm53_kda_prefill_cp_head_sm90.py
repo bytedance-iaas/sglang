@@ -307,7 +307,14 @@ def main() -> None:
         local_rank=local_rank,
         distributed_init_method="env://",
     )
-    publish_build_topology(world_rank=rank, tp_size=world_size)
+    publish_build_topology(
+        world_rank=rank,
+        tp_size=world_size,
+        enable_prefill_cp=True,
+        cp_strategy="interleave",
+        attn_cp_size=world_size,
+        attn_dp_size=1,
+    )
     initialize_model_parallel()
 
     try:
