@@ -132,6 +132,8 @@ run_benchmark() {
     --backend sglang
     --base-url "$BASE_URL"
     --model "$MODEL_NAME"
+    --served-model-name "$MODEL_NAME"
+    --tokenizer "$MODEL_PATH"
     --dataset-name sharegpt
     --dataset-path "$DATASET_PATH"
     --apply-chat-template
