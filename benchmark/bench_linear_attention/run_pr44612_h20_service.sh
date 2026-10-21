@@ -115,7 +115,9 @@ start_server() {
   printf '%s\n' "$server_pid" > "$run_dir/server.pid"
   wait_ready "$run_dir/server.log"
   real_smoke "$run_dir"
-  curl -fsS "$BASE_URL/metrics" > "$run_dir/metrics-ready.txt"
+  metrics_code=$(curl -sS -o "$run_dir/metrics-ready.txt" -w '%{http_code}' \
+    "$BASE_URL/metrics" || true)
+  printf '%s\n' "$metrics_code" > "$run_dir/metrics-ready.status"
 }
 
 run_benchmark() {
@@ -150,7 +152,9 @@ run_benchmark() {
   date --iso-8601=ns > "$run_dir/$name.start"
   "${command[@]}" > "$run_dir/$name.stdout" 2> "$run_dir/$name.stderr"
   date --iso-8601=ns > "$run_dir/$name.end"
-  curl -fsS "$BASE_URL/metrics" > "$run_dir/$name.metrics.txt"
+  metrics_code=$(curl -sS -o "$run_dir/$name.metrics.txt" -w '%{http_code}' \
+    "$BASE_URL/metrics" || true)
+  printf '%s\n' "$metrics_code" > "$run_dir/$name.metrics.status"
 }
 
 profile_path() {
