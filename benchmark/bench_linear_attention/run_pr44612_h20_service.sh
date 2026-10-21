@@ -131,7 +131,7 @@ run_benchmark() {
     python3 -m sglang.benchmark.serving
     --backend sglang
     --base-url "$BASE_URL"
-    --model "$MODEL_NAME"
+    --model "$MODEL_PATH"
     --served-model-name "$MODEL_NAME"
     --tokenizer "$MODEL_PATH"
     --dataset-name sharegpt
