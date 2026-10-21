@@ -283,10 +283,35 @@ class SchedulerPPMixin:
         release_rids: Optional[PPTransferStatus] = None
         send_transfer_work = []
         send_release_work = []
+        pending_batch_results = [None] * self.pp_loop_size
+        pending_d2h_events = [None] * self.pp_loop_size
+        pending_release_rids = [None] * self.pp_loop_size
+        pending_release_ready = [False] * self.pp_loop_size
 
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                # Retire this slot only when it is about to be scheduled again.
+                # The previous iteration can then forward its current proxy while
+                # this slot's D2H completion overlaps the current GPU batch.
+                if self.mbs[mb_id] is not None:
+                    d2h_event = pending_d2h_events[mb_id]
+                    assert d2h_event is not None
+                    d2h_event.synchronize()
+                    self._pp_process_batch_result(
+                        self.mbs[mb_id],
+                        pending_batch_results[mb_id],
+                    )
+                    self.last_mbs[mb_id] = self.mbs[mb_id]
+                    pending_batch_results[mb_id] = None
+                    pending_d2h_events[mb_id] = None
+                if pending_release_ready[mb_id]:
+                    self.process_disagg_prefill_inflight_queue(
+                        pending_release_rids[mb_id]
+                    )
+                    pending_release_rids[mb_id] = None
+                    pending_release_ready[mb_id] = False
+
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (
@@ -362,17 +387,7 @@ class SchedulerPPMixin:
                 if tmbs[next_mb_id] is not None:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
                 self._pp_commit_comm_work(send_release_work)
-                # post-process the coming microbatch
-                if self.mbs[next_mb_id] is not None:
-                    d2h_event.synchronize()
-                    self._pp_process_batch_result(
-                        self.mbs[next_mb_id],
-                        next_batch_result,
-                    )
-                    self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
-                if tmbs[next_mb_id] is not None:
-                    self.process_disagg_prefill_inflight_queue(next_release_rids)
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
@@ -382,6 +397,15 @@ class SchedulerPPMixin:
                     )
                     if cur_batch:
                         self._pp_send_proxy_to_next_stage(result)
+
+                if self.mbs[next_mb_id] is not None:
+                    assert pending_d2h_events[next_mb_id] is None
+                    pending_batch_results[next_mb_id] = next_batch_result
+                    pending_d2h_events[next_mb_id] = d2h_event
+                if tmbs[next_mb_id] is not None:
+                    assert not pending_release_ready[next_mb_id]
+                    pending_release_rids[next_mb_id] = next_release_rids
+                    pending_release_ready[next_mb_id] = True
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids

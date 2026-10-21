@@ -82,6 +82,7 @@ from sglang.srt.layers.cp.utils import (
     dsa_prefill_cp_fused_symm_mem,
     dsa_prefill_cp_fused_symm_mem_for_rows,
     dsa_prefill_cp_moe_gather,
+    dsa_prefill_cp_moe_reduce_scatter,
     is_cp_active,
 )
 from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
@@ -107,7 +108,6 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.engram import Engram, EngramHasher, EngramLayout
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
-from sglang.srt.layers.layer_boundary.ops import attn_cp_interleave_reduce_scatter
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -3659,7 +3659,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                         deferred_moe=output.routed,
                     )
             else:
-                hidden_states = attn_cp_interleave_reduce_scatter(hidden_states)
+                hidden_states = dsa_prefill_cp_moe_reduce_scatter(hidden_states)
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_parallel().tp_group),

@@ -204,6 +204,63 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                             0 if pending_transfer else 1 + (pattern == "idle_cycle"),
                         )
 
+    def test_pp_prefill_retires_result_after_proxy_send_before_slot_reuse(self):
+        batches = self.make_batches(ForwardMode.EXTEND)[:2]
+        scheduler = self.make_scheduler(batches)
+        self.prepare_pp_scheduler(scheduler)
+        scheduler.pp_group = SimpleNamespace(is_last_rank=False)
+        scheduler._pp_send_pyobj_to_next_stage = Mock(return_value=[])
+
+        actions = []
+
+        def launch(mb_id, batch, *args):
+            actions.append(("launch", mb_id))
+            return SimpleNamespace(), Mock()
+
+        class Event:
+            def synchronize(self):
+                actions.append(("sync", 0))
+
+        def receive_output(next_first_rank_mb_id, next_mb_id):
+            if scheduler.mbs[next_mb_id] is None:
+                return None, None, None
+            return None, GenerationBatchResult(), Event()
+
+        scheduler._pp_launch_batch = launch
+        scheduler._pp_commit_send_output_work_and_preprocess_output_tensors = (
+            receive_output
+        )
+        scheduler._pp_commit_proxy_send_work = Mock(
+            side_effect=lambda: actions.append(("flush_proxy", None))
+        )
+        scheduler._pp_send_proxy_to_next_stage = Mock(
+            side_effect=lambda result: actions.append(("send_proxy", None))
+        )
+        scheduler._pp_process_batch_result = Mock(
+            side_effect=lambda batch, result: actions.append(("process", 0))
+        )
+
+        with (
+            get_parallel().override(
+                pp_size=2,
+                pp_rank=0,
+                attn_tp_rank=0,
+                attn_cp_rank=0,
+                pp_async_batch_depth=0,
+            ),
+            self.assertRaises(StopIteration),
+        ):
+            scheduler.event_loop_pp_disagg_prefill()
+
+        self.assertLess(
+            actions.index(("send_proxy", None), 3),
+            actions.index(("sync", 0)),
+        )
+        self.assertLess(actions.index(("sync", 0)), actions.index(("process", 0)))
+        for index, action in enumerate(actions):
+            if action[0] == "launch":
+                self.assertEqual(actions[index - 1], ("flush_proxy", None))
+
     def test_pdmux_idle_gap(self):
         for idle_iterations in (0, 1, 2):
             with self.subTest(idle_iterations=idle_iterations):
