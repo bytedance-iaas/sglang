@@ -1,6 +1,6 @@
 {
   "repository": "https://github.com/bytedance-iaas/iaas-kernels.git",
-  "revision": "2a21d98c16e0bba4624479d7cd5681317b0fcab9",
+  "revision": "7aa679809325e8af28366271fa6dff7316a42a3c",
   "version": "0.1.0.dev0",
   "platform": "linux/amd64",
   "python": "3.12",
@@ -9,7 +9,7 @@
   "apache-tvm-ffi": "0.1.11",
   "transports": ["nvlink", "rdma"],
   "rdma": {
-    "api_version": 3,
+    "api_version": 5,
     "nvshmem_version": "3.4.5",
     "nvshmem_repository": "https://github.com/NVIDIA/nvshmem.git",
     "nvshmem_revision": "131da55f643ac87c810ba0bc51d359258bf433a1"

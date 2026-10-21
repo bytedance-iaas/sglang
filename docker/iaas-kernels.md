@@ -26,7 +26,9 @@ so automatic transport selection uses the effective EP size rather than raw inpu
 This branch's packaging profile targets **linux/amd64, CUDA 13.0.3, Python 3.12,
 Torch 2.14.1, NVLink and RDMA**.
 `docker/iaas-kernels.lock.json` pins the source commit, package version and ABI.
-The pin includes the fixed-M64 FP4 RDMA RS implementation (RDMA API v3).
+The pin includes per-EP-group topology caching and one transport summary from
+group rank 0 during SGLang initialization. It also includes topology-aware FP4
+RDMA pacing and resource-aware FP8 decode with capacity-aware buffers (RDMA API v5).
 The pinned commit must be available in the private source repository before
 starting a release; a commit present only in a developer's local main cannot
 be fetched by the wheel builder. There is no fallback to a moving branch or an
@@ -68,8 +70,9 @@ the wheel's private ABI headers and uses the wheel's generated build options.
 A CPU-only compile/link probe with a real NVSHMEM device call must pass. The
 resulting tools and NVIDIA license are installed under
 `/opt/sglang/share/iaas-kernels/lto/`; they do not rely on files copied from a
-benchmark container. This archive is for iaas-kernels FP4 JIT, and does not replace
-Torch/DeepEP's ordinary NVSHMEM archive or host library.
+benchmark container. This archive is for iaas-kernels FP4 JIT. The pinned wheel
+also builds and packages its own validated LTO bundle for FP8 RDMA. Neither bundle
+replaces Torch/DeepEP's ordinary NVSHMEM archive or host library.
 
 The image saves source/submodule SHAs, build ABI, wheel SHA256 and native library
 SHA256 in `/opt/sglang/share/iaas-kernels/manifest.json`, alongside its lock file.
@@ -81,7 +84,7 @@ commit and wheel digest, not by the version string alone.
 ## Verification
 
 The final stages run `scripts/ci/check_iaas_kernels_image.py` without a GPU. The
-check validates the installed source/ABI/binaries, RDMA API v3, NVSHMEM 3.4.5,
+check validates the installed source/ABI/binaries, RDMA API v5, NVSHMEM 3.4.5,
 JIT headers/tools, LTO hashes/executable, Torch NVSHMEM support, continued ownership
 of `deep_gemm` by `sgl-deep-gemm`, both native host libraries, and plugin registration
 without CUDA initialization.
