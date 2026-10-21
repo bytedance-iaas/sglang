@@ -606,11 +606,14 @@ class EICKVClient:
         retry_codes += [None] * (len(failed) - len(retry_codes))
         still_failed = 0
         # The retry response is only a data-plane fault when some key failed
-        # for a transport/server reason. A key that returns KEY_NOT_EXIST is
-        # a normal cold miss and must not drive the probe backoff.
+        # for a transport/server reason. A key (or the whole retry batch)
+        # returning KEY_NOT_EXIST is a normal cold miss and must not drive
+        # the probe backoff; top-level KEY_NOT_EXIST matches the healthy
+        # cold-miss branch above.
         plane_error = retry_status not in (
             eic.StatusCode.SUCCESS,
             eic.StatusCode.PARTIAL_FAILED,
+            eic.StatusCode.KEY_NOT_EXIST,
         )
         for j, i in enumerate(failed):
             rc = retry_codes[j] if j < len(retry_codes) else None
@@ -618,7 +621,12 @@ class EICKVClient:
                 codes[i] = eic.StatusCode.SUCCESS
             else:
                 still_failed += 1
-                if rc != eic.StatusCode.KEY_NOT_EXIST:
+                # A concrete transport/server fault code marks the plane;
+                # KEY_NOT_EXIST (cold miss) and an absent code under a healthy
+                # status do not.
+                if retry_status != eic.StatusCode.KEY_NOT_EXIST and (
+                    rc is not None and rc != eic.StatusCode.KEY_NOT_EXIST
+                ):
                     plane_error = True
         stats.record_rpc(
             "mexist",

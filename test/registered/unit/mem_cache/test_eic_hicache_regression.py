@@ -219,6 +219,137 @@ class TestEICHiCacheRegression(unittest.TestCase):
                 self.assertTrue(os.path.isfile(option.flag_file))
                 self.assertEqual(option.multi_net_local_interface_names, "eth0;eth1")
 
+    def _drive_init_failure(self, module_path, cls_name, resolved, extra_mocks=()):
+        """Drive a real constructor until Client.init returns nonzero.
+
+        Records every private flag-file owner directory closed on the failure
+        path and returns (raised exception, closed directories). Mirrors
+        `_drive_constructor` but uses a nonzero init return instead of raising
+        at init.
+        """
+        from importlib import import_module
+        from sglang.srt.mem_cache.storage.eic import eic_env_config
+
+        conn = mock.Mock()
+        conn.init.return_value = 1
+        sdk = SimpleNamespace(
+            Client=lambda: conn,
+            InitOption=SimpleNamespace,
+            LogLevel=lambda value: value,
+            TransportType=lambda value: value,
+        )
+        closed_dirs = []
+        real_close = eic_env_config._PrivateFlagFile.close
+
+        def spy_close(owner):
+            closed_dirs.append(owner._directory)
+            real_close(owner)
+
+        with mock.patch.dict(sys.modules, {"eic": sdk}):
+            module = import_module(module_path)
+        globals_to_restore = {
+            key: value
+            for key, value in vars(module).items()
+            if key.startswith("G_") or key in ("GPUNicAffinity", "CPUNicAffinity")
+        }
+        stack = [
+            mock.patch.multiple(module, **globals_to_restore),
+            mock.patch.object(module, "eic", sdk),
+            mock.patch.object(module, "load_eic_config", return_value=resolved),
+            mock.patch.object(module.os.path, "exists", return_value=True),
+            mock.patch("torch.cuda.is_available", return_value=False),
+            mock.patch("sglang.srt.mem_cache.eic_stats.stats.start_periodic_dump"),
+            mock.patch.object(eic_env_config._PrivateFlagFile, "close", spy_close),
+            *extra_mocks,
+        ]
+        exc = None
+        with ExitStack() as es:
+            for cm in stack:
+                es.enter_context(cm)
+            try:
+                if cls_name == "EICKVClient":
+                    module.EICKVClient(torch.float16, (1,), None)
+                else:
+                    module.EICStorage(SimpleNamespace(model_name="test"), None)
+            except BaseException as raised:
+                exc = raised
+        return exc, closed_dirs
+
+    def test_init_failure_closes_owners_pool_exits_storage_raises(self):
+        # On Client.init returning nonzero the private flag-file owners
+        # (default file, network wrapper) are closed and their temp
+        # directories removed; None-safe when an owner is absent. The pool
+        # keeps exit(1); the storage backend keeps RuntimeError.
+        import tempfile
+        from sglang.srt.mem_cache.storage.eic.eic_env_config import (
+            DEFAULT_FIXED_CONFIG,
+            EicResolvedConfig,
+        )
+
+        if_nameindex = mock.patch(
+            "sglang.srt.mem_cache.storage.eic.eic_env_config.socket.if_nameindex",
+            return_value=[(1, "eth0")],
+        )
+        with tempfile.NamedTemporaryFile("w", delete=False) as fh:
+            fh.write("--eic_client_rpc_timeout_in_ms=5000\n")
+            external_flag = fh.name
+        try:
+            for path, cls_name, expect_exc in (
+                ("sglang.srt.mem_cache.eic_memory_pool", "EICKVClient", SystemExit),
+                (
+                    "sglang.srt.mem_cache.storage.eic.eic_storage",
+                    "EICStorage",
+                    RuntimeError,
+                ),
+            ):
+                # Case 1: no external file, no NIC -> default-file owner closed.
+                resolved = EicResolvedConfig(
+                    enabled=True,
+                    endpoint="127.0.0.1:10000",
+                    instance_id="test",
+                    fixed=dict(DEFAULT_FIXED_CONFIG),
+                )
+                exc, closed = self._drive_init_failure(path, cls_name, resolved)
+                self.assertIsInstance(exc, expect_exc)
+                if cls_name == "EICKVClient":
+                    self.assertEqual(exc.code, 1)
+                else:
+                    self.assertIn("EIC Client Init Failed", str(exc))
+                self.assertEqual(len(closed), 1)
+                for directory in closed:
+                    self.assertFalse(os.path.exists(directory))
+
+                # Case 2: external flag file + NIC -> network wrapper owner closed.
+                fixed = dict(DEFAULT_FIXED_CONFIG)
+                fixed["eic_flag_file"] = external_flag
+                resolved = EicResolvedConfig(
+                    enabled=True,
+                    endpoint="127.0.0.1:10000",
+                    instance_id="test",
+                    fixed=fixed,
+                    network_interface_names="eth0",
+                )
+                exc, closed = self._drive_init_failure(
+                    path, cls_name, resolved, extra_mocks=(if_nameindex,)
+                )
+                self.assertIsInstance(exc, expect_exc)
+                self.assertEqual(len(closed), 1)
+                for directory in closed:
+                    self.assertFalse(os.path.exists(directory))
+
+                # Case 3: external file, no NIC -> no owner; None-safe, no crash.
+                resolved = EicResolvedConfig(
+                    enabled=True,
+                    endpoint="127.0.0.1:10000",
+                    instance_id="test",
+                    fixed=fixed,
+                )
+                exc, closed = self._drive_init_failure(path, cls_name, resolved)
+                self.assertIsInstance(exc, expect_exc)
+                self.assertEqual(closed, [])
+        finally:
+            os.unlink(external_flag)
+
     def test_match_from_remote_skips_zero_committed_tokens(self):
         cache = object.__new__(EICPagedHiRadixCache)
         cache.match_req_set = {}
@@ -2095,6 +2226,23 @@ class TestEICHiCacheRegression(unittest.TestCase):
         with mock.patch.object(pool_mod, "eic", fake_eic):
             res, plane_ok = client.exists_batch(["k0", "k1", "k2"])
         self.assertEqual(res, [True, True, False])
+        self.assertTrue(plane_ok)
+
+        # 5) Retry batch answers top-level KEY_NOT_EXIST: the whole retry is
+        # a healthy cold miss and must not be recorded as a plane fault.
+        def partial_then_knx(keys, opt):
+            if len(keys) == 3:
+                return S.PARTIAL_FAILED, SimpleNamespace(
+                    status_codes=[S.SUCCESS, S.FAILED, S.FAILED]
+                )
+            return S.KEY_NOT_EXIST, SimpleNamespace(status_codes=[])
+
+        client.connection = SimpleNamespace(
+            mexist=mock.Mock(side_effect=partial_then_knx)
+        )
+        with mock.patch.object(pool_mod, "eic", fake_eic):
+            res, plane_ok = client.exists_batch(["k0", "k1", "k2"])
+        self.assertEqual(res, [True, False, False])
         self.assertTrue(plane_ok)
 
     def test_match_from_remote_canary_probes_one_request_after_failure(self):
