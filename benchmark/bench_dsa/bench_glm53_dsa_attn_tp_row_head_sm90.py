@@ -36,7 +36,7 @@ from sglang.srt.layers.attention.dsa.dsa_backend_kpool import (
     DeepseekSparseAttnBackendKPoolMixin,
 )
 from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
-from sglang.srt.runtime_context import publish_build_topology
+from sglang.test.test_utils import publish_build_topology
 
 
 ROWS = 4096
