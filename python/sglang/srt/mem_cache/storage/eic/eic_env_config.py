@@ -329,92 +329,25 @@ SDK_DEFAULTS_VERSION = "eic-eic-defaults/v1"
 # tunables without live evidence stay deferred in SDK_FLAG_AUDIT. "static-present"
 # means the wheel registers/mangles the flag name; it does NOT imply Init has
 # been verified against it on 1.5.2.
-# tuple: (default, 1.5.2 static, emitted this round, note)
-SDK_DEFAULT_FLAGS = {
-    "--eic_client_rpc_timeout_in_ms": (
-        "5000",
-        "static-present",
-        True,
-        "RPC timeout",
-    ),
-    "--eic_client_kv_req_timeout_in_ms": (
-        "5000",
-        "static-present",
-        True,
-        "KvReq timeout",
-    ),
-    "--eic_client_kv_req_rdma_timeout_in_ms": (
-        "1000",
-        "static-present",
-        True,
-        "KvReq RDMA timeout",
-    ),
-    "--eic_client_kv_rpc_rdma_timeout_in_ms": (
-        "1000",
-        "static-present",
-        True,
-        "KvRpc RDMA timeout",
-    ),
-    "--eic_client_enable_slice_task_copy_bypass": (
-        "false",
-        "static-present",
-        True,
-        "conservative: slice copy bypass off",
-    ),
-    "--eic_client_enable_slice_task_copy_thread": (
-        "false",
-        "static-present",
-        True,
-        "conservative: slice copy thread off",
-    ),
-    "--eic_client_enable_kv_set_crc": (
-        "false",
-        "static-present",
-        True,
-        "conservative: Set CRC off",
-    ),
-    "--eic_client_kv_get_check_crc_type": (
-        "0",
-        "static-present",
-        True,
-        "CRC check type 0",
-    ),
-    # Explicit conservative off; this SDK gflag is distinct from the Python
-    # enable_kvset_gpu_direct forced-off knob and must not be equated.
-    "--eic_client_kv_set_enable_gdr": (
-        "false",
-        "static-present",
-        True,
-        "conservative: Set GDR off; not Python set-direct",
-    ),
-}
-
-# Bump when SDK_DEFAULT_FLAGS changes; recorded for audit/rollback.
-SDK_DEFAULTS_VERSION = "eic-eic-defaults/v1"
 
 
-class EicDefaultFlagFile:
-    """Own a private flag file carrying SDK_DEFAULT_FLAGS (missing-file path).
+class _PrivateFlagFile:
+    """Own an atomic-written private flag file in a 0700 directory (0600 file).
 
     The directory is removed at process exit; a forked child never deletes a
-    parent's directory.
+    parent's directory. Subclasses supply the prefix and the exact lines; the
+    write, atomic replace, atexit cleanup and PID guard are shared.
     """
 
-    def __init__(self):
+    def __init__(self, prefix: str, lines: list):
         self._owner_pid = os.getpid()
-        self._directory = tempfile.mkdtemp(prefix="sglang-eic-defaults-")
+        self._directory = tempfile.mkdtemp(prefix=prefix)
         self.path = os.path.join(self._directory, "flags")
         try:
             fd, pending = tempfile.mkstemp(dir=self._directory)
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                for flag, (
-                    _value,
-                    _static,
-                    emitted,
-                    _note,
-                ) in SDK_DEFAULT_FLAGS.items():
-                    if emitted:
-                        stream.write(f"{flag}={_value}\n")
+                for line in lines:
+                    stream.write(f"{line}\n")
             os.replace(pending, self.path)
         except BaseException:
             self.close()
@@ -424,6 +357,18 @@ class EicDefaultFlagFile:
     def close(self):
         if os.getpid() == self._owner_pid:
             shutil.rmtree(self._directory, ignore_errors=True)
+
+
+class EicDefaultFlagFile(_PrivateFlagFile):
+    """Own a private flag file carrying SDK_DEFAULT_FLAGS (missing-file path)."""
+
+    def __init__(self):
+        lines = [
+            f"{flag}={entry[0]}"
+            for flag, entry in SDK_DEFAULT_FLAGS.items()
+            if entry[2]
+        ]
+        super().__init__("sglang-eic-defaults-", lines)
 
 
 @dataclass
@@ -466,29 +411,18 @@ def parse_network_interface_names(raw: str) -> str:
     return ";".join(names)
 
 
-class EicNetworkFlagFile:
+class EicNetworkFlagFile(_PrivateFlagFile):
     """Own a private flag-file wrapper without changing the user's file."""
 
     def __init__(self, source: str, names: str):
-        self._owner_pid = os.getpid()
-        self._directory = tempfile.mkdtemp(prefix="sglang-eic-network-")
-        self.path = os.path.join(self._directory, "flags")
-        try:
-            fd, pending = tempfile.mkstemp(dir=self._directory)
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                # gflags processes the source first, then the explicit override.
-                stream.write(f"--flagfile={source}\n")
-                stream.write(f"--eic_client_multi_net_local_interface_names={names}\n")
-            os.replace(pending, self.path)
-        except BaseException:
-            self.close()
-            raise
-        atexit.register(self.close)
-
-    def close(self):
-        # A forked child must not remove a parent's flag file.
-        if os.getpid() == self._owner_pid:
-            shutil.rmtree(self._directory, ignore_errors=True)
+        # gflags processes the source first, then the explicit override.
+        super().__init__(
+            "sglang-eic-network-",
+            [
+                f"--flagfile={source}",
+                f"--eic_client_multi_net_local_interface_names={names}",
+            ],
+        )
 
 
 def apply_eic_network_interfaces(init_option, resolved: EicResolvedConfig):
