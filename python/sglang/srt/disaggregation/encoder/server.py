@@ -495,6 +495,26 @@ def _get_mm_feature(mm_inputs, modality):
     )
 
 
+def _get_legacy_mm_feature(mm_inputs, modality):
+    if get_encoder_preprocessed_items(mm_inputs) is not None:
+        return None
+    return _convert(_get_mm_feature(mm_inputs, modality))
+
+
+def _flatten_mm_embedding(embedding) -> torch.Tensor:
+    if isinstance(embedding, (list, tuple)):
+        if not embedding:
+            raise ValueError("Encoder returned an empty embedding list")
+        embedding = torch.cat(embedding, dim=0)
+    if not isinstance(embedding, torch.Tensor):
+        raise TypeError(
+            f"Encoder returned {type(embedding).__name__}, expected a tensor"
+        )
+    if embedding.ndim != 2:
+        embedding = embedding.reshape(-1, embedding.shape[-1])
+    return embedding
+
+
 def _normalize_aux_value(val):
     """Normalize aux values to pickle types compatible with safe_pickle_loads.
 
@@ -631,6 +651,7 @@ class MMEncoder:
             server_args=server_args,
             model_config=self.model_config,
             model_preprocessor=getattr(self.model, "preprocess_mm_for_encoder", None),
+            model_token_counter=getattr(self.model, "get_encoder_token_count", None),
             encoder_media_processor_config=encoder_media_processor_config,
         )
 
@@ -1030,9 +1051,7 @@ class MMEncoder:
 
         forward_start = time.perf_counter()
         with torch.inference_mode():
-            new_embeddings = get_feature_fn(mm_items)
-            if new_embeddings.ndim != 2:
-                new_embeddings = new_embeddings.reshape(-1, new_embeddings.shape[-1])
+            new_embeddings = _flatten_mm_embedding(get_feature_fn(mm_items))
         if encoder_metrics_collector is not None:
             encoder_metrics_collector.observe_model_forward(
                 time.perf_counter() - forward_start, modality=modality.name.lower()
@@ -1173,7 +1192,7 @@ class MMEncoder:
         mm_inputs = preprocess_result.mm_inputs
         grid_thw = preprocess_result.grid_thw
         token_counts = preprocess_result.token_counts
-        mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
+        mm_feature = _get_legacy_mm_feature(mm_inputs, modality)
         num_items = len(grid_thw)
         if num_items != sum(items_per_req):
             raise InternalError(
@@ -1760,11 +1779,9 @@ class MMEncoder:
             if mm_embedding is None:
                 forward_start = time.perf_counter()
                 with torch.inference_mode():
-                    mm_embedding: torch.Tensor = ctx.get_feature_fn(mm_items)
+                    mm_embedding = _flatten_mm_embedding(ctx.get_feature_fn(mm_items))
                     if not keep_on_gpu:
                         mm_embedding = mm_embedding.cpu()
-                if len(mm_embedding.shape) != 2:
-                    mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
                 if encoder_metrics_collector is not None and not ctx.is_health_check:
                     encoder_metrics_collector.observe_model_forward(
                         time.perf_counter() - forward_start, modality=modality_str
