@@ -275,6 +275,9 @@ class EICStorage(HiCacheStorage):
         ret = self.connection.init(eic_instance_id, endpoint, init_option)
         if ret != 0:
             logger.error(f"fail to init eic client, ret: {ret}")
+            for _owner in (self._default_flag_file, self._network_flag_file):
+                if _owner is not None:
+                    _owner.close()
             raise RuntimeError("EIC Client Init Failed.")
         self.warmup()
 
