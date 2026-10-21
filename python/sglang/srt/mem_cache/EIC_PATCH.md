@@ -141,11 +141,110 @@ not text conflicts but API-contract breaks found by review, all in EIC-owned fil
 | `release_kv_cache(is_decode=...)` | No caller passes `is_decode` on either branch |
 | `/enable_eic`, `/disable_eic` (#481) | On ep_main they only reported state; the working runtime toggle (flush and rebuild pools) exists only on poc_weizhong. They misreported under `EICChunkCache`. `/server_info` already returns `enable_eic_cache`. A real toggle should follow ep_main's `/hicache/storage-backend` attach/detach. |
 
+## NetworkInterfaceNames environment variable
+
+Set `NetworkInterfaceNames=eth0,eth1` to select EIC client network devices.
+The resolver trims surrounding spaces, removes duplicates and preserves order.
+It converts commas to semicolons for the SDK. Empty items, malformed names and
+names longer than 15 ASCII bytes raise `ValueError` when EIC is enabled.
+The client checks that every name exists in its own network namespace.
+This check does not prove that the device supports RDMA or can reach EIC.
+
+Both `EICKVClient` and `EICStorage` apply this list before `Client.init`.
+The list takes precedence over the GPU NIC mapping without changing CPU affinity.
+When the variable is absent, the existing NIC selection remains unchanged.
+When EIC is disabled, the resolver ignores this variable.
+
+With no external flag file, the list goes directly into `InitOption` and creates
+no file. With an external flag file, a private wrapper includes that file first
+and appends only the NIC flag. This prevents the SDK flag parser from replacing
+the env selection. The source file remains unchanged. Wrapper permissions are
+0600 in a 0700 directory; the owner process removes it at normal exit.
+A missing or unreadable source file raises an error. Forced termination can leave
+the temporary directory behind. Other flags and transport defaults do not change.
+
+Tests: `TestEicNetworkInterfaces` and
+`TestEICHiCacheRegression.test_network_env_reaches_both_real_client_constructors`.
+The constructor test stops at a mock `Client.init`; it is not a live SDK or GPU test.
+
+## Centralized defaults and config resolution
+
+`storage/eic/eic_env_config.py` is the single source for built-in fixed
+parameters. `FIXED_CONFIG_SPEC` lists each key with its built-in default,
+consumer (`both` clients / `pool` / `hiradix` cache tier), bind point and
+status (`live-init` / `live-local` / `cache-tier` / `log-only` /
+`forced-off` / `unconsumed`); `DEFAULT_FIXED_CONFIG` is derived from it.
+Resolution priority stays env > CLI > yaml > built-in. Fixed parameters have
+no env channel; only the switch, endpoint, instance id and
+`NetworkInterfaceNames` read from the environment.
+
+File-existence semantics:
+
+- A missing `remote-eic.yaml` falls back to the built-in defaults (no error).
+- A present-but-broken yaml (corrupt YAML, non-mapping, unreadable
+  permission) raises `ValueError`; it never silently falls back.
+- When a yaml is present but pyyaml is unavailable, resolution fails instead
+  of warning and ignoring the mounted config.
+- `eic_flag_file` is validated independently of `NetworkInterfaceNames`: an
+  explicit yaml path must exist, be a regular file and be readable, else it
+  raises (missing explicit path is an error, not a silent fallback to the
+  standard path); the auto-discovered standard path is used only when it
+  exists, and a present-but-broken standard path also raises.
+
+Transport provenance: the centralized built-in `eic_trans_type` is 2 (RDMA).
+`load_fixed_config` rewrites it to 3 (GDR) only when no flag file is
+resolved and yaml did not set it explicitly; both clients receive the final
+value through `resolved.fixed` identically and neither overrides it locally.
+The rewrite exists because type 2 without the template flag file keeps KvGet
+CRC on over device memory and segfaults in `CalculateKvValueCRCsPerSlice` /
+`OnKvGetGDR`.
+
+flagfile parsing semantics (upstream gflags, not measured on embedded 1.5.2):
+`--flag=value` takes the whole rest of the line after `=`; spaces and `#` are
+legal inside a path and are not truncated or blind-quoted; a nested `--flagfile`
+recurses and later entries win (last-wins). A `,` in an external flag_file path
+is refused fail-closed because gflags may read it as list separation; spaces
+and `#` remain allowed.
+
+`SDK_FLAG_AUDIT` records the standard SDK gflags for audit/comparison only;
+`SDK_DEFAULT_FLAGS` (versioned by `SDK_DEFAULTS_VERSION`) holds the conservative
+emitted subset on the missing-file path. When no external `eic_flag_file` is
+mounted, an `EicDefaultFlagFile` writes the emitted safe defaults to a private
+temporary file and hands it to `InitOption.flag_file`, so the defaults truly
+reach `Client.init` in both EICKVClient and EICStorage. Priority is safe
+defaults -> external flags -> explicit NIC env; the URL/instance-id/switch env
+priority is unchanged.
+
+- An existing external `eic_flag_file` is passed through unchanged: defaults
+  are never appended to or mixed into it, so an old deployed file's effect does
+  not silently change. External file + NIC env only adds the NIC override.
+- The default profile writes no hardcoded `eth1;eth2;eth3;eth4` list; without
+  `NetworkInterfaceNames` the existing NIC selection / GPU affinity is kept.
+- Completion boundary (this round): only the 9-item conservative subset is
+  emitted — 4 timeouts (`rpc/kv_req/kv_req_rdma/kv_rpc_rdma`),
+  `slice_task_copy_bypass=false`, `slice_task_copy_thread=false`,
+  `kv_set_crc=false`, `kv_get_check_crc_type=0`, and `kv_set_enable_gdr=false`.
+  This is a safe subset, NOT the full standard flag set; no claim of standard
+  full-set completion.
+- Deferred (audit-only, not emitted this round): `kv_get_enable_gdr`,
+  `eic_use_polling_mode`, `eic_use_byte_express`, `dram_mempool_limit_bytes`,
+  `split_kv_slice_size_byte`; they lack live evidence on 1.5.2.
+- `--eic_enable_multi_nic`: no target support found in current static evidence;
+  this profile does not generate it. This is a per-profile choice, not a
+  permanent SDK conclusion; revisit if later evidence shows support.
+  `default_io_thread_num` is never mapped (no consumption evidence).
+
+Transport safety: generating the private default file never switches
+`eic_trans_type` back to 2; with no explicit user transport and no external
+flags the no-flag fallback stays 3 (GDR), and the generated file sets no
+transport. The type-2-without-flag segfault in `CalculateKvValueCRCsPerSlice` /
+`OnKvGetGDR` is unchanged by this change.
+
 ## Dead or misleading config keys
 
-- `load_remote_threshold`: removed as a separate knob in #763. The servingkit ConfigMap template still sets it (RDMA 100, TCP 400), so `eic_env_config.LEGACY_KEY_ALIASES` maps it to `load_back_threshold`, the same min-loadable-tokens rule. An explicit `load_back_threshold` wins. The remote probe budget is `eic_check_max_num` (default 2048).
-- `save_decode_cache` in `EICHiRadixCache`: read, never used. Default is now False, matching the template.
-- Built-in defaults (`DEFAULT_FIXED_CONFIG`) follow the SGLang + RDMA ConfigMap template, so `--enable-eic-cache` plus `EicRemoteUrl`/`EicInstanceId` start EIC without a yaml. `enable_gpu_nic_affinity` stays False until a node-specific ConfigMap sets it. When no `eic_flag_file` is set and `/sgl-workspace/config/eic_flag_file` exists, that file is used.
+- `load_remote_threshold`: removed as a separate knob in #763. The servingkit ConfigMap template still sets it (RDMA 100, TCP 400), so `eic_env_config.LEGACY_KEY_ALIASES` redirects it to `load_back_threshold` as a best-effort alias; an explicit `load_back_threshold` wins. The two are NOT proven semantically equivalent: the old key was a remote-probe gate (removed in ad7b8d9), while `load_back_threshold` governs L2/PP load admission. The alias does not restore the old 16384-token probe gate, and full legacy compatibility is not claimed. The remote probe budget is `eic_check_max_num` (default 2048).
+- `save_decode_cache` in `EICHiRadixCache`: read and logged, never used. Default is False, matching the template. `EICChunkCache` hardcodes True and is not bound to this key.
+- Built-in defaults (`DEFAULT_FIXED_CONFIG`, derived from `FIXED_CONFIG_SPEC`) follow the current safe code, not a blind template alignment, so `--enable-eic-cache` plus `EicRemoteUrl`/`EicInstanceId` start EIC without a yaml. `enable_gpu_nic_affinity` stays False until a node-specific ConfigMap sets it. When no explicit `eic_flag_file` is set and `/sgl-workspace/config/eic_flag_file` exists, that file is used after validation.
 - No flag file means no `eic_trans_type: 2` default. RDMA forces the GDR read path on, and without the template flag file the client keeps KvGet CRC on and computes it over device memory: SIGSEGV in `CalculateKvValueCRCsPerSlice` (reproduced 2026-10-19, n54). The env-only path therefore defaults to `eic_trans_type: 3`. An explicit yaml `eic_trans_type` or any flag file keeps 2.
 - `eic_thread_num`: read, no effect on the client. Set `--eic_client_default_io_thread_num` in `eic_flag_file`.
 - `enable_kvset_gpu_direct`: forced off in `eic_memory_pool.py`, with a warning if a
@@ -169,7 +268,10 @@ not text conflicts but API-contract breaks found by review, all in EIC-owned fil
   the flag file a few lines later, so the file's value is the one that takes effect.
   Production runs `--eic_client_kv_set_enable_gdr=false` with
   `--eic_client_kv_get_enable_gdr=true` (confirmed in prefill startup logs), i.e. the
-  GDR write path is off and only the GDR read path is live.
+  GDR write path is off and only the GDR read path is live. This repo does not
+  set that SDK gflag by default; the Python `enable_kvset_gpu_direct` forced-off
+  knob above is a separate setting and must not be equated with
+  `kv_set_enable_gdr`.
 
 ## Open risks
 
@@ -177,3 +279,25 @@ not text conflicts but API-contract breaks found by review, all in EIC-owned fil
   `EICDeepSeekV4TokenToKVPoolHost._build_page_specs` reads them. With MTP on,
   EIC page bytes may change, and data written by an older build becomes
   layout-incompatible. Not yet run with MTP.
+- gflags are process-global and the EicClient singleton re-runs FLAGS on each
+  Init (verified against 1.7.3 source only, not 1.5.2). A private generated
+  flag file does NOT mean SDK state isolation: once the SDK parses a flag_file
+  it writes into the process-global FLAGS, whether or not Python calls a setter
+  directly. A same-process second client / second Init is unverified here;
+  isolation across different NIC or default-flag configurations is NOT
+  guaranteed, and per-client flag isolation must not be claimed. Application
+  construction paths (EICMemoryPool -> EICKVClient; storage backend ->
+  EICStorage) were not proven to run two clients concurrently here.
+- Flags come from one source: `_SDK_FLAG_REGISTRY` (standard value, 1.5.2
+  static status, emitted flag, note). `SDK_DEFAULT_FLAGS` is the emitted view
+  (the conservative subset written to the private file); `SDK_FLAG_AUDIT` is a
+  specification-reference view carrying only (value, static status, note) and
+  NO emitted marker, so the two tables cannot disagree on emission. `unverified`
+  means statically unconfirmed, NOT unsupported or inapplicable. Unknown flags
+  (e.g. a `prefer_dn_subnets`-style knob not scanned locally) stay unknown until
+  the full reviewed flag list and live evidence arrive.
+- The `EicNetworkFlagFile` wrapper (`--flagfile=<source>` then NIC override)
+  retains pending gflags path-parsing questions (whitespace/`#`) awaiting
+  precise gflags evidence; no blind quoting applied. ParseInitFlags runs after
+  the InitOption NIC assignment, so the trailing-override order is reasonable;
+  1.5.2 has not been executed live.

@@ -44,6 +44,281 @@ class FakeDeviceAllocator:
 
 
 class TestEICHiCacheRegression(unittest.TestCase):
+    def test_network_env_reaches_both_real_client_constructors(self):
+        from importlib import import_module
+
+        from sglang.srt.mem_cache.storage.eic.eic_env_config import EicResolvedConfig
+
+        class InitReached(Exception):
+            pass
+
+        # Stop at Client.init, before any GPU pool allocation or network I/O.
+        for path, cls_name in (
+            ("sglang.srt.mem_cache.eic_memory_pool", "EICKVClient"),
+            ("sglang.srt.mem_cache.storage.eic.eic_storage", "EICStorage"),
+        ):
+            for affinity in (False, True):
+                with self.subTest(path=path, affinity=affinity):
+                    conn = mock.Mock()
+                    conn.init.side_effect = InitReached
+                    sdk = SimpleNamespace(
+                        Client=lambda: conn,
+                        InitOption=SimpleNamespace,
+                        LogLevel=lambda value: value,
+                        TransportType=lambda value: value,
+                    )
+                    with mock.patch.dict(sys.modules, {"eic": sdk}):
+                        module = import_module(path)
+                    resolved = EicResolvedConfig(
+                        enabled=True,
+                        endpoint="127.0.0.1:10000",
+                        instance_id="test",
+                        fixed={
+                            "eic_log_dir": "/tmp",
+                            "enable_gpu_nic_affinity": affinity,
+                            "gpu_nic_affinity_config": '{"cuda:0": "old"}',
+                        },
+                        network_interface_names="eth0;eth1",
+                    )
+                    globals_to_restore = {
+                        key: value
+                        for key, value in vars(module).items()
+                        if key.startswith("G_")
+                        or key in ("GPUNicAffinity", "CPUNicAffinity")
+                    }
+                    with (
+                        mock.patch.multiple(module, **globals_to_restore),
+                        mock.patch.object(module, "eic", sdk),
+                        mock.patch.object(
+                            module, "load_eic_config", return_value=resolved
+                        ),
+                        mock.patch.object(module.os.path, "exists", return_value=True),
+                        mock.patch("torch.cuda.is_available", return_value=False),
+                        mock.patch(
+                            "torch.cuda.current_device",
+                            side_effect=AssertionError("env list needs no GPU mapping"),
+                        ),
+                        mock.patch(
+                            "sglang.srt.mem_cache.eic_stats.stats.start_periodic_dump"
+                        ),
+                        mock.patch(
+                            "sglang.srt.mem_cache.storage.eic.eic_env_config.socket.if_nameindex",
+                            return_value=[(1, "eth0"), (2, "eth1")],
+                        ),
+                        self.assertRaises(InitReached),
+                    ):
+                        if cls_name == "EICKVClient":
+                            module.EICKVClient(torch.float16, (1,), None)
+                        else:
+                            module.EICStorage(SimpleNamespace(model_name="test"), None)
+                    conn.init.assert_called_once()
+                    option = conn.init.call_args.args[2]
+                    self.assertEqual(
+                        option.multi_net_local_interface_names, "eth0;eth1"
+                    )
+
+    def test_centralized_defaults_reach_both_client_init_option(self):
+        from importlib import import_module
+
+        from sglang.srt.mem_cache.storage.eic.eic_env_config import (
+            DEFAULT_FIXED_CONFIG,
+            EicResolvedConfig,
+        )
+
+        class InitReached(Exception):
+            pass
+
+        # Stop at Client.init: centralized built-ins must land on InitOption
+        # in both real constructors; no per-client divergent fallback may
+        # mask the centralized value.
+        for path, cls_name in (
+            ("sglang.srt.mem_cache.eic_memory_pool", "EICKVClient"),
+            ("sglang.srt.mem_cache.storage.eic.eic_storage", "EICStorage"),
+        ):
+            with self.subTest(path=path):
+                conn = mock.Mock()
+                conn.init.side_effect = InitReached
+                sdk = SimpleNamespace(
+                    Client=lambda: conn,
+                    InitOption=SimpleNamespace,
+                    LogLevel=lambda value: value,
+                    TransportType=lambda value: value,
+                )
+                with mock.patch.dict(sys.modules, {"eic": sdk}):
+                    module = import_module(path)
+                resolved = EicResolvedConfig(
+                    enabled=True,
+                    endpoint="127.0.0.1:10000",
+                    instance_id="test",
+                    fixed=dict(DEFAULT_FIXED_CONFIG),
+                )
+                globals_to_restore = {
+                    key: value
+                    for key, value in vars(module).items()
+                    if key.startswith("G_")
+                    or key in ("GPUNicAffinity", "CPUNicAffinity")
+                }
+                with (
+                    mock.patch.multiple(module, **globals_to_restore),
+                    mock.patch.object(module, "eic", sdk),
+                    mock.patch.object(module, "load_eic_config", return_value=resolved),
+                    mock.patch.object(module.os.path, "exists", return_value=True),
+                    mock.patch("torch.cuda.is_available", return_value=False),
+                    mock.patch(
+                        "sglang.srt.mem_cache.eic_stats.stats.start_periodic_dump"
+                    ),
+                    self.assertRaises(InitReached),
+                ):
+                    if cls_name == "EICKVClient":
+                        module.EICKVClient(torch.float16, (1,), None)
+                    else:
+                        module.EICStorage(SimpleNamespace(model_name="test"), None)
+                conn.init.assert_called_once()
+                option = conn.init.call_args.args[2]
+                self.assertEqual(option.log_dir, DEFAULT_FIXED_CONFIG["eic_log_dir"])
+                self.assertEqual(
+                    option.log_level, DEFAULT_FIXED_CONFIG["eic_log_level"]
+                )
+                self.assertEqual(
+                    option.transport_type,
+                    DEFAULT_FIXED_CONFIG["eic_trans_type"],
+                )
+
+    def test_default_flag_file_used_only_when_no_external_file(self):
+        from importlib import import_module
+
+        from sglang.srt.mem_cache.storage.eic.eic_env_config import EicResolvedConfig
+
+        class InitReached(Exception):
+            pass
+
+        # external=None -> private safe-default file; external set -> passthrough.
+        cases = [(None, False), ("/tmp/external.flags", True)]
+        from sglang.srt.mem_cache.storage.eic.eic_env_config import (
+            DEFAULT_FIXED_CONFIG,
+            EicResolvedConfig,
+        )
+
+        for path, cls_name in (
+            ("sglang.srt.mem_cache.eic_memory_pool", "EICKVClient"),
+            ("sglang.srt.mem_cache.storage.eic.eic_storage", "EICStorage"),
+        ):
+            for external, passthrough in cases:
+                with self.subTest(path=path, external=external):
+                    conn = mock.Mock()
+                    conn.init.side_effect = InitReached
+                    sdk = SimpleNamespace(
+                        Client=lambda: conn,
+                        InitOption=SimpleNamespace,
+                        LogLevel=lambda value: value,
+                        TransportType=lambda value: value,
+                    )
+                    with mock.patch.dict(sys.modules, {"eic": sdk}):
+                        module = import_module(path)
+                    fixed = dict(DEFAULT_FIXED_CONFIG)
+                    fixed["eic_flag_file"] = external
+                    resolved = EicResolvedConfig(
+                        enabled=True,
+                        endpoint="127.0.0.1:10000",
+                        instance_id="test",
+                        fixed=fixed,
+                    )
+                    globals_to_restore = {
+                        key: value
+                        for key, value in vars(module).items()
+                        if key.startswith("G_")
+                        or key in ("GPUNicAffinity", "CPUNicAffinity")
+                    }
+                    with (
+                        mock.patch.multiple(module, **globals_to_restore),
+                        mock.patch.object(module, "eic", sdk),
+                        mock.patch.object(
+                            module, "load_eic_config", return_value=resolved
+                        ),
+                        mock.patch.object(module.os.path, "exists", return_value=True),
+                        mock.patch("torch.cuda.is_available", return_value=False),
+                        mock.patch(
+                            "sglang.srt.mem_cache.eic_stats.stats.start_periodic_dump"
+                        ),
+                        self.assertRaises(InitReached),
+                    ):
+                        if cls_name == "EICKVClient":
+                            module.EICKVClient(torch.float16, (1,), None)
+                        else:
+                            module.EICStorage(SimpleNamespace(model_name="test"), None)
+                    option = conn.init.call_args.args[2]
+                    if passthrough:
+                        self.assertEqual(option.flag_file, external)
+                    else:
+                        self.assertTrue(os.path.exists(option.flag_file))
+                        self.assertTrue(os.path.isfile(option.flag_file))
+
+    def test_generated_default_file_survives_with_nic_override(self):
+        from importlib import import_module
+
+        from sglang.srt.mem_cache.storage.eic.eic_env_config import (
+            DEFAULT_FIXED_CONFIG,
+            EicResolvedConfig,
+        )
+
+        class InitReached(Exception):
+            pass
+
+        # No external file: generated private default file must remain on
+        # InitOption.flag_file; NIC override is applied directly (the wrapper
+        # only wraps an external source, never resolved.fixed's None).
+        for path, cls_name in (
+            ("sglang.srt.mem_cache.eic_memory_pool", "EICKVClient"),
+            ("sglang.srt.mem_cache.storage.eic.eic_storage", "EICStorage"),
+        ):
+            with self.subTest(path=path):
+                conn = mock.Mock()
+                conn.init.side_effect = InitReached
+                sdk = SimpleNamespace(
+                    Client=lambda: conn,
+                    InitOption=SimpleNamespace,
+                    LogLevel=lambda value: value,
+                    TransportType=lambda value: value,
+                )
+                with mock.patch.dict(sys.modules, {"eic": sdk}):
+                    module = import_module(path)
+                fixed = dict(DEFAULT_FIXED_CONFIG)
+                resolved = EicResolvedConfig(
+                    enabled=True,
+                    endpoint="127.0.0.1:10000",
+                    instance_id="test",
+                    fixed=fixed,
+                    network_interface_names="eth0;eth1",
+                )
+                globals_to_restore = {
+                    key: value
+                    for key, value in vars(module).items()
+                    if key.startswith("G_")
+                    or key in ("GPUNicAffinity", "CPUNicAffinity")
+                }
+                with (
+                    mock.patch.multiple(module, **globals_to_restore),
+                    mock.patch.object(module, "eic", sdk),
+                    mock.patch.object(module, "load_eic_config", return_value=resolved),
+                    mock.patch.object(module.os.path, "exists", return_value=True),
+                    mock.patch("torch.cuda.is_available", return_value=False),
+                    mock.patch(
+                        "sglang.srt.mem_cache.eic_stats.stats.start_periodic_dump"
+                    ),
+                    mock.patch(
+                        "sglang.srt.mem_cache.storage.eic.eic_env_config.socket.if_nameindex",
+                        return_value=[(1, "eth0"), (2, "eth1")],
+                    ),
+                    self.assertRaises(InitReached),
+                ):
+                    if cls_name == "EICKVClient":
+                        module.EICKVClient(torch.float16, (1,), None)
+                    else:
+                        module.EICStorage(SimpleNamespace(model_name="test"), None)
+                option = conn.init.call_args.args[2]
+                self.assertTrue(os.path.isfile(option.flag_file))
+                self.assertEqual(option.multi_net_local_interface_names, "eth0;eth1")
+
     def test_match_from_remote_skips_zero_committed_tokens(self):
         cache = object.__new__(EICPagedHiRadixCache)
         cache.match_req_set = {}

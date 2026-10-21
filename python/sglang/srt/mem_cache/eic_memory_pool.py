@@ -23,6 +23,9 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.memory_pool_host import synchronized
 from sglang.srt.mem_cache.storage.eic.eic_env_config import (
+    DEFAULT_FIXED_CONFIG,
+    EicDefaultFlagFile,
+    apply_eic_network_interfaces,
     load_eic_config,
     load_fixed_config,
 )
@@ -249,13 +252,17 @@ class EICKVClient:
         eic_instance_id = resolved.instance_id
         logger.info(f"eic instance_id: {eic_instance_id}")
 
-        eic_thread_num = config.get("eic_thread_num", 1)
+        eic_thread_num = config.get(
+            "eic_thread_num", DEFAULT_FIXED_CONFIG["eic_thread_num"]
+        )
         logger.info(f"eic thread_num: {eic_thread_num}")
 
-        eic_log_dir = config.get("eic_log_dir", "/tmp/eic-client-log")
+        eic_log_dir = config.get("eic_log_dir", DEFAULT_FIXED_CONFIG["eic_log_dir"])
         logger.info(f"eic log_dir: {eic_log_dir}")
 
-        eic_log_level = config.get("eic_log_level", 2)
+        eic_log_level = config.get(
+            "eic_log_level", DEFAULT_FIXED_CONFIG["eic_log_level"]
+        )
         logger.info(f"eic log_level: {eic_log_level}")
 
         eic_trans_type = config.get("eic_trans_type", 3)
@@ -359,10 +366,17 @@ class EICKVClient:
         init_option.log_dir = eic_log_dir
         init_option.log_level = eic.LogLevel(eic_log_level)
         init_option.transport_type = eic.TransportType(eic_trans_type)
-        if eic_flag_file is not None:
+        self._default_flag_file = None
+        if eic_flag_file:
+            # External mounted flag_file is passed through unchanged; defaults
+            # are never appended to or mixed into it.
             init_option.flag_file = eic_flag_file
+        else:
+            # Missing-file path only: private safe-default flag file.
+            self._default_flag_file = EicDefaultFlagFile()
+            init_option.flag_file = self._default_flag_file.path
 
-        if G_EnableGPUNicAffinity:
+        if G_EnableGPUNicAffinity and resolved.network_interface_names is None:
             gpu_id = torch.cuda.current_device()
             init_option.multi_net_local_interface_names = GPUNicAffinity.get(
                 "cuda:" + str(gpu_id), "eth1"
@@ -371,6 +385,7 @@ class EICKVClient:
                 f"gpu {gpu_id} set gpu nic affinity to {init_option.multi_net_local_interface_names}"
             )
 
+        self._network_flag_file = apply_eic_network_interfaces(init_option, resolved)
         ret = self.connection.init(eic_instance_id, endpoint, init_option)
         if ret != 0:
             logger.error(f"fail to init eic client, ret: {ret}")
