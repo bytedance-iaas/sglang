@@ -55,6 +55,7 @@ logger = logging.getLogger(__name__)
 _VERDICT_TAG = 1
 
 if TYPE_CHECKING:
+    from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
     from sglang.srt.managers.io_struct import (
         ReleaseMemoryOccupationReqInput,
         ReleaseMemoryOccupationReqOutput,
@@ -122,6 +123,7 @@ class PPBatchMetadata:
     verify_out_cache_loc: Optional[torch.Tensor] = None
     # Rank-local; never sent over the wire.
     fpm_timing: Optional[FpmTiming] = None
+    expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
     # First stage only: where the routed experts that come back belong.
     routed_experts_slots: Optional[torch.Tensor] = None
     # The step's launch record, which its processed result carries.
@@ -1145,6 +1147,9 @@ class SchedulerPPMixin:
             ),
             skipped_output_comm=True,
             fpm_timing=mb_metadata.fpm_timing if mb_metadata else None,
+            expert_distribution_metrics=(
+                mb_metadata.expert_distribution_metrics if mb_metadata else None
+            ),
             forward_launch=mb_metadata.forward_launch if mb_metadata else None,
             unified_forward_done=(
                 mb_metadata.unified_forward_done if mb_metadata else None
@@ -1259,6 +1264,7 @@ class SchedulerPPMixin:
                 extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
                 can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
                 fpm_timing=mb_metadata.fpm_timing,
+                expert_distribution_metrics=mb_metadata.expert_distribution_metrics,
                 forward_launch=mb_metadata.forward_launch,
                 unified_forward_done=mb_metadata.unified_forward_done,
             )
@@ -1359,6 +1365,7 @@ class SchedulerPPMixin:
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
             fpm_timing=mb_metadata.fpm_timing,
+            expert_distribution_metrics=mb_metadata.expert_distribution_metrics,
             routed_experts_output=returned_routed_experts_output(
                 rows=routed_experts_rows, slots=mb_metadata.routed_experts_slots
             ),
@@ -1912,6 +1919,7 @@ class SchedulerPPMixin:
                     fwd_batch=_pp_snapshot_forward_batch(cur_batch),
                     verify_out_cache_loc=result.spec_verify_out_cache_loc,
                     fpm_timing=result.fpm_timing,
+                    expert_distribution_metrics=result.expert_distribution_metrics,
                     routed_experts_slots=_pp_routed_experts_slots(result),
                     forward_launch=result.forward_launch,
                     unified_forward_done=result.unified_forward_done,
