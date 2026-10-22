@@ -1,8 +1,9 @@
 """Complete-cost SM90 microbenchmark for GLM-5.3-Flash KDA PTPC.
 
-This compares the exact BF16 fallback with the opt-in FP8 adapter at the two
-P3 target shapes. It includes activation quantization and the separate BF16
-beta projection for the packed first stage, and gated RMSNorm for o_proj.
+This compares the exact BF16 fallback with the opt-in FP8 adapter at the
+GLM-5.3-Flash KDA projection shapes. It includes activation quantization and
+the separate BF16 beta projection for the packed first stage, and gated
+RMSNorm for o_proj.
 """
 
 import argparse
@@ -109,7 +110,8 @@ def _bench_packed_first_stage(m: int, heads: int, warmup: int, iters: int) -> di
 @torch.inference_mode()
 def _bench_o_proj(m: int, heads: int, warmup: int, iters: int) -> dict:
     head_dim = 128
-    k = n = heads * head_dim
+    k = heads * head_dim
+    n = 4096
     core = torch.randn(1, m, heads, head_dim, device="cuda", dtype=torch.bfloat16)
     gate = torch.randn_like(core)
     norm_weight = torch.ones(head_dim, device="cuda", dtype=torch.bfloat16)
