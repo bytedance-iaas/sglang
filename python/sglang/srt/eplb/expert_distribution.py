@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import time
@@ -40,7 +41,7 @@ import torch.distributed
 
 from sglang.kernels.ops.moe.eplb_map_record import record_physical_counts
 from sglang.srt.environ import envs
-from sglang.srt.eplb.expert_location import get_eplb_group
+from sglang.srt.eplb.stage_domain import EPLBStageDomain
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.metrics_collector import (
@@ -139,6 +140,7 @@ class ExpertDistributionRecorder(ABC):
     def init_new(
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
+        stage_domain: Optional[EPLBStageDomain] = None,
     ):
         if get_exec().moe.expert_distribution_recorder_mode is not None:
             assert expert_location_metadata is not None, (
@@ -146,7 +148,23 @@ class ExpertDistributionRecorder(ABC):
                 "reason is that you are using a model that does not support expert distribution "
                 "recording. Try setting `get_model_config_for_expert_location` in your model."
             )
-            return _ExpertDistributionRecorderReal(expert_location_metadata, rank)
+            stage_domain = stage_domain or (
+                EPLBStageDomain.from_world()
+                if get_exec().moe.elastic_ep_backend is not None
+                else EPLBStageDomain.from_runtime()
+            )
+            if (
+                get_exec().moe.elastic_ep_backend is None
+                and expert_location_metadata.ep_size != stage_domain.ep_size
+            ):
+                raise RuntimeError(
+                    "Expert metadata and recorder domain disagree on EP size: "
+                    f"metadata={expert_location_metadata.ep_size}, "
+                    f"domain={stage_domain.ep_size}"
+                )
+            return _ExpertDistributionRecorderReal(
+                expert_location_metadata, rank, stage_domain
+            )
         else:
             return _ExpertDistributionRecorderNoop()
 
@@ -197,7 +215,7 @@ class ExpertDistributionRecorder(ABC):
     def stop_record(self):
         self._on_not_implemented()
 
-    def dump_record(self, output_mode: _OutputMode = "file"):
+    def dump_record(self, output_mode: _OutputMode = "file", *, metadata=None):
         self._on_not_implemented()
 
     @property
@@ -219,8 +237,10 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
+        stage_domain: EPLBStageDomain,
     ):
         self._expert_location_metadata = expert_location_metadata
+        self._stage_domain = stage_domain
 
         self._recording = False
         self._disable_all = False
@@ -228,7 +248,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._current_forward_pass_id = Withable()
         self._current_layer_idx = Withable()
         self._current_debug_name = Withable()
-        self._accumulator = _Accumulator.init_new(expert_location_metadata, rank)
+        self._accumulator = _Accumulator.init_new(
+            expert_location_metadata, rank, stage_domain
+        )
         self._single_pass_gatherers = {
             k: _SinglePassGatherer.init_new(expert_location_metadata, rank)
             for k in self._accumulator.get_single_pass_gatherer_keys()
@@ -385,11 +407,15 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             )
         self._recording = False
 
-    def dump_record(self, output_mode: _OutputMode = "file"):
+    def dump_record(self, output_mode: _OutputMode = "file", *, metadata=None):
         """Dump the expert distribution record and reset the recorder after dumping."""
-        output = self._accumulator.dump(output_mode=output_mode)
-        self._reset()
-        return output
+        try:
+            return self._accumulator.dump(output_mode=output_mode, metadata=metadata)
+        finally:
+            # Only the stage root writes the file. A root-side I/O error must
+            # not leave its window populated after peers have reset theirs:
+            # the next DUMP would all-reduce tensors with different shapes.
+            self._reset()
 
     @property
     def recording(self):
@@ -762,8 +788,9 @@ class _Accumulator(ABC):
     def init_new(
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
+        stage_domain: EPLBStageDomain,
     ) -> _Accumulator:
-        return _Accumulator.get_class()(expert_location_metadata, rank)
+        return _Accumulator.get_class()(expert_location_metadata, rank, stage_domain)
 
     @staticmethod
     def get_class() -> Type[_Accumulator]:
@@ -778,10 +805,11 @@ class _Accumulator(ABC):
         self,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
+        stage_domain: EPLBStageDomain,
     ):
         self._expert_location_metadata = expert_location_metadata
         self._rank = rank
-        self._communication_group = get_eplb_group()
+        self._stage_domain = stage_domain
 
     def get_single_pass_gatherer_keys(self):
         return [_SINGLE_PASS_GATHERER_KEY_PRIMARY]
@@ -801,8 +829,22 @@ class _Accumulator(ABC):
     def reset(self):
         pass
 
-    def dump(self, output_mode: _OutputMode):
+    def dump(self, output_mode: _OutputMode, *, metadata=None):
         pass
+
+    def _dump_metadata(self, metadata):
+        mapping = self._expert_location_metadata.physical_to_logical_map
+        identity = dict(metadata or {})
+        owned_layer_ids = identity.get("owned_layer_ids")
+        if owned_layer_ids is not None:
+            mapping = mapping[owned_layer_ids]
+        identity.update(
+            ep_size=self._stage_domain.ep_size,
+            layout_hash=hashlib.sha256(
+                mapping.detach().cpu().contiguous().numpy().tobytes()
+            ).hexdigest(),
+        )
+        return identity
 
 
 class _UtilizationRateAccumulatorMixin(_Accumulator):
@@ -815,7 +857,6 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             self.window_sizes = EPLB_BALANCEDNESS_WINDOW_SIZES
             self._history = _DequeCollection(maxlens=self.window_sizes)
             self._reset_server_log_history = True
-            self._rank = torch.distributed.get_rank()
             expert_dispatch_cls = resolve_collector_class(
                 STAT_LOGGER_ROLE_EXPERT_DISPATCH,
                 ExpertDispatchCollector,
@@ -857,12 +898,12 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         gpu_physical_count = gpu_physical_count.to(get_device_namespace().device)
         torch.distributed.reduce(
             gpu_physical_count,
-            dst=0,
+            dst=self._stage_domain.root_global_rank,
             op=torch.distributed.ReduceOp.SUM,
-            group=self._communication_group,
+            group=self._stage_domain.device_group,
         )
 
-        if self._rank == 0:
+        if self._stage_domain.is_root:
             self._handle_metric_eplb_heatmap(gpu_physical_count)
 
             utilization_rate_gpu = torch.mean(
@@ -964,15 +1005,23 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
         super().reset()
         self._records.clear()
 
-    def dump(self, output_mode: _OutputMode):
+    def dump(self, output_mode: _OutputMode, *, metadata=None):
         assert output_mode == "file"
         output = dict(
             records=self._records,
+            pp_rank=self._stage_domain.pp_rank,
+            ep_rank=self._stage_domain.ep_rank,
+            global_rank=self._stage_domain.global_rank,
+            ep_global_ranks=self._stage_domain.global_ranks,
             # NOTE: This may change during recording, so here we say it is the "last" one
             last_physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
+            **self._dump_metadata(metadata),
         )
         _dump_to_file(
-            f"expert_distribution_recorder_{time.time()}_{self._rank}.pt", output
+            "expert_distribution_recorder_"
+            f"pp{self._stage_domain.pp_rank}_"
+            f"rank{self._stage_domain.global_rank}_{time.time()}.pt",
+            output,
         )
 
 
@@ -1008,7 +1057,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         super().reset()
         self._global_physical_count_of_buffered_step.reset()
 
-    def dump(self, output_mode: _OutputMode):
+    def dump(self, output_mode: _OutputMode, *, metadata=None):
         logical_count_of_buffered_step = _convert_global_physical_count_to_logical_count(
             self._global_physical_count_of_buffered_step.get_all(),
             num_layers=self._expert_location_metadata.num_layers,
@@ -1023,18 +1072,28 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         torch.distributed.all_reduce(
             logical_count_of_buffered_step,
             op=torch.distributed.ReduceOp.SUM,
-            group=self._communication_group,
+            group=self._stage_domain.device_group,
         )
 
         output = dict(
             rank=self._rank,
+            pp_rank=self._stage_domain.pp_rank,
+            global_rank=self._stage_domain.global_rank,
+            ep_global_ranks=self._stage_domain.global_ranks,
             logical_count=logical_count_of_buffered_step,
             average_utilization_rate_over_window=self._get_global_average_utilization_rate(),
+            num_recorded_passes=logical_count_of_buffered_step.shape[0],
+            **self._dump_metadata(metadata),
         )
 
         if output_mode == "file":
-            if self._rank == 0:
-                _dump_to_file(f"expert_distribution_recorder_{time.time()}.pt", output)
+            if self._stage_domain.is_root:
+                _dump_to_file(
+                    "expert_distribution_recorder_"
+                    f"pp{self._stage_domain.pp_rank}_"
+                    f"root{self._stage_domain.root_global_rank}_{time.time()}.pt",
+                    output,
+                )
         elif output_mode == "object":
             return output
         else:
@@ -1046,7 +1105,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         ):
             return None
 
-        if self._rank == 0:
+        if self._stage_domain.is_root:
             utilization_mean_rates = self._history.mean()
             window_index = self.window_sizes[-1]
             average_utilization_rate_over_window = (
@@ -1062,12 +1121,12 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             )
         else:
             avg_rate_tensor = torch.empty(
-                1,
-                dtype=torch.float32,
-                device=get_device_namespace().device,
+                1, dtype=torch.float32, device=get_device_namespace().device
             )
         torch.distributed.broadcast(
-            avg_rate_tensor, src=0, group=self._communication_group
+            avg_rate_tensor,
+            src=self._stage_domain.root_global_rank,
+            group=self._stage_domain.device_group,
         )
         return avg_rate_tensor.item()
 
