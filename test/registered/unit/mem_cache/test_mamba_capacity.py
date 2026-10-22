@@ -135,6 +135,10 @@ class TestMambaCapacity(unittest.TestCase):
                     init_pool.call_args.kwargs["mamba_size"],
                     3 * expected_slots_per_req,
                 )
+                self.assertEqual(
+                    init_pool.call_args.kwargs["mamba_spec_state_size"],
+                    2,
+                )
 
     def test_reclaims_full_shortfall_before_allocation(self):
         for free, expected_eviction in [(1, 2), (2, 1), (3, 0)]:
