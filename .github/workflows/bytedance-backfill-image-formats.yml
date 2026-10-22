@@ -56,6 +56,8 @@ jobs:
       VOLCENGINE_CR_REPOSITORY: ${{ vars.VOLCENGINE_CR_REPOSITORY || 'sglang' }}
       VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
       VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
+      CRANE_VERSION: "0.22.1"
+      CRANE_SHA256: "0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0"
       NYDUS_VERSION: "2.3.0"
       DEFAULT_SGLANG_VERSION: "0.0.0dev"
     steps:
@@ -66,7 +68,7 @@ jobs:
         run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Reclaim disposable caches and require conversion capacity
         run: |
@@ -74,7 +76,7 @@ jobs:
           scripts/ci/cleanup_build_runner_disk.sh --required-gb 150
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
         with:
           buildkitd-config-inline: |
             [worker.oci]
@@ -83,8 +85,22 @@ jobs:
               maxUsedSpace = "100GB"
               minFreeSpace = "150GB"
 
-      - name: Set up crane
-        uses: imjasonh/setup-crane@v0.4
+      # setup-crane's publisher is not a verified Marketplace creator allowed by this repo.
+      - name: Install crane from official release
+        run: |
+          set -euo pipefail
+          crane_dir="$(mktemp -d "${RUNNER_TEMP}/crane.XXXXXX")"
+          archive="go-containerregistry_Linux_x86_64.tar.gz"
+          curl --fail --show-error --location \
+            --retry 5 --retry-all-errors --retry-delay 2 \
+            --output "${crane_dir}/${archive}" \
+            "https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/${archive}"
+          printf '%s  %s\n' "${CRANE_SHA256}" "${crane_dir}/${archive}" | sha256sum --check --strict
+          tar -xzf "${crane_dir}/${archive}" -C "${crane_dir}" crane
+          chmod 0755 "${crane_dir}/crane"
+          rm -f "${crane_dir}/${archive}"
+          echo "${crane_dir}" >> "$GITHUB_PATH"
+          "${crane_dir}/crane" version
 
       - name: Login to Volcengine CR
         run: |
