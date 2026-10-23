@@ -1,22 +1,29 @@
-name: Bytedance Clean Build Runner Disk
+name: Bytedance Maintain Build Runner
+run-name: Runner maintenance - ${{ inputs.operation || 'clean_disk' }} - ${{ inputs.runner }}
 
 on:
   workflow_dispatch:
     inputs:
       runner:
-        description: "Runner pool to clean; run only when that pool has no active jobs"
+        description: "Build runner pool or unique maintenance label"
+        required: true
+        type: string
+      operation:
+        description: "Maintenance operation"
         required: true
         type: choice
+        default: clean_disk
         options:
-          - x64-kernel-build-node
-          - x64-docker-build-node
+          - clean_disk
+          - stage_broker_direct
+          - verify_broker_direct
       confirm:
-        description: "Type DELETE_BUILD_CACHES to confirm"
+        description: "Type DELETE_BUILD_CACHES or FIX_BROKER_ROUTING for the selected operation"
         required: true
         type: string
 
 concurrency:
-  group: bytedance-${{ inputs.runner }}
+  group: bytedance-runner-maintenance-${{ inputs.runner }}
   cancel-in-progress: false
 
 permissions:
@@ -28,10 +35,18 @@ jobs:
     runs-on: ${{ inputs.runner }}
     steps:
       - name: Validate explicit confirmation
+        env:
+          OPERATION: ${{ inputs.operation || 'clean_disk' }}
+          CONFIRM: ${{ inputs.confirm }}
         run: |
           set -euo pipefail
-          if [ "${{ inputs.confirm }}" != "DELETE_BUILD_CACHES" ]; then
-            echo "::error::confirmation must be DELETE_BUILD_CACHES"
+          case "${OPERATION}" in
+            clean_disk) expected=DELETE_BUILD_CACHES ;;
+            stage_broker_direct|verify_broker_direct) expected=FIX_BROKER_ROUTING ;;
+            *) exit 1 ;;
+          esac
+          if [ "${CONFIRM}" != "${expected}" ]; then
+            echo "::error::confirmation does not match the selected operation"
             exit 1
           fi
 
@@ -39,6 +54,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Deep-clean disposable build caches
+        if: ${{ inputs.operation == '' || inputs.operation == 'clean_disk' }}
         run: |
           set -euo pipefail
           case "${{ inputs.runner }}" in
@@ -50,3 +66,34 @@ jobs:
           scripts/ci/cleanup_build_runner_disk.sh \
             --deep-clean \
             --required-gb "${required_gb}"
+
+      - name: Stage Broker direct routing and restart after this worker exits
+        if: ${{ inputs.operation == 'stage_broker_direct' }}
+        env:
+          EXPECTED_RUNNER: ${{ runner.name }}
+        run: |
+          set -euo pipefail
+          expected_host="${EXPECTED_RUNNER%-sglang-build}"
+          service="$(cat /data/runner/actions-runner/.service)"
+          sudo python3 scripts/ci/repair_runner_broker_routing.py \
+            --expected-host "${expected_host}" --service "${service}" --stage-only
+          # The transient unit is outside the runner's cgroup. Its helper waits
+          # for Runner.Worker to exit before restarting the listener service.
+          repair_dir="$(sudo mktemp -d /tmp/codex-broker-repair.XXXXXX)"
+          sudo install -m 700 scripts/ci/repair_runner_broker_routing.py "${repair_dir}/repair.py"
+          sudo systemd-run --collect --on-active=5s \
+            --unit "codex-broker-restart-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            /bin/bash -c \
+            'trap '\''rm -f -- "$1/repair.py"; rmdir -- "$1"'\'' EXIT; python3 "$1/repair.py" --expected-host "$2" --service "$3" --wait-idle 180 --apply' \
+            broker-repair "${repair_dir}" "${expected_host}" "${service}"
+
+      - name: Verify the active listener's persistent Broker routing
+        if: ${{ inputs.operation == 'verify_broker_direct' }}
+        env:
+          EXPECTED_RUNNER: ${{ runner.name }}
+        run: |
+          set -euo pipefail
+          expected_host="${EXPECTED_RUNNER%-sglang-build}"
+          service="$(cat /data/runner/actions-runner/.service)"
+          sudo python3 scripts/ci/repair_runner_broker_routing.py \
+            --expected-host "${expected_host}" --service "${service}" --verify-only

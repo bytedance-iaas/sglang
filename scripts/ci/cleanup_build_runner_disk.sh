@@ -93,6 +93,14 @@ if [[ "${deep_clean}" == "true" ]] || ((current_available_gb < required_gb)); th
       exit 1
       ;;
   esac
+
+  # Host-local image exports are disposable too. Reclaim them only under
+  # explicit deep-clean or disk pressure, alongside the BuildKit state above.
+  image_cache_dir="$(realpath -m "${HOME}/.cache/sglang-docker")"
+  if [[ "${image_cache_dir}" == "${HOME}/.cache/sglang-docker" ]] && [[ -d "${image_cache_dir}" ]]; then
+    echo "Removing disposable SGLang image cache: ${image_cache_dir}"
+    sudo rm -rf -- "${image_cache_dir}"
+  fi
 else
   echo "Keeping bounded build caches: ${current_available_gb}GB available; ${required_gb}GB required"
 fi
