@@ -1,4 +1,4 @@
-"""Build the pinned NVLink/RDMA wheel and SM90 FP4 LTO runtime tools."""
+"""Build the pinned NVLink/RDMA wheel with its packaged SM90 LTO tools."""
 
 import argparse
 import base64
@@ -11,10 +11,10 @@ import tomllib
 import zipfile
 from pathlib import Path
 
-from build_iaas_kernels_lto import build_lto
 from check_iaas_kernels_image import (
     check_environment,
     check_rdma_info,
+    check_wheel_lto,
     load_lock,
     require,
 )
@@ -71,7 +71,7 @@ def build(lock_path, source, output, token_file):
         rdma_info = json.loads(archive.read("iaas_kernels/RDMA_BUILD_INFO.json"))
         rdma_native = archive.read("iaas_kernels/_iaas_kernels_rdma.so")
         check_rdma_info(lock, info, rdma_info)
-    lto = build_lto(lock, source.parent / "nvshmem-lto-source", output / "lto")
+        lto = check_wheel_lto(archive, rdma_info, lock)
     manifest = dict(
         lock=lock,
         build_info=info,

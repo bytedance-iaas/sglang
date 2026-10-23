@@ -1,11 +1,14 @@
 """CPU regressions for image provenance/ABI and plugin failures."""
 
 import hashlib
+import io
 import json
+import re
 import sys
 import tempfile
 import types
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -18,25 +21,43 @@ class TestIaasKernelsImage(unittest.TestCase):
             Path(__file__).resolve().parents[2] / "docker/iaas-kernels.lock.json"
         )
         self.lock = checks.load_lock(self.lock_path)
+        self.torch_version = f"{self.lock['torch']}+cu130"
         self.info = dict(
-            torch="2.13.0+cu130",
+            torch=self.torch_version,
             cuda="13.0",
             cxx11_abi=True,
             checkout=self.lock["revision"],
         )
 
     def test_matching_abi(self):
-        checks.check_abi(self.lock, self.info, "2.13.0+cu130", "13.0", True)
+        checks.check_abi(self.lock, self.info, self.torch_version, "13.0", True)
+
+    def test_lock_matches_sglang_torch_pins(self):
+        project = self.lock_path.parents[1] / "python/pyproject.toml"
+        # Check both build-system and runtime pins without requiring Torch or
+        # third-party TOML parsers on the CPU-only workflow runner.
+        pins = re.findall(r'^\s*"torch==([^"\n]+)"', project.read_text(), re.MULTILINE)
+        self.assertEqual(len(pins), 2, "Expected build-system and runtime Torch pins")
+        for version in pins:
+            with self.subTest(version=version):
+                self.assertEqual(version, self.lock["torch"])
 
     def test_reject_incompatible_image(self):
-        for torch, cuda in [("2.15.0+cu134", "13.4"), ("2.13.0+cu129", "12.9")]:
-            with self.subTest(torch=torch), self.assertRaisesRegex(
-                RuntimeError, "Unsupported image ABI"
+        for torch, cuda in [
+            ("2.14.1+cu130", "13.0"),
+            ("2.14.0+cu130", "13.0"),
+            ("2.15.0+cu130", "13.0"),
+            (self.torch_version, "12.9"),
+        ]:
+            with (
+                self.subTest(torch=torch),
+                self.assertRaisesRegex(RuntimeError, "Unsupported image ABI"),
             ):
                 checks.check_abi(self.lock, self.info, torch, cuda, True)
 
     def test_reject_stale_wheel(self):
         for key, value in [
+            ("torch", "2.14.1+cu130"),
             ("torch", "2.13.0a0+git123"),
             ("cuda", "12.9"),
             ("cxx11_abi", False),
@@ -46,7 +67,7 @@ class TestIaasKernelsImage(unittest.TestCase):
                 checks.check_abi(
                     self.lock,
                     dict(self.info, **{key: value}),
-                    "2.13.0+cu130",
+                    self.torch_version,
                     "13.0",
                     True,
                 )
@@ -68,6 +89,8 @@ class TestIaasKernelsImage(unittest.TestCase):
     def test_reject_unpinned_or_incompatible_nvshmem(self):
         for key, value in [
             ("api_version", 2),
+            ("api_version", 3),
+            ("api_version", 5),
             ("nvshmem_version", "3.5.0"),
             ("nvshmem_revision", "main"),
             ("nvshmem_repository", "https://example.com/nvshmem.git"),
@@ -84,18 +107,21 @@ class TestIaasKernelsImage(unittest.TestCase):
 
     def test_rdma_must_match_single_node_wheel_and_api(self):
         info = dict(self.info, source_tree_sha256="a" * 64)
-        rdma = dict(info, rdma_api_version=3, nvshmem="3.4.5", topology="runtime")
+        rdma = dict(info, rdma_api_version=6, nvshmem="3.4.5", topology="runtime")
         checks.check_rdma_info(self.lock, info, rdma)
         for key, value in [
             ("rdma_api_version", 2),
+            ("rdma_api_version", 3),
+            ("rdma_api_version", 5),
             ("nvshmem", "3.5.0"),
             ("topology", "fixed"),
             ("source_tree_sha256", "b" * 64),
             ("checkout", "f" * 40),
             ("cxx11_abi", False),
         ]:
-            with self.subTest(key=key), self.assertRaisesRegex(
-                RuntimeError, "RDMA wheel"
+            with (
+                self.subTest(key=key),
+                self.assertRaisesRegex(RuntimeError, "RDMA wheel"),
             ):
                 checks.check_rdma_info(self.lock, info, dict(rdma, **{key: value}))
 
@@ -157,9 +183,10 @@ class TestIaasKernelsImage(unittest.TestCase):
                 path.parent.mkdir(exist_ok=True)
                 path.touch()
             dist = Mock(version="3.4.5", locate_file=Mock(return_value=home))
-            with patch.object(
-                checks.metadata, "distribution", return_value=dist
-            ), patch.dict(checks.os.environ, {}, clear=True):
+            with (
+                patch.object(checks.metadata, "distribution", return_value=dist),
+                patch.dict(checks.os.environ, {}, clear=True),
+            ):
                 self.assertEqual(checks.nvshmem_home(self.lock), home.resolve())
                 dist.version = "3.5.0"
                 with self.assertRaisesRegex(RuntimeError, "package mismatch"):
@@ -170,6 +197,57 @@ class TestIaasKernelsImage(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(RuntimeError, "headers mismatch"):
                     checks.nvshmem_home(self.lock)
+
+    def test_wheel_lto_payload_and_native_metadata_must_agree(self):
+        files = {
+            "link_object": b"executable",
+            "libnvshmem_device_lto.a": b"device archive",
+            "License.nvshmem.txt": b"license",
+        }
+        manifest = dict(
+            files={
+                name: hashlib.sha256(data).hexdigest() for name, data in files.items()
+            },
+            cuda=self.lock["cuda"],
+            cpu_link_probe="passed",
+            nvshmem_revision=self.lock["rdma"]["nvshmem_revision"],
+            nvshmem_version=self.lock["rdma"]["nvshmem_version"],
+        )
+        files["manifest.json"] = json.dumps(manifest).encode()
+        rdma_info = dict(
+            fp8_lto_manifest_sha256=hashlib.sha256(files["manifest.json"]).hexdigest()
+        )
+
+        def wheel(payload, executable=True):
+            stream = io.BytesIO()
+            with zipfile.ZipFile(stream, "w") as archive:
+                for name, data in payload.items():
+                    entry = zipfile.ZipInfo(f"iaas_kernels/lto/{name}")
+                    entry.create_system = 3
+                    mode = 0o755 if name == "link_object" and executable else 0o644
+                    entry.external_attr = (0o100000 | mode) << 16
+                    archive.writestr(entry, data)
+            stream.seek(0)
+            return zipfile.ZipFile(stream)
+
+        with wheel(files) as archive:
+            self.assertEqual(
+                checks.check_wheel_lto(archive, rdma_info, self.lock), manifest
+            )
+            with self.assertRaisesRegex(RuntimeError, "RDMA build metadata"):
+                checks.check_wheel_lto(archive, {}, self.lock)
+        with wheel(files, executable=False) as archive:
+            with self.assertRaisesRegex(RuntimeError, "not executable"):
+                checks.check_wheel_lto(archive, rdma_info, self.lock)
+        with wheel(dict(files, link_object=b"corrupt")) as archive:
+            with self.assertRaisesRegex(RuntimeError, "LTO hash mismatch"):
+                checks.check_wheel_lto(archive, rdma_info, self.lock)
+        without_linker = {
+            name: data for name, data in files.items() if name != "link_object"
+        }
+        with wheel(without_linker) as archive:
+            with self.assertRaises(KeyError):
+                checks.check_wheel_lto(archive, rdma_info, self.lock)
 
     def plugin_modules(self, *, registered=True, initialized=False):
         factory = Mock(__module__="iaas_kernels.integrations.sglang")
@@ -199,14 +277,16 @@ class TestIaasKernelsImage(unittest.TestCase):
 
     def test_swallowed_plugin_exception_is_a_smoke_failure(self):
         # load_plugins() can return successfully after logging a load exception.
-        with self.plugin_modules(registered=False), self.assertRaisesRegex(
-            RuntimeError, "factory was not registered"
+        with (
+            self.plugin_modules(registered=False),
+            self.assertRaisesRegex(RuntimeError, "factory was not registered"),
         ):
             checks.check_plugin()
 
     def test_eager_cuda_initialization_is_a_smoke_failure(self):
-        with self.plugin_modules(initialized=True), self.assertRaisesRegex(
-            RuntimeError, "CUDA was initialized"
+        with (
+            self.plugin_modules(initialized=True),
+            self.assertRaisesRegex(RuntimeError, "CUDA was initialized"),
         ):
             checks.check_plugin()
 

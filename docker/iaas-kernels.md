@@ -4,7 +4,9 @@ The internal release and development workflows preinstall the SM90 MegaMoE
 provider for **linux/amd64, CUDA 13.0.3, Python 3.12, Torch 2.13.0,
 NVLink and RDMA**.
 `docker/iaas-kernels.lock.json` pins the source commit, package version and ABI.
-The pin includes the fixed-M64 FP4 RDMA RS implementation (RDMA API v3).
+The pin includes precision-specific buffer policies (RDMA API v6), default FP4
+RS/LTO, FP4 RDMA optimizations through requested capacity 1024, and automatic FP8
+kernel policy. Upgrade the Python package and native extensions together.
 The pinned commit must be available in the private source repository before
 starting a release; a commit present only in a developer's local main cannot
 be fetched by CI. There is no fallback to a moving branch or an older wheel.
@@ -43,14 +45,15 @@ freezing the consuming image's dependency constraints and retained in both final
 stages. Its headers, ordinary device archive and host library are runtime JIT
 dependencies, not just build dependencies.
 
-The builder also fetches the pinned NVIDIA NVSHMEM source and builds the SM90a
-device LTO archive and a small nvJitLink executable. It checks the source against
-the wheel's private ABI headers and uses the wheel's generated build options.
+The iaas-kernels wheel build fetches the pinned NVIDIA NVSHMEM source and builds
+the SM90a device LTO archive and a small nvJitLink executable. It checks the source
+against the wheel's private ABI headers and uses the wheel's generated build options.
 A CPU-only compile/link probe with a real NVSHMEM device call must pass. The
-resulting tools and NVIDIA license are installed under
-`/opt/sglang/share/iaas-kernels/lto/`; they do not rely on files copied from a
-benchmark container. This archive is for iaas-kernels FP4 JIT, and does not replace
-Torch/DeepEP's ordinary NVSHMEM archive or host library.
+resulting tools, manifest and NVIDIA license are included in the wheel under
+`iaas_kernels/lto/`. SGLang validates that payload and its binding to RDMA build
+metadata; it does not build a second copy. FP4 and FP8 discover the packaged tools
+automatically. This archive does not replace Torch/DeepEP's ordinary NVSHMEM
+archive or host library.
 
 The image saves source/submodule SHAs, build ABI, wheel SHA256 and native library
 SHA256 in `/opt/sglang/share/iaas-kernels/manifest.json`, alongside its lock file.
@@ -64,7 +67,7 @@ commit and wheel digest, not by the version string alone.
 ## Verification and publishing
 
 The final stages run `scripts/ci/check_iaas_kernels_image.py` without a GPU. The
-check validates the installed source/ABI/binaries, RDMA API v3, NVSHMEM 3.4.5,
+check validates the installed source/ABI/binaries, RDMA API v6, NVSHMEM 3.4.5,
 JIT headers/tools, LTO hashes/executable, Torch NVSHMEM support, continued ownership
 of `deep_gemm` by `sgl-deep-gemm`, both native host libraries, and plugin registration
 without CUDA initialization.
@@ -98,11 +101,15 @@ provider on SM90, use `--moe-a2a-backend megamoe --megamoe-transport nvlink
 --disable-shared-experts-fusion`, together with the normal TP/EP settings and
 `SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK` capacity for the workload.
 
-For two-node FP4 RDMA, source the installed profile **in every worker's launch
-environment**, then supply the normal node address/rank and model arguments:
+Single-node FP4 defaults to RS. Set `IAAS_KERNELS_SM90_FP4_USE_RS=0` before loading
+the model only when SS is required; weight packing follows that selection.
+
+For two-node FP4 or FP8 RDMA, source the installed profile **in every worker's
+launch environment**, then supply the normal node address/rank and model arguments:
 
 ```bash
 source /opt/sglang/share/iaas-kernels/rdma-fp4.env
+export SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=1024
 export NVSHMEM_IBGDA_NUM_RC_PER_PE=25  # E384 / EP16 + 1; recompute for other models
 # Configure NIC/PE mapping, socket interface, GID and traffic class for your cluster.
 python3 -m sglang.launch_server --model-path /path/to/model \
@@ -112,19 +119,28 @@ python3 -m sglang.launch_server --model-path /path/to/model \
   --disable-shared-experts-fusion
 ```
 
-The FP4 profile enables IBGDA, disables relaxed ordering, selects `RS_GENERAL=1`
-and FP4 RS LTO, and points JIT at the image's linker/archive. The GENERAL=1,
-LTO=0, B1 path has a known misaligned-address failure on H20, so LTO is required
-for this validated profile. Network-specific settings are deliberately supplied
+The profile keeps its existing `rdma-fp4.env` filename for launch-script
+compatibility and now only enables IBGDA and disables relaxed ordering. FP4
+defaults to `IAAS_KERNELS_RDMA_RS_GENERAL=1` and
+`IAAS_KERNELS_RDMA_MEGA_MOE_FP4_RS_LTO=1`; no LTO paths need to be exported.
+The GENERAL=1, LTO=0, B1 path has a known misaligned-address failure on H20, so LTO
+is required for this validated profile. Network-specific settings are deliberately supplied
 by the deployment. The image does not globally change the allocator, MoE backend,
 FP4 policy or network configuration for other workloads.
 Buffer capacity also remains a deployment setting. The optimized EP16/NVL8
-same-rail push path uses requested capacity <=256, not the current forward's
+same-rail push path supports requested capacity <=1024, not the current forward's
 token count; choose `SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK` for the
-workload instead of assuming that every small forward uses this path.
+workload instead of assuming that every small forward uses this path. FP4 RDMA
+capacity >1024 requires explicitly setting `IAAS_KERNELS_RDMA_RS_GENERAL=0` before
+model loading; otherwise preparation fails with a configuration error. Sourcing
+the profile preserves this override. SGLang's general capacity default remains
+8192 for other backends and precisions, so select a capacity <=1024 for default
+FP4 RDMA as in the example, or explicitly opt out of GENERAL for larger capacity.
 
-FP8 RDMA uses `IAAS_KERNELS_RDMA_RS_GENERAL=0`; do not source the FP4 profile for
-FP8. It still requires IBGDA/relaxed-ordering settings and enough RC QPs.
+FP8 RDMA selects its own policy and ignores both FP4 overrides. It does not need
+`IAAS_KERNELS_RDMA_RS_GENERAL=0`, and can use the same profile. It still requires
+IBGDA/relaxed-ordering settings and enough RC QPs. Removed tuning variables are
+silently ignored.
 RDMA currently requires EP=WORLD in identical rank order, equal contiguous NVLink
 domains of 1–8 ranks (at least two domains, at most 64 ranks), MoE TP=1, SwiGLU,
 and separate shared experts. PP/EP subgroups, TBO and live EPLB are unsupported.
