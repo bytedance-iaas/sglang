@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+from contextlib import ExitStack
 from queue import Queue
 from types import SimpleNamespace
 from unittest import mock
@@ -21,7 +22,7 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeNode
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class FakeTreeNode:
@@ -43,7 +44,312 @@ class FakeDeviceAllocator:
         return torch.arange(100, 100 + size, dtype=torch.int32)
 
 
+# The two real constructors exercised through the shared scaffolding below.
+_CLIENT_MODULES = [
+    ("sglang.srt.mem_cache.eic_memory_pool", "EICKVClient"),
+    ("sglang.srt.mem_cache.storage.eic.eic_storage", "EICStorage"),
+]
+
+
+class _InitReached(Exception):
+    """Raised by the stubbed Client.init to stop before network I/O."""
+
+
 class TestEICHiCacheRegression(unittest.TestCase):
+    def _drive_constructor(self, module_path, cls_name, resolved, extra_mocks=()):
+        """Import `module_path` under a stub eic SDK, run the real constructor
+        until Client.init, and return the InitOption handed to conn.init.
+
+        Shared scaffolding: stub SDK module, G_*/affinity globals restored,
+        load_eic_config replaced with `resolved`, log-dir exists patch,
+        CUDA unavailable, periodic dump silenced. `extra_mocks` enters the
+        same stack for per-test patches (NIC namespace, current_device).
+        """
+        from importlib import import_module
+
+        conn = mock.Mock()
+        conn.init.side_effect = _InitReached
+        sdk = SimpleNamespace(
+            Client=lambda: conn,
+            InitOption=SimpleNamespace,
+            LogLevel=lambda value: value,
+            TransportType=lambda value: value,
+        )
+        with mock.patch.dict(sys.modules, {"eic": sdk}):
+            module = import_module(module_path)
+        globals_to_restore = {
+            key: value
+            for key, value in vars(module).items()
+            if key.startswith("G_") or key in ("GPUNicAffinity", "CPUNicAffinity")
+        }
+        stack = [
+            mock.patch.multiple(module, **globals_to_restore),
+            mock.patch.object(module, "eic", sdk),
+            mock.patch.object(module, "load_eic_config", return_value=resolved),
+            mock.patch.object(module.os.path, "exists", return_value=True),
+            mock.patch("torch.cuda.is_available", return_value=False),
+            mock.patch("sglang.srt.mem_cache.eic_stats.stats.start_periodic_dump"),
+            *extra_mocks,
+        ]
+        with ExitStack() as es:
+            for cm in stack:
+                es.enter_context(cm)
+            with self.assertRaises(_InitReached):
+                if cls_name == "EICKVClient":
+                    module.EICKVClient(torch.float16, (1,), None)
+                else:
+                    module.EICStorage(SimpleNamespace(model_name="test"), None)
+        conn.init.assert_called_once()
+        return conn.init.call_args.args[2]
+
+    def test_network_env_reaches_both_real_client_constructors(self):
+        from sglang.srt.mem_cache.storage.eic.eic_env_config import EicResolvedConfig
+
+        # Stop at Client.init, before any GPU pool allocation or network I/O.
+        if_nameindex = mock.patch(
+            "sglang.srt.mem_cache.storage.eic.eic_env_config.socket.if_nameindex",
+            return_value=[(1, "eth0"), (2, "eth1")],
+        )
+        cuda_current_device = mock.patch(
+            "torch.cuda.current_device",
+            side_effect=AssertionError("env list needs no GPU mapping"),
+        )
+        for path, cls_name in _CLIENT_MODULES:
+            for affinity in (False, True):
+                with self.subTest(path=path, affinity=affinity):
+                    resolved = EicResolvedConfig(
+                        enabled=True,
+                        endpoint="127.0.0.1:10000",
+                        instance_id="test",
+                        fixed={
+                            "eic_log_dir": "/tmp",
+                            "enable_gpu_nic_affinity": affinity,
+                            "gpu_nic_affinity_config": '{"cuda:0": "old"}',
+                        },
+                        network_interface_names="eth0;eth1",
+                    )
+                    option = self._drive_constructor(
+                        path,
+                        cls_name,
+                        resolved,
+                        extra_mocks=(if_nameindex, cuda_current_device),
+                    )
+                    self.assertEqual(
+                        option.multi_net_local_interface_names, "eth0;eth1"
+                    )
+
+    def test_centralized_defaults_reach_both_client_init_option(self):
+        from sglang.srt.mem_cache.storage.eic.eic_env_config import (
+            DEFAULT_FIXED_CONFIG,
+            EicResolvedConfig,
+        )
+
+        # Stop at Client.init: centralized built-ins must land on InitOption
+        # in both real constructors; no per-client divergent fallback may
+        # mask the centralized value.
+        for path, cls_name in _CLIENT_MODULES:
+            with self.subTest(path=path):
+                resolved = EicResolvedConfig(
+                    enabled=True,
+                    endpoint="127.0.0.1:10000",
+                    instance_id="test",
+                    fixed=dict(DEFAULT_FIXED_CONFIG),
+                )
+                option = self._drive_constructor(path, cls_name, resolved)
+                self.assertEqual(option.log_dir, DEFAULT_FIXED_CONFIG["eic_log_dir"])
+                self.assertEqual(
+                    option.log_level, DEFAULT_FIXED_CONFIG["eic_log_level"]
+                )
+                self.assertEqual(
+                    option.transport_type,
+                    DEFAULT_FIXED_CONFIG["eic_trans_type"],
+                )
+
+    def test_default_flag_file_used_only_when_no_external_file(self):
+        from sglang.srt.mem_cache.storage.eic.eic_env_config import (
+            DEFAULT_FIXED_CONFIG,
+            EicResolvedConfig,
+        )
+
+        # external=None -> private safe-default file; external set -> passthrough.
+        cases = [(None, False), ("/tmp/external.flags", True)]
+        for path, cls_name in _CLIENT_MODULES:
+            for external, passthrough in cases:
+                with self.subTest(path=path, external=external):
+                    fixed = dict(DEFAULT_FIXED_CONFIG)
+                    fixed["eic_flag_file"] = external
+                    resolved = EicResolvedConfig(
+                        enabled=True,
+                        endpoint="127.0.0.1:10000",
+                        instance_id="test",
+                        fixed=fixed,
+                    )
+                    option = self._drive_constructor(path, cls_name, resolved)
+                    if passthrough:
+                        self.assertEqual(option.flag_file, external)
+                    else:
+                        self.assertTrue(os.path.exists(option.flag_file))
+                        self.assertTrue(os.path.isfile(option.flag_file))
+
+    def test_generated_default_file_survives_with_nic_override(self):
+        from sglang.srt.mem_cache.storage.eic.eic_env_config import (
+            DEFAULT_FIXED_CONFIG,
+            EicResolvedConfig,
+        )
+
+        # No external file: generated private default file must remain on
+        # InitOption.flag_file; NIC override is applied directly (the wrapper
+        # only wraps an external source, never resolved.fixed's None).
+        if_nameindex = mock.patch(
+            "sglang.srt.mem_cache.storage.eic.eic_env_config.socket.if_nameindex",
+            return_value=[(1, "eth0"), (2, "eth1")],
+        )
+        for path, cls_name in _CLIENT_MODULES:
+            with self.subTest(path=path):
+                resolved = EicResolvedConfig(
+                    enabled=True,
+                    endpoint="127.0.0.1:10000",
+                    instance_id="test",
+                    fixed=dict(DEFAULT_FIXED_CONFIG),
+                    network_interface_names="eth0;eth1",
+                )
+                option = self._drive_constructor(
+                    path, cls_name, resolved, extra_mocks=(if_nameindex,)
+                )
+                self.assertTrue(os.path.isfile(option.flag_file))
+                self.assertEqual(option.multi_net_local_interface_names, "eth0;eth1")
+
+    def _drive_init_failure(self, module_path, cls_name, resolved, extra_mocks=()):
+        """Drive a real constructor until Client.init returns nonzero.
+
+        Records every private flag-file owner directory closed on the failure
+        path and returns (raised exception, closed directories). Mirrors
+        `_drive_constructor` but uses a nonzero init return instead of raising
+        at init.
+        """
+        from importlib import import_module
+        from sglang.srt.mem_cache.storage.eic import eic_env_config
+
+        conn = mock.Mock()
+        conn.init.return_value = 1
+        sdk = SimpleNamespace(
+            Client=lambda: conn,
+            InitOption=SimpleNamespace,
+            LogLevel=lambda value: value,
+            TransportType=lambda value: value,
+        )
+        closed_dirs = []
+        real_close = eic_env_config._PrivateFlagFile.close
+
+        def spy_close(owner):
+            closed_dirs.append(owner._directory)
+            real_close(owner)
+
+        with mock.patch.dict(sys.modules, {"eic": sdk}):
+            module = import_module(module_path)
+        globals_to_restore = {
+            key: value
+            for key, value in vars(module).items()
+            if key.startswith("G_") or key in ("GPUNicAffinity", "CPUNicAffinity")
+        }
+        stack = [
+            mock.patch.multiple(module, **globals_to_restore),
+            mock.patch.object(module, "eic", sdk),
+            mock.patch.object(module, "load_eic_config", return_value=resolved),
+            mock.patch.object(module.os.path, "exists", return_value=True),
+            mock.patch("torch.cuda.is_available", return_value=False),
+            mock.patch("sglang.srt.mem_cache.eic_stats.stats.start_periodic_dump"),
+            mock.patch.object(eic_env_config._PrivateFlagFile, "close", spy_close),
+            *extra_mocks,
+        ]
+        exc = None
+        with ExitStack() as es:
+            for cm in stack:
+                es.enter_context(cm)
+            try:
+                if cls_name == "EICKVClient":
+                    module.EICKVClient(torch.float16, (1,), None)
+                else:
+                    module.EICStorage(SimpleNamespace(model_name="test"), None)
+            except BaseException as raised:
+                exc = raised
+        return exc, closed_dirs
+
+    def test_init_failure_closes_owners_pool_exits_storage_raises(self):
+        # On Client.init returning nonzero the private flag-file owners
+        # (default file, network wrapper) are closed and their temp
+        # directories removed; None-safe when an owner is absent. The pool
+        # keeps exit(1); the storage backend keeps RuntimeError.
+        import tempfile
+        from sglang.srt.mem_cache.storage.eic.eic_env_config import (
+            DEFAULT_FIXED_CONFIG,
+            EicResolvedConfig,
+        )
+
+        if_nameindex = mock.patch(
+            "sglang.srt.mem_cache.storage.eic.eic_env_config.socket.if_nameindex",
+            return_value=[(1, "eth0")],
+        )
+        with tempfile.NamedTemporaryFile("w", delete=False) as fh:
+            fh.write("--eic_client_rpc_timeout_in_ms=5000\n")
+            external_flag = fh.name
+        try:
+            for path, cls_name, expect_exc in (
+                ("sglang.srt.mem_cache.eic_memory_pool", "EICKVClient", SystemExit),
+                (
+                    "sglang.srt.mem_cache.storage.eic.eic_storage",
+                    "EICStorage",
+                    RuntimeError,
+                ),
+            ):
+                # Case 1: no external file, no NIC -> default-file owner closed.
+                resolved = EicResolvedConfig(
+                    enabled=True,
+                    endpoint="127.0.0.1:10000",
+                    instance_id="test",
+                    fixed=dict(DEFAULT_FIXED_CONFIG),
+                )
+                exc, closed = self._drive_init_failure(path, cls_name, resolved)
+                self.assertIsInstance(exc, expect_exc)
+                if cls_name == "EICKVClient":
+                    self.assertEqual(exc.code, 1)
+                else:
+                    self.assertIn("EIC Client Init Failed", str(exc))
+                self.assertEqual(len(closed), 1)
+                for directory in closed:
+                    self.assertFalse(os.path.exists(directory))
+
+                # Case 2: external flag file + NIC -> network wrapper owner closed.
+                fixed = dict(DEFAULT_FIXED_CONFIG)
+                fixed["eic_flag_file"] = external_flag
+                resolved = EicResolvedConfig(
+                    enabled=True,
+                    endpoint="127.0.0.1:10000",
+                    instance_id="test",
+                    fixed=fixed,
+                    network_interface_names="eth0",
+                )
+                exc, closed = self._drive_init_failure(
+                    path, cls_name, resolved, extra_mocks=(if_nameindex,)
+                )
+                self.assertIsInstance(exc, expect_exc)
+                self.assertEqual(len(closed), 1)
+                for directory in closed:
+                    self.assertFalse(os.path.exists(directory))
+
+                # Case 3: external file, no NIC -> no owner; None-safe, no crash.
+                resolved = EicResolvedConfig(
+                    enabled=True,
+                    endpoint="127.0.0.1:10000",
+                    instance_id="test",
+                    fixed=fixed,
+                )
+                exc, closed = self._drive_init_failure(path, cls_name, resolved)
+                self.assertIsInstance(exc, expect_exc)
+                self.assertEqual(closed, [])
+        finally:
+            os.unlink(external_flag)
+
     def test_match_from_remote_skips_zero_committed_tokens(self):
         cache = object.__new__(EICPagedHiRadixCache)
         cache.match_req_set = {}
@@ -93,7 +399,10 @@ class TestEICHiCacheRegression(unittest.TestCase):
         match.i = 0
         cache._match_for_remote_fetch = match
         cache.cache_controller = mock.Mock()
-        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [8]
+        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = (
+            [8],
+            True,
+        )
         reqs = [
             mock.Mock(
                 rid=r, origin_input_ids=list(range(8)), output_ids=[9], extra_key=None
@@ -248,6 +557,52 @@ class TestEICHiCacheRegression(unittest.TestCase):
 
         SWATokenToKVPoolAllocator.free_swa(alloc, torch.arange(8))
 
+        freed = alloc.swa_attn_allocator.free.call_args[0][0]
+        self.assertEqual(sorted(freed.tolist()), [512, 768])
+
+    def test_free_swa_drops_reserved_page_slots_without_dedup(self):
+        # Without dedup, slots in reserved page 0 ([1, page_size)) must
+        # still not be credited: page 0 is never allocated, so freeing it
+        # would push available_size() past the pool size.
+        from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+
+        alloc = object.__new__(SWATokenToKVPoolAllocator)
+        alloc.page_size = 256
+        alloc.swa_attn_allocator = mock.Mock()
+        alloc.full_to_swa_index_mapping = torch.tensor(
+            [0, 100, 255, 256, 512], dtype=torch.int64
+        )
+        alloc._expand_to_full_pages = lambda idx: idx
+        alloc.dedup_aliased_swa = False
+        alloc.free_group = None
+
+        SWATokenToKVPoolAllocator.free_swa(alloc, torch.arange(5))
+
+        freed = alloc.swa_attn_allocator.free.call_args[0][0]
+        self.assertEqual(sorted(freed.tolist()), [256, 512])
+
+    def test_free_swa_group_end_dedups_across_calls(self):
+        # Aliased slots freed in separate group entries must be freed
+        # once at group end, not once per entry.
+        from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+
+        alloc = object.__new__(SWATokenToKVPoolAllocator)
+        alloc.page_size = 256
+        alloc.swa_attn_allocator = mock.Mock()
+        alloc.full_to_swa_index_mapping = torch.tensor(
+            [512, 512, 768, 768], dtype=torch.int64
+        )
+        alloc._expand_to_full_pages = lambda idx: idx
+        alloc.dedup_aliased_swa = True
+        alloc.free_group = []
+        alloc.swa_free_group = []
+        alloc.full_free_group = []
+
+        SWATokenToKVPoolAllocator.free_swa(alloc, torch.arange(2))
+        SWATokenToKVPoolAllocator.free_swa(alloc, torch.arange(2, 4))
+        SWATokenToKVPoolAllocator.free_group_end(alloc)
+
+        self.assertEqual(alloc.swa_attn_allocator.free.call_count, 1)
         freed = alloc.swa_attn_allocator.free.call_args[0][0]
         self.assertEqual(sorted(freed.tolist()), [512, 768])
 
@@ -1471,10 +1826,10 @@ class TestEICHiCacheRegression(unittest.TestCase):
         cache = self._remote_cache()
         node = SimpleNamespace(id=1, content_hash=None)
         cache._match_for_remote_fetch = lambda root, key: (0, node)
-        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [
-            256,
-            256,
-        ]
+        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = (
+            [256, 256],
+            True,
+        )
         reqs = [
             mock.Mock(
                 rid=r, origin_input_ids=list(range(n)), output_ids=[9], extra_key=None
@@ -1502,13 +1857,24 @@ class TestEICHiCacheRegression(unittest.TestCase):
             return_value=False,
         )
 
-        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [0]
+        # First round: data plane faults, so the probe enters cooldown and
+        # the miss is not admitted.
+        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = (
+            [0],
+            False,
+        )
         with patch_hash:
             EICPagedHiRadixCache.match_from_remote(cache, [req])
         cache._insert_remote_node.assert_not_called()
         self.assertEqual(cache.match_req_set, {})
 
-        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [768]
+        # The miss is retried once the cooldown expires (the write may
+        # have landed in the meantime).
+        cache._probe_backoff_until = 0.0
+        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = (
+            [768],
+            True,
+        )
         with patch_hash:
             EICPagedHiRadixCache.match_from_remote(cache, [req])
         key = cache._insert_remote_node.call_args[0][1]
@@ -1534,10 +1900,10 @@ class TestEICHiCacheRegression(unittest.TestCase):
             cache.pp_group = object()
             node = SimpleNamespace(id=1, content_hash=None)
             cache._match_for_remote_fetch = lambda root, key: (0, node)
-            cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [
-                256,
-                256,
-            ]
+            cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = (
+                [256, 256],
+                True,
+            )
             shapes = []
 
             def fake_reduce(t):
@@ -1639,7 +2005,10 @@ class TestEICHiCacheRegression(unittest.TestCase):
         node = SimpleNamespace(id=1, content_hash=None)
         cache._match_for_remote_fetch = lambda root, key: (0, node)
         cache.cache_controller = mock.Mock()
-        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = [0, 0]
+        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = (
+            [0, 0],
+            True,
+        )
 
         reqs = [
             mock.Mock(
@@ -1718,6 +2087,243 @@ class TestEICHiCacheRegression(unittest.TestCase):
             EICKVClient._write_thread(c)
 
         self.assertEqual(freed, [v.data_ptr() for v in values])
+
+    def test_probe_backoff_after_wholesale_failures(self):
+        # Probing runs on the scheduler thread every loop and a miss is
+        # retried next loop, so a down data plane stalls scheduling on
+        # RPC timeouts. The first wholesale-miss round must already
+        # enter a long cooldown, the cooldown doubles per consecutive
+        # wholesale failure up to a cap, and any hit clears the state.
+        import time
+
+        from sglang.srt.mem_cache.eic_hiradix_cache import EICHiRadixCache
+
+        cache = object.__new__(EICHiRadixCache)
+        EICHiRadixCache.init_hyper_params(
+            cache,
+            {
+                "save_decode_cache": True,
+                "load_back_threshold": 10,
+                "eic_probe_backoff_seconds": 10.0,
+                "eic_probe_backoff_max_seconds": 25.0,
+            },
+        )
+        self.assertFalse(cache._probe_in_backoff())
+        # First data-plane fault already backs off for the base cooldown.
+        cache._note_probe_result([0, 0], plane_ok=False)
+        self.assertTrue(cache._probe_in_backoff())
+        self.assertAlmostEqual(
+            cache._probe_backoff_until - time.monotonic(), 10.0, delta=1.0
+        )
+        # Next fault after expiry doubles the cooldown.
+        cache._probe_backoff_until = 0.0
+        cache._note_probe_result([0], plane_ok=False)
+        self.assertAlmostEqual(
+            cache._probe_backoff_until - time.monotonic(), 20.0, delta=1.0
+        )
+        # Growth is capped.
+        cache._probe_backoff_until = 0.0
+        cache._note_probe_result([0], plane_ok=False)
+        self.assertAlmostEqual(
+            cache._probe_backoff_until - time.monotonic(), 25.0, delta=1.0
+        )
+        # A hit clears both the level and an active backoff, so the next
+        # fault starts from the base cooldown again.
+        cache._note_probe_result([4])
+        self.assertFalse(cache._probe_in_backoff())
+        cache._note_probe_result([0], plane_ok=False)
+        self.assertAlmostEqual(
+            cache._probe_backoff_until - time.monotonic(), 10.0, delta=1.0
+        )
+
+    def test_probe_cold_cache_miss_does_not_backoff(self):
+        # A healthy cold-cache round (mexist answers SUCCESS but each key
+        # returns KEY_NOT_EXIST) must not enter cooldown. The probe keeps
+        # running on each loop so the cache can warm as writes land.
+        from sglang.srt.mem_cache.eic_hiradix_cache import EICHiRadixCache
+
+        cache = object.__new__(EICHiRadixCache)
+        EICHiRadixCache.init_hyper_params(
+            cache,
+            {
+                "save_decode_cache": True,
+                "load_back_threshold": 10,
+                "eic_probe_backoff_seconds": 10.0,
+                "eic_probe_backoff_max_seconds": 25.0,
+            },
+        )
+        # Repeated healthy cold rounds still leave the plane un-backoffed.
+        cache._note_probe_result([0, 0], plane_ok=True)
+        self.assertFalse(cache._probe_in_backoff())
+        cache._note_probe_result([0], plane_ok=True)
+        self.assertFalse(cache._probe_in_backoff())
+        self.assertEqual(getattr(cache, "_probe_fail_level", 0), 0)
+        # A fault right after a cold round still enters the base cooldown.
+        cache._note_probe_result([0], plane_ok=False)
+        self.assertTrue(cache._probe_in_backoff())
+
+    def test_exists_batch_distinguishes_cold_miss_from_plane_fault(self):
+        # exists_batch returns (result, plane_ok). A cold miss -- top-level
+        # KEY_NOT_EXIST, or per-key KEY_NOT_EXIST inside a PARTIAL_FAILED retry
+        # -- must keep plane_ok True so the probe does not back off. A
+        # transport-level FAILED in the retry must set plane_ok False.
+        from sglang.srt.mem_cache import eic_memory_pool as pool_mod
+
+        S = SimpleNamespace(SUCCESS=0, FAILED=1, PARTIAL_FAILED=2, KEY_NOT_EXIST=3)
+        fake_eic = SimpleNamespace(
+            StatusCode=S,
+            StringVector=list,
+            ExistOption=SimpleNamespace,
+        )
+        client = object.__new__(pool_mod.EICKVClient)
+        client.eic_namespace = "ns"
+
+        # 1) Top-level KEY_NOT_EXIST: cold miss, plane healthy.
+        client.connection = SimpleNamespace(
+            mexist=mock.Mock(
+                return_value=(S.KEY_NOT_EXIST, SimpleNamespace(status_codes=[]))
+            )
+        )
+        with mock.patch.object(pool_mod, "eic", fake_eic):
+            res, plane_ok = client.exists_batch(["k0", "k1"])
+        self.assertEqual(res, [False, False])
+        self.assertTrue(plane_ok)
+
+        def first_partial(retry_codes):
+            def mexist(keys, opt):
+                if len(keys) == 3:
+                    return S.PARTIAL_FAILED, SimpleNamespace(
+                        status_codes=[S.SUCCESS, S.FAILED, S.FAILED]
+                    )
+                return S.PARTIAL_FAILED, SimpleNamespace(status_codes=list(retry_codes))
+
+            return mexist
+
+        # 2) Retry answers KEY_NOT_EXIST for every failed key: cold miss.
+        client.connection = SimpleNamespace(
+            mexist=mock.Mock(
+                side_effect=first_partial([S.KEY_NOT_EXIST, S.KEY_NOT_EXIST])
+            )
+        )
+        with mock.patch.object(pool_mod, "eic", fake_eic):
+            res, plane_ok = client.exists_batch(["k0", "k1", "k2"])
+        self.assertEqual(res, [True, False, False])
+        self.assertTrue(plane_ok)
+
+        # 3) One failed key returns transport FAILED on retry: plane fault.
+        client.connection = SimpleNamespace(
+            mexist=mock.Mock(side_effect=first_partial([S.KEY_NOT_EXIST, S.FAILED]))
+        )
+        with mock.patch.object(pool_mod, "eic", fake_eic):
+            res, plane_ok = client.exists_batch(["k0", "k1", "k2"])
+        self.assertEqual(res, [True, False, False])
+        self.assertFalse(plane_ok)
+
+        # 4) Retry succeeds for one key; the other is a cold miss: healthy.
+        client.connection = SimpleNamespace(
+            mexist=mock.Mock(side_effect=first_partial([S.SUCCESS, S.KEY_NOT_EXIST]))
+        )
+        with mock.patch.object(pool_mod, "eic", fake_eic):
+            res, plane_ok = client.exists_batch(["k0", "k1", "k2"])
+        self.assertEqual(res, [True, True, False])
+        self.assertTrue(plane_ok)
+
+        # 5) Retry batch answers top-level KEY_NOT_EXIST: the whole retry is
+        # a healthy cold miss and must not be recorded as a plane fault.
+        def partial_then_knx(keys, opt):
+            if len(keys) == 3:
+                return S.PARTIAL_FAILED, SimpleNamespace(
+                    status_codes=[S.SUCCESS, S.FAILED, S.FAILED]
+                )
+            return S.KEY_NOT_EXIST, SimpleNamespace(status_codes=[])
+
+        client.connection = SimpleNamespace(
+            mexist=mock.Mock(side_effect=partial_then_knx)
+        )
+        with mock.patch.object(pool_mod, "eic", fake_eic):
+            res, plane_ok = client.exists_batch(["k0", "k1", "k2"])
+        self.assertEqual(res, [True, False, False])
+        self.assertTrue(plane_ok)
+
+    def test_match_from_remote_canary_probes_one_request_after_failure(self):
+        # While recovering from a wholesale probe failure, a probe
+        # round must feel for the data plane with a single request
+        # instead of stalling the whole waiting queue on a full round.
+        cache = self._remote_cache()
+        cache._probe_fail_level = 1
+        cache._probe_backoff_until = 0.0
+        node = SimpleNamespace(id=1, content_hash=None)
+        cache._match_for_remote_fetch = lambda root, key: (512, node)
+        cache.cache_controller.batch_find_longest_prefix_in_eic.return_value = (
+            [0],
+            False,
+        )
+        reqs = [
+            mock.Mock(
+                rid=r,
+                origin_input_ids=list(range(4096)),
+                output_ids=[9],
+                extra_key=None,
+            )
+            for r in ("A", "B", "C")
+        ]
+        with mock.patch(
+            "sglang.srt.mem_cache.eic_hiradix_cache._need_calculate_hash",
+            return_value=False,
+        ):
+            EICPagedHiRadixCache.match_from_remote(cache, reqs)
+        probed = cache.cache_controller.batch_find_longest_prefix_in_eic.call_args[0][0]
+        self.assertEqual(len(probed), 1)
+
+    def test_write_backoff_after_wholesale_failures(self):
+        # write_through writes run on a write thread, but a down data
+        # plane makes every mset pay a multi-second timeout and churns
+        # host pages. After N consecutive failed write acks the cache
+        # must suppress remote writes for a cooldown; afterwards a
+        # single probe write decides whether writes resume.
+        import time
+
+        from sglang.srt.mem_cache.eic_hiradix_cache import EICHiRadixCache
+
+        cache = object.__new__(EICHiRadixCache)
+        EICHiRadixCache.init_hyper_params(
+            cache,
+            {
+                "save_decode_cache": True,
+                "load_back_threshold": 10,
+                "eic_probe_backoff_seconds": 10.0,
+                "eic_probe_backoff_max_seconds": 25.0,
+                "eic_probe_backoff_write_failures": 3,
+            },
+        )
+        self.assertFalse(cache._write_suppressed())
+        cache._note_write_result(False)
+        cache._note_write_result(False)
+        self.assertFalse(cache._write_suppressed())
+        cache._note_write_result(False)
+        self.assertTrue(cache._write_in_backoff())
+        self.assertTrue(cache._write_suppressed())
+        self.assertAlmostEqual(
+            cache._write_backoff_until - time.monotonic(), 10.0, delta=1.0
+        )
+        # After expiry exactly one probe write is let through.
+        cache._write_backoff_until = 0.0
+        self.assertFalse(cache._write_suppressed())
+        self.assertTrue(cache._write_suppressed())
+        # A failed probe re-enters backoff with a doubled cooldown.
+        cache._note_write_result(False)
+        self.assertTrue(cache._write_in_backoff())
+        self.assertAlmostEqual(
+            cache._write_backoff_until - time.monotonic(), 20.0, delta=1.0
+        )
+        # A successful probe clears the state entirely.
+        cache._write_backoff_until = 0.0
+        self.assertFalse(cache._write_suppressed())
+        cache._note_write_result(True)
+        self.assertFalse(cache._write_in_backoff())
+        self.assertFalse(cache._write_suppressed())
+        cache._note_write_result(False)
+        self.assertFalse(cache._write_suppressed())
 
     def test_memory_pool_refuses_a_region_the_client_will_not_register(self):
         # register_memory's bool return was dropped. An unregistered region still
@@ -1814,6 +2420,218 @@ class TestEICHiCacheRegression(unittest.TestCase):
             for hook in hooks:
                 self.assertTrue(callable(getattr(cls, hook, None)), f"{name}.{hook}")
         self.assertIn(eic_hiradix_cache.EICHiRadixCache.__name__, names)
+
+    def test_dsv41_page_specs_accept_new_pools(self):
+        # DSv4.1 host stacks carry low-ratio (C1/C2), FP4-indexer-scale and
+        # split-rope pools that the v4 adapter rejects as unsupported. Names
+        # arrive as PoolName members on v4.1 and plain values must also work.
+        from sglang.srt.mem_cache.eic_memory_pool import (
+            EICDeepSeekV4TokenToKVPoolHost,
+        )
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+
+        def entry(numel):
+            host_pool = SimpleNamespace(
+                get_dummy_flat_data_page=lambda n=numel: torch.zeros(
+                    n, dtype=torch.uint8
+                )
+            )
+            return SimpleNamespace(host_pool=host_pool)
+
+        host = object.__new__(EICDeepSeekV4TokenToKVPoolHost)
+        host.host_pool_group = SimpleNamespace(
+            entry_map={
+                PoolName.KV: entry(8),
+                PoolName.DEEPSEEK_V4_C1: entry(11),
+                PoolName.DEEPSEEK_V4_C1_INDEXER: entry(12),
+                PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE: entry(13),
+                PoolName.DEEPSEEK_V4_C2: entry(14),
+                PoolName.DEEPSEEK_V4_C2_INDEXER: entry(15),
+                PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE: entry(16),
+                PoolName.DEEPSEEK_V4_C4: entry(17),
+                PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE: entry(18),
+                PoolName.DEEPSEEK_V4_C4_ROPE: entry(19),
+                PoolName.DEEPSEEK_V4_C128_ROPE: entry(20),
+                PoolName.DEEPSEEK_V4_C128_STATE: entry(21),
+            }
+        )
+        specs = EICDeepSeekV4TokenToKVPoolHost._build_page_specs(host)
+        by_name = {str(spec["name"]): spec for spec in specs}
+        self.assertNotIn("kv", by_name)
+        for name in (
+            "deepseek_v4_c1",
+            "deepseek_v4_c1_indexer_scale",
+            "deepseek_v4_c2",
+            "deepseek_v4_c4_indexer_scale",
+            "deepseek_v4_c4_rope",
+            "deepseek_v4_c128_rope",
+            "deepseek_v4_c4",
+        ):
+            self.assertEqual(by_name[name]["source"], PoolName.KV, name)
+        self.assertEqual(by_name["deepseek_v4_c128_state"]["source"], PoolName.SWA)
+        self.assertEqual(sum(spec["numel"] for spec in specs), 176)
+
+        host.host_pool_group = SimpleNamespace(entry_map={PoolName.MAMBA: entry(1)})
+        with self.assertRaisesRegex(ValueError, "Unsupported DeepSeek V4 EIC pool"):
+            EICDeepSeekV4TokenToKVPoolHost._build_page_specs(host)
+
+    def test_dsv41_estimate_page_bytes_tolerates_missing_pools(self):
+        # DSv4.1 stages may have no SWA pool (unified KV), no C4/C128 pool,
+        # an indexer pool without index_k_with_scale_buffer, and pair state
+        # pools without kv_score_buffer. The estimate must not crash.
+        from sglang.srt.mem_cache.eic_memory_pool import (
+            EICDeepSeekV4TokenToKVPoolHost,
+        )
+
+        host = object.__new__(EICDeepSeekV4TokenToKVPoolHost)
+        device_pool = SimpleNamespace(
+            swa_kv_pool=None,
+            kv_pools={},
+            index_pools={},
+            compress_state_pools=[
+                SimpleNamespace(
+                    ratio=2,
+                    ring_size=0,
+                    kv_score_buffer=SimpleNamespace(
+                        kv_score=[torch.zeros(4, dtype=torch.uint8)]
+                    ),
+                )
+            ],
+            indexer_compress_state_pools=[],
+        )
+        self.assertEqual(
+            EICDeepSeekV4TokenToKVPoolHost._estimate_page_bytes(host, device_pool), 0
+        )
+
+        indexer_pool = SimpleNamespace(
+            page_size=64,
+            contiguous_page_row_buffers=lambda: [
+                torch.zeros(4, 50, dtype=torch.uint8),
+                torch.zeros(4, 50, dtype=torch.uint8),
+            ],
+        )
+        v4_pool = SimpleNamespace(
+            swa_kv_pool=SimpleNamespace(
+                kv_buffer=[torch.zeros(1), torch.zeros(1)], bytes_per_page_padded=100
+            ),
+            kv_pools={
+                4: SimpleNamespace(
+                    kv_buffer=[torch.zeros(1)],
+                    bytes_per_page_padded=200,
+                    page_size=64,
+                ),
+                128: SimpleNamespace(
+                    kv_buffer=[], bytes_per_page_padded=300, page_size=2
+                ),
+            },
+            index_pools={4: indexer_pool},
+            compress_state_pools=[
+                SimpleNamespace(
+                    ratio=4,
+                    ring_size=2,
+                    kv_score_buffer=SimpleNamespace(
+                        kv_score=[torch.zeros(50, dtype=torch.uint8)]
+                    ),
+                )
+            ],
+            indexer_compress_state_pools=[],
+        )
+        # 2*100 (SWA) + 200 (C4) + 2*50 (indexer rows) + 2*50 (C4 state).
+        self.assertEqual(
+            EICDeepSeekV4TokenToKVPoolHost._estimate_page_bytes(host, v4_pool), 600
+        )
+
+    def test_dsv41_estimate_page_bytes_covers_c1_c2_pools(self):
+        # DSv4.1 layouts pack C1/C2 KV and FP4 indexer pools that the v4
+        # named attributes miss, and skip state pools whose ratio has no
+        # layers. Live layout (bytes per page): swa 40*149760, c1 149760,
+        # c1_indexer 17408, c2 3*74880, c2_indexer 3*8704, plus a vestigial
+        # ratio-4 state pool that must not be counted.
+        from sglang.srt.mem_cache.eic_memory_pool import (
+            EICDeepSeekV4TokenToKVPoolHost,
+        )
+
+        def kv_pool(layers, page_bytes, pool_page_size):
+            return SimpleNamespace(
+                kv_buffer=[torch.zeros(1)] * layers,
+                bytes_per_page_padded=page_bytes,
+                page_size=pool_page_size,
+            )
+
+        def indexer_pool(rows):
+            # One device index page row is 4352 bytes (64 slots x 68 B);
+            # a FULL page packs 4 (C1) or 2 (C2) index pages per layer.
+            return SimpleNamespace(
+                page_size=64,
+                contiguous_page_row_buffers=lambda: [
+                    torch.zeros(4, row, dtype=torch.uint8) for row in rows
+                ],
+            )
+
+        host = object.__new__(EICDeepSeekV4TokenToKVPoolHost)
+        device_pool = SimpleNamespace(
+            swa_kv_pool=kv_pool(40, 149760, 256),
+            kv_pools={
+                1: kv_pool(1, 149760, 256),
+                2: kv_pool(3, 74880, 128),
+                4: kv_pool(0, 149760, 64),
+                128: kv_pool(0, 300, 2),
+            },
+            index_pools={
+                1: indexer_pool([4352]),
+                2: indexer_pool([4352] * 3),
+            },
+            compress_state_pools=[
+                SimpleNamespace(
+                    ratio=4,
+                    ring_size=16,
+                    kv_score_buffer=SimpleNamespace(
+                        kv_score=[torch.zeros(96, dtype=torch.uint8)]
+                    ),
+                )
+            ],
+            indexer_compress_state_pools=[],
+        )
+        expected = 40 * 149760 + 149760 + 17408 + 3 * 74880 + 3 * 8704
+        self.assertEqual(
+            EICDeepSeekV4TokenToKVPoolHost._estimate_page_bytes(host, device_pool),
+            expected,
+        )
+
+    def test_dsv41_swa_indices_without_swa_pool(self):
+        from sglang.srt.mem_cache.eic_memory_pool import (
+            EICDeepSeekV4TokenToKVPoolHost,
+        )
+
+        host = object.__new__(EICDeepSeekV4TokenToKVPoolHost)
+        host.device_pool = SimpleNamespace(swa_kv_pool=None)
+        out = EICDeepSeekV4TokenToKVPoolHost._swa_indices(host, torch.tensor([5, 6, 7]))
+        self.assertEqual(out.dtype, torch.int64)
+        self.assertEqual(out.tolist(), [0, 0, 0])
+
+    def test_dsv41_deploy_key_carries_layout_hash(self):
+        from sglang.srt.mem_cache.eic_memory_pool import (
+            EICDeepSeekV4TokenToKVPoolHost,
+        )
+
+        def key_for(specs):
+            host = object.__new__(EICDeepSeekV4TokenToKVPoolHost)
+            host.deploy_key = "model_1_0_512_torch.uint8@sglang"
+            host.page_specs = specs
+            EICDeepSeekV4TokenToKVPoolHost._apply_page_layout_to_deploy_key(host)
+            return host.deploy_key
+
+        specs = [
+            {"name": "deepseek_v4_c4", "numel": 100},
+            {"name": "deepseek_v4_c128", "numel": 28},
+        ]
+        key = key_for(specs)
+        self.assertTrue(key.startswith("model_1_0_512_torch.uint8@sglang_pl"))
+        # Same total bytes, different composition or order: different key.
+        self.assertNotEqual(key, key_for([{"name": "deepseek_v4_c4", "numel": 128}]))
+        self.assertNotEqual(key, key_for(list(reversed(specs))))
+        # Same layout: stable key.
+        self.assertEqual(key, key_for(specs))
 
 
 if __name__ == "__main__":

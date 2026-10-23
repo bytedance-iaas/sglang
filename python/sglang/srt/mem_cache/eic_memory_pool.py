@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -11,7 +12,6 @@ from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
 import torch
-import yaml
 
 from sglang.srt.mem_cache.eic_stats import stats
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
@@ -22,6 +22,13 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import synchronized
+from sglang.srt.mem_cache.storage.eic.eic_env_config import (
+    DEFAULT_FIXED_CONFIG,
+    EicDefaultFlagFile,
+    apply_eic_network_interfaces,
+    load_eic_config,
+    load_fixed_config,
+)
 from sglang.srt.runtime_context import get_parallel
 
 try:
@@ -82,9 +89,10 @@ CPUNicAffinity = {
 
 
 def get_eic_config_file_path():
-    if os.environ.get(REMOTE_EIC_YAML_ENV_VAR) is not None:
+    # An empty REMOTE_EIC_YAML counts as unset, matching eic_env_config.
+    config_file = os.environ.get(REMOTE_EIC_YAML_ENV_VAR)
+    if config_file:
         logger.info(f"eic init with env var {REMOTE_EIC_YAML_ENV_VAR}")
-        config_file = os.environ.get(REMOTE_EIC_YAML_ENV_VAR)
     else:
         config_file = "/sgl-workspace/config/remote-eic.yaml"
         logger.info(f"eic init with default config, config_file {config_file}")
@@ -229,32 +237,32 @@ class EICKVClient:
         global GPUNicAffinity, CPUNicAffinity, G_EnableGPUNicAffinity, G_KVSetTTLOption
         global G_GDRBounceBufferSize, G_GDRBounceTensorCount
 
-        config_file = get_eic_config_file_path()
-        if os.path.exists(config_file) is False:
-            logger.error(f"config file {config_file} not exists")
-            exit(1)
+        # Only constructed when EIC is enabled; an explicit env switch of
+        # non-'True' raises instead of silently starting without EIC.
+        resolved = load_eic_config(cli_enabled=True)
+        if not resolved.enabled:
+            raise RuntimeError(
+                "EICKVClient constructed but EIC is disabled by "
+                "EnableEicCache environment variable"
+            )
+        config = resolved.fixed
+        endpoint = resolved.endpoint
+        logger.info(f"eic endpoint: {endpoint} source: {resolved.source}")
 
-        with open(config_file, "r") as fin:
-            config = yaml.safe_load(fin)
-
-        remote_url = config.get("remote_url", None)
-        if remote_url is None:
-            raise RuntimeError("remote_url is None")
-
-        endpoint = remote_url[len("eic://") :]
-
-        logger.info(f"eic remote_url:" + remote_url + " endpoint: " + endpoint)
-
-        eic_instance_id = config.get("eic_instance_id", "")
+        eic_instance_id = resolved.instance_id
         logger.info(f"eic instance_id: {eic_instance_id}")
 
-        eic_thread_num = config.get("eic_thread_num", 1)
+        eic_thread_num = config.get(
+            "eic_thread_num", DEFAULT_FIXED_CONFIG["eic_thread_num"]
+        )
         logger.info(f"eic thread_num: {eic_thread_num}")
 
-        eic_log_dir = config.get("eic_log_dir", "/tmp/eic-client-log")
+        eic_log_dir = config.get("eic_log_dir", DEFAULT_FIXED_CONFIG["eic_log_dir"])
         logger.info(f"eic log_dir: {eic_log_dir}")
 
-        eic_log_level = config.get("eic_log_level", 2)
+        eic_log_level = config.get(
+            "eic_log_level", DEFAULT_FIXED_CONFIG["eic_log_level"]
+        )
         logger.info(f"eic log_level: {eic_log_level}")
 
         eic_trans_type = config.get("eic_trans_type", 3)
@@ -358,10 +366,17 @@ class EICKVClient:
         init_option.log_dir = eic_log_dir
         init_option.log_level = eic.LogLevel(eic_log_level)
         init_option.transport_type = eic.TransportType(eic_trans_type)
-        if eic_flag_file is not None:
+        self._default_flag_file = None
+        if eic_flag_file:
+            # External mounted flag_file is passed through unchanged; defaults
+            # are never appended to or mixed into it.
             init_option.flag_file = eic_flag_file
+        else:
+            # Missing-file path only: private safe-default flag file.
+            self._default_flag_file = EicDefaultFlagFile()
+            init_option.flag_file = self._default_flag_file.path
 
-        if G_EnableGPUNicAffinity:
+        if G_EnableGPUNicAffinity and resolved.network_interface_names is None:
             gpu_id = torch.cuda.current_device()
             init_option.multi_net_local_interface_names = GPUNicAffinity.get(
                 "cuda:" + str(gpu_id), "eth1"
@@ -370,9 +385,13 @@ class EICKVClient:
                 f"gpu {gpu_id} set gpu nic affinity to {init_option.multi_net_local_interface_names}"
             )
 
+        self._network_flag_file = apply_eic_network_interfaces(init_option, resolved)
         ret = self.connection.init(eic_instance_id, endpoint, init_option)
         if ret != 0:
             logger.error(f"fail to init eic client, ret: {ret}")
+            for _owner in (self._default_flag_file, self._network_flag_file):
+                if _owner is not None:
+                    _owner.close()
             exit(1)
 
         self.device = device
@@ -548,7 +567,7 @@ class EICKVClient:
             logger.debug(f"eic exists {key} failed, err_code {err_code}")
         return success
 
-    def exists_batch(self, keys: List[str]) -> List[bool]:
+    def exists_batch(self, keys: List[str]) -> Tuple[List[bool], bool]:
         logger.debug(f"eic exists {len(keys)}")
         keys_vec = eic.StringVector()
         for key in keys:
@@ -560,13 +579,20 @@ class EICKVClient:
         status_code, exist_outcome = self.connection.mexist(keys_vec, exist_option)
         if status_code == eic.StatusCode.SUCCESS:
             stats.record_rpc("mexist", time.perf_counter() - _t0, "SUCCESS", len(keys))
-            return [c == eic.StatusCode.SUCCESS for c in exist_outcome.status_codes]
+            return (
+                [c == eic.StatusCode.SUCCESS for c in exist_outcome.status_codes],
+                True,
+            )
+        # KEY_NOT_EXIST at the top level is a healthy cold miss, not a fault.
+        if status_code == eic.StatusCode.KEY_NOT_EXIST:
+            stats.record_rpc("mexist", time.perf_counter() - _t0, "SUCCESS", len(keys))
+            return [False] * len(keys), True
         if status_code != eic.StatusCode.PARTIAL_FAILED:
             logger.error(f"eic exists {len(keys)} failed, status_code {status_code}")
             stats.record_rpc(
                 "mexist", time.perf_counter() - _t0, "FAILED", len(keys), len(keys)
             )
-            return [False] * len(keys)
+            return [False] * len(keys), False
 
         codes = list(exist_outcome.status_codes)
         codes += [None] * (len(keys) - len(codes))
@@ -577,14 +603,31 @@ class EICKVClient:
             retry_keys.append(keys[i])
         retry_status, retry_outcome = self.connection.mexist(retry_keys, exist_option)
         retry_codes = list(retry_outcome.status_codes)
+        retry_codes += [None] * (len(failed) - len(retry_codes))
         still_failed = 0
+        # The retry response is only a data-plane fault when some key failed
+        # for a transport/server reason. A key (or the whole retry batch)
+        # returning KEY_NOT_EXIST is a normal cold miss and must not drive
+        # the probe backoff; top-level KEY_NOT_EXIST matches the healthy
+        # cold-miss branch above.
+        plane_error = retry_status not in (
+            eic.StatusCode.SUCCESS,
+            eic.StatusCode.PARTIAL_FAILED,
+            eic.StatusCode.KEY_NOT_EXIST,
+        )
         for j, i in enumerate(failed):
-            if retry_status == eic.StatusCode.SUCCESS or (
-                j < len(retry_codes) and retry_codes[j] == eic.StatusCode.SUCCESS
-            ):
+            rc = retry_codes[j] if j < len(retry_codes) else None
+            if rc == eic.StatusCode.SUCCESS:
                 codes[i] = eic.StatusCode.SUCCESS
             else:
                 still_failed += 1
+                # A concrete transport/server fault code marks the plane;
+                # KEY_NOT_EXIST (cold miss) and an absent code under a healthy
+                # status do not.
+                if retry_status != eic.StatusCode.KEY_NOT_EXIST and (
+                    rc is not None and rc != eic.StatusCode.KEY_NOT_EXIST
+                ):
+                    plane_error = True
         stats.record_rpc(
             "mexist",
             time.perf_counter() - _t0,
@@ -592,7 +635,7 @@ class EICKVClient:
             len(keys),
             still_failed,
         )
-        return [c == eic.StatusCode.SUCCESS for c in codes]
+        return [c == eic.StatusCode.SUCCESS for c in codes], not plane_error
 
     def allocate_eic_read_buffer(self, count):
         registered = True
@@ -1035,16 +1078,25 @@ class EICBaseTokenToKVPoolHost:
 
     def batch_exist_page(self, content_hashes):
         """
-        for multi prompt detect prefix key
+        for multi prompt detect prefix key.
+
+        Returns (exist_result, plane_ok): plane_ok is False only when one or
+        more RPC batches hit a transport/server-level fault; a cold-cache
+        KEY_NOT_EXIST round keeps plane_ok True.
         """
         batch_size = self.eic_client.eic_check_bs
         keys = self._encode_key_shared(content_hashes)
 
         exist_result = []
+        plane_ok = True
         for i in range(0, len(keys), batch_size):
-            batch_ret = self.eic_client.exists_batch(keys[i : i + batch_size])
+            batch_ret, batch_plane = self.eic_client.exists_batch(
+                keys[i : i + batch_size]
+            )
             exist_result.extend(batch_ret)
-        return exist_result
+            if not batch_plane:
+                plane_ok = False
+        return exist_result, plane_ok
 
     def get_flat_data_direct(self, keys, device_indices=None):
         bs = G_GDRBounceTensorCount // 2
@@ -1745,14 +1797,24 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
     """Native EIC shared-page adapter for DeepSeek V4 hybrid KV pools."""
 
     _KV_SOURCED_POOLS = {
+        PoolName.DEEPSEEK_V4_C1,
+        PoolName.DEEPSEEK_V4_C1_INDEXER,
+        PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE,
+        PoolName.DEEPSEEK_V4_C2,
+        PoolName.DEEPSEEK_V4_C2_INDEXER,
+        PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE,
         PoolName.DEEPSEEK_V4_C4,
         PoolName.DEEPSEEK_V4_C4_INDEXER,
+        PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
+        PoolName.DEEPSEEK_V4_C4_ROPE,
         PoolName.DEEPSEEK_V4_C128,
+        PoolName.DEEPSEEK_V4_C128_ROPE,
     }
     _SWA_SOURCED_POOLS = {
         PoolName.SWA,
         PoolName.DEEPSEEK_V4_C4_STATE,
         PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+        PoolName.DEEPSEEK_V4_C128_STATE,
     }
 
     def __init__(
@@ -1815,6 +1877,7 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
                 self._estimated_page_bytes,
                 self.page_bytes,
             )
+        self._apply_page_layout_to_deploy_key()
 
         self.eic_chunk_bytes = self._resolve_eic_chunk_bytes()
         self.page_chunk_count = (
@@ -1835,16 +1898,13 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
 
     def _resolve_eic_chunk_bytes(self) -> int:
         chunk_bytes = DEFAULT_DSV4_EIC_CHUNK_BYTES
-        config_file = get_eic_config_file_path()
-        if os.path.exists(config_file):
-            with open(config_file, "r") as fin:
-                config = yaml.safe_load(fin) or {}
-            chunk_bytes = int(
-                config.get(
-                    "dsv4_eic_chunk_bytes",
-                    config.get("eic_object_chunk_bytes", chunk_bytes),
-                )
+        config = load_fixed_config()
+        chunk_bytes = int(
+            config.get(
+                "dsv4_eic_chunk_bytes",
+                config.get("eic_object_chunk_bytes", chunk_bytes),
             )
+        )
         if chunk_bytes <= 0:
             chunk_bytes = self.page_bytes
         return max(1, min(chunk_bytes, self.page_bytes))
@@ -1857,34 +1917,54 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
         return "kernel"
 
     def _estimate_page_bytes(self, device_pool) -> int:
+        # Best-effort sizing hint only: the authoritative page size is the
+        # packed spec sum built in __init__. Mirror the assembler's pool
+        # set: the SWA pool plus every ratio pool in kv_pools/index_pools
+        # (DSv4.1 adds C1/C2 KV and FP4 indexer pools that the v4 named
+        # attributes c4_kv_pool/c4_indexer_kv_pool do not cover). Only C4
+        # state is packed, and only when this stage holds C4 layers.
         page_bytes = 0
-        if device_pool.swa_kv_pool.kv_buffer:
-            page_bytes += len(device_pool.swa_kv_pool.kv_buffer) * int(
-                device_pool.swa_kv_pool.bytes_per_page_padded
-            )
-        if device_pool.c4_kv_pool.kv_buffer:
-            page_bytes += len(device_pool.c4_kv_pool.kv_buffer) * int(
-                device_pool.c4_kv_pool.bytes_per_page_padded
-            )
-        c4_indexer_buffer = device_pool.c4_indexer_kv_pool.index_k_with_scale_buffer
-        if c4_indexer_buffer:
-            page_bytes += len(c4_indexer_buffer) * (
-                c4_indexer_buffer[0].shape[1] * c4_indexer_buffer[0].element_size()
-            )
-        if device_pool.c128_kv_pool.kv_buffer:
-            page_bytes += len(device_pool.c128_kv_pool.kv_buffer) * int(
-                device_pool.c128_kv_pool.bytes_per_page_padded
-            )
+        seen = set()
 
-        for pools in (
-            device_pool.compress_state_pools,
-            device_pool.indexer_compress_state_pools,
-        ):
-            for pool in pools:
-                if pool is None or pool.ratio == 128:
-                    continue
-                state_tensor = pool.kv_score_buffer.kv_score
-                page_bytes += int(pool.ring_size * state_tensor[0].nbytes)
+        kv_pools = [device_pool.swa_kv_pool, *device_pool.kv_pools.values()]
+        for pool in kv_pools:
+            if pool is None or id(pool) in seen:
+                continue
+            seen.add(id(pool))
+            if pool.kv_buffer:
+                page_bytes += len(pool.kv_buffer) * int(pool.bytes_per_page_padded)
+
+        for ratio, pool in device_pool.index_pools.items():
+            if pool is None or id(pool) in seen:
+                continue
+            seen.add(id(pool))
+            # The assembler reshapes index pages into FULL-page rows: one
+            # packed page holds (kv page slots / index page slots) index
+            # pages. Ratio 4 packs exactly one; C1/C2 pack several.
+            kv_pool = device_pool.kv_pools.get(ratio)
+            index_pages = 1
+            if kv_pool is not None and pool.page_size:
+                index_pages = max(1, kv_pool.page_size // pool.page_size)
+            row_bytes = sum(
+                buf.shape[1] * buf.element_size()
+                for buf in pool.contiguous_page_row_buffers()
+            )
+            page_bytes += index_pages * row_bytes
+
+        # Only C4 state is packed (the assembler builds state host pools
+        # from c4 layers only; low-ratio ring state is rebuilt, not
+        # cached), and only when this stage actually holds C4 layers.
+        c4_pool = device_pool.kv_pools.get(4)
+        if c4_pool is not None and c4_pool.kv_buffer:
+            for pools in (
+                device_pool.compress_state_pools,
+                device_pool.indexer_compress_state_pools,
+            ):
+                for pool in pools:
+                    if pool is None or pool.ratio != 4:
+                        continue
+                    state_tensor = pool.kv_score_buffer.kv_score
+                    page_bytes += int(pool.ring_size * state_tensor[0].nbytes)
         return page_bytes
 
     def get_size_per_token(self):
@@ -1915,7 +1995,25 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
             )
         return specs
 
+    def _apply_page_layout_to_deploy_key(self) -> None:
+        # The base deploy key carries model path, page size and dtype only.
+        # A v4 and a v4.1 deployment of one checkpoint would otherwise share
+        # EIC keys while packing different layouts. Key on the layout itself
+        # (pool names and per-pool sizes in pack order), not the total byte
+        # count: two layouts with the same total but different composition
+        # must miss and rewrite instead of misreading each other's pages.
+        layout = ";".join(f"{spec['name']}:{spec['numel']}" for spec in self.page_specs)
+        digest = hashlib.sha256(layout.encode()).hexdigest()[:16]
+        self.deploy_key = f"{self.deploy_key}_pl{digest}"
+
     def _swa_indices(self, full_indices: torch.Tensor) -> torch.Tensor:
+        if self.device_pool.swa_kv_pool is None:
+            # Unified-KV stages have no SWA pool and no SWA-sourced specs;
+            # the SWA index stream is unused, so return a zero stream in
+            # the shape callers expect instead of dereferencing None.
+            return torch.zeros(
+                full_indices.shape, dtype=torch.int64, device=full_indices.device
+            )
         return self.device_pool.translate_loc_from_full_to_swa(full_indices).to(
             torch.int64
         )
@@ -2002,22 +2100,26 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
 
     def batch_exist_page(self, content_hashes):
         if len(content_hashes) == 0:
-            return []
+            return [], True
 
         chunk_keys = self._encode_page_chunk_keys(content_hashes)
         batch_size = self.eic_client.eic_check_bs
         chunk_exists = []
+        plane_ok = True
         for i in range(0, len(chunk_keys), batch_size):
-            chunk_exists.extend(
-                self.eic_client.exists_batch(chunk_keys[i : i + batch_size])
+            ret, batch_plane = self.eic_client.exists_batch(
+                chunk_keys[i : i + batch_size]
             )
+            chunk_exists.extend(ret)
+            if not batch_plane:
+                plane_ok = False
 
         page_exists = []
         for page_id in range(len(content_hashes)):
             start = page_id * self.page_chunk_count
             end = start + self.page_chunk_count
             page_exists.append(all(chunk_exists[start:end]))
-        return page_exists
+        return page_exists, plane_ok
 
     def device_backup(
         self, device_indices: torch.Tensor, dst_tensors: List[torch.Tensor]

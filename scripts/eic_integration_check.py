@@ -65,6 +65,13 @@ class Probe:
     def read(self, keys):
         return self.client.batch_get(keys)
 
+    def exists(self, keys):
+        # exists_batch returns (per-key hits, plane_ok); a plane fault must not
+        # read as a miss, so the check fails on it explicitly.
+        hits, plane_ok = self.client.exists_batch(keys)
+        check("exists data plane healthy", plane_ok)
+        return hits
+
     def delete(self, keys):
         keys_vec = eic.StringVector()
         for k in keys:
@@ -94,9 +101,27 @@ def main():
     if args.pages < 2:
         p.error("--pages must be at least 2, or the mixed-batch check is vacuous")
 
-    cfg = get_eic_config_file_path()
-    if not check("config file present", os.path.exists(cfg), cfg):
-        return 1
+    # Same config source as the server: environment variables win over yaml.
+    # In env mode (EnableEicCache present) the yaml file is not required.
+    from sglang.srt.mem_cache.storage.eic.eic_env_config import (
+        ENV_ENABLE_EIC_CACHE,
+        load_eic_config,
+    )
+
+    if ENV_ENABLE_EIC_CACHE in os.environ:
+        try:
+            resolved = load_eic_config(cli_enabled=True)
+        except ValueError as exc:
+            check("env config valid", False, str(exc))
+            return 1
+        if not check(
+            "env config enables EIC", resolved.enabled, f"source={resolved.source}"
+        ):
+            return 1
+    else:
+        cfg = get_eic_config_file_path()
+        if not check("config file present", os.path.exists(cfg), cfg):
+            return 1
 
     global PROBE
     t0 = time.perf_counter()
@@ -111,7 +136,7 @@ def main():
     n = args.pages
     keys = [probe.key(i) for i in range(n)]
 
-    check("absent key reports miss", not any(probe.client.exists_batch(keys)))
+    check("absent key reports miss", not any(probe.exists(keys)))
 
     pages = [probe.page(i) for i in range(n)]
     t = time.perf_counter()
@@ -123,7 +148,7 @@ def main():
         f"{n} pages  {n * probe.page_bytes / dt / 2**30:.2f} GiB/s",
     )
 
-    check("exists after write", all(probe.client.exists_batch(keys)))
+    check("exists after write", all(probe.exists(keys)))
 
     t = time.perf_counter()
     vals, mask = probe.read(keys)
@@ -150,7 +175,7 @@ def main():
     if hasattr(probe.client, "missing_keys"):
         check(
             "a read miss suppresses the next exists",
-            not any(probe.client.exists_batch(ghosts)),
+            not any(probe.exists(ghosts)),
         )
 
     # Overwrite: the same key must come back with the new content.
@@ -165,7 +190,7 @@ def main():
     # a read marks the key missing locally, which would answer for the server.
     victim = keys[:4]
     probe.delete(victim)
-    gone = not any(probe.client.exists_batch(victim))
+    gone = not any(probe.exists(victim))
     _, mask = probe.read(victim)
     check("delete removes the value", gone and not any(mask))
 
@@ -187,7 +212,7 @@ def main():
         )
 
         survivors = keys[4:]
-        exists = probe.client.exists_batch(survivors)
+        exists = probe.exists(survivors)
         _, mask = probe.read(survivors)
         # Eviction is allowed to take anything; what is not allowed is exists
         # claiming a hit the read cannot deliver.

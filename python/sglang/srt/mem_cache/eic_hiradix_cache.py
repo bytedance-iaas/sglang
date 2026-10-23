@@ -1,7 +1,6 @@
 import hashlib
 import heapq
 import logging
-import os
 import pickle
 import threading
 import time
@@ -9,7 +8,6 @@ from functools import partial
 from typing import List, Optional
 
 import torch
-import yaml
 
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.managers.eic_cache_controller import (
@@ -32,7 +30,6 @@ from sglang.srt.mem_cache.eic_memory_pool import (
     EICMLATokenToKVPoolHost,
     EICNSATokenToKVPoolHost,
     MemoryStateInt,
-    get_eic_config_file_path,
 )
 from sglang.srt.mem_cache.eic_pp_reconcile import eic_pp_unsupported_reason
 from sglang.srt.mem_cache.eic_stats import stats
@@ -42,6 +39,8 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.mem_cache.storage.eic.eic_env_config import load_fixed_config
+from sglang.srt.runtime_context import get_memory
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -216,8 +215,8 @@ class EICHiRadixCache(RadixCache):
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = EICMHATokenToKVPoolHost(
                 self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
+                get_memory().hicache_ratio,
+                get_memory().hicache_size,
                 "cpu",
                 params.page_size,
                 self.rank,
@@ -228,8 +227,8 @@ class EICHiRadixCache(RadixCache):
         elif isinstance(self.kv_cache, NSATokenToKVPool):
             self.token_to_kv_pool_host = EICNSATokenToKVPoolHost(
                 self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
+                get_memory().hicache_ratio,
+                get_memory().hicache_size,
                 "cpu",
                 params.page_size,
                 self.rank,
@@ -240,8 +239,8 @@ class EICHiRadixCache(RadixCache):
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = EICMLATokenToKVPoolHost(
                 self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
+                get_memory().hicache_ratio,
+                get_memory().hicache_size,
                 "cpu",
                 params.page_size,
                 self.rank,
@@ -252,8 +251,8 @@ class EICHiRadixCache(RadixCache):
         elif isinstance(self.kv_cache, DeepSeekV4TokenToKVPool):
             self.token_to_kv_pool_host = EICDeepSeekV4TokenToKVPoolHost(
                 self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
+                get_memory().hicache_ratio,
+                get_memory().hicache_size,
                 "cpu",
                 params.page_size,
                 self.rank,
@@ -294,7 +293,7 @@ class EICHiRadixCache(RadixCache):
         self.load_back_reserve = (
             server_args.chunked_prefill_size
             if server_args.chunked_prefill_size and server_args.chunked_prefill_size > 0
-            else self.page_size
+            else params.page_size
         )
         if self.pp_size > 1:
             # The verdict protocol assumes lockstep candidate iteration and
@@ -313,11 +312,9 @@ class EICHiRadixCache(RadixCache):
         super().__init__(params)
 
         self.save_decode_cache = True
-        config_file = get_eic_config_file_path()
-        if os.path.exists(config_file):
-            with open(config_file, "r") as fin:
-                config = yaml.safe_load(fin)
-            self.init_hyper_params(config)
+        # Fixed parameters come from the unified module: yaml when present,
+        # built-in defaults when the yaml file is absent (env-var mode).
+        self.init_hyper_params(load_fixed_config())
 
     def get_extra_info(self, params: CacheInitParams, server_args: ServerArgs):
         # TODO update when sglang support pp
@@ -340,6 +337,98 @@ class EICHiRadixCache(RadixCache):
         logger.info(
             f"EICHiRadixCache load_back_threshold set to {self.load_back_threshold}"
         )
+        self._probe_backoff_seconds = float(
+            config.get("eic_probe_backoff_seconds", 30.0)
+        )
+        self._probe_backoff_max_seconds = float(
+            config.get("eic_probe_backoff_max_seconds", 300.0)
+        )
+        self._write_backoff_failures = int(
+            config.get("eic_probe_backoff_write_failures", 3)
+        )
+        self._probe_fail_level = 0
+        self._probe_backoff_until = 0.0
+        self._write_fail_streak = 0
+        self._write_backoff_level = 0
+        self._write_backoff_until = 0.0
+        self._write_probe_outstanding = False
+
+    def _backoff_cooldown(self, level: int) -> float:
+        base = getattr(self, "_probe_backoff_seconds", 30.0)
+        cap = getattr(self, "_probe_backoff_max_seconds", 300.0)
+        return min(base * (2**level), cap)
+
+    def _probe_in_backoff(self) -> bool:
+        return time.monotonic() < getattr(self, "_probe_backoff_until", 0.0)
+
+    def _note_probe_result(self, lens, plane_ok: bool = True) -> None:
+        # A wholesale-miss round has two causes that must not be conflated:
+        #  (1) the data plane is failing (RPC timeout / network / server
+        #      error), in which case every probe round costs an RPC timeout
+        #      on the scheduler thread and a long cooldown is warranted;
+        #  (2) the cache is cold (RPC answers SUCCESS but each key returns
+        #      KEY_NOT_EXIST), which is the normal state at cold start and
+        #      must keep probing each loop instead of entering cooldown.
+        # plane_ok carries the RPC-level answer: True when the probe round
+        # got a response, False when the transport/server reported a fault.
+        # Cooldown doubles per consecutive fault up to a cap; any hit or
+        # any healthy round clears the state immediately.
+        if any(n > 0 for n in lens):
+            self._probe_fail_level = 0
+            self._probe_backoff_until = 0.0
+            return
+        if not lens:
+            return
+        if plane_ok:
+            # Healthy cold cache: the RPCs answered, keys are simply absent.
+            # Clear any stale fault and continue probing on the next loop.
+            self._probe_fail_level = 0
+            self._probe_backoff_until = 0.0
+            return
+        level = getattr(self, "_probe_fail_level", 0)
+        seconds = self._backoff_cooldown(level)
+        self._probe_backoff_until = time.monotonic() + seconds
+        self._probe_fail_level = level + 1
+        logger.warning(
+            "EIC remote probe failing wholesale; skipping remote match "
+            f"for {seconds:.1f}s"
+        )
+
+    def _write_in_backoff(self) -> bool:
+        return time.monotonic() < getattr(self, "_write_backoff_until", 0.0)
+
+    def _write_suppressed(self) -> bool:
+        # During write backoff no remote write is issued; the node keeps
+        # its device copy and simply is not backed up remotely. The
+        # first write after the cooldown expires is let through alone
+        # as the recovery probe; its ack decides the next state.
+        if self._write_in_backoff():
+            return True
+        if getattr(self, "_write_probe_outstanding", False):
+            return True
+        if getattr(self, "_write_backoff_level", 0) > 0:
+            self._write_probe_outstanding = True
+        return False
+
+    def _note_write_result(self, success: bool) -> None:
+        if success:
+            self._write_fail_streak = 0
+            self._write_backoff_level = 0
+            self._write_backoff_until = 0.0
+            self._write_probe_outstanding = False
+            return
+        self._write_probe_outstanding = False
+        self._write_fail_streak = getattr(self, "_write_fail_streak", 0) + 1
+        threshold = getattr(self, "_write_backoff_failures", 3)
+        if self._write_fail_streak >= threshold and not self._write_in_backoff():
+            level = getattr(self, "_write_backoff_level", 0)
+            seconds = self._backoff_cooldown(level)
+            self._write_backoff_until = time.monotonic() + seconds
+            self._write_backoff_level = level + 1
+            logger.warning(
+                "EIC write_through failing wholesale; suppressing remote "
+                f"writes for {seconds:.1f}s"
+            )
 
     def reset(self):
         TreeNode.counter = 0
@@ -356,6 +445,12 @@ class EICHiRadixCache(RadixCache):
         self._load_reports = {}
         self._await_load = {}
         self._verdict_outbox = []
+        self._probe_fail_level = 0
+        self._probe_backoff_until = 0.0
+        self._write_fail_streak = 0
+        self._write_backoff_level = 0
+        self._write_backoff_until = 0.0
+        self._write_probe_outstanding = False
         # Comm-layer state deliberately survives reset: seq counters must stay
         # monotonic (a pre-reset store batch may still be in flight), epochs
         # must never reuse, tombstones expire by round. Flush is idle-gated, so
@@ -376,6 +471,8 @@ class EICHiRadixCache(RadixCache):
         if not write_back and (
             node.parent != self.root_node and not node.parent.backuped
         ):
+            return 0
+        if self._write_suppressed():
             return 0
         host_indices = self.cache_controller.write(
             device_indices=node.value,
@@ -587,6 +684,8 @@ class EICHiRadixCache(RadixCache):
             ack_id, success = self.cache_controller.ack_write_queue.get_nowait()
             ack_list.append(ack_id)
             flags.append(success)
+        for success in flags:
+            self._note_write_result(success)
         for ack_id, success in zip(ack_list, flags):
             if not success:
                 node = self.ongoing_write_through[ack_id]
@@ -1739,7 +1838,12 @@ class EICPagedHiRadixCache(EICHiRadixCache):
 
         fetches = []  # (slot, last_node, compute_key, prev_hash)
         eic_keys = 0
-        for slot in range(local_n):
+        # Probing runs on the scheduler thread every batch-forming loop,
+        # and a miss is retried next loop (only hits are marked). When
+        # the data plane is down every probe is an RPC timeout, so a
+        # wholesale-failure backoff keeps the loop from stalling on it.
+        probe_slots = 0 if self._probe_in_backoff() else local_n
+        for slot in range(probe_slots):
             req = waiting_queue[slot]
             if req.rid in self.match_req_set:
                 continue
@@ -1758,6 +1862,11 @@ class EICPagedHiRadixCache(EICHiRadixCache):
             prev_hash = last_node.content_hash[-1] if last_node.content_hash else None
             fetches.append((slot, last_node, req_key[prefix_len:], prev_hash))
             eic_keys += (len(req_key) - prefix_len) // self.page_size
+            if getattr(self, "_probe_fail_level", 0) > 0:
+                # Recovery probe: after a wholesale failure, feel for
+                # the data plane with a single request instead of
+                # stalling the whole waiting queue on a full round.
+                break
             if 0 < self.eic_check_max_num <= eic_keys:
                 break
 
@@ -1766,9 +1875,10 @@ class EICPagedHiRadixCache(EICHiRadixCache):
         # the radix tree -- is identical on every stage.
         len_tensor = torch.zeros(num_ready, dtype=torch.int64, device="cpu")
         if fetches:
-            lens = self.cache_controller.batch_find_longest_prefix_in_eic(
+            lens, plane_ok = self.cache_controller.batch_find_longest_prefix_in_eic(
                 [f[2] for f in fetches], [f[3] for f in fetches]
             )
+            self._note_probe_result(lens, plane_ok)
             if len(lens) == len(fetches):
                 for (slot, *_), n in zip(fetches, lens):
                     len_tensor[slot] = n
@@ -1853,6 +1963,8 @@ class EICPagedHiRadixCache(EICHiRadixCache):
             node.parent != self.root_node and not node.parent.backuped
         ):
             return 0
+        if self._write_suppressed():
+            return 0
         if _need_calculate_hash(node, self.page_size):
             self._calculate_content_hash(node)
         host_indices = self.cache_controller.write_page(
@@ -1910,7 +2022,7 @@ class EICPagedHiRadixCache(EICHiRadixCache):
             check_keys = host_content_hash[
                 : self.load_back_threshold // self.page_size + 1
             ]
-            mask = self.cache_controller.mem_pool_host.batch_exist_page(check_keys)
+            mask, _ = self.cache_controller.mem_pool_host.batch_exist_page(check_keys)
             check_ret = all(mask)
             if self.tp_size > 1:
                 # gloo (cpu_group) has no ReduceOp.SUM for bool; use int32.
