@@ -11,6 +11,7 @@ import platform
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 
@@ -34,11 +35,11 @@ def load_lock(path):
     )
     rdma = lock.get("rdma", {})
     require(
-        rdma.get("api_version") == 3
+        rdma.get("api_version") == 6
         and rdma.get("nvshmem_version") == "3.4.5"
         and rdma.get("nvshmem_repository") == "https://github.com/NVIDIA/nvshmem.git"
         and re.fullmatch(r"[0-9a-f]{40}", rdma.get("nvshmem_revision", "")),
-        "RDMA requires API v3 and pinned NVSHMEM 3.4.5 sources",
+        "RDMA requires API v6 and pinned NVSHMEM 3.4.5 sources",
     )
     return lock
 
@@ -116,6 +117,37 @@ def check_abi(lock, info, torch_version, cuda_version, cxx11_abi):
         "iaas-kernels wheel build/runtime ABI mismatch",
     )
     require(info["checkout"] == lock["revision"], "iaas-kernels checkout mismatch")
+
+
+def check_packaged_lto(package, rdma_info, lock):
+    root = package / "lto"
+    data = (root / "manifest.json").read_bytes()
+    require(
+        hashlib.sha256(data).hexdigest() == rdma_info.get("fp8_lto_manifest_sha256"),
+        "Packaged LTO manifest differs from RDMA build metadata",
+    )
+    manifest = json.loads(data)
+    check_lto(root, manifest, lock)
+    return manifest
+
+
+def check_wheel_lto(archive, rdma_info, lock):
+    # Validate the actual wheel payload, including the executable bit preserved
+    # by pip. Native API v6 discovers these tools in the installed package.
+    with tempfile.TemporaryDirectory() as temp:
+        package = Path(temp)
+        (package / "lto").mkdir()
+        for name in (
+            "manifest.json",
+            "link_object",
+            "libnvshmem_device_lto.a",
+            "License.nvshmem.txt",
+        ):
+            entry = archive.getinfo(f"iaas_kernels/lto/{name}")
+            path = package / "lto" / name
+            path.write_bytes(archive.read(entry))
+            path.chmod((entry.external_attr >> 16) & 0o777)
+        return check_packaged_lto(package, rdma_info, lock)
 
 
 def check_environment(lock):
@@ -221,11 +253,15 @@ def check_image(manifest_path):
     require(
         (package / "include/iaas_kernels/rdma").is_dir(), "Missing RDMA JIT headers"
     )
-    lto_root = Path(manifest_path).parent / "lto"
+    lto_root = package / "lto"
     require(
-        (lto_root.parent / "rdma-fp4.env").is_file(), "Missing FP4 RDMA startup profile"
+        Path(manifest_path).with_name("rdma-fp4.env").is_file(),
+        "Missing RDMA startup profile",
     )
-    check_lto(lto_root, manifest["lto"], lock)
+    require(
+        check_packaged_lto(package, rdma_info, lock) == manifest["lto"],
+        "Installed LTO manifest differs from wheel",
+    )
     # Exercises the installed executable and its dynamic dependencies on CPU.
     subprocess.run(
         [str(lto_root / "link_object"), "--version"],

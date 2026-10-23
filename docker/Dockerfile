@@ -376,8 +376,7 @@ ARG TARGETARCH
 ARG CUDA_VERSION
 
 COPY docker/iaas-kernels.lock.json /build/iaas-kernels.lock.json
-COPY scripts/ci/build_iaas_kernels_wheel.py scripts/ci/check_iaas_kernels_image.py \
-     scripts/ci/build_iaas_kernels_lto.py scripts/ci/iaas_kernels_lto_link.cpp /build/
+COPY scripts/ci/build_iaas_kernels_wheel.py scripts/ci/check_iaas_kernels_image.py /build/
 # Build both host extensions and the device LTO runtime tools here. Shape-specific
 # SM90 kernels are JIT compiled at runtime; the CPU-only LTO probe needs no GPU.
 # The private repository token is a BuildKit secret, never a build argument.
@@ -563,7 +562,6 @@ RUN mkdir -p /opt/sglang/share/iaas-kernels && \
         rm -rf /var/lib/apt/lists/* && \
         python3 -m pip install --force-reinstall --no-deps /tmp/wheels/iaas-kernels/*.whl && \
         cp /tmp/wheels/iaas-kernels/*.json /opt/sglang/share/iaas-kernels/ && \
-        cp -a /tmp/wheels/iaas-kernels/lto /opt/sglang/share/iaas-kernels/ && \
         cp /tmp/iaas-kernels-rdma-fp4.env /opt/sglang/share/iaas-kernels/rdma-fp4.env; \
     fi && rm -rf /tmp/wheels/iaas-kernels /tmp/iaas-kernels-rdma-fp4.env
 
