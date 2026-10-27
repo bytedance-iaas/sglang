@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
     staging_grid_tokens,
 )
+from sglang.srt.disaggregation.pp_prefill_control import PPBootstrapRoomReuseError
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -379,12 +380,19 @@ class PrefillBootstrapQueue:
         )
         kv_sender_class = get_kv_class(backend, KVClassType.SENDER)
 
-        req.disagg_kv_sender = kv_sender_class(
-            mgr=self.kv_manager,
-            bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
-            bootstrap_room=req.bootstrap_room,
-            req_has_disagg_prefill_dp_rank=req.disagg_prefill_dp_rank is not None,
-        )
+        try:
+            req.disagg_kv_sender = kv_sender_class(
+                mgr=self.kv_manager,
+                bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
+                bootstrap_room=req.bootstrap_room,
+                req_has_disagg_prefill_dp_rank=req.disagg_prefill_dp_rank is not None,
+            )
+        except PPBootstrapRoomReuseError as exc:
+            # No sender/KV/metadata has been acquired for this attempt. Never
+            # clear the old room while rejecting a duplicate request at intake.
+            prepare_abort(req, str(exc), status_code=HTTPStatus.BAD_REQUEST)
+            self.scheduler.retire_unadmitted_request(req)
+            return False
         self._process_req(req)
         req.pending_bootstrap = True
         return True
@@ -433,6 +441,8 @@ class PrefillBootstrapQueue:
         if not self.create_sender(req, num_kv_heads):
             return
         self.queue.append(req)
+        if getattr(self.scheduler, "pp_prefill_control", None) is not None:
+            self.scheduler.pp_prefill_control.register(req)
 
     def extend(self, reqs: List[Req], num_kv_heads: int) -> None:
         for req in reqs:
@@ -464,7 +474,16 @@ class PrefillBootstrapQueue:
         if len(self.queue) == 0:
             return []
 
-        if self.pp_size > 1:
+        if getattr(self.scheduler, "pp_prefill_control", None) is not None:
+            from sglang.srt.disaggregation.pp_prefill_control import (
+                reserve_bootstrap_metadata,
+            )
+
+            reserve_bootstrap_metadata(self)
+            polls = SchedulerDisaggregationPrefillMixin.poll_prefill_bootstrap(
+                self.scheduler, self.queue, "bootstrap"
+            )
+        elif self.pp_size > 1:
             polls = poll_and_all_reduce_prefill_pp(
                 [req.disagg_kv_sender for req in self.queue],
                 self.scheduler.attn_cp_cpu_group,
@@ -582,6 +601,19 @@ class SchedulerDisaggregationPrefillMixin:
     Mixin for Scheduler to handle disaggregation prefill
     """
 
+    def poll_prefill_bootstrap(self, reqs, phase):
+        if getattr(self, "pp_prefill_control", None) is not None:
+            from sglang.srt.disaggregation.pp_prefill_control import (
+                poll_prefill_controlled,
+            )
+
+            return poll_prefill_controlled(self, reqs, phase)
+        return poll_and_all_reduce_attn_cp_tp_group(
+            [req.disagg_kv_sender for req in reqs],
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
+        )
+
     def maybe_prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
         """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""
         kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
@@ -594,6 +626,9 @@ class SchedulerDisaggregationPrefillMixin:
                 prefetch(room)
 
     def checkpoint_disagg_prefill(self: Scheduler, req: Req) -> None:
+        control = getattr(self, "pp_prefill_control", None)
+        if control is not None and control.is_fenced(req):
+            return
         cache = self.tree_cache
         if req.pending_bootstrap and _uses_write_through_cache(cache):
             cache.advance_unpublished_req(req)
@@ -603,6 +638,10 @@ class SchedulerDisaggregationPrefillMixin:
         checkpoint_kv_cache(req, cache)
 
     def release_aborted_prefill_waiting_req(self: Scheduler, req: Req) -> None:
+        control = getattr(self, "pp_prefill_control", None)
+        if control is not None:
+            control.propose(req, "Aborted waiting prefill")
+            return
         self.clear_pending_chunk_send(req)
         sender = getattr(req, "disagg_kv_sender", None)
         if sender is not None and hasattr(sender, "abort"):
@@ -624,10 +663,8 @@ class SchedulerDisaggregationPrefillMixin:
         candidates = [req for req in self.waiting_queue if not is_aborted(req)]
         if not candidates:
             return
-        polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender for req in candidates],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
+        polls = SchedulerDisaggregationPrefillMixin.poll_prefill_bootstrap(
+            self, candidates, "waiting-bootstrap"
         )
         failed = set()
         for req, poll in zip(candidates, polls):
@@ -960,6 +997,12 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
+            control = getattr(self, "pp_prefill_control", None)
+            if control is not None and control.is_fenced(req):
+                if req.inflight_middle_chunks > 0:
+                    req.inflight_middle_chunks -= 1
+                advance_logprob_pt(i, req)
+                continue
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
 
@@ -986,7 +1029,9 @@ class SchedulerDisaggregationPrefillMixin:
                             status=status
                         )
                     )
-                if sampling_mask_finish_reason is not None:
+                if sampling_mask_finish_reason is not None and control is not None:
+                    control.propose(req, sampling_mask_finish_reason.message)
+                elif sampling_mask_finish_reason is not None:
                     req.to_finish = sampling_mask_finish_reason
                     req.time_stats.trace_ctx.abort(
                         abort_info={"reason": sampling_mask_finish_reason.message}
@@ -1003,11 +1048,14 @@ class SchedulerDisaggregationPrefillMixin:
                         req.grammar.accept_token(next_token_id)
                     except ValueError as e:
                         error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                        prepare_abort(
-                            req,
-                            error_message,
-                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                        )
+                        if control is not None:
+                            control.propose(req, error_message)
+                        else:
+                            prepare_abort(
+                                req,
+                                error_message,
+                                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                            )
                     req.grammar.finished = req.finished()
                     if is_aborted(req):
                         if self._retire_aborted_prefill_result(req):
@@ -1145,16 +1193,31 @@ class SchedulerDisaggregationPrefillMixin:
         success_rids = set(transfer_status[0]) if transfer_status is not None else set()
         failed_rids = set(transfer_status[1]) if transfer_status is not None else set()
 
-        polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
+        polls = SchedulerDisaggregationPrefillMixin.poll_prefill_bootstrap(
+            self, self.disagg_prefill_inflight_queue, "inflight-bootstrap"
         )
 
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
-            if transfer_status is not None:
+            control = getattr(self, "pp_prefill_control", None)
+            if control is not None:
+                if req.rid in failed_rids:
+                    control.propose(req, "PP transfer release failed")
+                    undone_reqs.append(req)
+                    continue
+                if req.pending_bootstrap:
+                    if self.handle_pending_bootstrap(req, poll):
+                        self.send_kv_chunk(req, last_chunk=True)
+                    undone_reqs.append(req)
+                    continue
+                if req.rid not in success_rids:
+                    undone_reqs.append(req)
+                    continue
+                # Do not veto a frozen Success on one stage after a late abort.
+                poll = KVPoll.Success
+                control.forget_success(req)
+            elif transfer_status is not None:
                 consensus_failed = req.rid in failed_rids
                 failure_pending = isinstance(req.finished_reason, FINISH_ABORT)
                 if consensus_failed or failure_pending:
@@ -1272,6 +1335,10 @@ class SchedulerDisaggregationPrefillMixin:
         self: Scheduler, req: Req
     ) -> Optional[Exception]:
         """Conclude an inflight request whose KV transfer failed."""
+        control = getattr(self, "pp_prefill_control", None)
+        if control is not None:
+            control.propose(req, "Prefill transfer failed")
+            return None
         error_message = (
             f"Prefill transfer failed for request rank={get_parallel().tp_rank} "
             f"{req.rid=} {req.bootstrap_room=}"
@@ -1332,6 +1399,10 @@ class SchedulerDisaggregationPrefillMixin:
 
     def _retire_aborted_prefill_result(self: Scheduler, req: Req) -> bool:
         """Release an aborted request when its last prefill result is safe."""
+        control = getattr(self, "pp_prefill_control", None)
+        if control is not None:
+            control.propose(req, "Aborted prefill result")
+            return False
         self.clear_pending_chunk_send(req)
         owns_resources = (
             req.kv.holds_kv or req.kv.holds_mamba or req.metadata_buffer_index >= 0
@@ -1358,7 +1429,13 @@ class SchedulerDisaggregationPrefillMixin:
             release_kv_cache(req, self.tree_cache, checkpoint=False)
         return True
 
-    def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
+    def handle_bootstrap_failure(
+        self: Scheduler, req: Req, *, pp_retire_commit: bool = False
+    ) -> None:
+        control = getattr(self, "pp_prefill_control", None)
+        if control is not None and not pp_retire_commit:
+            control.propose(req, "Prefill bootstrap failed")
+            return
         self.clear_pending_chunk_send(req)
         error_message = (
             f"Prefill bootstrap failed for request rank={get_parallel().tp_rank} "
@@ -1411,10 +1488,8 @@ class SchedulerDisaggregationPrefillMixin:
         Returns True if bootstrap is finished."""
         if not req.pending_bootstrap:
             return True
-        polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
+        polls = SchedulerDisaggregationPrefillMixin.poll_prefill_bootstrap(
+            self, [req], "chunk-bootstrap"
         )
         return self.handle_pending_bootstrap(req, polls[0])
 
@@ -1509,6 +1584,9 @@ class SchedulerDisaggregationPrefillMixin:
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
     ) -> None:
+        control = getattr(self, "pp_prefill_control", None)
+        if control is not None and control.is_fenced(req):
+            return
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
         if last_chunk and computer is not None:
             if is_health_check_req(req):

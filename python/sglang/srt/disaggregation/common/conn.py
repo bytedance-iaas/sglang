@@ -703,6 +703,11 @@ class CommonKVManager(BaseKVManager):
         failure_reason: Optional[str] = None,
     ) -> None:
         """Push bootstrap readiness or transfer status to decode endpoints."""
+        gate = getattr(self, "_pp_abort_notifications", None)
+        if gate is not None and status == KVPoll.Failed:
+            targets, failure_reason = gate.failure(
+                bootstrap_room, targets, failure_reason
+            )
         if not targets:
             return
         parts = self._encode_kv_status_message(
@@ -1988,6 +1993,9 @@ class CommonKVSender(BaseKVSender):
         return KVPoll.Failed
 
     def clear(self) -> None:
+        gate = getattr(self.kv_mgr, "_pp_abort_notifications", None)
+        if gate is not None and self.conclude_state == KVPoll.Success:
+            gate.forget_success(self.bootstrap_room)
         notification = None
         if self.kv_mgr.deferred_bootstrap is not None:
             if not self._owns_bootstrap_room:

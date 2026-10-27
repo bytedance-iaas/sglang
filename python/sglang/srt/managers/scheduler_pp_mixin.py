@@ -10,6 +10,11 @@ import torch
 import torch.distributed
 
 from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.pp_prefill_control import (
+    apply_pp_boundary,
+    batch_signature,
+    init_pp_prefill_control,
+)
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
@@ -277,6 +282,8 @@ class SchedulerPPMixin:
         """
         self.init_pp_loop_state()
 
+        pp_control = init_pp_prefill_control(self)
+
         # PD additional state initialization
         tmbs = [None] * self.pp_loop_size
         transferred_rids: PPTransferStatus = ([], [])
@@ -304,6 +311,8 @@ class SchedulerPPMixin:
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
 
+                if pp_control is not None:
+                    apply_pp_boundary(self)
                 transferred_rids = self._pp_pd_get_prefill_transferred_ids()
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
@@ -321,6 +330,9 @@ class SchedulerPPMixin:
 
                 cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 self.cur_batch_for_debug = cur_batch
+                if pp_control is not None:
+                    pp_control.log.check("batch", batch_signature(cur_batch))
+                    pp_control.bind_batch(cur_batch)
                 if cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
@@ -369,13 +381,17 @@ class SchedulerPPMixin:
                         self.mbs[next_mb_id],
                         next_batch_result,
                     )
+                    if pp_control is not None:
+                        pp_control.complete_batch(self.mbs[next_mb_id])
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
+                frame = pp_control.log.finish() if pp_control is not None else None
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
+                        [*recv_reqs, frame] if frame is not None else recv_reqs,
+                        async_send=True,
                     )
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
