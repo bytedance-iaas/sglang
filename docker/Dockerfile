@@ -268,6 +268,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
            sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' pyproject.toml; \
        fi \
     && retry python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ".[${BUILD_TYPE}]" \
+    # Keep the frozen dependency set compatible with boto3/botocore, which is
+    # installed later by the runai-model-streamer S3 extra. This backports the
+    # dependency invariant from upstream #45857 without changing the pinned
+    # e64c1ee4 Python source manifest.
+    && retry python3 -m pip install "python-dateutil<3" --force-reinstall \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
            pip list --format=freeze | awk -F'==' '/-cu13(==|$)/ {print $1}' \
                | xargs -r python3 -m pip uninstall -y && \
