@@ -1,0 +1,44 @@
+name: Build GLM-5.3 clean image
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_formats:
+        description: "CSV image formats to publish (oci, zstd, nydus)"
+        required: false
+        default: "oci"
+
+concurrency:
+  group: glm53-poc-e64c1ee4-clean-image
+  cancel-in-progress: false
+
+jobs:
+  build-glm53-clean-image:
+    if: github.repository == 'bytedance-iaas/sglang'
+    uses: ./.github/workflows/_docker-build-and-publish.yml
+    with:
+      docker_target: framework_final
+      checkout_ref: e64c1ee4d531cc3df348ba4ac5d5ee786e841adf
+      cuda_key: cu130
+      cuda_version: 13.0.1
+      cuda_suffix: cu130
+      publish_default_cuda_alias: false
+      image_formats: ${{ inputs.image_formats || 'oci' }}
+      image_tag_override: ${{ format('glm53-poc-e64c1ee4-clean-{0}-{1}', github.run_id, github.run_attempt) }}
+      use_environment: prod
+      extra_build_args: >-
+        --build-arg BRANCH_TYPE=local
+        --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
+        --build-arg INSTALL_LOCAL_SGL_KERNEL_WHEEL=0
+        --build-arg HOPPER_SBO=0
+        --build-arg W4A8_PER_TENSOR_TRANSFER=0
+        --build-arg HTTP_PROXY=http://100.68.162.211:3128
+        --build-arg HTTPS_PROXY=http://100.68.162.211:3128
+        --build-arg ALL_PROXY=http://100.68.162.211:3128
+        --build-arg NO_PROXY=localhost,127.0.0.1,::1,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com
+        --build-arg BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_APT_URL || 'http://mirrors.ivolces.com/extra-tools/ubuntu' }}
+        --build-arg BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL || 'https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system' }}
+    secrets: inherit
