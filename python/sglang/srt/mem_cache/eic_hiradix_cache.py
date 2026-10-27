@@ -1,7 +1,6 @@
 import hashlib
 import heapq
 import logging
-import os
 import pickle
 import threading
 import time
@@ -9,7 +8,6 @@ from functools import partial
 from typing import List, Optional
 
 import torch
-import yaml
 
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.managers.eic_cache_controller import (
@@ -32,7 +30,6 @@ from sglang.srt.mem_cache.eic_memory_pool import (
     EICMLATokenToKVPoolHost,
     EICNSATokenToKVPoolHost,
     MemoryStateInt,
-    get_eic_config_file_path,
 )
 from sglang.srt.mem_cache.eic_pp_reconcile import eic_pp_unsupported_reason
 from sglang.srt.mem_cache.eic_stats import stats
@@ -42,6 +39,8 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.mem_cache.storage.eic.eic_env_config import load_fixed_config
+from sglang.srt.runtime_context import get_memory
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -213,11 +212,17 @@ class EICHiRadixCache(RadixCache):
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
         self.sliding_window_size = params.sliding_window_size
         self.load_cache_event = threading.Event()
+        # Read hicache sizing from the published config bag, not the raw
+        # ServerArgs field: the ratio default is a resolution decision that is
+        # projected only at publish, so the raw field is still None here.
+        mem = get_memory()
+        hicache_ratio = mem.hicache_ratio
+        hicache_size = mem.hicache_size
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = EICMHATokenToKVPoolHost(
                 self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
+                hicache_ratio,
+                hicache_size,
                 "cpu",
                 params.page_size,
                 self.rank,
@@ -228,8 +233,8 @@ class EICHiRadixCache(RadixCache):
         elif isinstance(self.kv_cache, NSATokenToKVPool):
             self.token_to_kv_pool_host = EICNSATokenToKVPoolHost(
                 self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
+                hicache_ratio,
+                hicache_size,
                 "cpu",
                 params.page_size,
                 self.rank,
@@ -240,8 +245,8 @@ class EICHiRadixCache(RadixCache):
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = EICMLATokenToKVPoolHost(
                 self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
+                hicache_ratio,
+                hicache_size,
                 "cpu",
                 params.page_size,
                 self.rank,
@@ -252,8 +257,8 @@ class EICHiRadixCache(RadixCache):
         elif isinstance(self.kv_cache, DeepSeekV4TokenToKVPool):
             self.token_to_kv_pool_host = EICDeepSeekV4TokenToKVPoolHost(
                 self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
+                hicache_ratio,
+                hicache_size,
                 "cpu",
                 params.page_size,
                 self.rank,
@@ -290,12 +295,11 @@ class EICHiRadixCache(RadixCache):
         )
         self.load_back_threshold = 10
         # Headroom a load-back must leave for the next chunked-prefill extend;
-        # both inputs are frozen for this object's lifetime.
-        self.load_back_reserve = (
-            server_args.chunked_prefill_size
-            if server_args.chunked_prefill_size and server_args.chunked_prefill_size > 0
-            else self.page_size
-        )
+        # both inputs are frozen for this object's lifetime. Read the resolved
+        # size from params: the raw ServerArgs field is None by default and is
+        # not DP-adjusted.
+        chunk = params.chunked_prefill_size
+        self.load_back_reserve = chunk if chunk and chunk > 0 else params.page_size
         if self.pp_size > 1:
             # The verdict protocol assumes lockstep candidate iteration and
             # lockstep releases. These knobs break that: cache-aware policies
@@ -313,11 +317,9 @@ class EICHiRadixCache(RadixCache):
         super().__init__(params)
 
         self.save_decode_cache = True
-        config_file = get_eic_config_file_path()
-        if os.path.exists(config_file):
-            with open(config_file, "r") as fin:
-                config = yaml.safe_load(fin)
-            self.init_hyper_params(config)
+        # Fixed parameters come from the unified module: yaml when present,
+        # built-in defaults when the yaml file is absent (env-var mode).
+        self.init_hyper_params(load_fixed_config())
 
     def get_extra_info(self, params: CacheInitParams, server_args: ServerArgs):
         # TODO update when sglang support pp

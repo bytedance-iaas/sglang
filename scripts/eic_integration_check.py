@@ -94,9 +94,27 @@ def main():
     if args.pages < 2:
         p.error("--pages must be at least 2, or the mixed-batch check is vacuous")
 
-    cfg = get_eic_config_file_path()
-    if not check("config file present", os.path.exists(cfg), cfg):
-        return 1
+    # Same config source as the server: environment variables win over yaml.
+    # In env mode (EnableEicCache present) the yaml file is not required.
+    from sglang.srt.mem_cache.storage.eic.eic_env_config import (
+        ENV_ENABLE_EIC_CACHE,
+        load_eic_config,
+    )
+
+    if ENV_ENABLE_EIC_CACHE in os.environ:
+        try:
+            resolved = load_eic_config(cli_enabled=True)
+        except ValueError as exc:
+            check("env config valid", False, str(exc))
+            return 1
+        if not check(
+            "env config enables EIC", resolved.enabled, f"source={resolved.source}"
+        ):
+            return 1
+    else:
+        cfg = get_eic_config_file_path()
+        if not check("config file present", os.path.exists(cfg), cfg):
+            return 1
 
     global PROBE
     t0 = time.perf_counter()

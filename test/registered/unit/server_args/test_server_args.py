@@ -1660,6 +1660,49 @@ class TestHiCacheArgs(unittest.TestCase):
             with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(backend):
                 handle_hicache(args)
 
+    def test_enable_eic_cache_alone_starts_full_eic_path(self):
+        # servingkit standard: --enable-eic-cache is the only EIC flag.
+        args = self._make_args(enable_eic_cache=True)
+        handle_hicache(args)
+
+        self.assertTrue(resolution_result(args, "enable_hierarchical_cache"))
+        self.assertEqual(resolution_result(args, "hicache_ratio"), 2.0)
+        self.assertEqual(args.hicache_write_policy, "write_through")
+        self._assert_hicache_fields(
+            args, expected_io_backend="kernel", expected_mem_layout="page_first"
+        )
+
+    def test_legacy_three_flag_eic_start_still_resolves(self):
+        # Old launch line: all three flags explicit.
+        args = self._make_args(
+            enable_eic_cache=True,
+            enable_hierarchical_cache=True,
+            hicache_write_policy="write_through",
+        )
+        handle_hicache(args)
+
+        self.assertTrue(resolution_result(args, "enable_hierarchical_cache"))
+        self.assertEqual(args.hicache_write_policy, "write_through")
+
+    def test_near_true_env_switch_warns_and_stays_disabled(self):
+        # Real-machine negative case: EnableEicCache=true started without
+        # EIC and logged no warning, because disabled values skip
+        # load_eic_config. The hook itself must warn.
+        from sglang.srt.arg_groups.hicache_hook import handle_eic_env
+
+        for raw in ("true", "1", "on"):
+            with self.subTest(raw=raw):
+                args = self._make_args()
+                with (
+                    patch.dict(os.environ, {"EnableEicCache": raw}),
+                    self.assertLogs(
+                        "sglang.srt.arg_groups.hicache_hook", level="WARNING"
+                    ) as logs,
+                ):
+                    handle_eic_env(args)
+                self.assertFalse(resolution_result(args, "enable_eic_cache"))
+                self.assertIn("treated as disabled", "\n".join(logs.output))
+
     def test_hicache_io_backend_and_mem_layout_compatibility(self):
         cases = [
             {
