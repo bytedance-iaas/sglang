@@ -30,7 +30,7 @@ jobs:
         run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
 
       - name: Check out pinned GLM-5.3 source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
@@ -76,7 +76,7 @@ jobs:
           echo "REGISTRY_HOST=$VOLCENGINE_CR_REGISTRY" >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         with:
           driver-opts: network=host
           buildkitd-config-inline: |
