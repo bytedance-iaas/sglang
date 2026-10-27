@@ -119,7 +119,6 @@ class EncoderBootstrapServer:
         health_check_timeout: Optional[float] = None,
         evicted_ttl: Optional[float] = None,
     ):
-
         self.host = host
         self.port = port
         self._urls: List[str] = urls if urls is not None else []
@@ -328,7 +327,6 @@ class EncoderBootstrapServer:
     # Lifecycle                                                          #
     # ------------------------------------------------------------------ #
     def _run_server(self):
-
         config = uvicorn.Config(
             self.app,
             host=self.host,
@@ -1071,7 +1069,8 @@ class WaitingMMRequestBase(ABC):
             recv_embedding,
             **self.recv_embedding_data.get_mm_extra_meta(),
         )
-        self._bind_pool_slot_to_mm_inputs(mm_inputs)
+        if not getattr(self.mm_processor, "detach_epd_embeddings_from_pool", False):
+            self._bind_pool_slot_to_mm_inputs(mm_inputs)
         self.recv_req.mm_inputs = mm_inputs
         self.recv_req.input_ids = array("q", mm_inputs.input_ids)
         self.status = WaitingMMRequestStatus.SUCCESS
