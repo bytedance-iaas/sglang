@@ -203,6 +203,7 @@ class SchedulePolicy:
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
         self._shortest_prefill_calls = 0
         self._last_waiting_prefix_refresh = float("-inf")
+        self.pp_decision_log = None
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -289,12 +290,33 @@ class SchedulePolicy:
             or not self.tree_cache.supports_prefix_sharing()
         ):
             return
-        now = time.monotonic()
-        if now - self._last_waiting_prefix_refresh < WAITING_PREFIX_REFRESH_INTERVAL_S:
-            return
-        self._last_waiting_prefix_refresh = now
-        for r in reversed(waiting_queue[:WAITING_QUEUE_PREFIX_MATCH_MAX]):
-            touch_waiting_prefix(r, self.tree_cache)
+
+        def decide_refresh():
+            now = time.monotonic()
+            if (
+                now - self._last_waiting_prefix_refresh
+                < WAITING_PREFIX_REFRESH_INTERVAL_S
+            ):
+                return False
+            self._last_waiting_prefix_refresh = now
+            return True
+
+        if self.pp_decision_log is None:
+            refresh = decide_refresh()
+        else:
+            # Only PP0's clock chooses the logical touch operation. Validate the
+            # same ordered request incarnations before mutating the LRU/tree.
+            refresh = self.pp_decision_log.decide(
+                "waiting-prefix-refresh",
+                (
+                    (r.rid, r.bootstrap_room, len(r.origin_input_ids))
+                    for r in waiting_queue[:WAITING_QUEUE_PREFIX_MATCH_MAX]
+                ),
+                decide_refresh,
+            )
+        if refresh:
+            for r in reversed(waiting_queue[:WAITING_QUEUE_PREFIX_MATCH_MAX]):
+                touch_waiting_prefix(r, self.tree_cache)
 
     def _determine_active_policy(self, waiting_queue: List[Req]) -> Policy:
         if (
