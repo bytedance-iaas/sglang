@@ -88,7 +88,13 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     ):
         return _create_unified_radix_cache(ctx, server_args, params)
 
-    if server_args.enable_eic_cache:
+    # Read the EIC switch from the published resolved bag, not the raw
+    # ServerArgs field: under env-only startup the field default (False) is
+    # not overwritten -- the resolution decision lives only in the bag after
+    # publish -- so reading the field here silently falls back to UnifiedRadix.
+    eic_enabled = get_memory().enable_eic_cache
+
+    if eic_enabled:
         from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 
         # Every EIC cache aliases FULL spans onto reused SWA slots.
@@ -96,7 +102,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             params.token_to_kv_pool_allocator.dedup_aliased_swa = True
 
     if ctx.effective_chunked_prefill_size is not None and ctx.disable_radix_cache:
-        if server_args.enable_eic_cache:
+        if eic_enabled:
             from sglang.srt.mem_cache.eic_chunk_cache import (
                 EICChunkCache,
                 EICSWAChunkCache,
@@ -117,7 +123,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
 
         return SWAChunkCache(params)
 
-    if server_args.enable_eic_cache:
+    if eic_enabled:
         # EIC owns its own hierarchical integration, so it is dispatched ahead of
         # the hybrid/DSA arms below: falling through to UnifiedRadixCache would
         # leave --enable-eic-cache silently ignored and then trip the scheduler's

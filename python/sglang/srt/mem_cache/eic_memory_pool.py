@@ -11,7 +11,6 @@ from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
 import torch
-import yaml
 
 from sglang.srt.mem_cache.eic_stats import stats
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
@@ -22,6 +21,13 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import synchronized
+from sglang.srt.mem_cache.storage.eic.eic_env_config import (
+    DEFAULT_FIXED_CONFIG,
+    EicDefaultFlagFile,
+    apply_eic_network_interfaces,
+    load_eic_config,
+    load_fixed_config,
+)
 from sglang.srt.runtime_context import get_parallel
 
 try:
@@ -82,9 +88,10 @@ CPUNicAffinity = {
 
 
 def get_eic_config_file_path():
-    if os.environ.get(REMOTE_EIC_YAML_ENV_VAR) is not None:
+    # An empty REMOTE_EIC_YAML counts as unset, matching eic_env_config.
+    config_file = os.environ.get(REMOTE_EIC_YAML_ENV_VAR)
+    if config_file:
         logger.info(f"eic init with env var {REMOTE_EIC_YAML_ENV_VAR}")
-        config_file = os.environ.get(REMOTE_EIC_YAML_ENV_VAR)
     else:
         config_file = "/sgl-workspace/config/remote-eic.yaml"
         logger.info(f"eic init with default config, config_file {config_file}")
@@ -229,32 +236,32 @@ class EICKVClient:
         global GPUNicAffinity, CPUNicAffinity, G_EnableGPUNicAffinity, G_KVSetTTLOption
         global G_GDRBounceBufferSize, G_GDRBounceTensorCount
 
-        config_file = get_eic_config_file_path()
-        if os.path.exists(config_file) is False:
-            logger.error(f"config file {config_file} not exists")
-            exit(1)
+        # Only constructed when EIC is enabled; an explicit env switch of
+        # non-'True' raises instead of silently starting without EIC.
+        resolved = load_eic_config(cli_enabled=True)
+        if not resolved.enabled:
+            raise RuntimeError(
+                "EICKVClient constructed but EIC is disabled by "
+                "EnableEicCache environment variable"
+            )
+        config = resolved.fixed
+        endpoint = resolved.endpoint
+        logger.info(f"eic endpoint: {endpoint} source: {resolved.source}")
 
-        with open(config_file, "r") as fin:
-            config = yaml.safe_load(fin)
-
-        remote_url = config.get("remote_url", None)
-        if remote_url is None:
-            raise RuntimeError("remote_url is None")
-
-        endpoint = remote_url[len("eic://") :]
-
-        logger.info(f"eic remote_url:" + remote_url + " endpoint: " + endpoint)
-
-        eic_instance_id = config.get("eic_instance_id", "")
+        eic_instance_id = resolved.instance_id
         logger.info(f"eic instance_id: {eic_instance_id}")
 
-        eic_thread_num = config.get("eic_thread_num", 1)
+        eic_thread_num = config.get(
+            "eic_thread_num", DEFAULT_FIXED_CONFIG["eic_thread_num"]
+        )
         logger.info(f"eic thread_num: {eic_thread_num}")
 
-        eic_log_dir = config.get("eic_log_dir", "/tmp/eic-client-log")
+        eic_log_dir = config.get("eic_log_dir", DEFAULT_FIXED_CONFIG["eic_log_dir"])
         logger.info(f"eic log_dir: {eic_log_dir}")
 
-        eic_log_level = config.get("eic_log_level", 2)
+        eic_log_level = config.get(
+            "eic_log_level", DEFAULT_FIXED_CONFIG["eic_log_level"]
+        )
         logger.info(f"eic log_level: {eic_log_level}")
 
         eic_trans_type = config.get("eic_trans_type", 3)
@@ -358,10 +365,17 @@ class EICKVClient:
         init_option.log_dir = eic_log_dir
         init_option.log_level = eic.LogLevel(eic_log_level)
         init_option.transport_type = eic.TransportType(eic_trans_type)
-        if eic_flag_file is not None:
+        self._default_flag_file = None
+        if eic_flag_file:
+            # External mounted flag_file is passed through unchanged; defaults
+            # are never appended to or mixed into it.
             init_option.flag_file = eic_flag_file
+        else:
+            # Missing-file path only: private safe-default flag file.
+            self._default_flag_file = EicDefaultFlagFile()
+            init_option.flag_file = self._default_flag_file.path
 
-        if G_EnableGPUNicAffinity:
+        if G_EnableGPUNicAffinity and resolved.network_interface_names is None:
             gpu_id = torch.cuda.current_device()
             init_option.multi_net_local_interface_names = GPUNicAffinity.get(
                 "cuda:" + str(gpu_id), "eth1"
@@ -370,10 +384,35 @@ class EICKVClient:
                 f"gpu {gpu_id} set gpu nic affinity to {init_option.multi_net_local_interface_names}"
             )
 
+        try:
+            self._network_flag_file = apply_eic_network_interfaces(
+                init_option, resolved
+            )
+        except BaseException:
+            # A rejected NIC list raises before init; the scheduler is then torn
+            # down by signal, so atexit never runs. Remove the private dir now.
+            if self._default_flag_file is not None:
+                self._default_flag_file.close()
+            raise
         ret = self.connection.init(eic_instance_id, endpoint, init_option)
         if ret != 0:
             logger.error(f"fail to init eic client, ret: {ret}")
+            for _owner in (self._default_flag_file, self._network_flag_file):
+                if _owner is not None:
+                    _owner.close()
             exit(1)
+
+        # gflags reads the flag file only while Client.init parses InitOption.
+        # The scheduler is normally stopped by signal, so atexit cleanup never
+        # runs; remove the private default file and the private network wrapper
+        # now and keep shutdown residue free. Live probes confirmed
+        # write/exists/read stay byte-identical after both private dirs are
+        # removed; the external flag file (if any) is never touched here.
+        for _owner in (self._default_flag_file, self._network_flag_file):
+            if _owner is not None:
+                _owner.close()
+        self._default_flag_file = None
+        self._network_flag_file = None
 
         self.device = device
         self.trans_type = eic.TransportType(eic_trans_type)
@@ -1835,16 +1874,13 @@ class EICDeepSeekV4TokenToKVPoolHost(EICBaseTokenToKVPoolHost):
 
     def _resolve_eic_chunk_bytes(self) -> int:
         chunk_bytes = DEFAULT_DSV4_EIC_CHUNK_BYTES
-        config_file = get_eic_config_file_path()
-        if os.path.exists(config_file):
-            with open(config_file, "r") as fin:
-                config = yaml.safe_load(fin) or {}
-            chunk_bytes = int(
-                config.get(
-                    "dsv4_eic_chunk_bytes",
-                    config.get("eic_object_chunk_bytes", chunk_bytes),
-                )
+        config = load_fixed_config()
+        chunk_bytes = int(
+            config.get(
+                "dsv4_eic_chunk_bytes",
+                config.get("eic_object_chunk_bytes", chunk_bytes),
             )
+        )
         if chunk_bytes <= 0:
             chunk_bytes = self.page_bytes
         return max(1, min(chunk_bytes, self.page_bytes))
