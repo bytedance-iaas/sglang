@@ -277,6 +277,8 @@ COPY proto                 /tmp/sglang_deps/proto
 # Install sglang dependencies (torch, transformers, etc.). CUDA 12 DeepEP
 # wheels live only on the SGLang index, so preinstall the local-version wheel;
 # it satisfies the public-version pyproject pin during the full dependency solve.
+# Resolve RunAI cloud extras before freezing: botocore requires dateutil <3,
+# while pandas alone can select 3.x and freeze an incompatible version.
 # Generate constraints.txt to prevent reinstalling these deps in later stages.
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/root/.cargo/registry \
@@ -305,7 +307,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
            sed -i 's/flashinfer_python\[cu13\]/flashinfer_python[cu12]/' pyproject.toml && \
            sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' pyproject.toml; \
        fi \
-    && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ".[${BUILD_TYPE}]" \
+    && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
+        ".[${BUILD_TYPE},runai]" "python-dateutil>=2.9,<3" \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
            pip list --format=freeze | awk -F'==' '/-cu13(==|$)/ {print $1}' \
                | xargs -r python3 -m pip uninstall -y && \
@@ -673,6 +676,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && rm -rf /tmp/mscclpp
 
 # Install essential Python packages (use constraints to prevent conflicts)
+# RunAI cloud extras were resolved and frozen together with SGLang in torch_deps.
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install -c /sgl-workspace/constraints.txt \
     datamodel_code_generator \
@@ -690,8 +694,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pandas \
     matplotlib \
     tabulate \
-    termplotlib \
-    "runai-model-streamer[s3,gcs,azure]>=0.15.7"
+    termplotlib
 
 # Install the EIC SDK required by the EIC HiCache backend. framework_final
 # inherits it directly, and runtime copies framework_final's site-packages.
