@@ -19,6 +19,7 @@ jobs:
     env:
       SOURCE_COMMIT: e64c1ee4d531cc3df348ba4ac5d5ee786e841adf
       SOURCE_TREE: 983ad845b0e3e21307566f7d032ea5ad09d6966f
+      BUILD_DEFINITION_COMMIT: ${{ github.sha }}
       IMAGE_TAG: glm53-poc-e64c1ee4-clean-${{ github.run_id }}-${{ github.run_attempt }}
       VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
       VOLCENGINE_CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
@@ -29,10 +30,10 @@ jobs:
       - name: Clean build workspace
         run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
 
-      - name: Check out pinned GLM-5.3 source
-        uses: actions/checkout@v4
+      - name: Check out GLM-5.3 build definition
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ env.SOURCE_COMMIT }}
+          ref: ${{ env.BUILD_DEFINITION_COMMIT }}
           fetch-depth: 0
 
       - name: Verify source identity and K1 payload
@@ -40,8 +41,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
-          test "$(git rev-parse HEAD^{tree})" = "$SOURCE_TREE"
+          test "$(git rev-parse HEAD)" = "$BUILD_DEFINITION_COMMIT"
+          test "$(git rev-parse "$SOURCE_COMMIT^{tree}")" = "$SOURCE_TREE"
+          # Keep the proven Dockerfile fixes while pinning all runtime content.
+          git diff --exit-code "$SOURCE_COMMIT" HEAD -- . \
+            ':!docker/Dockerfile' \
+            ':!.github/workflows/bytedance-release-docker-dev.yml'
           test -f python/sglang/kernels/jit/csrc/deepseek_v4/topk_v2.cuh
           test -f python/sglang/kernels/jit/include/sgl_kernel/deepseek_v4/topk_impl.cuh
           python_manifest_sha256="$(python3 - <<'PY'
@@ -73,7 +78,7 @@ jobs:
           echo "REGISTRY_HOST=$VOLCENGINE_CR_REGISTRY" >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         with:
           driver-opts: network=host
           buildkitd-config-inline: |
@@ -159,6 +164,7 @@ jobs:
             echo
             echo "- Source: \`$SOURCE_COMMIT\`"
             echo "- Tree: \`$SOURCE_TREE\`"
+            echo "- Build definition: \`$BUILD_DEFINITION_COMMIT\`"
             echo "- Image: \`$IMAGE_REPO:$IMAGE_TAG\`"
             echo "- Immutable ref: \`${{ steps.build.outputs.image_ref }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
