@@ -1,4 +1,4 @@
-name: Build GLM-5.3 clean image
+name: Build GLM-5.3 Mooncake registration fix image
 
 permissions:
   contents: read
@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: glm53-poc-e64c1ee4-clean-image
+  group: glm53-mooncake0311-0da6e347-image
   cancel-in-progress: false
 
 jobs:
@@ -17,10 +17,10 @@ jobs:
     runs-on: x64-docker-build-node
     timeout-minutes: 240
     env:
-      SOURCE_COMMIT: e64c1ee4d531cc3df348ba4ac5d5ee786e841adf
-      SOURCE_TREE: 983ad845b0e3e21307566f7d032ea5ad09d6966f
+      SOURCE_COMMIT: 0da6e34765e86694bc2a48457d6bcd0a5875be8b
+      SOURCE_TREE: ce1c5d691b44db3d084ce89cb34167c60da00ec0
       BUILD_DEFINITION_COMMIT: ${{ github.sha }}
-      IMAGE_TAG: glm53-poc-e64c1ee4-clean-${{ github.run_id }}-${{ github.run_attempt }}
+      IMAGE_TAG: glm53-mooncake0311-0da6e347-${{ github.run_id }}-${{ github.run_attempt }}
       VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
       VOLCENGINE_CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
       VOLCENGINE_CR_REPOSITORY: ${{ vars.VOLCENGINE_CR_REPOSITORY || 'sglang' }}
@@ -104,6 +104,7 @@ jobs:
             --file docker/Dockerfile \
             --build-arg CUDA_VERSION=13.0.1 \
             --build-arg BUILD_TYPE=all \
+            --build-arg MOONCAKE_VERSION=0.3.11.post1 \
             --build-arg UBUNTU_MIRROR=http://mirrors.ivolces.com/ubuntu \
             --build-arg BRANCH_TYPE=local \
             --build-arg GRACE_BLACKWELL=0 \
@@ -143,6 +144,7 @@ jobs:
             -e "EXPECTED_BUILD_COMMIT=$SOURCE_COMMIT" \
             -e "EXPECTED_BUILD_TREE=$SOURCE_TREE" \
             -e "EXPECTED_PYTHON_MANIFEST_SHA256=${{ steps.identity.outputs.python_manifest_sha256 }}" \
+            -e EXPECTED_MOONCAKE_VERSION=0.3.11.post1 \
             --entrypoint bash "$image_ref" -lc '
               set -euo pipefail
               test "$SGLANG_BUILD_COMMIT" = "$EXPECTED_BUILD_COMMIT"
@@ -152,6 +154,11 @@ jobs:
               test -f python/sglang/kernels/jit/include/sgl_kernel/deepseek_v4/topk_impl.cuh
               command -v oniond
               python3 scripts/ci/verify_private_image_runtime.py
+              sha256sum python/sglang/srt/disaggregation/mooncake/conn.py \
+                python/sglang/srt/disaggregation/mooncake/registration.py \
+                python/sglang/srt/distributed/device_communicators/mooncake_transfer_engine.py \
+                /sgl-workspace/mooncake-constraints.txt
+              python3 -m pytest -q test/registered/unit/disaggregation/test_mooncake_buffer_registration.py
               python3 -m py_compile python/sglang/kernels/ops/attention/dsv4/topk.py
               python3 -m pytest -q test/registered/unit/test_runtime_context.py -k TestMoeFlagsGroup
             '
