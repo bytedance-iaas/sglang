@@ -329,6 +329,10 @@ class MooncakeKVManager(CommonKVManager):
         return result
 
     def deregister_buffer_to_engine(self):
+        if getattr(self, "_buffer_deregistration_failed", False):
+            raise RuntimeError(
+                "Mooncake deregistration previously failed; restart required"
+            )
         batches = getattr(self, "_registered_buffer_batches", [])
         remaining = []
         errors = []
@@ -348,6 +352,10 @@ class MooncakeKVManager(CommonKVManager):
             with self.connection_lock:
                 self.connection_pool.clear()
         if errors:
+            # The SDK may have unregistered part of a failed batch. Never
+            # repeat that batch against an unknown partial registration state.
+            self._buffer_deregistration_failed = True
+            self._buffer_registration_failed = True
             raise RuntimeError(
                 "Mooncake buffer deregistration failed: " + "; ".join(errors)
             )

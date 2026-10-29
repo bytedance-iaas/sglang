@@ -135,7 +135,7 @@ class TestMooncakeBufferRegistration(unittest.TestCase):
             manager.register_buffer_to_engine()
         self.assertEqual(manager.engine.batch_register.call_count, 3)
 
-    def test_deregistration_failure_does_not_repeat_successful_batches(self):
+    def test_deregistration_failure_requires_restart_without_repeating_batches(self):
         manager = self.manager()
         manager.register_buffer_to_engine()
         manager.engine.batch_deregister.side_effect = [-7, 0, 0]
@@ -144,10 +144,13 @@ class TestMooncakeBufferRegistration(unittest.TestCase):
         ):
             manager.deregister_buffer_to_engine()
         manager.engine.batch_deregister.side_effect = None
-        manager.deregister_buffer_to_engine()
+        with self.assertRaisesRegex(RuntimeError, "deregistration previously failed"):
+            manager.deregister_buffer_to_engine()
+        with self.assertRaisesRegex(RuntimeError, "registration previously failed"):
+            manager.register_buffer_to_engine()
         self.assertEqual(
             manager.engine.batch_deregister.call_args_list,
-            [call([300]), call([2000]), call([1000]), call([300])],
+            [call([300]), call([2000]), call([1000])],
         )
 
     def test_staging_error_has_registration_context(self):
