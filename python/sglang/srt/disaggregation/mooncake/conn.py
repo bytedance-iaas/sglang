@@ -39,6 +39,7 @@ from sglang.srt.disaggregation.common.utils import (
     pack_int_lists,
     unpack_int_lists,
 )
+from sglang.srt.disaggregation.mooncake.registration import normalize_buffer_regions
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
 )
@@ -277,38 +278,79 @@ class MooncakeKVManager(CommonKVManager):
         self.engine = get_mooncake_transfer_engine()
 
     def register_buffer_to_engine(self):
-        # Batch register KV data buffers
-        if self.kv_args.kv_data_ptrs and self.kv_args.kv_data_lens:
-            self.engine.batch_register(
-                self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
+        if getattr(self, "_buffer_registration_failed", False):
+            raise RuntimeError(
+                "Mooncake registration previously failed; restart required"
             )
+        if getattr(self, "_registered_buffer_batches", []):
+            raise RuntimeError("Mooncake buffers already registered; deregister first")
+        state_ptrs = self.kv_args.state_data_ptrs or []
+        state_lens = self.kv_args.state_data_lens or []
+        if len(state_ptrs) != len(state_lens):
+            raise ValueError("Mooncake state component counts differ")
+        batches = normalize_buffer_regions(
+            [
+                ("kv", self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens),
+                ("aux", self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens),
+            ]
+            + [
+                (f"state[{index}]", ptrs, lengths)
+                for index, (ptrs, lengths) in enumerate(zip(state_ptrs, state_lens))
+            ]
+        )
+        self._registered_buffer_batches = []
+        for index, (category, ptrs, lengths) in enumerate(batches, 1):
+            try:
+                self._register_buffer_batch(
+                    ptrs, lengths, category, index, len(batches)
+                )
+            except Exception:
+                # A failed SDK batch can be partially registered. Only release
+                # earlier batches whose ownership is confirmed; never retry this
+                # manager against the engine's now-unknown partial state.
+                self._buffer_registration_failed = True
+                try:
+                    self.deregister_buffer_to_engine()
+                except Exception:
+                    logger.exception("Mooncake registration rollback failed")
+                raise
+            self._registered_buffer_batches.append((category, ptrs))
 
-        # Batch register auxiliary data buffers
-        if self.kv_args.aux_data_ptrs and self.kv_args.aux_data_lens:
-            self.engine.batch_register(
-                self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
-            )
-
-        for ptrs, lens in zip(
-            self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
-        ):
-            if ptrs and lens:
-                self.engine.batch_register(ptrs, lens)
+    def _register_buffer_batch(self, ptrs, lengths, category, index, total):
+        try:
+            result = self.engine.batch_register(ptrs, lengths)
+            if result != 0:
+                raise RuntimeError(f"ret={result}")
+        except Exception as exc:
+            raise RuntimeError(
+                f"Mooncake buffer registration failed: category={category} "
+                f"batch={index}/{total}: {exc}"
+            ) from exc
+        return result
 
     def deregister_buffer_to_engine(self):
-        if self.kv_args.kv_data_ptrs:
-            self.engine.batch_deregister(self.kv_args.kv_data_ptrs)
-
-        if self.kv_args.aux_data_ptrs:
-            self.engine.batch_deregister(self.kv_args.aux_data_ptrs)
-
-        for ptrs in self.kv_args.state_data_ptrs or []:
-            if ptrs:
-                self.engine.batch_deregister(ptrs)
+        batches = getattr(self, "_registered_buffer_batches", [])
+        remaining = []
+        errors = []
+        for index, (category, ptrs) in reversed(list(enumerate(batches, 1))):
+            try:
+                result = self.engine.batch_deregister(ptrs)
+                if result != 0:
+                    raise RuntimeError(f"ret={result}")
+            except Exception as exc:
+                remaining.append((category, ptrs))
+                errors.append(
+                    f"category={category} batch={index}/{len(batches)}: {exc}"
+                )
+        self._registered_buffer_batches = list(reversed(remaining))
 
         if hasattr(self, "connection_pool"):
             with self.connection_lock:
                 self.connection_pool.clear()
+        if errors:
+            raise RuntimeError(
+                "Mooncake buffer deregistration failed: " + "; ".join(errors)
+            )
 
     # ------------------------------------------------------------------
     # Staging buffer methods (all delegate to staging_handler.py)
@@ -331,7 +373,9 @@ class MooncakeKVManager(CommonKVManager):
         )
 
         self._staging_ctx.buffers = init_staging_buffers(
-            lambda ptr, size: self.engine.batch_register([ptr], [size]),
+            lambda ptr, size: self._register_buffer_batch(
+                [ptr], [size], "staging", 1, 1
+            ),
             self.kv_args,
             count,
             get_schedule().chunked_prefill_size,
@@ -344,7 +388,9 @@ class MooncakeKVManager(CommonKVManager):
         )
 
         self._staging_ctx.allocator = init_staging_allocator(
-            lambda ptr, size: self.engine.batch_register([ptr], [size]),
+            lambda ptr, size: self._register_buffer_batch(
+                [ptr], [size], "staging", 1, 1
+            ),
             self.kv_args,
         )
         self.kv_buffer_tensors = None
@@ -1003,9 +1049,7 @@ class MooncakeKVManager(CommonKVManager):
             )
             layer_ptr_pairs = [
                 (src_k_ptrs[i], dst_k_ptrs[i]) for i in range(layers_current_pp_stage)
-            ] + [
-                (src_v_ptrs[i], dst_v_ptrs[i]) for i in range(layers_current_pp_stage)
-            ]
+            ] + [(src_v_ptrs[i], dst_v_ptrs[i]) for i in range(layers_current_pp_stage)]
 
         # Calculate precise byte offset and length for the sub-slice within the token
         src_head_slice_offset = src_head_start_offset * bytes_per_head_slice_to_send

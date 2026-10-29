@@ -23,7 +23,8 @@ ARG FLASHINFER_VERSION=0.6.15.post1
 ARG TRTLLM_GEN_MOE_CUBIN_URL="https://github.com/sgl-project/whl/releases/download/trtllm_gen_moe_cubin_20260617/trtllm_gen_moe_cubin_pool_20260617_v0613rc1.zip"
 ARG TRTLLM_GEN_MOE_CUBIN_SHA256="4900501cbe782a76b08a5858f9f07152287b97cb68114466dac286366b66c192"
 ARG TRTLLM_GEN_MOE_CUBIN_ARCHIVE_ROOT="trtllm_gen_moe_cubin_pool_20260617_v0613rc1"
-ARG MOONCAKE_VERSION=0.3.12.post1
+# GLM-5.3 compact-indexer RDMA baseline; do not float this dependency.
+ARG MOONCAKE_VERSION=0.3.11.post1
 ARG MSCCLPP_VERSION=sglang-v0.9.1
 #if need other arg please add in MOONCAKE_COMPILE_ARG
 ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
@@ -673,8 +674,11 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
 # =============================================================================
 
 # Install Mooncake
+ENV PIP_CONSTRAINT=/sgl-workspace/mooncake-constraints.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; } \
+    && printf 'mooncake-transfer-engine-cuda13==%s\nmooncake-transfer-engine==%s\n' \
+        "$MOONCAKE_VERSION" "$MOONCAKE_VERSION" > "$PIP_CONSTRAINT" \
     && CUDA_MAJOR="${CUDA_VERSION%%.*}" && \
     if [ "$CUDA_MAJOR" -ge 13 ]; then \
         retry python3 -m pip install mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}; \
