@@ -106,11 +106,6 @@ on:
         required: false
         type: string
         default: ""
-      build_cache_ref:
-        description: "Optional registry BuildKit cache produced by a bounded prewarm job"
-        required: false
-        type: string
-        default: ""
       image_formats:
         description: "CSV of image formats to build and push. Default builds all three (oci,zstd,nydus); pass a subset to narrow."
         required: false
@@ -142,7 +137,7 @@ jobs:
       group: ${{ inputs.concurrency_group }}
       cancel-in-progress: false
     env:
-      SGL_IMAGE_BUILDER: builder-sgl-image-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.cuda_key }}-${{ inputs.variant_suffix || 'base' }}
+      SGL_IMAGE_BUILDER: builder-sgl-image-${{ inputs.cuda_key }}-${{ inputs.variant_suffix || 'base' }}
       CUDA_KEY: ${{ inputs.cuda_key }}
       CUDA_SUFFIX: ${{ inputs.cuda_suffix }}
       IMAGE_FORMATS: ${{ inputs.image_formats }}
@@ -153,7 +148,6 @@ jobs:
       TAG_MODE: ${{ inputs.tag_mode }}
       TAG_VALUE: ${{ inputs.tag_value }}
       IMAGE_TAG_OVERRIDE: ${{ inputs.image_tag_override }}
-      BUILD_CACHE_REF: ${{ inputs.build_cache_ref }}
       VARIANT_SUFFIX: ${{ inputs.variant_suffix }}
       VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
       VOLCENGINE_CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
@@ -362,13 +356,26 @@ jobs:
             --tos-uri "$KERNEL_ARTIFACT_TOS_URI" \
             --wheel-sha256 "$KERNEL_WHEEL_SHA256"
 
+      - name: Resolve host-local image build cache
+        env:
+          DOCKER_TARGET: ${{ inputs.docker_target }}
+        run: |
+          set -euo pipefail
+          cache_key="$(printf '%s' "${CUDA_KEY}-${VARIANT_SUFFIX:-base}-${DOCKER_TARGET}" | sed 's/[^A-Za-z0-9_.-]/-/g')"
+          cache_root="${HOME:?HOME must be set}/.cache/sglang-docker"
+          mkdir -p "${cache_root}"
+          cache_dir="${cache_root}/${cache_key}"
+          echo "SGL_LOCAL_CACHE=${cache_dir}" >> "$GITHUB_ENV"
+          echo "SGL_LOCAL_CACHE_NEXT=${cache_dir}.next-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+          echo "SGL_LOCAL_CACHE_PREVIOUS=${cache_dir}.previous-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+
       - name: Set up Docker Buildx with local Docker Hub mirror
         uses: docker/setup-buildx-action@v3
         with:
-          # A persistent named builder can retain a broken worker across runs.
-          # OCI and zstd still share this builder within the current job.
+          # Retain host-local layers and cache mounts between builds.
+          # Full local exports also protect OCI -> zstd reuse from BuildKit GC.
           name: ${{ env.SGL_IMAGE_BUILDER }}
-          keep-state: false
+          keep-state: true
           cleanup: true
           driver-opts: |
             network=host
@@ -403,23 +410,11 @@ jobs:
           mapfile -t METADATA_ARGS < /tmp/docker-metadata.args
           mapfile -t IAAS_ARGS < /tmp/iaas-kernels.args
 
-          # When a zstd re-export will follow, export a full (mode=max) registry
-          # build cache so the zstd step can reuse these freshly built layers
-          # instead of recompiling from scratch. The heavy intermediate stages
-          # (torch_deps/framework/deepep) reach the final image via COPY --from,
-          # so mode=max is required to cache them; mode=min/inline would not.
-          # The cache ref is keyed to the resolved primary tag (unique per
-          # variant+cuda+run) to avoid collisions across concurrent matrix jobs.
           CACHE_ARGS=()
-          if [ -n "${BUILD_CACHE_REF}" ]; then
-            CACHE_ARGS+=(--cache-from "type=registry,ref=${BUILD_CACHE_REF}")
+          if [ -f "${SGL_LOCAL_CACHE}/index.json" ]; then
+            CACHE_ARGS+=(--cache-from "type=local,src=${SGL_LOCAL_CACHE}")
           fi
-          if printf '%s' "${IMAGE_FORMATS}" | tr ',' '\n' | grep -qx "zstd"; then
-            PRIMARY_TAG=$(printf '%s\n' "${IMAGE_TAGS}" | grep -v '^[[:space:]]*$' | head -1 | tr -d '[:space:]')
-            CACHE_REF="${IMAGE_REPO}:buildcache-${PRIMARY_TAG}"
-            echo "cache-ref=${CACHE_REF}" >> "$GITHUB_OUTPUT"
-            CACHE_ARGS+=(--cache-to "type=registry,ref=${CACHE_REF},mode=max,image-manifest=true,oci-mediatypes=true")
-          fi
+          CACHE_ARGS+=(--cache-to "type=local,dest=${SGL_LOCAL_CACHE_NEXT},mode=max")
 
           docker buildx build \
             --builder "${SGL_IMAGE_BUILDER}" \
@@ -443,6 +438,21 @@ jobs:
           DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata.json'))['containerimage.digest'])")
           echo "Pushed digest: ${DIGEST}"
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+          # Promote only a complete export. Keep the prior cache available if
+          # promotion fails, and bound disk growth to one committed generation.
+          test -f "${SGL_LOCAL_CACHE_NEXT}/index.json"
+          if [ -d "${SGL_LOCAL_CACHE}" ]; then
+            mv -- "${SGL_LOCAL_CACHE}" "${SGL_LOCAL_CACHE_PREVIOUS}"
+          fi
+          if mv -- "${SGL_LOCAL_CACHE_NEXT}" "${SGL_LOCAL_CACHE}"; then
+            rm -rf -- "${SGL_LOCAL_CACHE_PREVIOUS}"
+          else
+            if [ -d "${SGL_LOCAL_CACHE_PREVIOUS}" ]; then
+              mv -- "${SGL_LOCAL_CACHE_PREVIOUS}" "${SGL_LOCAL_CACHE}"
+            fi
+            exit 1
+          fi
 
       - name: Verify iaas-kernels candidate
         if: ${{ inputs.install_iaas_kernels }}
@@ -519,13 +529,8 @@ jobs:
           print(json.dumps({"architecture": inspect["architecture"], **expected}))
           PY
 
-      # --- zstd format: re-export the just-built layers with zstd compression,
-      # then reuse the same provenance/runtime verification. It pulls the
-      # mode=max registry build cache written by the base step (--cache-from),
-      # so all intermediate stages are cache hits and only layer compression is
-      # redone. The config stays identical to base; only layer compression
-      # changes. (Without --cache-from the local BuildKit cache can be evicted
-      # between steps by the large image + verify pull, forcing a full rebuild.)
+      # Re-export the same layers with zstd compression, using the host-local
+      # mode=max cache written by OCI. Provenance and runtime checks still run.
       - name: Build and push AMD64 zstd image
         id: build-zstd
         if: ${{ contains(inputs.image_formats, 'zstd') }}
@@ -541,8 +546,8 @@ jobs:
           mapfile -t IAAS_ARGS < /tmp/iaas-kernels.args
 
           CACHE_FROM_ARGS=()
-          if [ -n "${{ steps.build.outputs.cache-ref }}" ]; then
-            CACHE_FROM_ARGS+=(--cache-from "type=registry,ref=${{ steps.build.outputs.cache-ref }}")
+          if [ -f "${SGL_LOCAL_CACHE}/index.json" ]; then
+            CACHE_FROM_ARGS+=(--cache-from "type=local,src=${SGL_LOCAL_CACHE}")
           fi
 
           docker buildx build \
@@ -773,6 +778,9 @@ jobs:
       - name: Remove disposable local images
         if: always()
         run: |
+          if [ -n "${SGL_LOCAL_CACHE_NEXT:-}" ]; then
+            rm -rf -- "${SGL_LOCAL_CACHE_NEXT}"
+          fi
           docker image prune -af || true
           df -h /
 
