@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: glm53-mooncake0311-e9df74db-image
+  group: glm53-mooncake0311-02b4aae9-image
   cancel-in-progress: false
 
 jobs:
@@ -17,10 +17,10 @@ jobs:
     runs-on: x64-docker-build-node
     timeout-minutes: 240
     env:
-      SOURCE_COMMIT: e9df74db32a1d0bfe2138f31bc7f31b37a8d2f8a
-      SOURCE_TREE: b00453c223c193cff819803be4593a257192fda5
+      SOURCE_COMMIT: 02b4aae9df12a5f690cdda1fa5c409c05479abc7
+      SOURCE_TREE: 57f86d431b885197bd8c8f8aa7d66a6321e2f382
       BUILD_DEFINITION_COMMIT: ${{ github.sha }}
-      IMAGE_TAG: glm53-mooncake0311-e9df74db-${{ github.run_id }}-${{ github.run_attempt }}
+      IMAGE_TAG: glm53-mooncake0311-02b4aae9-${{ github.run_id }}-${{ github.run_attempt }}
       VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
       VOLCENGINE_CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
       VOLCENGINE_CR_REPOSITORY: ${{ vars.VOLCENGINE_CR_REPOSITORY || 'sglang' }}
