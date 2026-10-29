@@ -72,7 +72,7 @@ class TestMooncakeBufferRegistration(unittest.TestCase):
         )
 
     def test_invalid_ranges_are_rejected_before_registration(self):
-        for ptrs, lengths in (([100], []), ([0], [100]), ([100], [0]), ([-1], [1])):
+        for ptrs, lengths in (([100], []), ([0], [100]), ([100], [-1]), ([-1], [1])):
             with self.subTest(ptrs=ptrs, lengths=lengths):
                 manager = self.manager()
                 manager.kv_args.state_data_ptrs = [ptrs]
@@ -80,6 +80,25 @@ class TestMooncakeBufferRegistration(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     manager.register_buffer_to_engine()
                 manager.engine.batch_register.assert_not_called()
+
+    def test_zero_row_placeholders_preserve_layer_positions(self):
+        manager = self.manager()
+        manager.kv_args.kv_data_ptrs = [0]
+        manager.kv_args.kv_data_lens = [0]
+        manager.kv_args.state_data_ptrs = [[0, 300, 300]]
+        manager.kv_args.state_data_lens = [[0, 100, 100]]
+        before = copy.deepcopy(vars(manager.kv_args))
+        manager.register_buffer_to_engine()
+        self.assertEqual(
+            manager.engine.batch_register.call_args_list,
+            [call([2000], [64]), call([300], [100])],
+        )
+        self.assertEqual(vars(manager.kv_args), before)
+        manager.deregister_buffer_to_engine()
+        self.assertEqual(
+            manager.engine.batch_deregister.call_args_list,
+            [call([300]), call([2000])],
+        )
 
     def test_state_component_count_mismatch_is_rejected(self):
         manager = self.manager()

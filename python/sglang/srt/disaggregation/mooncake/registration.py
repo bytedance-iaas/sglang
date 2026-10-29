@@ -19,6 +19,10 @@ def normalize_buffer_regions(batches):
             raise ValueError(f"Mooncake {category}: pointer/length counts differ")
         for ptr, length in zip(ptrs, lengths):
             ptr, length = operator.index(ptr), operator.index(length)
+            # Zero-row DSA placeholders preserve the logical layer positions
+            # but have no physical memory region to register (upstream policy).
+            if length == 0:
+                continue
             if ptr <= 0 or length <= 0 or ptr + length > 1 << 64:
                 raise ValueError(
                     f"Mooncake {category}: invalid range ptr={ptr} length={length}"
