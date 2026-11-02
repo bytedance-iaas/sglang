@@ -1,0 +1,173 @@
+# Repository entry manifest: the machine-readable map of this repository.
+# Validated by scripts/lint/check_agent_governance.py (run via `make agent-check`).
+# Human-readable companions: AGENTS.md (agent entry), governance/STRUCTURE.md (tree).
+
+schema_version: 1
+
+repository:
+  name: bytedance-iaas/sglang
+  default_branch: main
+  upstream: sgl-project/sglang
+  description: >-
+    Internal fork of SGLang, a high-performance serving framework for large
+    language and multimodal models. `main` tracks upstream `main`.
+
+# Every role used below must resolve to at least one GitHub handle here.
+# Interim: all roles point at the governance owner until each area confirms
+# its owners (tracked in governance/STATUS.md).
+owners:
+  repo-owner: ["@chenqianfzh"]
+  governance-owner: ["@chenqianfzh"]
+  ci-owner: ["@chenqianfzh"]
+  runtime-owner: ["@chenqianfzh"]
+  kernel-owner: ["@chenqianfzh"]
+  release-manager: ["@chenqianfzh"]
+  security-owner: ["@chenqianfzh"]
+
+entrypoints:
+  human: README.md
+  agent: AGENTS.md
+  structure: governance/STRUCTURE.md
+  status: governance/STATUS.md
+  legacy_ledger: governance/LEGACY_LEDGER.md
+  policy: governance/POLICY.md
+  adr_dir: governance/adr
+  agent_change_log: governance/AGENT_CHANGELOG.md
+  pr_template: .github/pull_request_template.md
+  ci_gate: .github/workflows/agent-verify.yml
+
+# Standard commands. Each must be a target in the root Makefile; the checker
+# verifies the target exists and that every script it calls is executable.
+commands:
+  bootstrap: make bootstrap
+  bootstrap-agent: make bootstrap-agent
+  lint: make lint
+  test: make test
+  verify: make verify
+  agent-check: make agent-check
+  agent-verify: make agent-verify
+  agent-record: make agent-record
+
+toolchain:
+  python: "3.12"           # .tool-versions; lint CI uses 3.12
+  python_supported: ">=3.10"  # python/pyproject.toml requires-python
+  rust: rust/rust-toolchain.toml
+  agent_lockfile: scripts/agent/requirements-agent.lock
+  runtime_images: docker/Dockerfile  # GPU runtime deps are pinned by image, not by a Python lockfile
+
+modules:
+  - path: python/sglang/srt
+    role: Serving runtime (scheduler, model executor, memory cache, models, layers, entrypoints).
+    boundary: Imports kernels via python/sglang/kernels and sgl-kernel; must not import from test/ or benchmark/.
+    owner: runtime-owner
+  - path: python/sglang/kernels
+    role: Python-side kernel wrappers and JIT kernels.
+    boundary: No dependency on srt managers or scheduler.
+    owner: kernel-owner
+  - path: python/sglang/multimodal_gen
+    role: Diffusion / multimodal generation runtime.
+    boundary: Self-contained; shares only utilities with srt.
+    owner: runtime-owner
+  - path: python/sglang/lang
+    role: Frontend language (SGLang DSL).
+    boundary: Talks to the runtime only through HTTP/engine APIs.
+    owner: runtime-owner
+  - path: python/sglang/test
+    role: Shared test utilities and CI registration helpers (no CI-registered tests here).
+    boundary: Used by test/; must not hold registered tests.
+    owner: ci-owner
+  - path: rust
+    role: Rust workspace (gRPC, multimodal, radix tree, server) and Python extensions.
+    boundary: Exposed to Python only via rust_extensions bindings.
+    owner: runtime-owner
+  - path: sgl-model-gateway
+    role: Model gateway / router (Rust).
+    boundary: Separate Cargo project; talks to workers over HTTP/gRPC.
+    owner: runtime-owner
+  - path: test
+    role: CI tests (test/registered) and manual tests, dispatched by test/run_suite.py.
+    boundary: Tests only; no production code.
+    owner: ci-owner
+  - path: benchmark
+    role: Benchmarks and accuracy evaluations.
+    boundary: Not imported by runtime code.
+    owner: runtime-owner
+  - path: docker
+    role: Container images and compose / k8s manifests.
+    boundary: Image definitions pin GPU runtime dependencies.
+    owner: release-manager
+  - path: .github
+    role: CI workflows, PR template, CODEOWNERS, CI permissions.
+    boundary: Changes require ci-owner approval.
+    owner: ci-owner
+  - path: scripts
+    role: CI, release, lint and agent scripts.
+    boundary: scripts/agent and scripts/lint back the standard commands.
+    owner: ci-owner
+  - path: docs
+    role: Mintlify documentation site.
+    boundary: Product docs only; governance docs live in governance/.
+    owner: repo-owner
+  - path: governance
+    role: Agent governance artifacts (manifest, status, ledger, policy, ADRs, agent change log).
+    boundary: Process documents only; no business specifications.
+    owner: governance-owner
+
+# Changed path -> checks to run. `checks` names are make targets or CI workflows.
+path_checks:
+  - paths: ["python/**/*.py", "test/**/*.py"]
+    checks: [lint, test, "ci:pr-test.yml"]
+  - paths: ["python/sglang/kernels/**"]
+    checks: [lint, "ci:pr-test.yml (kernel stages)"]
+  - paths: ["rust/**"]
+    checks: [lint, "ci:pr-test-rust-exts.yml"]
+  - paths: ["sgl-model-gateway/**"]
+    checks: [lint, "ci:pr-test-rust.yml"]
+  - paths: ["docs/**"]
+    checks: [lint]
+  - paths: [".github/workflows/**"]
+    checks: [lint, agent-verify]
+  - paths: ["AGENTS.md", "governance/**", "Makefile", "scripts/agent/**", "scripts/lint/**"]
+    checks: [agent-verify]
+
+# Paths where a change needs explicit approval by the named role
+# (see governance/POLICY.md for the checkpoint each role owns).
+high_risk_paths:
+  - path: python/sglang/srt/model_executor/model_runner.py
+    reason: Frozen core file (see .claude/skills/large-class-style).
+    approver: runtime-owner
+  - path: python/sglang/srt/managers/scheduler.py
+    reason: Scheduler hot path; regressions affect every request.
+    approver: runtime-owner
+  - path: python/sglang/srt/server_args.py
+    reason: Public CLI surface.
+    approver: runtime-owner
+  - path: python/sglang/srt/environ.py
+    reason: Environment variable registry (see .claude/skills/env-var-conventions).
+    approver: runtime-owner
+  - path: python/pyproject.toml
+    reason: Dependency and packaging changes.
+    approver: release-manager
+  - path: docker
+    reason: Release images.
+    approver: release-manager
+  - path: .github/workflows
+    reason: CI gates and secrets exposure.
+    approver: ci-owner
+  - path: .github/CODEOWNERS
+    reason: Review routing.
+    approver: governance-owner
+  - path: .gitignore
+    reason: Secret-file coverage.
+    approver: security-owner
+  - path: AGENTS.md
+    reason: Agent operating boundaries.
+    approver: governance-owner
+  - path: governance
+    reason: Governance artifacts.
+    approver: governance-owner
+
+# Freshness limits (days) for dated governance artifacts.
+freshness_days:
+  governance/STATUS.md: 30
+  governance/LEGACY_LEDGER.md: 90

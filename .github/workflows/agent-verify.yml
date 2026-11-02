@@ -1,0 +1,44 @@
+name: Agent Verify
+
+# Runs the same GPU-free gate as `make agent-verify` locally (governance checks,
+# pre-commit on changed files, lint-script unit tests). See AGENTS.md.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: agent-verify-${{ github.event_name }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  agent-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pre-commit environments
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: agent-verify-pre-commit|${{ hashFiles('.pre-commit-config.yaml', 'scripts/agent/requirements-agent.lock') }}
+
+      - name: Bootstrap agent toolchain
+        run: make bootstrap-agent
+
+      - name: Run agent-verify
+        env:
+          AGENT_BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || 'HEAD~1' }}
+        run: make agent-verify AGENT_BASE_REF="$AGENT_BASE_REF"

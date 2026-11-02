@@ -121,6 +121,8 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
+!.env.example
 .venv
 env/
 venv/
@@ -283,3 +285,13 @@ artifacts/
 
 # Internal, non-published docs
 internal-docs/
+
+# Secrets and credentials (checked by scripts/lint/check_agent_governance.py)
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+.netrc
+credentials.json
+*.kubeconfig

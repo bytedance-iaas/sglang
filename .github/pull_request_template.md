@@ -1,5 +1,34 @@
 <!-- Thank you for your contribution! Please follow these guidelines to enhance your pull request. If anything is unclear, submit your PR and reach out to maintainers for assistance. Join our Slack community at https://slack.sglang.io to discuss further. -->
 
+## Change contract
+
+<!-- Required. Reviewers check the diff against this contract. See AGENTS.md "Delivery". -->
+
+### Intent
+
+<!-- The problem and the intended outcome in one or two sentences. Link the issue / plan. -->
+
+### Scope
+
+<!-- Paths changed. List any manifest `high_risk_paths` touched and the approver role (governance/POLICY.md). -->
+
+### Risk
+
+<!-- low / medium / high, and why. Medium/high: `make agent-record MSG="..." RISK=...`. -->
+
+### Verification
+
+<!-- Commands run and results, e.g. `make agent-verify` (pass), `make test`, GPU CI stages, accuracy/benchmark numbers.
+     State any check you could not run. -->
+
+### Rollback
+
+<!-- How to undo: revert this PR / flag to disable / image to roll back to. -->
+
+### Agent assistance
+
+<!-- None, or the agent used and which parts it produced. -->
+
 ## Motivation
 
 <!-- Describe the purpose and goals of this pull request. -->

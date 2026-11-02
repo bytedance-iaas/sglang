@@ -79,6 +79,16 @@ Its core features include:
 - [Frontend Tutorial](https://docs.sglang.io/references/frontend/frontend_tutorial.html)
 - [Contribution Guide](https://docs.sglang.io/developer_guide/contribution_guide.html)
 
+## Develop in This Repository
+From `git clone` to first feedback (no GPU needed; Python 3.12):
+```bash
+git clone https://github.com/bytedance-iaas/sglang.git && cd sglang   # no submodules
+make bootstrap-agent   # hash-locked pre-commit toolchain
+make agent-verify      # governance checks + pre-commit on your changes + lint tests
+```
+For runtime work on Linux + CUDA, run `make bootstrap` then `make test` (CPU suite); GPU stages run in CI.
+`docker/compose.yaml` starts a GPU server. Coding agents start at [AGENTS.md](AGENTS.md); repository layout is in [governance/STRUCTURE.md](governance/STRUCTURE.md).
+
 ## Benchmark and Performance
 Learn more in the release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/), [v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/), [Large-scale expert parallelism](https://lmsys.org/blog/2025-05-05-large-scale-ep/), [GB200 rack-scale parallelism](https://lmsys.org/blog/2025-09-25-gb200-part-2/), [GB300 long context](https://lmsys.org/blog/2026-02-19-gb300-longctx/).
 

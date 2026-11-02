@@ -1,0 +1,4 @@
+# Agent toolchain: everything `make agent-check` / `make agent-verify` needs.
+# Regenerate the lock with scripts/agent/lock-agent-deps.sh after editing.
+pre-commit==4.3.0
+PyYAML==6.0.2

@@ -21,6 +21,7 @@ import yaml
 PROTECTED_JOB_NAMES = {
     "pr-test-finish",
     "lint",
+    "agent-verify",
 }
 
 

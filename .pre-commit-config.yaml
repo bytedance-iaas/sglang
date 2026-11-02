@@ -117,6 +117,12 @@ repos:
         language: system
         files: ^scripts/lint/(check_|test_check_).*\.py$
         pass_filenames: false
+      - id: check-agent-governance
+        name: validate agent governance (AGENTS.md, governance/manifest.yaml)
+        entry: python3 scripts/lint/check_agent_governance.py
+        language: system
+        files: ^(AGENTS\.md|CLAUDE\.md|Makefile|README\.md|\.gitignore|governance/.*|scripts/agent/.*|scripts/lint/check_agent_governance\.py|\.github/(pull_request_template\.md|workflows/agent-verify\.yml))$
+        pass_filenames: false
       - id: check-registered-tests
         name: validate registered test CI registries
         entry: python3 scripts/lint/check_registered_tests.py
