@@ -110,6 +110,7 @@ class RequestFuncOutput:
     start_time: float = 0.0
     cached_tokens: int = 0
     cached_tokens_details: Optional[Dict[str, Any]] = None
+    request_id: Optional[str] = None
     spec_accept_length: float = 0.0
     spec_cap_length: float = 0.0
     spec_block_accept_length: float = 0.0
@@ -754,6 +755,7 @@ async def async_request_sglang_generate(
                             data = orjson.loads(sse_data)
 
                             _meta_info = data.get("meta_info") or {}
+                            output.request_id = _meta_info.get("id", output.request_id)
                             if _meta_info.get("spec_accept_length") is not None:
                                 output.spec_accept_length = _meta_info[
                                     "spec_accept_length"
@@ -1927,6 +1929,11 @@ async def benchmark(
             )
 
     result_details = {
+        # perf_counter values share a clock within this benchmark process;
+        # combine with request IDs to join client tails to server diagnostics.
+        "request_ids": [output.request_id for output in outputs],
+        "start_times": [output.start_time for output in outputs],
+        "latencies": [output.latency for output in outputs],
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": output_lens,
         "ttfts": [output.ttft for output in outputs],

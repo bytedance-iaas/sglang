@@ -1192,6 +1192,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_pool_indices=batch.req_pool_indices,
         )
 
+        self._verify_planner.prepare_compensation(
+            reqs=batch.reqs,
+            req_pool_indices=batch.req_pool_indices,
+            req_pool_indices_cpu=batch.req_pool_indices_cpu,
+        )
         layout = self._verify_planner.schedule_layout(
             req_pool_indices=batch.req_pool_indices,
             prefix_lens=prefix_lens,
@@ -1342,7 +1347,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         logits_output.hidden_states = None
 
+        self._verify_planner.update_compensation(
+            req_pool_indices=batch.req_pool_indices,
+            layout=layout,
+            commit_lens=accept.commit_lens,
+        )
         self._observers.observe_verify_step(
+            budget_survival=draft_input.verify_budget_survival,
             forward_ct=int(batch.forward_iter),
             reqs=batch.reqs,
             bs=bs,

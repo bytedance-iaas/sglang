@@ -89,6 +89,10 @@ class ReqDetail(msgspec.Struct, omit_defaults=True):
     rid: Optional[str] = None
     confidence: Optional[list[float]] = None
     survival: Optional[list[float]] = None
+    budget_survival: Optional[list[float]] = None
+    baseline_verify_len: Optional[int] = None
+    compensation_credit: Optional[float] = None
+    compensation_weight: Optional[float] = None
 
 
 class DecodeStepRecord(msgspec.Struct, omit_defaults=True):
@@ -109,6 +113,7 @@ class DecodeStepRecord(msgspec.Struct, omit_defaults=True):
     draft_gpu_ms: Optional[float] = None
     target_verify_gpu_ms: Optional[float] = None
     reqs: Optional[list[ReqDetail]] = None
+    aligned_budget: Optional[int] = None
 
 
 class DecodeStepObservation(msgspec.Struct):
@@ -133,6 +138,11 @@ class DecodeStepObservation(msgspec.Struct):
     cap_trim_lens: torch.Tensor
     commit_lens: torch.Tensor
     rids: Optional[list[str]]
+    budget_survival: Optional[torch.Tensor] = None
+    baseline_verify_lens: Optional[torch.Tensor] = None
+    compensation_credit: Optional[torch.Tensor] = None
+    compensation_weights: Optional[torch.Tensor] = None
+    aligned_budget: Optional[int] = None
 
 
 class _PendingStep(msgspec.Struct):
@@ -151,6 +161,8 @@ class _PendingStep(msgspec.Struct):
     rids: Optional[list[str]]
     future: Optional[FutureTensors]
     segment_events: dict[InfoSegment, tuple[torch.cuda.Event, torch.cuda.Event]]
+    budget_survival: Optional[torch.Tensor] = None
+    aligned_budget: Optional[int] = None
 
 
 class DsparkInfoDumper:
@@ -255,6 +267,8 @@ class DsparkInfoDumper:
             rids=obs.rids,
             future=future,
             segment_events=self._current_segments,
+            budget_survival=obs.budget_survival,
+            aligned_budget=obs.aligned_budget,
         )
         self._current_segments = {}
         self._prev_stamp = now
@@ -329,6 +343,14 @@ class DsparkInfoDumper:
             tensors["verify_lens"] = obs.verify_lens
         if obs.confidence is not None:
             tensors["confidence"] = obs.confidence
+        for name in (
+            "baseline_verify_lens",
+            "compensation_credit",
+            "compensation_weights",
+        ):
+            value = getattr(obs, name)
+            if value is not None:
+                tensors[name] = value
         return FutureTensors.device_to_host(tensors, d2h_stream=self._d2h_stream)
 
     def _drain_pending(self) -> None:
@@ -342,6 +364,7 @@ class DsparkInfoDumper:
             record.bs = pending.bs
             record.mode = pending.mode
             record.budget = pending.budget
+            record.aligned_budget = pending.aligned_budget
             record.lag_steps = pending.lag_steps
             record.num_running_reqs = pending.bs
             record.num_verify_tokens = pending.num_verify_tokens
@@ -362,7 +385,10 @@ class DsparkInfoDumper:
             )
         if InfoComponent.REQS in self._components and pending.future is not None:
             record.reqs = self._build_reqs(
-                host=pending.future.wait(), bs=pending.bs, rids=pending.rids
+                host=pending.future.wait(),
+                bs=pending.bs,
+                rids=pending.rids,
+                budget_survival=pending.budget_survival,
             )
         elif pending.future is not None:
             pending.future.wait()
@@ -433,7 +459,12 @@ class DsparkInfoDumper:
         return round(elapsed_ms, 4)
 
     def _build_reqs(
-        self, *, host: dict, bs: int, rids: Optional[list[str]]
+        self,
+        *,
+        host: dict,
+        bs: int,
+        rids: Optional[list[str]],
+        budget_survival: Optional[torch.Tensor] = None,
     ) -> list[ReqDetail]:
         req_ids = host["req_pool_indices"].tolist()
         prefixes = host["prefix_lens"].tolist()
@@ -451,6 +482,16 @@ class DsparkInfoDumper:
             conf_rows = None
             survival_rows = None
 
+        history_rows = None if budget_survival is None else budget_survival.tolist()
+        extras = {
+            key: host[key].tolist()
+            for key in (
+                "baseline_verify_lens",
+                "compensation_credit",
+                "compensation_weights",
+            )
+            if key in host
+        }
         reqs: list[ReqDetail] = []
         for row in range(bs):
             verify_len = (
@@ -461,6 +502,22 @@ class DsparkInfoDumper:
             reqs.append(
                 ReqDetail(
                     rid=None if rids is None else rids[row],
+                    budget_survival=None if history_rows is None else history_rows[row],
+                    baseline_verify_len=(
+                        None
+                        if "baseline_verify_lens" not in extras
+                        else int(extras["baseline_verify_lens"][row])
+                    ),
+                    compensation_credit=(
+                        None
+                        if "compensation_credit" not in extras
+                        else float(extras["compensation_credit"][row])
+                    ),
+                    compensation_weight=(
+                        None
+                        if "compensation_weights" not in extras
+                        else float(extras["compensation_weights"][row])
+                    ),
                     req_pool_index=int(req_ids[row]),
                     prefix_len=int(prefixes[row]),
                     verify_len=verify_len,
@@ -836,6 +893,7 @@ class DsparkStepObservers:
         req_pool_indices: torch.Tensor,
         verify_tier_num_tokens: int,
         dp_tier_num_tokens: Optional[int],
+        budget_survival: Optional[torch.Tensor] = None,
     ) -> None:
         planner = self._planner
         if not proposal_folded:
@@ -923,6 +981,11 @@ class DsparkStepObservers:
                     cap_trim_lens=cap_trim_lens,
                     commit_lens=commit_lens,
                     rids=[req.rid for req in reqs],
+                    budget_survival=budget_survival,
+                    baseline_verify_lens=planner.baseline_verify_lens,
+                    compensation_credit=planner.compensation_credit,
+                    compensation_weights=planner.compensation_weights,
+                    aligned_budget=planner.aligned_budget,
                 )
             )
 

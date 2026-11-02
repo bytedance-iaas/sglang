@@ -16,10 +16,13 @@ import time
 import unittest
 from argparse import Namespace
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from unittest.mock import patch
 
+from sglang.benchmark import serving
 from sglang.benchmark.serving import (
     RequestFuncInput,
     async_request_openai_chat_completions,
+    async_request_sglang_generate,
     calculate_metrics,
     set_global_args,
 )
@@ -124,7 +127,7 @@ class TestBenchServingReasoningStream(CustomTestCase):
             )
         )
 
-    def _run(self, chunks):
+    def _run(self, chunks, request_func=async_request_openai_chat_completions):
         port = _free_port()
 
         class Handler(_SSEHandler):
@@ -145,10 +148,36 @@ class TestBenchServingReasoningStream(CustomTestCase):
                 image_data=None,
                 extra_request_body={},
             )
-            return asyncio.run(async_request_openai_chat_completions(req))
+            return asyncio.run(request_func(req))
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_native_request_id_survives_final_chunk_without_id(self):
+        native_args = Namespace(
+            temperature=0.0,
+            top_p=1.0,
+            disable_stream=False,
+            disable_ignore_eos=True,
+            return_logprob=False,
+            return_routed_experts=False,
+            logprob_start_len=-1,
+            top_logprobs_num=0,
+            token_ids_logprob=None,
+            header=None,
+        )
+        chunks = [
+            {"text": "a", "meta_info": {"id": "join-me", "completion_tokens": 1}},
+            {"text": "ab", "meta_info": {"completion_tokens": 2}},
+            {"meta_info": {}},
+        ]
+        with patch.object(serving, "args", native_args):
+            out = self._run(chunks, request_func=async_request_sglang_generate)
+        self.assertTrue(out.success, out.error)
+        self.assertEqual(out.request_id, "join-me")
+        self.assertEqual(out.output_len, 2)
+        self.assertGreater(out.start_time, 0)
+        self.assertGreater(out.latency, out.ttft)
 
     def test_reasoning_only_stream_populates_metrics(self):
         chunks = [

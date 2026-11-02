@@ -1,5 +1,6 @@
 import unittest
 
+import msgspec
 import torch
 
 from sglang.srt.environ import envs
@@ -229,6 +230,42 @@ class TestCoreAndCpuTiming(CustomTestCase):
         clock.advance(0.01)
         dumper.observe_decode_step(make_obs(forward_ct=10))
         self.assertEqual([r["forward_ct"] for r in dumper.dump()["records"]], [9, 10])
+
+
+class TestCompensationFields(CustomTestCase):
+    def test_request_details_keep_budget_history_and_counterfactual(self):
+        dumper, _ = make_dumper({"core"})
+        obs = make_obs(forward_ct=1, bs=2)
+        host = {
+            name: getattr(obs, name)
+            for name in (
+                "req_pool_indices",
+                "prefix_lens",
+                "draft_tokens",
+                "bonus_tokens",
+                "correct_len",
+                "cap_trim_lens",
+                "commit_lens",
+                "verify_lens",
+            )
+        }
+        host.update(
+            baseline_verify_lens=torch.tensor([1, 6]),
+            compensation_credit=torch.tensor([8.0, 0.0]),
+            compensation_weights=torch.tensor([1.5, 1.0]),
+        )
+        history = torch.tensor([[0.8] * 5, [0.7] * 5])
+        rows = dumper._build_reqs(
+            host=host, bs=2, rids=obs.rids, budget_survival=history
+        )
+        payload = msgspec.to_builtins(rows[0])
+        self.assertEqual(payload["rid"], "r0")
+        self.assertEqual(payload["baseline_verify_len"], 1)
+        self.assertEqual(payload["verify_len"], 6)
+        self.assertEqual(payload["compensation_credit"], 8)
+        self.assertEqual(payload["compensation_weight"], 1.5)
+        self.assertEqual(payload["budget_survival"], history[0].tolist())
+        self.assertNotIn("survival", payload)
 
 
 class TestPredictedStepFields(CustomTestCase):

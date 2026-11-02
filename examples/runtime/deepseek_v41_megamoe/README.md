@@ -172,6 +172,31 @@ throughput changes were +9.89%, -0.92%, and +6.02%. This configuration improved
 mean throughput while leaving request-level tail latency worse in this workload.
 The comparison measures the combined new-table and graph-fill configuration.
 
+### Experimental compensation for repeatedly capped requests
+
+`SGLANG_DSPARK_VERIFY_COMPENSATION_MAX_BOOST=0.5` enables an experimental
+compact-only ranking policy. The default `0` keeps the original scheduler.
+A request gains one credit when its verified window is shorter than B+1 and
+all of that window is committed. Credit is capped at eight and halves on
+other steps. Its candidate ranking weight is `1 + max_boost * credit / 8`;
+raw survival still determines eligibility and preserves candidate prefix order.
+SPS selects the same budget before compensation, and graph-tier alignment is
+unchanged. This reallocates the existing budget rather than enlarging it.
+A cap hit does not prove that an unverified candidate would have been accepted.
+
+Credit lives on the GPU. Slot ownership is checked against request identity;
+new/reused slots start at zero and requests absent from the current batch lose
+ownership. No per-step GPU readback is added for compensation. The policy is
+experimental, not an established tail-latency improvement.
+
+For attribution, `SGLANG_DSPARK_DEBUG_DUMP=core,step_cpu_time,reqs` additionally
+records the exact historical survival used to select the budget, the aligned
+budget, pre-update credit and ranking weight, and `baseline_verify_len` (the
+unweighted allocation at the same aligned budget). The baseline is a one-step
+counterfactual, not a replay of the output trajectory without compensation.
+Detailed recording performs extra copies and an extra top-k with compensation;
+use `core,step_cpu_time` only for performance measurements.
+
 ## Optional ReduceScatter path
 
 For ordinary decode without DSPARK, remove all three `--speculative-*`
