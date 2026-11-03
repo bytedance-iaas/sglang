@@ -1,0 +1,282 @@
+diff --git a/csrc/apis/sm90_mega.hpp b/csrc/apis/sm90_mega.hpp
+--- a/csrc/apis/sm90_mega.hpp
++++ b/csrc/apis/sm90_mega.hpp
+@@ -225,7 +225,9 @@
+     const std::tuple<int, int, int>& recipe,
+     const std::string& activation,
+     const std::optional<float>& activation_clamp_opt,
+-    const bool& fast_math
++    const bool& fast_math,
++    const std::optional<torch::Tensor>& early_values = std::nullopt,
++    const std::optional<torch::Tensor>& early_done = std::nullopt
+ ) {
+     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
+     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
+@@ -256,6 +258,21 @@
+     IAAS_KERNELS_HOST_ASSERT(hidden % 128 == 0 and intermediate_hidden % 128 == 0);
+     IAAS_KERNELS_HOST_ASSERT(intermediate_hidden / 64 <= 64);
+ 
++    IAAS_KERNELS_HOST_ASSERT(early_values.has_value() == early_done.has_value());
++    if (early_values.has_value()) {
++        const auto& values = *early_values;
++        const auto& done = *early_done;
++        IAAS_KERNELS_HOST_ASSERT(values.device() == y.device() and values.is_cuda());
++        IAAS_KERNELS_HOST_ASSERT(done.device() == y.device() and done.is_cuda());
++        IAAS_KERNELS_HOST_ASSERT(values.scalar_type() == torch::kBFloat16);
++        IAAS_KERNELS_HOST_ASSERT(done.scalar_type() == torch::kUInt8);
++        IAAS_KERNELS_HOST_ASSERT(values.is_contiguous() and done.is_contiguous());
++        IAAS_KERNELS_HOST_ASSERT(values.dim() == 3 and done.dim() == 2);
++        IAAS_KERNELS_HOST_ASSERT(values.size(0) >= num_tokens and done.size(0) >= num_tokens);
++        IAAS_KERNELS_HOST_ASSERT(values.size(1) == num_topk and values.size(2) == hidden);
++        IAAS_KERNELS_HOST_ASSERT(done.size(1) == num_topk);
++    }
++
+     constexpr int kGranMN = 128, kGranK = 128;
+     check_sf_layout(l1_weights_sf, intermediate_hidden * 2, hidden, kGranMN, kGranK,
+                     num_experts_per_rank, false, true, torch::kFloat);
+@@ -291,7 +308,7 @@
+                      num_experts_per_rank,
+                      num_tokens, num_topk,
+                      hidden, intermediate_hidden,
+-                     activation_clamp, fast_math);
++                     activation_clamp, fast_math, early_values, early_done);
+ 
+     if (deep_jit::get_env<int>("IAAS_KERNELS_COMM_KERNEL_DEBUG"))
+         sym_buffer.zero_();
+diff --git a/csrc/jit_kernels/impls/sm90_fp8_mega_moe.hpp b/csrc/jit_kernels/impls/sm90_fp8_mega_moe.hpp
+--- a/csrc/jit_kernels/impls/sm90_fp8_mega_moe.hpp
++++ b/csrc/jit_kernels/impls/sm90_fp8_mega_moe.hpp
+@@ -41,10 +41,13 @@
+         float activation_clamp;
+         bool fast_math;
+         bool use_swap_ab;
++        bool has_early;
+         MegaMoESM90Config config;
+ 
+         // Runtime arguments
+         void* y;
++        const void* early_values;
++        const uint8_t* early_done;
+         int* cumulative_local_expert_recv_stats;
+         int num_tokens;
+         layout::SymBuffer<> sym_buffer_ptrs;
+@@ -83,7 +86,7 @@
+         {}, {}, {},
+         {}, {},
+         {}, {},
+-        {}, {}
++        {}, {}, {}
+     >);
+ }};
+ )",
+@@ -106,7 +109,8 @@
+             args.hidden, args.intermediate_hidden, args.num_tokens), args.num_tokens,
+         args.use_swap_ab and use_glm_swap_policy_for_mega_moe_sm90(
+             args.launch_args.grid_dim->x, args.num_ranks, args.num_experts, args.num_topk,
+-            args.hidden, args.intermediate_hidden, args.num_tokens)));
++            args.hidden, args.intermediate_hidden, args.num_tokens)),
++    args.has_early ? "true" : "false");
+     }
+ 
+     static void launch(const std::shared_ptr<deep_jit::cuda::Kernel>& kernel, const Args& args) {
+@@ -123,7 +127,9 @@
+             args.tensor_map_l2_acts,
+             args.tensor_map_l2_acts_sf,
+             args.tensor_map_l2_weights,
+-            args.l2_weights_sf
++            args.l2_weights_sf,
++            args.early_values,
++            args.early_done
+         );
+     }
+ };
+@@ -141,7 +147,9 @@
+     const int& num_tokens, const int& num_topk,
+     const int& hidden, const int& intermediate_hidden,
+     const float& activation_clamp,
+-    const bool& fast_math
++    const bool& fast_math,
++    const std::optional<torch::Tensor>& early_values,
++    const std::optional<torch::Tensor>& early_done
+ ) {
+     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+     const auto num_experts = num_experts_per_rank * num_ranks;
+@@ -244,8 +252,11 @@
+         .activation_clamp = activation_clamp,
+         .fast_math = fast_math,
+         .use_swap_ab = use_swap_ab,
++        .has_early = early_values.has_value(),
+         .config = config,
+         .y = y.data_ptr(),
++        .early_values = early_values.has_value() ? early_values->data_ptr() : nullptr,
++        .early_done = early_done.has_value() ? early_done->data_ptr<uint8_t>() : nullptr,
+         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
+         .num_tokens = num_tokens,
+         .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
+diff --git a/csrc/tvm_ffi_api.cpp b/csrc/tvm_ffi_api.cpp
+--- a/csrc/tvm_ffi_api.cpp
++++ b/csrc/tvm_ffi_api.cpp
+@@ -145,6 +145,39 @@
+         static_cast<int>(num_max_tokens_per_rank), static_cast<int>(num_experts),
+         static_cast<int>(num_topk), recipe_val, activation, act_clamp_opt_val, fast_math
+     );
++}
++
++// Separate FFI entry keeps the existing fp8_mega_moe ABI unchanged.
++void iaas_fp8_mega_moe_with_early(
++    TensorView y, TensorView l1_weights, TensorView l1_weights_sf,
++    TensorView l2_weights, TensorView l2_weights_sf,
++    Optional<TensorView> recv_stats, TensorView sym_buffer,
++    Array<int64_t> buffer_ptrs, int64_t rank, int64_t capacity,
++    int64_t num_experts, int64_t num_topk,
++    Tuple<int64_t, int64_t, int64_t> recipe, std::string activation,
++    Optional<double> clamp, bool fast_math,
++    TensorView early_values, TensorView early_done) {
++    const auto stats = recv_stats.has_value()
++        ? std::optional<torch::Tensor>(convert_to_torch_tensor(recv_stats.value()))
++        : std::nullopt;
++    const auto clamp_value = clamp.has_value()
++        ? std::optional<float>(static_cast<float>(clamp.value())) : std::nullopt;
++    std::vector<int64_t> ptrs;
++    for (const auto ptr : buffer_ptrs)
++        ptrs.push_back(ptr);
++    const auto [rm, rn, rk] = recipe;
++    mega::fp8_mega_moe(
++        convert_to_torch_tensor(y),
++        std::make_pair(convert_to_torch_tensor(l1_weights),
++                       convert_to_torch_tensor(l1_weights_sf)),
++        std::make_pair(convert_to_torch_tensor(l2_weights),
++                       convert_to_torch_tensor(l2_weights_sf)),
++        stats, convert_to_torch_tensor(sym_buffer), ptrs,
++        static_cast<int>(rank), static_cast<int>(capacity),
++        static_cast<int>(num_experts), static_cast<int>(num_topk),
++        std::make_tuple(static_cast<int>(rm), static_cast<int>(rn), static_cast<int>(rk)),
++        activation, clamp_value, fast_math,
++        convert_to_torch_tensor(early_values), convert_to_torch_tensor(early_done));
+ }
+ 
+ void iaas_mega_moe_pre_dispatch_sm90(
+@@ -175,6 +208,7 @@
+ TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_fp4_mega_moe_sm90, iaas_fp8_fp4_mega_moe_sm90<false>);
+ TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_fp4_mega_moe_sm90_act32, iaas_fp8_fp4_mega_moe_sm90<true>);
+ TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_mega_moe, iaas_fp8_mega_moe);
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_mega_moe_with_early, iaas_fp8_mega_moe_with_early);
+ TVM_FFI_DLL_EXPORT_TYPED_FUNC(mega_moe_pre_dispatch_sm90, iaas_mega_moe_pre_dispatch_sm90);
+ 
+ TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_fp4_mega_moe_sm90_rs, iaas_fp8_fp4_mega_moe_sm90_rs);
+diff --git a/iaas_kernels/__init__.py b/iaas_kernels/__init__.py
+--- a/iaas_kernels/__init__.py
++++ b/iaas_kernels/__init__.py
+@@ -4,6 +4,7 @@
+ 
+ __version__ = "0.1.0.dev0"
+ API_VERSION = 1
++EARLY_COMBINE_API_VERSION = 1
+ __all__ = [
+     "SM90SymmBuffer",
+     "get_symm_buffer_for_sm90_mega_moe",
+diff --git a/iaas_kernels/include/iaas_kernels/impls/sm90_fp8_mega_moe.cuh b/iaas_kernels/include/iaas_kernels/impls/sm90_fp8_mega_moe.cuh
+--- a/iaas_kernels/include/iaas_kernels/impls/sm90_fp8_mega_moe.cuh
++++ b/iaas_kernels/include/iaas_kernels/impls/sm90_fp8_mega_moe.cuh
+@@ -92,6 +92,7 @@
+     uint32_t kNumMaxPoolTokens, uint32_t kNumPaddedSFPoolTokens, uint32_t kNumStages, uint32_t kNumDispatchThreads,
+     uint32_t kNumNonEpilogueThreads, uint32_t kNumEpilogueThreads, uint32_t kNumSMs, uint32_t kNumRanks,
+     float kActivationClamp, bool kFastMath, bool kFP8SwapAB = false, uint32_t kSwapBucketMode = 0,
++    bool kHasEarly = false,
+     uint32_t L1_SHAPE_N = kIntermediateHidden * 2, uint32_t L1_SHAPE_K = kHidden, uint32_t L2_SHAPE_N = kHidden,
+     uint32_t L2_SHAPE_K = kIntermediateHidden, uint32_t kNumDispatchWarps = kNumDispatchThreads / 32,
+     uint32_t kNumMMANonEpilogueWarps = kNumNonEpilogueThreads / 32,
+@@ -107,7 +108,8 @@
+     const __grid_constant__ cute::TmaDescriptor tensor_map_l1_output,
+     const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts,
+     const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_sf,
+-    const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights, const float *__restrict__ l2_weights_sf) {
++    const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights, const float *__restrict__ l2_weights_sf,
++    const void* __restrict__ early_values, const uint8_t* __restrict__ early_done) {
+ #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900) and (__CUDA_ARCH__ < 1000)) or defined(__CLION_IDE__)
+     using Barrier = cutlass::arch::ClusterTransactionBarrier;
+ 
+@@ -2065,7 +2067,16 @@
+                 lane_idx < kNumTopk ? static_cast<int>(__ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() +
+                                                              token_idx * kNumTopk + lane_idx))
+                                     : -1;
+-            const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
++            uint32_t early_mask = 0;
++            if constexpr (kHasEarly) {
++                const bool done = lane_idx < kNumTopk and
++                    __ldg(early_done + token_idx * kNumTopk + lane_idx) != 0;
++                // Every completed slot must have been removed from dispatch.
++                IAAS_KERNELS_TRAP_ONLY_DEVICE_ASSERT(not done or stored_topk_slot_idx < 0);
++                early_mask = __ballot_sync(0xffffffff, done);
++            }
++            const uint32_t total_mask =
++                __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0) | early_mask;
+ 
+             for (uint32_t chunk = 0; chunk < kNumChunks; ++chunk) {
+                 const uint32_t chunk_byte_offset = chunk * kNumChunkBytes;
+@@ -2076,11 +2087,21 @@
+                         const uint32_t slot_idx = __ffs(mask) - 1;
+                         mask ^= 1 << slot_idx;
+                         if (cute::elect_one_sync()) {
+-                            const auto src_ptr =
++                            const void* src_ptr =
+                                 math::advance_ptr<uint8_t>(combine_token_buffer.get_rank_buffer(slot_idx)
+                                                                .get_data_buffer(token_idx)
+                                                                .get_base_ptr(),
+                                                            chunk_byte_offset);
++                            if constexpr (kHasEarly) {
++                                if (early_mask & (1u << slot_idx)) {
++                                    // Keep the original slot order and the native
++                                    // FP32 reduction. Only the load source changes.
++                                    const uint64_t assignment =
++                                        uint64_t(token_idx) * kNumTopk + slot_idx;
++                                    src_ptr = static_cast<const uint8_t*>(early_values) +
++                                        assignment * kNumHiddenBytes + chunk_byte_offset;
++                                }
++                            }
+                             ptx::tma_load_1d(combine_load_buffer[i], src_ptr, combine_load_barriers[i], kNumChunkBytes);
+                             ptx::mbarrier_arrive_and_set_tx(combine_load_barriers[i], kNumChunkBytes);
+                         }
+diff --git a/iaas_kernels/mega_moe.py b/iaas_kernels/mega_moe.py
+--- a/iaas_kernels/mega_moe.py
++++ b/iaas_kernels/mega_moe.py
+@@ -195,12 +195,30 @@
+     activation: str = "swiglu",
+     activation_clamp: Optional[float] = None,
+     fast_math: bool = True,
++    *,
++    early_values: Optional[torch.Tensor] = None,
++    early_done: Optional[torch.Tensor] = None,
+ ):
++    """Combine completed local assignments in original top-k slot order.
++
++    Both early tensors must be supplied together. Completed assignments must
++    already be removed from dispatch IDs. Values are contiguous BF16 [N,K,H]
++    and done is uint8 [N,K]; N may exceed the current token count. The producer
++    must finish on this stream (or publish an event dependency) before launch.
++    Unmarked values are never read. No intermediate partial sum is rounded.
++    """
++    if (early_values is None) != (early_done is None):
++        raise ValueError("early_values and early_done must be supplied together")
+     l1_weights_data, l1_weights_sf = l1_weights
+     l2_weights_data, l2_weights_sf = l2_weights
+     if getattr(sym_buffer, "activation_group_sizes", (128, 64)) != (128, 64):
+         raise ValueError("group-32 activations require the FP4 weight kernel")
+-    _C.fp8_mega_moe(
++    op = _C.fp8_mega_moe
++    extra = ()
++    if early_values is not None:
++        op = _C.fp8_mega_moe_with_early
++        extra = (early_values, early_done)
++    op(
+         y,
+         l1_weights_data,
+         l1_weights_sf,
+@@ -217,6 +235,7 @@
+         activation,
+         activation_clamp,
+         fast_math,
++        *extra,
+     )
+ 
+ 

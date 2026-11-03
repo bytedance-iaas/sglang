@@ -1,0 +1,26 @@
+{
+  "csrc/apis/sm90_mega.hpp": {
+    "before": "874183d40880b0486f5b37bb349380ab28bb7e2b031d14216411edad6e24282f",
+    "after": "ed3b77da316f0211173c9f02a8fca090002aca3d4d8f994fe71b0e14934e994d"
+  },
+  "csrc/jit_kernels/impls/sm90_fp8_mega_moe.hpp": {
+    "before": "847960e0aae2c539d003e83dfedd4f928e6c62fda1bc8bc0add4e92fed40de62",
+    "after": "965bd60dbf18f6cd8dd043c5e5eae5715ed5258e33062a0680627eb9f3dfb41c"
+  },
+  "csrc/tvm_ffi_api.cpp": {
+    "before": "bf94542f08f0d5e70d5b9eb38eaa69e507465b87ee4f2aa6327d86356147b757",
+    "after": "7f621cfb92db08e65c6d871d440a03b2fa7355d9cace6c252a7423deea550881"
+  },
+  "iaas_kernels/__init__.py": {
+    "before": "eee9ad2536fe934b8442327212363411e26bcfb8ca08fe08c9d8158a743192da",
+    "after": "40b4b6a94a5167b049f390c384b2bdb9e451ff5322bc4da1dd26c1a0184527ea"
+  },
+  "iaas_kernels/include/iaas_kernels/impls/sm90_fp8_mega_moe.cuh": {
+    "before": "493364fa342671d2fe2944a67d55ebb84335e6d71044223f82bb735b8138f059",
+    "after": "ed5153a3d1d5e7cca59a65d51c92782d7121b355b0551f95f4cb9c4cba129dc6"
+  },
+  "iaas_kernels/mega_moe.py": {
+    "before": "ca68f6e86831106248dd12b741f584fbb9ba796c04e9b0c3fc99bb648ecd0daf",
+    "after": "81b2ede186b5fd2c5540f42342777c25e9676220e1f032ac64525554ea4a233f"
+  }
+}

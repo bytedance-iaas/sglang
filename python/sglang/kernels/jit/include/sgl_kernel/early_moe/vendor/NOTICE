@@ -1,0 +1,3 @@
+Math headers derived from the user-provided IAAS-kernels source snapshot.
+Original DeepSeek / sgl-deep-gemm MIT licenses are retained beside this file.
+Only the early FFN transitive include closure is vendored.
