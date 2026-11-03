@@ -2486,6 +2486,14 @@ class ServerArgs:
     )
     enable_eplb: A[bool, "Enable EPLB algorithm", NS("exec.moe")] = False
     eplb_algorithm: A[str, "Chosen EPLB algorithm", NS("exec.moe")] = "auto"
+    enable_block_eplb: A[bool, "Enable block-aware EPLB placement.", NS("exec.moe")] = (
+        False
+    )
+    eplb_block_size: A[
+        int,
+        "Row-block size for the block EPLB algorithm (64 or 128).",
+        NS("exec.moe"),
+    ] = 64
     eplb_rebalance_num_iterations: A[
         int,
         "Number of iterations to automatically trigger a EPLB re-balance.",

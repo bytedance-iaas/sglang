@@ -205,6 +205,7 @@ class ExpertLocationMetadata:
                 num_local_physical_experts=num_physical_experts // common["ep_size"],
                 num_groups=num_groups,
                 num_nodes=num_nodes,
+                block_size=get_exec().moe.eplb_block_size,
                 algorithm=eplb_algorithms.compute_algorithm(
                     raw_algorithm=get_exec().moe.eplb_algorithm,
                     num_groups=num_groups,

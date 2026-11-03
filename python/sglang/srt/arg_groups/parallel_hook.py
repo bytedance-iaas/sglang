@@ -544,6 +544,12 @@ def handle_eplb_and_dispatch(server_args: Any):
 
     # `dynamic` / `fake` switch to the row-index pick; `static` reads a
     # per-rank table and `lp` samples inside its kernel.
+    if cfg.enable_block_eplb:
+        declare_resolution(
+            server_args, "_handle_eplb_and_dispatch", eplb_algorithm="block"
+        )
+    cfg = resolved_view(server_args)
+
     if needs_rank_invariant_dispatch and cfg.ep_dispatch_algorithm in (
         "static",
         "lp",
