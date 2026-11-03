@@ -132,7 +132,7 @@ def prepare(moe, hidden_states, forward_batch, input_ids_global):
     )
 
 
-def run_remaining(prepared):
+def run_remaining(prepared, early=None):
     moe, buf = prepared.moe, prepared.buf
     impl = prepared.implementation
     factor = (
@@ -157,6 +157,7 @@ def run_remaining(prepared):
         dtype=torch.bfloat16,
         device=prepared.hidden_states.device,
     )
+    extra = {} if early is None else early.combine_inputs()
     impl.fp8_mega_moe(
         output,
         moe.experts.mega_l1_weights,
@@ -166,6 +167,7 @@ def run_remaining(prepared):
         activation="swiglu",
         activation_clamp=getattr(moe.config, "swiglu_limit", None),
         fast_math=True,
+        **extra,
     )
     return output[: prepared.num_tokens]
 
@@ -185,6 +187,21 @@ def forward(moe, hidden_states, forward_batch=None, input_ids_global=None):
     if not getattr(moe.experts, "_mega_moe_sm90_fp8_weights", False):
         raise ValueError("SM90 expert weights must be prepared before block execution")
     p = prepare(moe, hidden_states, forward_batch, input_ids_global)
+    early = None
+    if options().enable_early_expert_compute:
+        from sglang.srt.eplb.early_compute import state_for as early_state_for
+
+        if getattr(p.implementation, "EARLY_COMBINE_API_VERSION", 0) < 1:
+            raise RuntimeError(
+                "Early MoE requires a backend with slot-ordered early combine. "
+                "Apply the supplied IAAS backend patch and rebuild it, or disable "
+                "--enable-early-expert-compute. Rounded partial-sum merge is unsafe."
+            )
+        cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+        early = early_state_for(
+            moe, get_global_expert_location_metadata(), get_moe_ep_group(), cap
+        )
+        p.topk_ids = early.run(p)
     p.topk_ids = block_dispatch.global_block_route(p.topk_ids, moe.layer_id, p.ep_group)
     state = None
     if options().enable_expert_migration:
@@ -200,9 +217,11 @@ def forward(moe, hidden_states, forward_batch=None, input_ids_global=None):
     else:
         shared = moe._forward_shared_experts(hidden_states)
     with torch.profiler.record_function("block_moe_remaining"):
-        output = run_remaining(p)
+        output = run_remaining(p, early)
     if state is not None:
         state.finish()
+    if early is not None:
+        early.finish()
     if shared is not None:
         output.add_(shared)
     return output

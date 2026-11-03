@@ -1,29 +1,39 @@
-# Block expert balancing
+# Block-based expert balancing
 
-All feature flags default to off. This branch is part of a stacked series; the
-next branch adds a separate opt-in feature without changing the native path.
+`--eplb-algorithm block --eplb-block-size 64` chooses replica placement from
+recorded `[step, layer, expert]` counts. It preserves the native DeepSeek replica
+counts. A candidate must not increase Bmax or Tmax on any observed step. This is
+a historical estimate, not a guarantee for an unseen request.
 
-## Block-EPLB
+`--ep-dispatch-algorithm block --moe-a2a-backend megamoe` selects runtime
+Block-LPLB. Gate results first use the live physical map with local-replica
+preference. All EP ranks, including ranks with no tokens, then gather counts and
+compute exact integer quotas. Routing conserves every `(token, top-k slot)`.
+The native `lp` option is unchanged. Shared experts must remain separate.
 
-`--enable-block-eplb --eplb-block-size 64` selects per-step Bmax/Tmax placement.
-`--enable-eplb` still controls periodic updates. Native replica counts are kept.
-Candidates must not increase either tail on any observed step; future inputs
-are not covered by that historical bound. Bmax/Bmean is averaged per step and
-layer, not computed from aggregate counts.
+The common unit is `SGLANG_LPLB_BLOCK_SIZE=64` (also accepts 128). Bmax is the
+maximum across ranks of `sum_expert(ceil(assignments / block_size))`; Bsum is not
+the objective. Average Bmax/Bmean per **step and layer** before aggregating.
+This unit is a load proxy, not a count of CUDA CTAs or a runtime prediction.
 
-## Block-LPLB
+`SGLANG_LPLB_BLOCK_FAST=1` reuses per-layer buffers and the caller's NCCL stream.
+`SGLANG_LPLB_BLOCK_PLANNER_VARIANT=boundary` selects the optimized planner;
+`reference` and `warp` remain available as numerical references. Use only the
+`BLOCK_*` names; obsolete `TAIL_*` aliases have been removed.
 
-`--enable-block-lplb --moe-a2a-backend megamoe` enables global integer quotas and
-live-map token routing. Use `SGLANG_LPLB_BLOCK_SIZE=64` (or 128), matching EPLB.
-All ranks participate, including empty ranks. The original `lp` policy remains.
-`SGLANG_LPLB_BLOCK_FAST=1` reuses buffers and the NCCL stream.
-`SGLANG_LPLB_BLOCK_PLANNER_VARIANT=boundary` is the optimized quota planner;
-`reference` and `warp` are comparison paths. Old `TAIL_*` aliases are removed.
-Shared experts stay separate. Model graph capture is not supported.
+Current runtime scope: eager SM90 FP8 MegaMoE. CUDA graph capture and
+provider-owned packed MoE layouts are not supported by this adapter. The
+ordinary SGLang path is used unless the block feature is explicitly enabled.
 
-## Expert migration
+## Feature switches and migration
 
-`--enable-expert-migration` requires Block-LPLB.
+Each extension is opt-in. The named switches are `--enable-block-eplb`,
+`--enable-block-lplb`, `--enable-expert-migration`,
+`--enable-early-expert-compute`, and `--enable-fused-early-moe`.
+The first selects the placement policy; `--enable-eplb` still controls periodic
+updates, and `--init-expert-location` still controls the initial layout.
+Migration requires Block-LPLB. Early computation requires Block-LPLB and the
+fused kernel, but does not require migration.
 
 Migration budget is **per rank, per layer**, independently for sends and receives
 (`--expert-migration-budget 1`, operator capacity 1..4). All selected copies read
@@ -35,7 +45,10 @@ The CPU metadata mirror is updated after the remaining kernel is enqueued.
 hosts. `ipc` requires peer-accessible GPUs; `nccl` is portable but currently reads
 a small command list on the CPU, so its overhead is not equivalent to device IPC.
 `--block-moe-validate` enables conservation/quota/weight checks;
-`--block-moe-audit` logs actual per-layer **remaining-work** B/T counts for each forward. The early-compute bridge is added in a later branch.
+`--block-moe-audit` logs actual per-layer **remaining-work** B/T counts and
+per-rank early-work counters. Early work has already been removed from the
+remaining quotas; do not compare these counts with total-work counts without
+accounting for it.
 
 Model dimensions and the EP world size come from the model, metadata, and group.
 Planner rank masks support up to 32 ranks. Physical expert slots must divide
@@ -43,6 +56,31 @@ exactly by EP size; for example, 256 logical experts plus R8 cannot be evenly
 sharded over EP16. Choose a compatible redundant-slot count explicitly; the code
 does not silently round it or change R8 to a different configuration.
 
+## Early computation and numerical contract
+
+The fused SM90 kernel computes local `(token, top-k slot)` assignments in M64
+blocks while polling peer-ready epochs. It stops admitting work when all peers
+are ready, drains admitted work, and marks only completed assignments `-1` in
+the remaining route. A token may still have other, uncomputed experts. It is
+never removed wholesale. Scratch is reused only after native combine finishes.
+
+IPC readiness and FFN computation share a kernel. With
+`--early-moe-ready-transport nccl`, the all-reduce runs on a separate stream and
+publishes a device epoch; this is overlap, not in-kernel NCCL fusion.
+`--early-moe-max-inflight` bounds concurrent tasks, not total admitted work.
+
+The backend now reads completed early contributions in its original top-k slot
+order, accumulates in FP32, and writes BF16 once. There is no external merge of
+an already rounded remaining sum. The optional backend contract and IAAS patch
+are in `python/sglang/kernels/ops/moe/early_moe/backend/`; early mode rejects a
+backend without this contract. The regression fixture loads checkpoint weights
+through `test/manual/early_moe/checkpoint_weights.py`.
+
+`test/manual/early_moe/check_native_combine.py` requires exact equality for
+real-weight contributions, poisoned unread slots and actual fused execution.
+The DSV4 8-GPU live-input audit also passed exact checks across all 43 layers.
+Other model geometries, quantization settings and distributed backends still
+require their own numerical regression; this is not a universal quality claim.
 
 With migration enabled, statistical EPLB counts are resolved to logical IDs at
 gate time. This prevents later physical-map updates from relabeling historical
@@ -58,10 +96,3 @@ hosts. This does not imply that every selected MegaMoE backend supports RDMA.
 spans hosts. The installed IAAS wheel must include a compatible RDMA extension,
 and its NVSHMEM allocator is selected before communicators are created. A
 non-RDMA backend fails explicitly for a multi-host group. Hardware validation currently covers eight local GPUs. EP16/EP32 planner simulations do not establish multi-node performance.
-
-## Standalone early kernel
-
-The fused M64 kernel API and tests are available under
-`python/sglang/kernels/ops/moe/early_moe/` and `test/manual/early_moe/`.
-This branch does not enable early computation in the model adapter.
-The next branch supplies that opt-in integration.

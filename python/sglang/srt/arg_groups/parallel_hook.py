@@ -555,6 +555,10 @@ def handle_eplb_and_dispatch(server_args: Any):
     cfg = resolved_view(server_args)
     if cfg.enable_expert_migration and cfg.ep_dispatch_algorithm != "block":
         raise ValueError("Expert migration requires --enable-block-lplb")
+    if cfg.enable_early_expert_compute and (
+        cfg.ep_dispatch_algorithm != "block" or not cfg.enable_fused_early_moe
+    ):
+        raise ValueError("Early compute requires block LPLB and the fused early kernel")
     if cfg.enable_expert_migration and not 1 <= cfg.expert_migration_budget <= 4:
         raise ValueError("expert_migration_budget must be 1..4 per rank per layer")
     if cfg.ep_dispatch_algorithm == "block":
