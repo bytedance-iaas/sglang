@@ -29,7 +29,6 @@ from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     gather_dequant_requant_fp8_paged,
     q8kv8_padded_num_heads,
 )
-from sglang.kernels.ops.attention.dsv4.fp4_indexer import fp4_index_logits_decode
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     fill_all_compressed_indices,
@@ -68,6 +67,7 @@ from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     mask_topk_scores,
     published_masks,
     select_candidate_blocks,
+    sm90_index_logits_with_candidates,
 )
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
@@ -3246,7 +3246,11 @@ class DeepseekV4AttnBackend(
         if (
             (mode.is_decode() or mode.is_target_verify())
             and _is_sm90()
-            and envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER.get()
+            and (
+                envs.SGLANG_DSV41_SM90_CANDIDATE_MASK.get()
+                or envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER.get()
+                or envs.SGLANG_DSV41_SM90_QUERY_K_REUSE.get()
+            )
         ):
             group_size = 1
             if (
@@ -3264,7 +3268,13 @@ class DeepseekV4AttnBackend(
             ):
                 group_size = self.speculative_num_draft_tokens
             self._low_ratio_index_topk_sm90_decode(
-                layer, x, q_lora, req, pos, group_size=group_size
+                layer,
+                x,
+                q_lora,
+                req,
+                pos,
+                group_size=group_size,
+                request_ids=req if mode.is_target_verify() else None,
             )
             return
         if self._use_sm90_fp8_prefill_indexer(forward_batch):
@@ -3581,7 +3591,7 @@ class DeepseekV4AttnBackend(
             )
 
     def _low_ratio_index_topk_sm90_decode(
-        self, layer, x, q_lora, req, pos, *, group_size=1
+        self, layer, x, q_lora, req, pos, *, group_size=1, request_ids=None
     ) -> None:
         pool = self.token_to_kv_pool
         core = self.forward_metadata.core_metadata
@@ -3614,6 +3624,8 @@ class DeepseekV4AttnBackend(
         table = pool.get_index_k_with_scale_buffer(layer.layer_id)
         use_grouped = (
             envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER.get()
+            and not envs.SGLANG_DSV41_SM90_CANDIDATE_MASK.get()
+            and not envs.SGLANG_DSV41_SM90_QUERY_K_REUSE.get()
             and group_size > 1
             and ratio in (1, 2)
             and q.is_cuda
@@ -3753,10 +3765,20 @@ class DeepseekV4AttnBackend(
                 // ratio
             )
             slots = slots.masked_fill(~valid, 0)
-            s = fp4_index_logits_decode(
-                q, weights, slots, lens, table, table.shape[1] // 68
+            s, self.forward_metadata.candidate_metadata = (
+                sm90_index_logits_with_candidates(
+                    q,
+                    weights,
+                    slots,
+                    lens,
+                    table,
+                    table.shape[1] // 68,
+                    indexer=indexer,
+                    candidate_metadata=self.forward_metadata.candidate_metadata,
+                    request_ids=request_ids,
+                )
             )
-        if indexer.is_candidate_source:
+        if use_grouped and indexer.is_candidate_source:
             mask = select_candidate_blocks(
                 s,
                 lens[:, None],
@@ -3764,7 +3786,7 @@ class DeepseekV4AttnBackend(
                 block_size=indexer.candidate_block_size,
             )
             self.forward_metadata.candidate_metadata = CandidateMasks(mask=mask)
-        elif indexer.uses_candidates:
+        elif use_grouped and indexer.uses_candidates:
             # Published this step by the candidate-source layer's decode pass above.
             consume = published_masks(self.forward_metadata.candidate_metadata).mask
             assert torch.is_tensor(consume) and consume.shape[0] == bs, (

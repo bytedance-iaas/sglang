@@ -360,6 +360,31 @@ register_kernel(
     )
 )
 
+for _fn, _description in (
+    (
+        "compact_candidate_logits",
+        "Score candidate blocks from packed FP4 index-K into dense FP32 logits.",
+    ),
+    (
+        "paired_query_logits",
+        "Reuse packed FP4 index-K across same-layer H32 query pairs.",
+    ),
+):
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.dsv4.sm90_candidate_indexer:{_fn}",
+            capabilities=frozenset(
+                {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}
+            ),
+            format_signature=FormatSignature(
+                supported_dtypes=("bfloat16",), description=_description
+            ),
+        )
+    )
+del _fn, _description
+
 register_kernel(
     KernelSpec(
         op="attention.pack_prefix_current",
