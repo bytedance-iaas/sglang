@@ -368,11 +368,15 @@ class ExpertLocationMetadata:
             return list(
                 range(logical_expert_id, num_physical_experts, self.num_logical_experts)
             )
-        return [
-            physical_expert_id
-            for physical_expert_id in cpu_map[layer_id, logical_expert_id].tolist()
-            if physical_expert_id != -1
-        ]
+        # Dispatch preference may hide a same-rank replica from cpu_map. Remote
+        # ranks and runtime balancing can still route to it, so load every slot
+        # in the authoritative physical layout. This is a CPU-only load path.
+        return (
+            self.physical_to_logical_map_cpu[layer_id]
+            .eq(logical_expert_id)
+            .nonzero(as_tuple=True)[0]
+            .tolist()
+        )
 
 
 def format_expert_location_layout(
