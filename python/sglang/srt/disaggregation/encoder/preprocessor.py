@@ -125,10 +125,12 @@ class EncoderPreprocessor:
         model_config: ModelConfig,
         encoder_media_processor_config: EncoderMediaProcessorConfig,
         model_preprocessor: Optional[Callable] = None,
+        model_token_counter: Optional[Callable] = None,
     ):
         self.server_args = server_args
         self.model_config = model_config
         self._model_preprocessor = model_preprocessor
+        self._model_token_counter = model_token_counter
         self.encoder_media_processor_config = encoder_media_processor_config
         self.model_type = getattr(
             model_config.hf_config, "model_type", "unknown"
@@ -900,6 +902,8 @@ class EncoderPreprocessor:
         self, grid: Union[torch.Tensor, List[int]], modality: Modality
     ) -> int:
         """Compatibility helper for callers that still provide patch grids."""
+        if self._model_token_counter is not None:
+            return int(self._model_token_counter(grid, modality))
         if modality == Modality.AUDIO:
             input_length = self.get_num_patches(grid, modality)
             return self._get_feat_extract_output_lengths(input_length)
