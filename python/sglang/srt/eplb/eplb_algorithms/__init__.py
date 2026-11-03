@@ -7,6 +7,7 @@ from sglang.srt.eplb.eplb_algorithms import deepseek, deepseek_vec, elasticity_a
 
 
 class EplbAlgorithm(Enum):
+    block = auto()
     deepseek = auto()
     deepseek_hierarchical = auto()
     deepseek_vec = auto()
@@ -23,7 +24,21 @@ def rebalance_experts(
     num_groups: Optional[int],
     num_nodes: int,
     algorithm: EplbAlgorithm,
+    block_size: int = 64,
 ):
+    if algorithm == EplbAlgorithm.block:
+        from sglang.srt.eplb.eplb_algorithms import block
+
+        return block.rebalance_experts(
+            tokens_per_expert,
+            num_physical_experts,
+            num_local_physical_experts,
+            num_groups,
+            num_nodes,
+            block_size,
+            False,
+        )
+
     if algorithm in [EplbAlgorithm.deepseek, EplbAlgorithm.deepseek_hierarchical]:
         return deepseek.rebalance_experts(
             weight=tokens_per_expert.sum(dim=0),
