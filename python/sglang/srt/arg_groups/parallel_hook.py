@@ -553,6 +553,10 @@ def handle_eplb_and_dispatch(server_args: Any):
             server_args, "_handle_eplb_and_dispatch", ep_dispatch_algorithm="block"
         )
     cfg = resolved_view(server_args)
+    if cfg.enable_expert_migration and cfg.ep_dispatch_algorithm != "block":
+        raise ValueError("Expert migration requires --enable-block-lplb")
+    if cfg.enable_expert_migration and not 1 <= cfg.expert_migration_budget <= 4:
+        raise ValueError("expert_migration_budget must be 1..4 per rank per layer")
     if cfg.ep_dispatch_algorithm == "block":
         if cfg.moe_a2a_backend != "megamoe":
             raise ValueError("Block-LPLB currently requires MegaMoE")

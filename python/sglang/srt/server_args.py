@@ -2492,6 +2492,28 @@ class ServerArgs:
     enable_block_lplb: A[
         bool, "Enable global block-quota token routing.", NS("exec.moe")
     ] = False
+    enable_expert_migration: A[
+        bool, "Migrate experts within the current forward.", NS("exec.moe")
+    ] = False
+    expert_migration_budget: A[
+        int, "Per-layer, per-rank send and receive budget (1..4).", NS("exec.moe")
+    ] = 1
+    expert_migration_transport: A[
+        Literal["auto", "ipc", "nccl"],
+        "Expert transfer transport; auto uses IPC within a host.",
+        NS("exec.moe"),
+    ] = "auto"
+    block_moe_backend: A[
+        Literal["native", "iaas"],
+        "Remaining MegaMoE implementation for the opt-in block path.",
+        NS("exec.moe"),
+    ] = "native"
+    block_moe_validate: A[
+        bool, "Enable assignment, quota and weight-copy validation.", NS("exec.moe")
+    ] = False
+    block_moe_audit: A[
+        bool, "Log per-layer B/T and early-compute counters.", NS("exec.moe")
+    ] = False
     eplb_block_size: A[
         int,
         "Row-block size for the block EPLB algorithm (64 or 128).",

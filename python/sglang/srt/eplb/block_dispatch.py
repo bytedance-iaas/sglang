@@ -8,6 +8,7 @@ from sglang.kernels.ops.lplb.block_planner import BlockLPLB
 from sglang.srt.eplb.balance_config import BLOCK_SIZE
 
 _CACHE = {}
+_LAST_CURRENT = {}
 
 
 def global_block_route(ids, layer_id, ep_group):
@@ -71,6 +72,10 @@ def global_block_route(ids, layer_id, ep_group):
     else:
         dist.all_gather_into_tensor(gathered.view(-1), local, group=ep_group)
     quota = planner.plan(gathered, quota)
+    from sglang.srt.eplb.block_options import migration_enabled
+
+    if migration_enabled():
+        _LAST_CURRENT[layer_id] = (gathered, quota)
     return planner.route(ids, gathered, quota, dist.get_rank(ep_group), out, cursor)
 
 
@@ -80,9 +85,5 @@ def invalidate_layers(layer_ids):
     for key in list(_CACHE):
         if key[0] in changed:
             del _CACHE[key]
-
-
-def enabled():
-    from sglang.srt.runtime_context import get_exec
-
-    return get_exec().moe.ep_dispatch_algorithm == "block"
+    for layer in changed:
+        _LAST_CURRENT.pop(layer, None)
