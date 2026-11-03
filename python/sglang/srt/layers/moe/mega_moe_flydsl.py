@@ -198,10 +198,10 @@ def forward_mega_moe(
     if overlap:
         current_stream = torch.cuda.current_stream()
         moe.alt_stream.wait_stream(current_stream)
-        shared_output = moe._forward_shared_experts(hidden_states)
+        _, shared_output = moe._forward_shared_experts(hidden_states)
         stream_context = torch.cuda.stream(moe.alt_stream)
     else:
-        shared_output = moe._forward_shared_experts(hidden_states)
+        _, shared_output = moe._forward_shared_experts(hidden_states)
         stream_context = nullcontext()
 
     with stream_context:

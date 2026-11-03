@@ -13,7 +13,12 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.layers.moe import MoeA2ABackend, MoeRunnerBackend, mega_moe
+from sglang.srt.layers.moe import (
+    MoeA2ABackend,
+    MoeRunnerBackend,
+    mega_moe,
+    mega_moe_flydsl,
+)
 from sglang.srt.layers.moe.fused_moe_triton import layer as fused_moe_layer_module
 from sglang.srt.layers.moe.utils import draft_model_build_scope
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
@@ -41,6 +46,85 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
     def tearDown(self):
         mega_moe._MEGA_MOE_SYMM_BUFFER.clear()
         super().tearDown()
+
+    def test_forward_unpacks_shared_expert_output(self):
+        for backend in (mega_moe, mega_moe_flydsl):
+            for overlap in (False, True):
+                for num_tokens, has_shared in ((2, True), (2, False), (0, False)):
+                    with self.subTest(
+                        backend=backend.__name__,
+                        overlap=overlap,
+                        num_tokens=num_tokens,
+                        has_shared=has_shared,
+                    ):
+                        hidden_states = torch.zeros(num_tokens, 4)
+                        routed = torch.full_like(hidden_states, 2)
+                        shared = (
+                            torch.full_like(hidden_states, 3) if has_shared else None
+                        )
+                        moe = SimpleNamespace(
+                            alt_stream=MagicMock() if overlap else None,
+                            num_fused_shared_experts=0,
+                            mega_shared_l1_weights=None,
+                            _forward_shared_experts=MagicMock(
+                                return_value=(None, shared)
+                            ),
+                        )
+                        current_stream = MagicMock()
+                        with (
+                            patch.object(
+                                mega_moe, "_use_amd_flydsl_mega_moe", return_value=False
+                            ),
+                            patch.object(
+                                backend, "get_is_capture_mode", return_value=True
+                            ),
+                            patch.object(
+                                backend, "_run_mega_routed", return_value=routed
+                            ),
+                            patch.object(
+                                torch.cuda,
+                                "current_stream",
+                                return_value=current_stream,
+                            ),
+                            patch.object(
+                                torch.cuda, "stream", return_value=nullcontext()
+                            ),
+                            mega_moe.envs.SGLANG_AITER_MEGA_RANK_SYNC.override(False),
+                        ):
+                            output = backend.forward_mega_moe(moe, hidden_states)
+
+                        self.assertIs(output, routed)
+                        torch.testing.assert_close(
+                            output,
+                            torch.full_like(hidden_states, 5 if has_shared else 2),
+                        )
+                        if overlap and num_tokens > 0:
+                            moe.alt_stream.wait_stream.assert_called_once_with(
+                                current_stream
+                            )
+                            current_stream.wait_stream.assert_called_once_with(
+                                moe.alt_stream
+                            )
+                        else:
+                            current_stream.wait_stream.assert_not_called()
+
+    def test_forward_keeps_fused_shared_experts_in_kernel(self):
+        hidden_states = torch.zeros(2, 4)
+        routed = torch.full_like(hidden_states, 2)
+        moe = SimpleNamespace(
+            alt_stream=None,
+            mega_shared_l1_weights=object(),
+            _forward_shared_experts=MagicMock(),
+        )
+        with (
+            patch.object(mega_moe, "_use_amd_flydsl_mega_moe", return_value=False),
+            patch.object(mega_moe, "_run_mega_routed", return_value=routed),
+        ):
+            output = mega_moe.forward_mega_moe(moe, hidden_states)
+
+        moe._forward_shared_experts.assert_not_called()
+        self.assertIs(output, routed)
+        torch.testing.assert_close(output, torch.full_like(hidden_states, 2))
 
     def test_mxf4_buffer_uses_typed_api(self):
         deep_gemm = self.deep_gemm
