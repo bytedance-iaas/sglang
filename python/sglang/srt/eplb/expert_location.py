@@ -315,6 +315,9 @@ class ExpertLocationMetadata:
         other: ExpertLocationMetadata,
         update_layer_ids: List[int],
     ):
+        from sglang.srt.eplb.block_dispatch import invalidate_layers
+
+        invalidate_layers(update_layer_ids)
         for field in [
             "ep_size",
         ]:

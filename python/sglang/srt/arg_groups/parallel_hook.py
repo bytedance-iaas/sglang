@@ -548,7 +548,19 @@ def handle_eplb_and_dispatch(server_args: Any):
         declare_resolution(
             server_args, "_handle_eplb_and_dispatch", eplb_algorithm="block"
         )
+    if cfg.enable_block_lplb:
+        declare_resolution(
+            server_args, "_handle_eplb_and_dispatch", ep_dispatch_algorithm="block"
+        )
     cfg = resolved_view(server_args)
+    if cfg.ep_dispatch_algorithm == "block":
+        if cfg.moe_a2a_backend != "megamoe":
+            raise ValueError("Block-LPLB currently requires MegaMoE")
+        if cfg.enable_eplb and cfg.eplb_algorithm == "block":
+            from sglang.srt.eplb.balance_config import BLOCK_SIZE
+
+            if cfg.eplb_block_size != BLOCK_SIZE:
+                raise ValueError("Block-EPLB and Block-LPLB tile sizes must agree")
 
     if needs_rank_invariant_dispatch and cfg.ep_dispatch_algorithm in (
         "static",

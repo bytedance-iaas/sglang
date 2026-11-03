@@ -23,7 +23,7 @@ from sglang.srt.runtime_context import get_exec
 
 @dataclass
 class ExpertLocationDispatchInfo:
-    ep_dispatch_algorithm: Literal["static", "dynamic", "fake", "lp"]
+    ep_dispatch_algorithm: Literal["static", "dynamic", "fake", "lp", "block"]
     # (num_logical_experts,)
     partial_logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
     # (num_logical_experts, X)
@@ -37,6 +37,7 @@ class ExpertLocationDispatchInfo:
     # logical expert several times. With one, each rank dispatches only its own
     # tokens and is free to disagree.
     rank_invariant: bool = False
+    source_rank_offset: int = 0
 
     @classmethod
     def init_new(cls, layer_id: int):
@@ -47,7 +48,14 @@ class ExpertLocationDispatchInfo:
         if ep_dispatch_algorithm is None:
             return None
 
+        from sglang.srt.distributed import get_moe_expert_parallel_rank
+
         return cls(
+            source_rank_offset=(
+                get_moe_expert_parallel_rank()
+                if ep_dispatch_algorithm == "block"
+                else 0
+            ),
             ep_dispatch_algorithm=ep_dispatch_algorithm,
             rank_invariant=get_exec().moe.moe_a2a_backend == "none",
             partial_logical_to_rank_dispatch_physical_map=(
@@ -88,6 +96,10 @@ def topk_ids_logical_to_physical(
     if info is None:
         return topk_ids
 
+    if info.ep_dispatch_algorithm == "block":
+        from sglang.kernels.ops.lplb.initial_route import initial_route
+
+        return initial_route(topk_ids, info)
     if info.ep_dispatch_algorithm == "static":
         return _topk_ids_logical_to_physical_static(topk_ids, info)
     if info.ep_dispatch_algorithm in ["dynamic", "fake"]:

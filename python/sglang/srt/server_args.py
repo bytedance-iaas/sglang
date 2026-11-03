@@ -2477,7 +2477,7 @@ class ServerArgs:
         NS("exec.moe"),
     ] = 0
     ep_dispatch_algorithm: A[
-        Optional[Literal["static", "dynamic", "fake", "lp"]],
+        Optional[Literal["static", "dynamic", "fake", "lp", "block"]],
         "The algorithm to choose ranks for redundant experts in expert parallel.",
         NS("exec.moe"),
     ] = None
@@ -2489,6 +2489,9 @@ class ServerArgs:
     enable_block_eplb: A[bool, "Enable block-aware EPLB placement.", NS("exec.moe")] = (
         False
     )
+    enable_block_lplb: A[
+        bool, "Enable global block-quota token routing.", NS("exec.moe")
+    ] = False
     eplb_block_size: A[
         int,
         "Row-block size for the block EPLB algorithm (64 or 128).",

@@ -263,6 +263,15 @@ def _run_mega_routed(
         topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int32)
         topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
 
+    from sglang.srt.eplb import block_dispatch
+
+    if block_dispatch.enabled():
+        if moe.num_fused_shared_experts:
+            raise ValueError("Block-LPLB requires separate shared experts")
+        topk_ids_in = block_dispatch.global_block_route(
+            topk_ids_in, moe.layer_id, ep_group
+        )
+
     if _device_sm == 90:
         return run_sm90_mega_routed(
             moe,
