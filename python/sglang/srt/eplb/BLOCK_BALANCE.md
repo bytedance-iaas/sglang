@@ -58,3 +58,10 @@ hosts. This does not imply that every selected MegaMoE backend supports RDMA.
 spans hosts. The installed IAAS wheel must include a compatible RDMA extension,
 and its NVSHMEM allocator is selected before communicators are created. A
 non-RDMA backend fails explicitly for a multi-host group. Hardware validation currently covers eight local GPUs. EP16/EP32 planner simulations do not establish multi-node performance.
+
+## Standalone early kernel
+
+The fused M64 kernel API and tests are available under
+`python/sglang/kernels/ops/moe/early_moe/` and `test/manual/early_moe/`.
+This branch does not enable early computation in the model adapter.
+The next branch supplies that opt-in integration.
