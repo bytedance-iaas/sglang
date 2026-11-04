@@ -110,7 +110,12 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     CombineInput,
     DispatchOutput,
 )
-from sglang.srt.layers.moe.topk import BypassedTopKOutput, TopK, TopKOutputFormat
+from sglang.srt.layers.moe.topk import (
+    BypassedTopKOutput,
+    TopK,
+    TopKOutputFormat,
+    _eplb_remap_enabled,
+)
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
@@ -980,7 +985,7 @@ class DeepseekV2MoE(nn.Module):
         )
         dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-            if get_exec().moe.enable_eplb and not self.is_nextn
+            if _eplb_remap_enabled() and not self.is_nextn
             else None
         )
         # router_logits: (num_tokens, n_experts)
@@ -1080,7 +1085,7 @@ class DeepseekV2MoE(nn.Module):
             return self.forward_cpu(hidden_states)
         dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-            if get_exec().moe.enable_eplb and not self.is_nextn
+            if _eplb_remap_enabled() and not self.is_nextn
             else None
         )
         defer_shared = not self.experts.moe_runner_config.inplace

@@ -152,6 +152,12 @@ def forward_mega_moe(
     forward_batch: Optional[ForwardBatch] = None,
     input_ids_global: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    from sglang.srt.eplb.block_options import enabled as block_enabled
+
+    if block_enabled():
+        from sglang.srt.layers.moe.block_moe import forward
+
+        return forward(moe, hidden_states, forward_batch, input_ids_global)
     num_tokens = hidden_states.shape[0]
 
     sbo_overlap_flag = (

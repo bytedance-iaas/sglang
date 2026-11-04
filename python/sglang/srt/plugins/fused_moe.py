@@ -32,6 +32,20 @@ def prepare_fused_moe_worker(server_args):
     from sglang.srt.plugins import load_plugins
 
     load_plugins()
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    cfg = resolved_view(server_args)
+    if cfg.ep_dispatch_algorithm == "block":
+        local_world = cfg.tp_size * cfg.pp_size // cfg.nnodes
+        if cfg.ep_size > local_world:
+            if cfg.block_moe_backend != "iaas":
+                raise ValueError(
+                    "Multi-node Block MoE requires --block-moe-backend iaas"
+                )
+            # Select NVSHMEM before any communicator allocates symmetric memory.
+            from iaas_kernels.rdma._buffer import prepare_allocator
+
+            prepare_allocator()
     for initializer in _worker_initializers.values():
         initializer(server_args)
 
@@ -46,7 +60,14 @@ def register_fused_moe_backend(name: str, capability: tuple[int, int], factory):
 
 def create_fused_moe_backend(name: str, capability: tuple[int, int], layer):
     from sglang.srt.plugins import load_plugins
+    from sglang.srt.runtime_context import get_exec
 
+    if name == "megamoe" and get_exec().moe.ep_dispatch_algorithm == "block":
+        # The opt-in block adapter manages mutable physical slots and uses the
+        # native FP8 preparation path. Provider-owned packing is incompatible.
+        if capability != (9, 0):
+            raise ValueError("Block MoE execution currently requires SM90 FP8")
+        return None
     load_plugins()
     factory = _factories.get((name, capability))
     if factory is not None:

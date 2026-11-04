@@ -544,6 +544,14 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
 class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs, enable_global_physical_experts=True)
+        self._logical_data = None
+        if get_exec().moe.enable_expert_migration:
+            metadata = self._expert_location_metadata
+            self._logical_data = torch.zeros(
+                (metadata.num_layers, metadata.num_logical_experts),
+                dtype=torch.int32,
+                device=self._data.device,
+            )
 
     # can optimize (e.g. fuse / compile)
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
@@ -552,6 +560,25 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
         self._data[layer_idx, :].scatter_add_(
             dim=0, index=topk_ids.masked_fill(~mask, 0).long(), src=mask.int()
         )
+        if self._logical_data is not None:
+            # Resolve at selection time: migration may overwrite this layer's
+            # physical map before the recorder consumes the completed forward.
+            physical = topk_ids.masked_fill(~mask, 0).long()
+            logical = self._expert_location_metadata.physical_to_logical_map[
+                layer_idx, physical
+            ]
+            self._logical_data[layer_idx].scatter_add_(0, logical, mask.int())
+
+    def reset(self):
+        super().reset()
+        if self._logical_data is not None:
+            self._logical_data.zero_()
+
+    def collect(self):
+        result = super().collect()
+        if self._logical_data is not None:
+            result["global_logical_count"] = self._logical_data
+        return result
 
 
 class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
@@ -876,11 +903,16 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
 class _StatAccumulator(_UtilizationRateAccumulatorMixin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._store_logical = get_exec().moe.enable_expert_migration
         self._global_physical_count_of_buffered_step = _Buffer.init_new(
             item_shape=(
                 self._expert_location_metadata.num_layers,
-                # Cannot use local_physical_count to support select_experts
-                self._expert_location_metadata.num_physical_experts,
+                # Migration resolves IDs before the physical map changes.
+                (
+                    self._expert_location_metadata.num_logical_experts
+                    if self._store_logical
+                    else self._expert_location_metadata.num_physical_experts
+                ),
             ),
             buffer_size=get_exec().moe.expert_distribution_recorder_buffer_size,
             dtype=torch.int32,
@@ -898,7 +930,13 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         super().append(forward_pass_id, gatherer_key, single_pass_data, outputs)
         # Can optimize if overhead here is large
         self._global_physical_count_of_buffered_step.append(
-            single_pass_data["global_physical_count"]
+            single_pass_data[
+                (
+                    "global_logical_count"
+                    if self._store_logical
+                    else "global_physical_count"
+                )
+            ]
         )
 
     def reset(self):
@@ -906,11 +944,16 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         self._global_physical_count_of_buffered_step.reset()
 
     def dump(self, output_mode: _OutputMode):
-        logical_count_of_buffered_step = _convert_global_physical_count_to_logical_count(
-            self._global_physical_count_of_buffered_step.get_all(),
-            num_layers=self._expert_location_metadata.num_layers,
-            num_logical_experts=self._expert_location_metadata.num_logical_experts,
-            physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
+        buffered = self._global_physical_count_of_buffered_step.get_all()
+        logical_count_of_buffered_step = (
+            buffered.clone()
+            if self._store_logical
+            else _convert_global_physical_count_to_logical_count(
+                buffered,
+                num_layers=self._expert_location_metadata.num_layers,
+                num_logical_experts=self._expert_location_metadata.num_logical_experts,
+                physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
+            )
         )
 
         if self._first_dump:

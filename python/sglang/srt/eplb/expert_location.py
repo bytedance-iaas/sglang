@@ -205,6 +205,7 @@ class ExpertLocationMetadata:
                 num_local_physical_experts=num_physical_experts // common["ep_size"],
                 num_groups=num_groups,
                 num_nodes=num_nodes,
+                block_size=get_exec().moe.eplb_block_size,
                 algorithm=eplb_algorithms.compute_algorithm(
                     raw_algorithm=get_exec().moe.eplb_algorithm,
                     num_groups=num_groups,
@@ -314,6 +315,9 @@ class ExpertLocationMetadata:
         other: ExpertLocationMetadata,
         update_layer_ids: List[int],
     ):
+        from sglang.srt.eplb.block_dispatch import invalidate_layers
+
+        invalidate_layers(update_layer_ids)
         for field in [
             "ep_size",
         ]:
@@ -367,11 +371,15 @@ class ExpertLocationMetadata:
             return list(
                 range(logical_expert_id, num_physical_experts, self.num_logical_experts)
             )
-        return [
-            physical_expert_id
-            for physical_expert_id in cpu_map[layer_id, logical_expert_id].tolist()
-            if physical_expert_id != -1
-        ]
+        # Dispatch preference may hide a same-rank replica from cpu_map. Remote
+        # ranks and runtime balancing can still route to it, so load every slot
+        # in the authoritative physical layout. This is a CPU-only load path.
+        return (
+            self.physical_to_logical_map_cpu[layer_id]
+            .eq(logical_expert_id)
+            .nonzero(as_tuple=True)[0]
+            .tolist()
+        )
 
 
 def format_expert_location_layout(

@@ -2477,7 +2477,7 @@ class ServerArgs:
         NS("exec.moe"),
     ] = 0
     ep_dispatch_algorithm: A[
-        Optional[Literal["static", "dynamic", "fake", "lp"]],
+        Optional[Literal["static", "dynamic", "fake", "lp", "block"]],
         "The algorithm to choose ranks for redundant experts in expert parallel.",
         NS("exec.moe"),
     ] = None
@@ -2486,6 +2486,58 @@ class ServerArgs:
     )
     enable_eplb: A[bool, "Enable EPLB algorithm", NS("exec.moe")] = False
     eplb_algorithm: A[str, "Chosen EPLB algorithm", NS("exec.moe")] = "auto"
+    enable_block_eplb: A[bool, "Enable block-aware EPLB placement.", NS("exec.moe")] = (
+        False
+    )
+    enable_block_lplb: A[
+        bool, "Enable global block-quota token routing.", NS("exec.moe")
+    ] = False
+    enable_expert_migration: A[
+        bool, "Migrate experts within the current forward.", NS("exec.moe")
+    ] = False
+    enable_early_expert_compute: A[
+        bool, "Compute local assignments while peers finish gating.", NS("exec.moe")
+    ] = False
+    enable_fused_early_moe: A[
+        bool, "Use the fused M64 early expert kernel.", NS("exec.moe")
+    ] = False
+    expert_migration_budget: A[
+        int, "Per-layer, per-rank send and receive budget (1..4).", NS("exec.moe")
+    ] = 1
+    expert_migration_transport: A[
+        Literal["auto", "ipc", "nccl"],
+        "Expert transfer transport; auto uses IPC within a host.",
+        NS("exec.moe"),
+    ] = "auto"
+    early_moe_ready_transport: A[
+        Literal["auto", "ipc", "nccl"],
+        "Ready-signal transport for early compute.",
+        NS("exec.moe"),
+    ] = "auto"
+    early_moe_max_inflight: A[
+        int, "Maximum in-flight M64 blocks, not a total-work cap.", NS("exec.moe")
+    ] = 16
+    early_moe_max_ctas: A[
+        Optional[int],
+        "Cooperative CTA cap; derived from SM count when unset.",
+        NS("exec.moe"),
+    ] = None
+    block_moe_backend: A[
+        Literal["native", "iaas"],
+        "Remaining MegaMoE implementation for the opt-in block path.",
+        NS("exec.moe"),
+    ] = "native"
+    block_moe_validate: A[
+        bool, "Enable assignment, quota and weight-copy validation.", NS("exec.moe")
+    ] = False
+    block_moe_audit: A[
+        bool, "Log per-layer B/T and early-compute counters.", NS("exec.moe")
+    ] = False
+    eplb_block_size: A[
+        int,
+        "Row-block size for the block EPLB algorithm (64 or 128).",
+        NS("exec.moe"),
+    ] = 64
     eplb_rebalance_num_iterations: A[
         int,
         "Number of iterations to automatically trigger a EPLB re-balance.",

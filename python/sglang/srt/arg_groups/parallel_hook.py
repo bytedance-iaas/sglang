@@ -544,6 +544,32 @@ def handle_eplb_and_dispatch(server_args: Any):
 
     # `dynamic` / `fake` switch to the row-index pick; `static` reads a
     # per-rank table and `lp` samples inside its kernel.
+    if cfg.enable_block_eplb:
+        declare_resolution(
+            server_args, "_handle_eplb_and_dispatch", eplb_algorithm="block"
+        )
+    if cfg.enable_block_lplb:
+        declare_resolution(
+            server_args, "_handle_eplb_and_dispatch", ep_dispatch_algorithm="block"
+        )
+    cfg = resolved_view(server_args)
+    if cfg.enable_expert_migration and cfg.ep_dispatch_algorithm != "block":
+        raise ValueError("Expert migration requires --enable-block-lplb")
+    if cfg.enable_early_expert_compute and (
+        cfg.ep_dispatch_algorithm != "block" or not cfg.enable_fused_early_moe
+    ):
+        raise ValueError("Early compute requires block LPLB and the fused early kernel")
+    if cfg.enable_expert_migration and not 1 <= cfg.expert_migration_budget <= 4:
+        raise ValueError("expert_migration_budget must be 1..4 per rank per layer")
+    if cfg.ep_dispatch_algorithm == "block":
+        if cfg.moe_a2a_backend != "megamoe":
+            raise ValueError("Block-LPLB currently requires MegaMoE")
+        if cfg.enable_eplb and cfg.eplb_algorithm == "block":
+            from sglang.srt.eplb.balance_config import BLOCK_SIZE
+
+            if cfg.eplb_block_size != BLOCK_SIZE:
+                raise ValueError("Block-EPLB and Block-LPLB tile sizes must agree")
+
     if needs_rank_invariant_dispatch and cfg.ep_dispatch_algorithm in (
         "static",
         "lp",
