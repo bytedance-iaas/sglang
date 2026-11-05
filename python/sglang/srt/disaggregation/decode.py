@@ -24,7 +24,7 @@ import logging
 import time
 from collections import deque
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -296,6 +296,7 @@ class DecodeRequest:
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
     is_rebootstrap: bool = False
+    enqueue_time: float = field(default_factory=time.monotonic)
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -360,6 +361,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.max_total_num_tokens = max_total_num_tokens
         self.pp_rank = pp_rank
         self.pp_size = scheduler.ps.pp_size
+        # Prefill drops a request whose KV indices have not arrived within this
+        # budget (see _abort_expired_prealloc).
+        self.prealloc_deadline = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
         # Queue for requests pending pre-allocation
@@ -868,6 +872,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if not self.queue:
             return
 
+        # Before the early return below: a queue of handshaken waiters is
+        # exactly where expired requests sit.
+        self._abort_expired_prealloc()
+
         # Still poll if any receiver was aborted, otherwise it stays stuck.
         if (
             self.pp_size <= 1
@@ -924,6 +932,42 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
+
+    def _abort_expired_prealloc(self) -> None:
+        # The prefill sender waits SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT for
+        # our KV indices, then fails the request. It cannot tell us: it learns
+        # our endpoint only from send_metadata, which runs at preallocation.
+        # Without this check a request that waited out that budget here would
+        # still be preallocated, pin KV for another waiting_timeout on a transfer
+        # that never comes, and push the requests behind it past their own
+        # deadline, while the client hears nothing until its own timeout.
+        # Rebootstrap requests dispatch prefill after preallocation, so they
+        # have no such deadline.
+        if self.pp_size > 1 or not self.queue:
+            return
+        now = time.monotonic()
+        expired = torch.tensor(
+            [
+                not d.is_rebootstrap
+                and not isinstance(d.req.finished_reason, FINISH_ABORT)
+                and now - d.enqueue_time >= self.prealloc_deadline
+                for d in self.queue
+            ],
+            dtype=torch.uint8,
+        )
+        # Ranks read the clock at different instants; agree before aborting.
+        torch.distributed.all_reduce(
+            expired, op=torch.distributed.ReduceOp.MAX, group=self.gloo_group
+        )
+        for decode_req, hit in zip(self.queue, expired.tolist()):
+            if hit:
+                prepare_abort(
+                    decode_req.req,
+                    f"Request {decode_req.req.rid} waited over "
+                    f"{self.prealloc_deadline}s for decode KV preallocation; "
+                    "prefill has dropped it",
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
 
     def _ensure_prefill_info(
         self, addr_to_reqs: Dict[str, List[DecodeRequest]]
