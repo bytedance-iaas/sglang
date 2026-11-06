@@ -1,6 +1,7 @@
 """DFLASH spec-v2 overlap scheduling data structures."""
 
 import contextlib
+import copy
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -15,6 +16,16 @@ from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils.common import is_pin_memory_available
 
 _OVERLAP_PLAN_STREAMS: dict[str, torch.cuda.Stream] = {}
+
+
+def _device_matches(
+    actual: torch.device,
+    requested: torch.device | str,
+) -> bool:
+    requested = torch.device(requested)
+    return actual.type == requested.type and (
+        requested.index is None or actual.index == requested.index
+    )
 
 
 def _get_overlap_plan_stream(
@@ -72,7 +83,11 @@ class DFlashDraftInputV2(SpecInput):
             return buf is None or buf.numel() < bs
 
         def needs_gpu_alloc(buf: Optional[torch.Tensor]) -> bool:
-            return buf is None or buf.numel() < bs or str(buf.device) != str(device)
+            return (
+                buf is None
+                or buf.numel() < bs
+                or not _device_matches(buf.device, device)
+            )
 
         def grown_capacity(buf: Optional[torch.Tensor]) -> int:
             current = 0 if buf is None else int(buf.numel())
@@ -242,6 +257,13 @@ class DFlashDraftInputV2(SpecInput):
         self.hidden_states = self.hidden_states[new_indices]
 
     def merge_batch(self, spec_info: "DFlashDraftInputV2"):
+        if self.nxt_kv_lens_cpu is not None and spec_info.nxt_kv_lens_cpu is None:
+            # A delayed PP result can leave the running batch prepared while a
+            # newly transferred prebuilt batch is not. The merged ScheduleBatch
+            # is prepared again immediately, so invalidate this row-derived
+            # cache instead of requiring both inputs to share transient state.
+            self.nxt_kv_lens_cpu = None
+            self.nxt_kv_lens_sum = None
         if self.nxt_kv_lens_cpu is not None:
             assert spec_info.nxt_kv_lens_cpu is not None
             self.nxt_kv_lens_cpu = torch.cat(
@@ -270,3 +292,57 @@ class DFlashDraftInputV2(SpecInput):
         self.hidden_states = torch.cat(
             [self.hidden_states, spec_info.hidden_states], dim=0
         )
+
+    def merge_committed_rows(
+        self,
+        committed: "DFlashDraftInputV2",
+        *,
+        live_rows: List[int],
+        committed_rows: List[int],
+    ) -> "DFlashDraftInputV2":
+        """Return live state with selected rows replaced by committed content."""
+        if len(live_rows) != len(committed_rows):
+            raise ValueError("Committed DSpark row mappings must have equal lengths")
+        if not live_rows:
+            return self
+
+        merged = copy.copy(self)
+        for field in (
+            "topk_p",
+            "topk_index",
+            "bonus_tokens",
+            "new_seq_lens",
+            "hidden_states",
+        ):
+            live_tensor = getattr(self, field)
+            committed_tensor = getattr(committed, field)
+            if live_tensor.shape[1:] != committed_tensor.shape[1:]:
+                raise RuntimeError(
+                    f"Cannot merge DSpark field {field}: "
+                    f"live_shape={tuple(live_tensor.shape)}, "
+                    f"committed_shape={tuple(committed_tensor.shape)}"
+                )
+            live_index = torch.tensor(
+                live_rows, dtype=torch.int64, device=live_tensor.device
+            )
+            committed_index = torch.tensor(
+                committed_rows,
+                dtype=torch.int64,
+                device=committed_tensor.device,
+            )
+            value = live_tensor.clone()
+            value.index_copy_(
+                0,
+                live_index,
+                committed_tensor.index_select(0, committed_index).to(
+                    device=live_tensor.device
+                ),
+            )
+            setattr(merged, field, value)
+
+        # These are planning products for the old row composition. The next
+        # prepare pass rebuilds them from the merged content state.
+        merged.nxt_kv_lens_cpu = None
+        merged.nxt_kv_lens_sum = None
+        merged.future_indices = None
+        return merged
