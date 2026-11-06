@@ -626,6 +626,23 @@ class Envs:
     # PP2 replicated DSpark: exchange result relays in one batched bidirectional
     # operation instead of serializing recv-before-send on the odd PP rank.
     SGLANG_PP_DSPARK_BATCHED_RESULT_RELAY = EnvBool(False)
+    # PP2 replicated DSpark decode: use a correctness-first generation protocol
+    # with fixed output/proxy participation and no launch/relay overlap.
+    SGLANG_PP_DSPARK_SERIAL_GENERATION = EnvBool(False)
+    # Restore only the delayed-output/Target overlap inside the serial
+    # generation protocol. Proxy and proposal communication remain synchronous.
+    SGLANG_PP_DSPARK_OUTPUT_OVERLAP = EnvBool(False)
+    # Restore proxy-send overlap after output overlap is enabled. The send work
+    # still commits before the generation can advance.
+    SGLANG_PP_DSPARK_PROXY_OVERLAP = EnvBool(False)
+    # Apply the previous generation's output and install its DSpark proposal
+    # before launching the current Target generation.
+    SGLANG_PP_DSPARK_PRELAUNCH_RESULT_APPLY = EnvBool(False)
+    # Commit the previous result before planning the current batch so verify
+    # geometry is built from the newly installed proposal and sequence state.
+    SGLANG_PP_DSPARK_PREPLAN_RESULT_APPLY = EnvBool(False)
+    # Propagate committed content state to equivalent live scheduler slots.
+    SGLANG_PP_DSPARK_SYNC_COMMITTED_SLOT_STATE = EnvBool(False)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
 
     # ===================================================================

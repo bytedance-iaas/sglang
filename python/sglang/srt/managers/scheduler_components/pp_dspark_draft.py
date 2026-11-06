@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.dspark_components.dspark_pp import (
@@ -58,7 +59,7 @@ class PPDSparkDraftCoordinator:
         ):
             return
 
-        if self._is_bubble_policy():
+        if self._is_bubble_policy() and not self._is_serial_generation_protocol():
             self.enqueue(batch, result.next_draft_input)
         else:
             result.pp_dspark_next_proposal = self._run_draft(
@@ -163,6 +164,63 @@ class PPDSparkDraftCoordinator:
                 unpack_proposal(owner, work.pp_outputs.tensors),
             )
 
+    def relay_serial_proposals(
+        self,
+        batch: Optional[ScheduleBatch],
+        pp_outputs: PPProxyTensors,
+        transport_generation: int,
+        ready_event: Optional[torch.Event],
+    ) -> None:
+        """Relay PP0's complete proposal set back to PP1 before Target launch."""
+        scheduler = self._scheduler
+        active = batch is not None
+        send_work = []
+        if scheduler.pp_group.is_first_rank:
+            tensor_dict = {
+                "__pp_generation__": transport_generation,
+                "__pp_active__": active,
+            }
+            if active:
+                for owner in range(get_parallel().pp_size):
+                    tensor_dict.update(
+                        pack_proposal(
+                            owner,
+                            unpack_proposal(owner, pp_outputs.tensors),
+                        )
+                    )
+            send_work = scheduler._pp_send_dict_to_next_stage(
+                tensor_dict,
+                async_send=True,
+                msg_type="dspark_draft_serial",
+                ready_event=ready_event,
+            )
+        else:
+            tensor_dict = scheduler._pp_recv_typed_dict(
+                expected_kind="dspark_draft_serial",
+                all_gather_group=scheduler.attn_tp_group,
+            )
+            generation = tensor_dict.pop("__pp_generation__", None)
+            received_active = tensor_dict.pop("__pp_active__", None)
+            if generation != transport_generation:
+                raise RuntimeError(
+                    "Stale serial PP DSpark proposal envelope: "
+                    f"expected generation {transport_generation}, got {generation}"
+                )
+            if received_active is not active:
+                raise RuntimeError(
+                    "Serial PP DSpark proposal activity mismatch for generation "
+                    f"{transport_generation}: expected {active}, "
+                    f"got {received_active}"
+                )
+            if active:
+                for owner in range(get_parallel().pp_size):
+                    scheduler.model_worker.install_pp_draft(
+                        batch,
+                        owner,
+                        unpack_proposal(owner, tensor_dict),
+                    )
+        scheduler._pp_commit_comm_work(send_work)
+
     def _run_draft(self, batch: ScheduleBatch, draft_input: object):
         scheduler = self._scheduler
         if not self._is_bubble_policy():
@@ -178,3 +236,7 @@ class PPDSparkDraftCoordinator:
     @staticmethod
     def _is_bubble_policy() -> bool:
         return get_spec().speculative_draft_scheduling_policy == "bubble"
+
+    @staticmethod
+    def _is_serial_generation_protocol() -> bool:
+        return envs.SGLANG_PP_DSPARK_SERIAL_GENERATION.get()

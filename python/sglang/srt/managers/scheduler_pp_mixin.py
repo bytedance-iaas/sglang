@@ -86,6 +86,51 @@ def _pp_use_batched_result_relay() -> bool:
     )
 
 
+def _pp_use_serial_dspark_generation() -> bool:
+    return (
+        envs.SGLANG_PP_DSPARK_SERIAL_GENERATION.get()
+        and get_parallel().pp_size == 2
+        and get_parallel().pp_async_batch_depth == 0
+        and get_spec().speculative_dspark_pp_replicated_draft
+        and get_spec().speculative_draft_scheduling_policy == "bubble"
+    )
+
+
+def _pp_use_serial_dspark_output_overlap() -> bool:
+    return (
+        envs.SGLANG_PP_DSPARK_OUTPUT_OVERLAP.get()
+        and _pp_use_serial_dspark_generation()
+    )
+
+
+def _pp_use_serial_dspark_proxy_overlap() -> bool:
+    return (
+        envs.SGLANG_PP_DSPARK_PROXY_OVERLAP.get()
+        and _pp_use_serial_dspark_output_overlap()
+    )
+
+
+def _pp_use_serial_dspark_prelaunch_result_apply() -> bool:
+    return (
+        envs.SGLANG_PP_DSPARK_PRELAUNCH_RESULT_APPLY.get()
+        and _pp_use_serial_dspark_output_overlap()
+    )
+
+
+def _pp_use_serial_dspark_preplan_result_apply() -> bool:
+    return (
+        envs.SGLANG_PP_DSPARK_PREPLAN_RESULT_APPLY.get()
+        and _pp_use_serial_dspark_prelaunch_result_apply()
+    )
+
+
+def _pp_use_serial_dspark_sync_committed_slot_state() -> bool:
+    return (
+        envs.SGLANG_PP_DSPARK_SYNC_COMMITTED_SLOT_STATE.get()
+        and _pp_use_serial_dspark_preplan_result_apply()
+    )
+
+
 def _pp_snapshot_forward_batch(batch: ScheduleBatch) -> Optional[ScheduleBatch]:
     if batch.spec_algorithm.is_none():
         return None
@@ -452,6 +497,55 @@ class SchedulerPPMixin:
 
     @DynamicGradMode()
     def event_loop_pp_disagg_decode(self: Scheduler):
+        if (
+            envs.SGLANG_PP_DSPARK_SYNC_COMMITTED_SLOT_STATE.get()
+            and not envs.SGLANG_PP_DSPARK_PREPLAN_RESULT_APPLY.get()
+        ):
+            raise RuntimeError(
+                "SGLANG_PP_DSPARK_SYNC_COMMITTED_SLOT_STATE requires "
+                "SGLANG_PP_DSPARK_PREPLAN_RESULT_APPLY."
+            )
+        if (
+            envs.SGLANG_PP_DSPARK_PREPLAN_RESULT_APPLY.get()
+            and not envs.SGLANG_PP_DSPARK_PRELAUNCH_RESULT_APPLY.get()
+        ):
+            raise RuntimeError(
+                "SGLANG_PP_DSPARK_PREPLAN_RESULT_APPLY requires "
+                "SGLANG_PP_DSPARK_PRELAUNCH_RESULT_APPLY."
+            )
+        if (
+            envs.SGLANG_PP_DSPARK_PRELAUNCH_RESULT_APPLY.get()
+            and not envs.SGLANG_PP_DSPARK_OUTPUT_OVERLAP.get()
+        ):
+            raise RuntimeError(
+                "SGLANG_PP_DSPARK_PRELAUNCH_RESULT_APPLY requires "
+                "SGLANG_PP_DSPARK_OUTPUT_OVERLAP."
+            )
+        if (
+            envs.SGLANG_PP_DSPARK_PROXY_OVERLAP.get()
+            and not envs.SGLANG_PP_DSPARK_OUTPUT_OVERLAP.get()
+        ):
+            raise RuntimeError(
+                "SGLANG_PP_DSPARK_PROXY_OVERLAP requires "
+                "SGLANG_PP_DSPARK_OUTPUT_OVERLAP."
+            )
+        if (
+            envs.SGLANG_PP_DSPARK_OUTPUT_OVERLAP.get()
+            and not envs.SGLANG_PP_DSPARK_SERIAL_GENERATION.get()
+        ):
+            raise RuntimeError(
+                "SGLANG_PP_DSPARK_OUTPUT_OVERLAP requires "
+                "SGLANG_PP_DSPARK_SERIAL_GENERATION."
+            )
+        if envs.SGLANG_PP_DSPARK_SERIAL_GENERATION.get():
+            if not _pp_use_serial_dspark_generation():
+                raise RuntimeError(
+                    "SGLANG_PP_DSPARK_SERIAL_GENERATION requires PP2, "
+                    "pp_async_batch_depth=0, replicated PP DSpark, and the "
+                    "bubble draft scheduling policy."
+                )
+            return self._event_loop_pp_disagg_decode_serial_generation()
+
         self.init_pp_loop_state()
 
         # PD additional state initialization
@@ -656,6 +750,438 @@ class SchedulerPPMixin:
             if server_is_idle and queue_size == 0:
                 self.on_idle()
 
+    def _event_loop_pp_disagg_decode_serial_generation(self: Scheduler):
+        """Correctness-first PP2 generation protocol for replicated DSpark.
+
+        Content generations travel with forwarded requests. Output and proxy
+        channels carry one typed envelope per generation, including idle
+        generations, so local slot occupancy never changes participation.
+        """
+        self.init_pp_loop_state()
+
+        send_retract_work = []
+        send_prealloc_work = []
+        send_transfer_work = []
+        send_consensus_retract_work = []
+        send_consensus_prealloc_work = []
+        send_release_work = []
+        send_generation_work = []
+        next_generation = 0
+
+        while True:
+            server_is_idle = True
+            for mb_id in range(self.pp_loop_size):
+                self.running_batch = self.running_mbs[mb_id]
+                self.last_batch = self.last_mbs[mb_id]
+                next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
+                next_mb_id = (mb_id + 1) % self.pp_loop_size
+
+                recv_reqs = self.request_receiver.recv_requests()
+                self.process_input_requests(recv_reqs)
+
+                if self.pp_group.is_first_rank:
+                    generation = next_generation
+                    next_generation += 1
+                else:
+                    generation_envelope = self._pp_recv_pyobj_from_prev_stage()
+                    generation = self._pp_validate_generation_envelope(
+                        generation_envelope, next_generation
+                    )
+                    next_generation += 1
+                self._pp_serial_generation = generation
+
+                if not self.pp_group.is_last_rank:
+                    self._pp_commit_comm_work(self.send_req_work)
+                    self._pp_commit_comm_work(send_generation_work)
+
+                retract_rids = self._pp_pd_get_retract_ids(mb_id)
+                self._pp_commit_comm_work(send_retract_work)
+
+                prealloc_rids = self._pp_pd_get_prealloc_ids()
+                self._pp_commit_comm_work(send_prealloc_work)
+
+                transferred_rids = self._pp_pd_get_decode_transferred_ids()
+                self._pp_commit_comm_work(send_transfer_work)
+
+                # Forward the current generation before either rank enters a
+                # blocking tensor exchange. This is what lets the peer reach
+                # the matching output/proxy receive.
+                if not self.pp_group.is_last_rank:
+                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                        recv_reqs, async_send=True
+                    )
+                    send_generation_work = self._pp_send_pyobj_to_next_stage(
+                        self._pp_make_generation_envelope(generation),
+                        async_send=True,
+                    )
+                    send_retract_work = self._pp_send_pyobj_to_next_stage(
+                        retract_rids, async_send=True
+                    )
+                    send_prealloc_work = self._pp_send_pyobj_to_next_stage(
+                        prealloc_rids, async_send=True
+                    )
+                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
+                        transferred_rids, async_send=True
+                    )
+                    self._pp_commit_comm_work(self.send_req_work)
+                    self._pp_commit_comm_work(send_generation_work)
+                    self._pp_commit_comm_work(send_retract_work)
+                    self._pp_commit_comm_work(send_prealloc_work)
+                    self._pp_commit_comm_work(send_transfer_work)
+                self._pp_serial_generation_fence()
+
+                next_pp_outputs = None
+                next_batch_result = None
+                d2h_event = None
+                if _pp_use_serial_dspark_preplan_result_apply():
+                    self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                        next_first_rank_mb_id,
+                        next_mb_id,
+                    )
+                    next_pp_outputs, _, _, _ = (
+                        self._pp_complete_serial_output_exchange()
+                    )
+                    self._pp_commit_comm_work(self.send_output_work)
+                    next_batch_result, d2h_event = (
+                        self._pp_preprocess_deferred_serial_output()
+                    )
+                    dspark_draft = _pp_get_dspark_draft_coordinator(self)
+                    dspark_draft.drain()
+                    completed_generation = self._pp_received_output_generation
+                    proposal_batch = (
+                        self._pp_generation_states[completed_generation][0]
+                        if (
+                            completed_generation is not None
+                            and next_batch_result is not None
+                            and next_batch_result.accept_lens is not None
+                        )
+                        else None
+                    )
+                    dspark_draft.relay_serial_proposals(
+                        proposal_batch,
+                        next_pp_outputs,
+                        generation,
+                        d2h_event,
+                    )
+                    if completed_generation is not None:
+                        if d2h_event is None:
+                            raise RuntimeError(
+                                "Active PP generation received an empty output "
+                                "envelope."
+                            )
+                        d2h_event.synchronize()
+                        (
+                            process_batch,
+                            process_metadata,
+                            slot_id,
+                        ) = self._pp_generation_states.pop(completed_generation)
+                        self._pp_process_batch_result(
+                            process_batch,
+                            next_batch_result,
+                        )
+                        if _pp_use_serial_dspark_sync_committed_slot_state():
+                            self._pp_sync_committed_snapshot_to_running_slots(
+                                process_batch,
+                                (
+                                    process_metadata.dspark_commit_state.identities
+                                    if (
+                                        process_metadata is not None
+                                        and process_metadata.dspark_commit_state
+                                        is not None
+                                    )
+                                    else ()
+                                ),
+                            )
+                        self.last_mbs[slot_id] = process_batch
+
+                plan = self.get_next_disagg_decode_batch_to_run(
+                    running_batch=self.running_batch
+                )
+                self.running_batch = plan.running_batch
+                cur_batch = plan.batch_to_run
+                self.mbs[mb_id] = cur_batch
+                self.running_mbs[mb_id] = self.running_batch
+                self._pp_slot_generations[mb_id] = generation
+                self.cur_batch_for_debug = cur_batch
+
+                # PP2 reverse consensus is one direct, fixed triplet per
+                # generation. The last rank owns the consensus result; rank 0
+                # receives the same shapes even when all lists are empty.
+                if self.pp_group.is_last_rank:
+                    send_consensus_retract_work = self._pp_send_pyobj_to_next_stage(
+                        retract_rids, async_send=True
+                    )
+                    send_consensus_prealloc_work = self._pp_send_pyobj_to_next_stage(
+                        prealloc_rids, async_send=True
+                    )
+                    send_release_work = self._pp_send_pyobj_to_next_stage(
+                        transferred_rids, async_send=True
+                    )
+                    self._pp_commit_comm_work(send_consensus_retract_work)
+                    self._pp_commit_comm_work(send_consensus_prealloc_work)
+                    self._pp_commit_comm_work(send_release_work)
+                    self.process_retract_queue(retract_rids)
+                    self.process_prealloc_queue(prealloc_rids)
+                    self.process_decode_transfer_queue(transferred_rids)
+                else:
+                    self.process_retract_queue(self._pp_recv_pyobj_from_prev_stage())
+                    self.process_prealloc_queue(self._pp_recv_pyobj_from_prev_stage())
+                    self.process_decode_transfer_queue(
+                        self._pp_recv_pyobj_from_prev_stage()
+                    )
+                self._pp_commit_comm_work(send_consensus_retract_work)
+                self._pp_commit_comm_work(send_consensus_prealloc_work)
+                self._pp_commit_comm_work(send_release_work)
+                self._pp_serial_generation_fence()
+
+                if get_disagg().disaggregation_decode_enable_offload_kvcache:
+                    self.decode_offload_manager.check_offload_progress()
+
+                if (
+                    _pp_use_serial_dspark_output_overlap()
+                    and not _pp_use_serial_dspark_preplan_result_apply()
+                ):
+                    # Submit the previous generation's fixed output envelope
+                    # before the current proxy/Target edge. Its comm event is
+                    # consumed only after the current proxy send completes.
+                    self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                        next_first_rank_mb_id,
+                        next_mb_id,
+                    )
+                if (
+                    _pp_use_serial_dspark_prelaunch_result_apply()
+                    and not _pp_use_serial_dspark_preplan_result_apply()
+                ):
+                    next_pp_outputs, _, _, _ = (
+                        self._pp_complete_serial_output_exchange()
+                    )
+                    self._pp_commit_comm_work(self.send_output_work)
+                    next_batch_result, d2h_event = (
+                        self._pp_preprocess_deferred_serial_output()
+                    )
+                    # Proposal installation must precede the Target launch
+                    # that consumes it. CPU result processing remains delayed.
+                    dspark_draft = _pp_get_dspark_draft_coordinator(self)
+                    dspark_draft.drain()
+                    completed_generation = self._pp_received_output_generation
+                    proposal_batch = (
+                        self._pp_generation_states[completed_generation][0]
+                        if (
+                            completed_generation is not None
+                            and next_batch_result is not None
+                            and next_batch_result.accept_lens is not None
+                        )
+                        else None
+                    )
+                    dspark_draft.relay_serial_proposals(
+                        proposal_batch,
+                        next_pp_outputs,
+                        generation,
+                        d2h_event,
+                    )
+
+                # Reverse control completes before rank 1 blocks on the
+                # current proxy. Rank 0 then launches and satisfies that recv.
+                pp_proxy_tensors = None
+                self._pp_commit_comm_work(self.send_proxy_work)
+                if not self.pp_group.is_first_rank:
+                    pp_proxy_tensors = self._pp_recv_proxy_tensors(
+                        expected_generation=generation,
+                        expected_active=(
+                            cur_batch is not None
+                            and not cur_batch.forward_mode.is_prebuilt()
+                        ),
+                    )
+
+                result = None
+                active = (
+                    cur_batch is not None and not cur_batch.forward_mode.is_prebuilt()
+                )
+                if cur_batch:
+                    server_is_idle = False
+                    result, self.launch_event = self._pp_launch_batch(
+                        mb_id,
+                        cur_batch,
+                        pp_proxy_tensors,
+                        self.mb_metadata,
+                        self.last_rank_comm_queue,
+                    )
+                    if active:
+                        metadata = self.mb_metadata[mb_id]
+                        process_batch = (
+                            metadata.fwd_batch
+                            if metadata is not None and metadata.fwd_batch is not None
+                            else cur_batch
+                        )
+                        self._pp_generation_states[generation] = (
+                            process_batch,
+                            metadata,
+                            mb_id,
+                        )
+
+                if not self.pp_group.is_last_rank:
+                    proxy_tensors = (
+                        result.pp_hidden_states_proxy_tensors.tensors if active else {}
+                    )
+                    if active:
+                        self.device_module.current_stream().wait_event(
+                            self.launch_event
+                        )
+                    self._pp_queue_proxy_send(
+                        proxy_tensors,
+                        generation=generation,
+                        active=active,
+                    )
+                    if not _pp_use_serial_dspark_proxy_overlap():
+                        self._pp_commit_comm_work(self.send_proxy_work)
+
+                self._pp_serial_generation_fence()
+
+                if not _pp_use_serial_dspark_prelaunch_result_apply():
+                    if _pp_use_serial_dspark_output_overlap():
+                        next_pp_outputs, _, _, _ = (
+                            self._pp_complete_serial_output_exchange()
+                        )
+                    else:
+                        next_pp_outputs, _, _ = (
+                            self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                                next_first_rank_mb_id,
+                                next_mb_id,
+                            )
+                        )
+                    self._pp_commit_comm_work(self.send_output_work)
+                    next_batch_result, d2h_event = (
+                        self._pp_preprocess_deferred_serial_output()
+                    )
+                    # Draft from the immutable forward-time state before
+                    # process_batch_result advances request.spec_verify_ct.
+                    _pp_get_dspark_draft_coordinator(self).drain()
+
+                completed_generation = self._pp_received_output_generation
+                if (
+                    completed_generation is not None
+                    and not _pp_use_serial_dspark_preplan_result_apply()
+                ):
+                    if d2h_event is None:
+                        raise RuntimeError(
+                            "Active PP generation received an empty output envelope."
+                        )
+                    d2h_event.synchronize()
+                    process_batch, _, slot_id = self._pp_generation_states.pop(
+                        completed_generation
+                    )
+                    self._pp_process_batch_result(
+                        process_batch,
+                        next_batch_result,
+                    )
+                    self.last_mbs[slot_id] = process_batch
+
+                if _pp_use_serial_dspark_proxy_overlap():
+                    self._pp_commit_comm_work(self.send_proxy_work)
+                self._pp_serial_generation_fence()
+                self.pp_outputs = next_pp_outputs
+                self.running_batch.batch_is_full = False
+
+            queue_size = (
+                len(self.waiting_queue)
+                + len(self.disagg_decode_transfer_queue.queue)
+                + len(self.disagg_decode_prealloc_queue.queue)
+            )
+            if get_disagg().disaggregation_decode_enable_offload_kvcache:
+                queue_size += len(self.decode_offload_manager.ongoing_offload)
+            if server_is_idle and queue_size == 0:
+                self.on_idle()
+
+    def _pp_sync_committed_snapshot_to_running_slots(
+        self: Scheduler,
+        committed: ScheduleBatch,
+        committed_identities=(),
+    ) -> None:
+        committed_rows = {req.rid: i for i, req in enumerate(committed.reqs)}
+        committed_generations = {
+            identity.rid: identity.generation for identity in committed_identities
+        }
+        if set(committed_generations) != set(committed_rows):
+            raise RuntimeError(
+                "Committed PP DSpark rows require matching frozen identities: "
+                f"rows={tuple(committed_rows)}, "
+                f"identities={tuple(committed_generations)}."
+            )
+        for live in self.running_mbs:
+            live_rows = []
+            source_rows = []
+            for live_row, req in enumerate(live.reqs):
+                source_row = committed_rows.get(req.rid)
+                if source_row is None:
+                    continue
+                expected_generation = committed_generations[req.rid]
+                live_generation = (
+                    int(req.bootstrap_room),
+                    int(req.retraction_count),
+                )
+                if live_generation != expected_generation:
+                    continue
+                live_rows.append(live_row)
+                source_rows.append(source_row)
+
+            if not live_rows:
+                continue
+
+            if tuple(req.rid for req in live.reqs) == tuple(
+                req.rid for req in committed.reqs
+            ) and len(live_rows) == len(live.reqs):
+                live.spec_info = committed.spec_info
+                live.seq_lens = committed.seq_lens
+                live.seq_lens_cpu = committed.seq_lens_cpu
+                live.seq_lens_sum = committed.seq_lens_sum
+                live.orig_seq_lens = committed.orig_seq_lens
+                live.input_ids = committed.input_ids
+                continue
+
+            live.spec_info = live.spec_info.merge_committed_rows(
+                committed.spec_info,
+                live_rows=live_rows,
+                committed_rows=source_rows,
+            )
+            live_index = torch.tensor(
+                live_rows, dtype=torch.int64, device=live.seq_lens.device
+            )
+            committed_index = torch.tensor(
+                source_rows, dtype=torch.int64, device=committed.seq_lens.device
+            )
+            live.seq_lens = live.seq_lens.clone()
+            live.seq_lens.index_copy_(
+                0,
+                live_index,
+                committed.seq_lens.index_select(0, committed_index).to(
+                    device=live.seq_lens.device
+                ),
+            )
+            if live.seq_lens_cpu is not None and committed.seq_lens_cpu is not None:
+                live.seq_lens_cpu = live.seq_lens_cpu.clone()
+                live.seq_lens_cpu[live_rows] = committed.seq_lens_cpu[source_rows]
+                live.seq_lens_sum = int(live.seq_lens_cpu.sum())
+            else:
+                live.seq_lens_cpu = None
+                live.seq_lens_sum = None
+            if live.orig_seq_lens is not None and committed.orig_seq_lens is not None:
+                live_index = live_index.to(device=live.orig_seq_lens.device)
+                committed_index = committed_index.to(
+                    device=committed.orig_seq_lens.device
+                )
+                live.orig_seq_lens = live.orig_seq_lens.clone()
+                live.orig_seq_lens.index_copy_(
+                    0,
+                    live_index,
+                    committed.orig_seq_lens.index_select(0, committed_index).to(
+                        device=live.orig_seq_lens.device
+                    ),
+                )
+            else:
+                live.orig_seq_lens = None
+            # Decode input IDs are reconstructed from merged draft state.
+            live.input_ids = None
+
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.ps.pp_size + get_parallel().pp_async_batch_depth
         self._pp_spec_relay = False
@@ -681,9 +1207,73 @@ class SchedulerPPMixin:
         self.launch_event = None
         self.pp_comm_stream = None
         self.pp_comm_stream_ctx = nullcontext()
+        if _pp_use_serial_dspark_generation():
+            self.pp_comm_stream = self.device_module.Stream()
+            self.pp_comm_stream_ctx = self.device_module.stream(self.pp_comm_stream)
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
             defaultdict(deque)
         )
+        self._pp_slot_generations: List[Optional[int]] = [None] * self.pp_loop_size
+        self._pp_generation_states: Dict[
+            int, Tuple[ScheduleBatch, Optional[PPBatchMetadata], int]
+        ] = {}
+        self._pp_received_output_generation: Optional[int] = None
+        self._pp_serial_generation: Optional[int] = None
+        self._pp_local_output_to_process: Optional[PPProxyTensors] = None
+        self._pp_local_output_ready_event: Optional[torch.Event] = None
+        self._pp_deferred_output: Optional[
+            Tuple[ScheduleBatch, PPBatchMetadata, PPProxyTensors, bool]
+        ] = None
+        self._pp_pending_serial_output_exchange: Optional[
+            Tuple[Optional[PPProxyTensors], Dict[str, object], torch.Event]
+        ] = None
+
+    @staticmethod
+    def _pp_make_generation_envelope(generation: int) -> Dict[str, object]:
+        return {
+            "kind": "pp_dspark_generation",
+            "generation": generation,
+        }
+
+    @staticmethod
+    def _pp_validate_generation_envelope(
+        envelope: object, expected_generation: int
+    ) -> int:
+        if not isinstance(envelope, dict):
+            raise RuntimeError(f"Invalid PP generation envelope: {envelope!r}")
+        if envelope.get("kind") != "pp_dspark_generation":
+            raise RuntimeError(f"Invalid PP generation kind: {envelope!r}")
+        generation = envelope.get("generation")
+        if generation != expected_generation:
+            raise RuntimeError(
+                "Stale PP generation envelope: "
+                f"expected {expected_generation}, got {generation}"
+            )
+        return generation
+
+    def _pp_preprocess_deferred_serial_output(
+        self: Scheduler,
+    ) -> Tuple[Optional[GenerationBatchResult], Optional[torch.Event]]:
+        deferred = self._pp_deferred_output
+        self._pp_deferred_output = None
+        if deferred is None:
+            return None, None
+
+        target, target_metadata, pp_outputs, local_output = deferred
+        with self.copy_stream_ctx:
+            self.copy_stream.wait_stream(self.schedule_stream)
+            batch_result = self._pp_prep_batch_result(
+                target,
+                target_metadata,
+                pp_outputs,
+                local_output=local_output,
+            )
+            d2h_event = self.device_module.Event()
+            d2h_event.record(self.device_module.current_stream())
+        return batch_result, d2h_event
+
+    def _pp_serial_generation_fence(self: Scheduler) -> None:
+        torch.distributed.barrier(group=self.world_group.cpu_group)
 
     def profile_and_init_predictor(self: Scheduler):
         """
@@ -1235,9 +1825,16 @@ class SchedulerPPMixin:
         return p2p_work
 
     def _pp_queue_proxy_send(
-        self: Scheduler, tensor_dict: Dict[str, torch.Tensor]
+        self: Scheduler,
+        tensor_dict: Dict[str, torch.Tensor],
+        generation: Optional[int] = None,
+        active: Optional[bool] = None,
     ) -> None:
         """Queue a proxy for the peer's next scheduler slot without waiting."""
+        if generation is not None:
+            tensor_dict = dict(tensor_dict)
+            tensor_dict["__pp_generation__"] = generation
+            tensor_dict["__pp_active__"] = bool(active)
         self.send_proxy_work = self._pp_send_dict_to_next_stage(
             tensor_dict,
             async_send=True,
@@ -1277,17 +1874,35 @@ class SchedulerPPMixin:
                 )
                 self._pp_tensor_dict_inbox[received_kind].append(tensor_dict)
 
-    def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
+    def _pp_recv_proxy_tensors(
+        self: Scheduler,
+        expected_generation: Optional[int] = None,
+        expected_active: Optional[bool] = None,
+    ) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
-            pp_proxy_tensors = PPProxyTensors(
-                self._pp_recv_typed_dict(
-                    expected_kind="proxy",
-                    all_gather_group=(
-                        self.attn_tp_group if self.require_attn_tp_allgather else None
-                    ),
-                )
+            tensor_dict = self._pp_recv_typed_dict(
+                expected_kind="proxy",
+                all_gather_group=(
+                    self.attn_tp_group if self.require_attn_tp_allgather else None
+                ),
             )
+            if expected_generation is not None:
+                generation = tensor_dict.pop("__pp_generation__", None)
+                active = tensor_dict.pop("__pp_active__", None)
+                if generation != expected_generation:
+                    raise RuntimeError(
+                        "Stale PP proxy envelope: "
+                        f"expected generation {expected_generation}, got {generation}"
+                    )
+                if active is not expected_active:
+                    raise RuntimeError(
+                        "PP proxy activity mismatch for generation "
+                        f"{expected_generation}: expected {expected_active}, got {active}"
+                    )
+                if not active:
+                    return None
+            pp_proxy_tensors = PPProxyTensors(tensor_dict)
         return pp_proxy_tensors
 
     def _pp_recv_dict_from_prev_stage(
@@ -1328,6 +1943,7 @@ class SchedulerPPMixin:
         batch: ScheduleBatch,
         mb_metadata: PPBatchMetadata,
         pp_outputs: PPProxyTensors,
+        local_output: bool = False,
     ):
         from sglang.srt.managers.scheduler import GenerationBatchResult
 
@@ -1354,7 +1970,8 @@ class SchedulerPPMixin:
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
 
         dspark_draft = _pp_get_dspark_draft_coordinator(self)
-        dspark_draft.on_relayed_idle(batch, pp_outputs)
+        if not local_output:
+            dspark_draft.on_relayed_idle(batch, pp_outputs)
 
         if "dspark_projected_context" in pp_outputs.tensors:
             from sglang.srt.speculative.dspark_components.dspark_draft import (
@@ -1417,7 +2034,7 @@ class SchedulerPPMixin:
             fwd_batch.seq_lens = new_seq_lens
 
             is_decode = accept_lens is not None
-            if is_decode:
+            if is_decode and not local_output:
                 dspark_draft.on_relayed_proposals(
                     fwd_batch,
                     next_draft_input,
@@ -1784,6 +2401,28 @@ class SchedulerPPMixin:
         pp_outputs: PPProxyTensors | None,
     ) -> List[P2PWork]:
         send_output_work = []
+        serial_generation = _pp_use_serial_dspark_generation()
+        if serial_generation:
+            tensor_dict = None
+            ready_event = None
+            if (
+                self.pp_group.is_last_rank
+                and self._pp_local_output_to_process is not None
+            ):
+                ready_event = self._pp_local_output_ready_event
+                tensor_dict = self._pp_local_output_to_process.tensors
+            if tensor_dict is None:
+                tensor_dict = {
+                    "__pp_generation__": None,
+                    "__pp_active__": False,
+                }
+            return self._pp_send_dict_to_next_stage(
+                tensor_dict,
+                async_send=True,
+                msg_type="output",
+                ready_event=ready_event,
+            )
+
         if self.pp_group.is_last_rank:
             # send ready PP output to rank 0
             target = mbs[next_first_rank_mb_id]
@@ -1800,6 +2439,26 @@ class SchedulerPPMixin:
                             async_send=True,
                             msg_type="output",
                         )
+                elif serial_generation:
+                    send_output_work = self._pp_send_dict_to_next_stage(
+                        {
+                            "__pp_generation__": self._pp_slot_generations[
+                                next_first_rank_mb_id
+                            ],
+                            "__pp_active__": False,
+                        },
+                        async_send=True,
+                        msg_type="output",
+                    )
+            elif serial_generation:
+                send_output_work = self._pp_send_dict_to_next_stage(
+                    {
+                        "__pp_generation__": None,
+                        "__pp_active__": False,
+                    },
+                    async_send=True,
+                    msg_type="output",
+                )
         # send the outputs from the last round to let the next stage worker run post processing
         if not self.pp_group.is_last_rank:
             if pp_outputs:
@@ -1809,7 +2468,130 @@ class SchedulerPPMixin:
                         async_send=True,
                         msg_type="output",
                     )
+            elif serial_generation:
+                send_output_work = self._pp_send_dict_to_next_stage(
+                    {
+                        "__pp_generation__": None,
+                        "__pp_active__": False,
+                    },
+                    async_send=True,
+                    msg_type="output",
+                )
         return send_output_work
+
+    def _pp_exchange_serial_output_tensors(
+        self: Scheduler,
+        last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]],
+    ) -> Tuple[
+        Optional[PPProxyTensors],
+        Optional[GenerationBatchResult],
+        Optional[torch.Event],
+        List[P2PWork],
+    ]:
+        local_output = None
+        ready_event = None
+        if self.pp_group.is_last_rank and last_rank_comm_queue:
+            candidate_generation = last_rank_comm_queue[0][1].tensors.get(
+                "__pp_generation__"
+            )
+            if (
+                candidate_generation is not None
+                and self._pp_serial_generation is not None
+                and candidate_generation < self._pp_serial_generation
+            ):
+                ready_event, local_output = last_rank_comm_queue.popleft()
+
+        send_dict = (
+            dict(local_output.tensors)
+            if local_output is not None
+            else {
+                "__pp_generation__": None,
+                "__pp_active__": False,
+            }
+        )
+        send_dict["__msg_type__"] = "output"
+
+        all_gather_group = (
+            self.attn_tp_group if self.require_attn_tp_allgather else None
+        )
+        with self.pp_comm_stream_ctx:
+            if ready_event is not None:
+                self.device_module.current_stream().wait_event(ready_event)
+            received_dict = self.pp_group.send_recv_tensor_dict(
+                send_tensor_dict=send_dict,
+                send_all_gather_group=all_gather_group,
+                recv_all_gather_group=all_gather_group,
+            )
+            comm_done = self.device_module.Event()
+            comm_done.record(self.device_module.current_stream())
+
+        if self._pp_pending_serial_output_exchange is not None:
+            raise RuntimeError("A serial PP output exchange is already pending.")
+        self._pp_pending_serial_output_exchange = (
+            local_output,
+            received_dict,
+            comm_done,
+        )
+        if _pp_use_serial_dspark_output_overlap():
+            return None, None, None, []
+        return self._pp_complete_serial_output_exchange()
+
+    def _pp_complete_serial_output_exchange(
+        self: Scheduler,
+    ) -> Tuple[
+        Optional[PPProxyTensors],
+        Optional[GenerationBatchResult],
+        Optional[torch.Event],
+        List[P2PWork],
+    ]:
+        pending = self._pp_pending_serial_output_exchange
+        self._pp_pending_serial_output_exchange = None
+        if pending is None:
+            raise RuntimeError("No serial PP output exchange is pending.")
+
+        local_output, received_dict, comm_done = pending
+        comm_done.synchronize()
+        if received_dict.get("__msg_type__") != "output":
+            raise RuntimeError(
+                "Serial PP output exchange received a non-output envelope."
+            )
+
+        if self.pp_group.is_last_rank:
+            if received_dict.get("__pp_active__") is not False:
+                raise RuntimeError(
+                    "The first PP rank sent data on the serial output ack channel."
+                )
+            tensor_dict = (
+                local_output.tensors if local_output is not None else received_dict
+            )
+        else:
+            tensor_dict = received_dict
+
+        self._pp_received_output_generation = None
+        self._pp_deferred_output = None
+        active = tensor_dict.get("__pp_active__")
+        if active not in (True, False):
+            raise RuntimeError(f"Invalid PP output activity marker: {active!r}")
+
+        pp_outputs = PPProxyTensors(tensor_dict)
+        if not active:
+            return pp_outputs, None, None, []
+
+        generation = tensor_dict.get("__pp_generation__")
+        generation_state = self._pp_generation_states.get(generation)
+        if generation_state is None:
+            raise RuntimeError(
+                f"Stale PP output envelope for unknown generation {generation}"
+            )
+        target, target_metadata, _ = generation_state
+        self._pp_received_output_generation = generation
+        self._pp_deferred_output = (
+            target,
+            target_metadata,
+            pp_outputs,
+            self.pp_group.is_last_rank,
+        )
+        return pp_outputs, None, None, []
 
     def _pp_send_recv_and_preprocess_output_tensors(
         self: Scheduler,
@@ -1830,6 +2612,9 @@ class SchedulerPPMixin:
         batch_result = None
         send_output_work = []
 
+        if _pp_use_serial_dspark_generation():
+            return self._pp_exchange_serial_output_tensors(last_rank_comm_queue)
+
         # HCCL requires paired submission for correctness. CUDA can opt into
         # the same PP2 exchange for replicated DSpark to remove the odd rank's
         # recv-before-send serialization from the result-relay critical path.
@@ -1842,6 +2627,18 @@ class SchedulerPPMixin:
                 last_rank_comm_queue,
                 pp_outputs,
             )
+
+        serial_generation = _pp_use_serial_dspark_generation()
+        if (
+            serial_generation
+            and self.pp_group.is_last_rank
+            and self._pp_local_output_to_process is None
+            and last_rank_comm_queue
+        ):
+            (
+                self._pp_local_output_ready_event,
+                self._pp_local_output_to_process,
+            ) = last_rank_comm_queue.popleft()
 
         # On CUDA, isend is async: it enqueues to the stream and returns,
         # so every rank can send first safely. On some backends isend is
@@ -1878,19 +2675,66 @@ class SchedulerPPMixin:
         def _do_recv():
             nonlocal next_pp_outputs, batch_result, d2h_event
             target = mbs[next_mb_id]
-            if target is None or target.forward_mode.is_prebuilt():
+            if not serial_generation and (
+                target is None or target.forward_mode.is_prebuilt()
+            ):
                 return
-            if _pp_can_skip_output_comm(target):
+            if target is not None and _pp_can_skip_output_comm(target):
                 next_pp_outputs, batch_result, d2h_event = (
                     self._pp_make_skip_output_result(target, mb_metadata[next_mb_id])
                 )
                 return
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
-                next_pp_outputs = PPProxyTensors(self._pp_recv_dict_from_prev_stage())
+                received_tensor_dict = self._pp_recv_dict_from_prev_stage()
+            if serial_generation:
+                if self.pp_group.is_last_rank:
+                    if received_tensor_dict.get("__pp_active__") is not False:
+                        raise RuntimeError(
+                            "The first PP rank sent data on the serial output "
+                            "ack channel."
+                        )
+                    local_output = self._pp_local_output_to_process
+                    tensor_dict = (
+                        local_output.tensors
+                        if local_output is not None
+                        else received_tensor_dict
+                    )
+                else:
+                    tensor_dict = received_tensor_dict
+                active = tensor_dict.get("__pp_active__")
+                generation = tensor_dict.get("__pp_generation__")
+                self._pp_received_output_generation = None
+                if active not in (True, False):
+                    raise RuntimeError(f"Invalid PP output activity marker: {active!r}")
+                if not active:
+                    next_pp_outputs = PPProxyTensors(tensor_dict)
+                    return
+                generation_state = self._pp_generation_states.get(generation)
+                if generation_state is None:
+                    raise RuntimeError(
+                        f"Stale PP output envelope for unknown generation {generation}"
+                    )
+                target, target_metadata, _ = generation_state
+                next_pp_outputs = PPProxyTensors(tensor_dict)
+                self._pp_received_output_generation = generation
+                self._pp_deferred_output = (
+                    target,
+                    target_metadata,
+                    next_pp_outputs,
+                    self.pp_group.is_last_rank,
+                )
+                return
+            else:
+                tensor_dict = received_tensor_dict
+                next_pp_outputs = PPProxyTensors(tensor_dict)
+                target_metadata = mb_metadata[next_mb_id]
             with self.copy_stream_ctx:
                 self.copy_stream.wait_stream(self.schedule_stream)
                 batch_result = self._pp_prep_batch_result(
-                    target, mb_metadata[next_mb_id], next_pp_outputs
+                    target,
+                    target_metadata,
+                    next_pp_outputs,
+                    local_output=(serial_generation and self.pp_group.is_last_rank),
                 )
                 d2h_event = self.device_module.Event()
                 d2h_event.record(self.device_module.current_stream())
@@ -1901,6 +2745,10 @@ class SchedulerPPMixin:
         else:
             _do_recv()
             send_output_work = _do_send()
+
+        if serial_generation and self.pp_group.is_last_rank:
+            self._pp_local_output_to_process = None
+            self._pp_local_output_ready_event = None
 
         return next_pp_outputs, batch_result, d2h_event, send_output_work
 
@@ -2069,12 +2917,15 @@ class SchedulerPPMixin:
                 event.record(self.device_module.current_stream())
                 if self.pp_group.is_last_rank:
                     # (last rank) buffer the outputs for async batch depth
+                    output_tensors = self._pp_prepare_tensor_dict(result, cur_batch)
+                    generation = self._pp_slot_generations[mb_id]
+                    if generation is not None and _pp_use_serial_dspark_generation():
+                        output_tensors["__pp_generation__"] = generation
+                        output_tensors["__pp_active__"] = True
                     last_rank_comm_queue.append(
                         (
                             event,
-                            PPProxyTensors(
-                                self._pp_prepare_tensor_dict(result, cur_batch)
-                            ),
+                            PPProxyTensors(output_tensors),
                         )
                     )
         return result, event
