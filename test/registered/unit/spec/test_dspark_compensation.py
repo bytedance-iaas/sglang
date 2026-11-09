@@ -1,11 +1,14 @@
 import types
 import unittest
+from unittest.mock import patch
 
 import torch
 
 from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
     schedule_verify_lens_topk,
 )
+from sglang.srt.environ import envs
+from sglang.srt.speculative.dspark_components import dspark_planner
 from sglang.srt.speculative.dspark_components.dspark_compensation import (
     CappedRequestCompensation,
 )
@@ -20,6 +23,36 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestCompensation(CustomTestCase):
+    def test_constructor_accepts_not_yet_created_request_pool(self):
+        spec = types.SimpleNamespace(
+            speculative_dspark_align_verify_tokens_to_graph_tier=False,
+            speculative_dspark_confidence_sts_path=None,
+        )
+        with (
+            envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"),
+            envs.SGLANG_DSPARK_VERIFY_COMPENSATION_MAX_BOOST.override(0.5),
+            patch.object(dspark_planner, "get_spec", return_value=spec),
+            patch.object(
+                dspark_planner,
+                "get_schedule",
+                return_value=types.SimpleNamespace(disable_overlap_schedule=True),
+            ),
+            patch.object(dspark_planner, "build_sps_cost_table"),
+            patch.object(dspark_planner, "is_uninitialized_sps_table", return_value=False),
+            patch.object(dspark_planner, "HostConfidenceBudgetPlanner"),
+            patch.object(dspark_planner, "is_dp_attention_enabled", return_value=False),
+        ):
+            planner = DSparkVerifyPlanner(
+                draft_model=types.SimpleNamespace(confidence_head=object()),
+                gamma=6,
+                model_runner=types.SimpleNamespace(req_to_token_pool=None),
+                device="cpu",
+                tp_rank=1,
+                verify_num_draft_tokens=7,
+                tp_sync=None,
+            )
+        self.assertEqual(planner._compensation.credit.numel(), 0)
+
     def test_pool_binding_preserves_credit_and_rejects_resize(self):
         state = CappedRequestCompensation(pool_size=0, device="cpu", max_boost=0.25)
         self.assertEqual(state.credit.numel(), 0)
