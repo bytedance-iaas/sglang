@@ -10,7 +10,10 @@ from sglang.srt.mem_cache.storage.hf3fs.hf3fs_client import Hf3fsClient
 
 
 class Hf3fsNativeClient(Hf3fsClient):
-    def __init__(self, path, size, bytes_per_page, read_entries, write_entries, *, aligned_slot=False):
+    def __init__(
+        self, path, size, bytes_per_page, read_entries, write_entries,
+        *, aligned_slot=False,
+    ):
         try:
             from hf3fs_py_batch import Batch, Buffers
         except ImportError as exc:
@@ -39,7 +42,9 @@ class Hf3fsNativeClient(Hf3fsClient):
             payload_args = (bytes_per_page,)
         self.reader = Batch(path, physical_size, io_bytes, read_entries, True, *payload_args)
         try:
-            self.writer = Batch(path, physical_size, io_bytes, write_entries, False, *payload_args)
+            self.writer = Batch(
+                path, physical_size, io_bytes, write_entries, False, *payload_args
+            )
         except BaseException:
             self.reader.close()
             raise
@@ -57,8 +62,12 @@ class Hf3fsNativeClient(Hf3fsClient):
                 or not 0 <= offset <= self.size - size
             ):
                 raise ValueError("HF3FS page is outside the file or staging buffer")
-            if self.aligned_slot and (offset % self.bytes_per_page or size != self.bytes_per_page):
-                raise ValueError("Aligned slots require complete, page-aligned logical pages")
+            if self.aligned_slot and (
+                offset % self.bytes_per_page or size != self.bytes_per_page
+            ):
+                raise ValueError(
+                    "Aligned slots require complete, page-aligned logical pages"
+                )
 
     def _io(self, ring, offsets, tensors):
         self.check(offsets, tensors)
@@ -67,7 +76,9 @@ class Hf3fsNativeClient(Hf3fsClient):
             [tensor.detach().view(torch.uint8).numpy() for tensor in tensors]
         )
         if self.aligned_slot:
-            offsets = [offset // self.bytes_per_page * self.slot_stride for offset in offsets]
+            offsets = [
+                offset // self.bytes_per_page * self.slot_stride for offset in offsets
+            ]
         return ring.io(offsets, buffers)
 
     def batch_read(self, offsets, tensors):

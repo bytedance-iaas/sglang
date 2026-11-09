@@ -178,7 +178,8 @@ def create_hf3fs_client(
         )
 
         return Hf3fsNativeClient(
-            path, size, bytes_per_page, read_entries, write_entries, aligned_slot=aligned_slot
+            path, size, bytes_per_page, read_entries, write_entries,
+            aligned_slot=aligned_slot,
         )
     else:
         from sglang.srt.mem_cache.storage.hf3fs.hf3fs_usrbio_client import (
@@ -197,7 +198,7 @@ class _PoolStorageCtx:
     pool_name: str
     bytes_per_page: int
     num_pages: int
-    namespace: PoolName
+    namespace: PoolName | str
     clients: List[Hf3fsClient]
     gb_per_page: float
 
@@ -249,10 +250,16 @@ class HiCacheHF3FS(HiCacheStorage):
             raise ValueError(f"Unknown HF3FS io_backend: {io_backend}")
         self.aligned_slot_page_sizes = frozenset(aligned_slot_page_sizes or [])
         if self.aligned_slot_page_sizes and (
-            io_backend != "native" or use_mock_client
-            or any(type(n) is not int or not 0 < n <= 256 * 1024 for n in self.aligned_slot_page_sizes)
+            io_backend != "native"
+            or use_mock_client
+            or any(
+                type(n) is not int or not 0 < n <= 256 * 1024
+                for n in self.aligned_slot_page_sizes
+            )
         ):
-            raise ValueError("aligned_slot_page_sizes requires native IO and sizes in (0, 256 KiB]")
+            raise ValueError(
+                "aligned_slot_page_sizes requires native IO and sizes in (0, 256 KiB]"
+            )
         self.io_backend = io_backend
         self.client_timeout = client_timeout
         self.dtype = dtype
