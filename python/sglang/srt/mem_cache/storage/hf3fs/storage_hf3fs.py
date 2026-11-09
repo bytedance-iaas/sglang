@@ -144,6 +144,10 @@ def create_hf3fs_client(
     entries: int,
     client_timeout: int,
     use_mock: bool = False,
+    *,
+    io_backend: str = "python",
+    read_entries: Optional[int] = None,
+    write_entries: Optional[int] = None,
 ) -> Hf3fsClient:
     """Factory function to create appropriate HF3FS client.
 
@@ -156,17 +160,31 @@ def create_hf3fs_client(
 
     Returns:
     """
+    read_entries = entries if read_entries is None else read_entries
+    write_entries = entries if write_entries is None else write_entries
     if use_mock:
         from sglang.srt.mem_cache.storage.hf3fs.hf3fs_client import Hf3fsMockClient
 
         logger.info(f"[Rank Using Hf3fsMockClient for testing")
-        return Hf3fsMockClient(path, size, bytes_per_page, entries)
+        return Hf3fsMockClient(
+            path, size, bytes_per_page, max(read_entries, write_entries)
+        )
+    elif io_backend == "native":
+        from sglang.srt.mem_cache.storage.hf3fs.hf3fs_native_client import (
+            Hf3fsNativeClient,
+        )
+
+        return Hf3fsNativeClient(
+            path, size, bytes_per_page, read_entries, write_entries
+        )
     else:
         from sglang.srt.mem_cache.storage.hf3fs.hf3fs_usrbio_client import (
             Hf3fsUsrBioClient,
         )
 
-        return Hf3fsUsrBioClient(path, size, bytes_per_page, entries, client_timeout)
+        return Hf3fsUsrBioClient(
+            path, size, bytes_per_page, max(read_entries, write_entries), client_timeout
+        )
 
 
 @dataclass
@@ -201,7 +219,15 @@ class HiCacheHF3FS(HiCacheStorage):
         is_page_first_layout: bool = False,
         use_mock_client: bool = False,
         enable_storage_metrics: bool = False,
+        read_entries: Optional[int] = None,
+        write_entries: Optional[int] = None,
+        io_backend: str = "python",
     ):
+        self._logical_anchor = bytes_per_page == 0
+        bytes_per_page = bytes_per_page or 4096
+        self.anchor_file_size = (
+            min(file_size, 4 * 2**30) if self._logical_anchor else file_size
+        )
         self.rank = rank
         self.file_path = file_path
         self.file_size = file_size
@@ -209,6 +235,15 @@ class HiCacheHF3FS(HiCacheStorage):
         self.bytes_per_page = bytes_per_page
         self.gb_per_page = bytes_per_page / (1 << 30)
         self.entries = entries
+        self.read_entries = entries if read_entries is None else int(read_entries)
+        self.write_entries = entries if write_entries is None else int(write_entries)
+        if not all(
+            1 <= depth <= 4096 for depth in (self.read_entries, self.write_entries)
+        ):
+            raise ValueError("HF3FS read_entries/write_entries must be in [1, 4096]")
+        if io_backend not in ("python", "native"):
+            raise ValueError(f"Unknown HF3FS io_backend: {io_backend}")
+        self.io_backend = io_backend
         self.client_timeout = client_timeout
         self.dtype = dtype
         self.metadata_client = metadata_client
@@ -217,7 +252,7 @@ class HiCacheHF3FS(HiCacheStorage):
         self.enable_storage_metrics = enable_storage_metrics
         self.use_mock_client = use_mock_client
         self.numel = self.bytes_per_page // self.dtype.itemsize
-        self.num_pages = self.file_size // self.bytes_per_page
+        self.num_pages = self.anchor_file_size // self.bytes_per_page
         self.skip_backup = False
         if self.is_mla_model and self.rank != 0:
             self.skip_backup = True
@@ -237,11 +272,14 @@ class HiCacheHF3FS(HiCacheStorage):
         self.clients = [
             create_hf3fs_client(
                 self.file_path,
-                self.file_size,
+                self.anchor_file_size,
                 self.bytes_per_page,
                 self.entries,
                 self.client_timeout,
                 use_mock_client,
+                io_backend=self.io_backend,
+                read_entries=self.read_entries,
+                write_entries=self.write_entries,
             )
             for _ in range(numjobs)
         ]
@@ -373,8 +411,39 @@ class HiCacheHF3FS(HiCacheStorage):
             is_mla_model=is_mla_model,
             is_page_first_layout=is_page_first_layout,
             use_mock_client=use_mock_client,
-            enable_storage_metrics=storage_config.enable_storage_metrics,
+            enable_storage_metrics=bool(
+                storage_config and storage_config.enable_storage_metrics
+            ),
+            read_entries=config.get("read_entries"),
+            write_entries=config.get("write_entries"),
+            io_backend=config.get("io_backend", "python"),
         )
+
+    def _run_io(self, clients, method, offsets, values, entries):
+        futures = []
+        submission_error = None
+        try:
+            for i in range(0, len(offsets), entries):
+                client = clients[self.ac.next()]
+                futures.append(
+                    self.executor.submit(
+                        getattr(client, method),
+                        offsets[i : i + entries],
+                        values[i : i + entries],
+                    )
+                )
+        except BaseException as exc:
+            submission_error = exc
+        results = []
+        for future in futures:
+            try:
+                results.extend(future.result())
+            except BaseException as exc:
+                if submission_error is None:
+                    submission_error = exc
+        if submission_error is not None:
+            raise submission_error
+        return results
 
     def _batch_get(
         self,
@@ -395,19 +464,13 @@ class HiCacheHF3FS(HiCacheStorage):
 
         for target_location in values:
             assert target_location.is_contiguous()
-        file_results = values
+        file_results = [values[i] for i in batch_indices]
 
         start_time = time.perf_counter()
 
-        futures = [
-            self.executor.submit(
-                self.clients[self.ac.next()].batch_read,
-                file_offsets[i : i + self.entries],
-                file_results[i : i + self.entries],
-            )
-            for i in range(0, len(batch_indices), self.entries)
-        ]
-        read_results = [result for future in futures for result in future.result()]
+        read_results = self._run_io(
+            self.clients, "batch_read", file_offsets, file_results, self.read_entries
+        )
 
         end_time = time.perf_counter()
         ionum = len(batch_indices)
@@ -467,18 +530,15 @@ class HiCacheHF3FS(HiCacheStorage):
 
         start_time = time.perf_counter()
 
-        futures = [
-            self.executor.submit(
-                self.clients[self.ac.next()].batch_write,
-                file_offsets[i : i + self.entries],
-                file_values[i : i + self.entries],
-            )
-            for i in range(0, len(batch_indices), self.entries)
-        ]
         write_results = [
-            result == self.bytes_per_page
-            for future in futures
-            for result in future.result()
+            r == self.bytes_per_page
+            for r in self._run_io(
+                self.clients,
+                "batch_write",
+                file_offsets,
+                file_values,
+                self.write_entries,
+            )
         ]
 
         end_time = time.perf_counter()
@@ -543,12 +603,12 @@ class HiCacheHF3FS(HiCacheStorage):
 
     def close(self) -> None:
         try:
+            self.executor.shutdown(wait=True)
             for c in self.clients:
                 c.close()
             for ctx in getattr(self, "_pool_storage_ctx", {}).values():
                 for c in ctx.clients:
                     c.close()
-            self.executor.shutdown(wait=True)
         except Exception as e:
             logger.error(f"close HiCacheHF3FS: {e}")
         logger.info("close HiCacheHF3FS")
@@ -567,7 +627,7 @@ class HiCacheHF3FS(HiCacheStorage):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
-        self.is_zero_copy = self.mem_pool_host.layout in [
+        self.is_zero_copy = not self._logical_anchor and self.mem_pool_host.layout in [
             "page_first",
             "page_first_direct",
         ]
@@ -581,7 +641,11 @@ class HiCacheHF3FS(HiCacheStorage):
         super().register_mem_host_pool_v2(host_pool, host_pool_name)
 
         pool_page_size = getattr(host_pool, "page_size", 1) or 1
-        pool_bytes_per_page = host_pool.get_ksize_per_token() * pool_page_size
+        page_sample = host_pool.get_dummy_flat_data_page()
+        pool_bytes_per_page = page_sample.numel() * page_sample.element_size()
+        del page_sample
+        if pool_bytes_per_page <= 0:
+            raise ValueError(f"Empty payload component: {host_pool_name}")
         pool_num_pages = self.file_size // pool_bytes_per_page
         pool_file_path = f"{self.file_path}.{host_pool_name}"
         namespace = host_pool_name  # e.g. PoolName.MAMBA, PoolName.INDEXER
@@ -594,6 +658,9 @@ class HiCacheHF3FS(HiCacheStorage):
                 self.entries,
                 self.client_timeout,
                 self.use_mock_client,
+                io_backend=self.io_backend,
+                read_entries=self.read_entries,
+                write_entries=self.write_entries,
             )
             for _ in range(self.numjobs)
         ]
@@ -631,6 +698,11 @@ class HiCacheHF3FS(HiCacheStorage):
         return _values
 
     def _batch_get_preprocess(self, keys, host_indices):
+        if self._logical_anchor:
+            assert len(host_indices) == len(keys) * self.mem_pool_host.page_size
+            return keys, [
+                torch.empty(self.bytes_per_page, dtype=torch.uint8) for _ in keys
+            ]
         page_num = len(host_indices) // self.mem_pool_host.page_size
         # host_indices to kv_buffer
         flat = not self.is_zero_copy
@@ -654,6 +726,8 @@ class HiCacheHF3FS(HiCacheStorage):
         return keys, values
 
     def _batch_get_postprocess(self, host_indices, values, results):
+        if self._logical_anchor:
+            return results
         page_num = len(host_indices) // self.mem_pool_host.page_size
 
         if self.is_zero_copy:
@@ -746,15 +820,9 @@ class HiCacheHF3FS(HiCacheStorage):
             return [False] * page_num
 
         start_time = time.perf_counter()
-        futures = [
-            self.executor.submit(
-                ctx.clients[self.ac.next()].batch_read,
-                file_offsets[j : j + self.entries],
-                values[j : j + self.entries],
-            )
-            for j in range(0, len(batch_indices), self.entries)
-        ]
-        read_results = [r for f in futures for r in f.result()]
+        read_results = self._run_io(
+            ctx.clients, "batch_read", file_offsets, values, self.read_entries
+        )
         end_time = time.perf_counter()
         ionum = len(batch_indices)
 
@@ -816,15 +884,16 @@ class HiCacheHF3FS(HiCacheStorage):
             file_values.append(data)
 
         start_time = time.perf_counter()
-        futures = [
-            self.executor.submit(
-                ctx.clients[self.ac.next()].batch_write,
-                file_offsets[j : j + self.entries],
-                file_values[j : j + self.entries],
+        write_results = [
+            r == ctx.bytes_per_page
+            for r in self._run_io(
+                ctx.clients,
+                "batch_write",
+                file_offsets,
+                file_values,
+                self.write_entries,
             )
-            for j in range(0, len(batch_indices), self.entries)
         ]
-        write_results = [r == ctx.bytes_per_page for f in futures for r in f.result()]
         end_time = time.perf_counter()
         ionum = len(batch_indices)
 
@@ -890,6 +959,11 @@ class HiCacheHF3FS(HiCacheStorage):
         return self._batch_get_postprocess(host_indices, values, results)
 
     def _batch_set_preprocess(self, keys, host_indices):
+        if self._logical_anchor:
+            assert len(host_indices) == len(keys) * self.mem_pool_host.page_size
+            return keys, [
+                torch.ones(self.bytes_per_page, dtype=torch.uint8) for _ in keys
+            ]
         page_num = len(host_indices) // self.mem_pool_host.page_size
         # host_indices to kv_buffer
         flat = not self.is_zero_copy

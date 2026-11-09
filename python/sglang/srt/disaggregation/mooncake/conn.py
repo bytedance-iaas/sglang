@@ -401,9 +401,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
     def register_buffer_to_engine(self):
         regions = self._registerable_regions()
-        if regions:
+        if envs.SGLANG_MOONCAKE_REGISTER_SERIAL.get():
+            # Opt-in mitigation for registration bursts; not a kernel RDMA fix.
+            for ptr, length in regions:
+                self.engine.register(ptr, length)
+        elif regions:
             ptrs, lens = zip(*regions)
-            self.engine.batch_register(list(ptrs), list(lens))
+            result = self.engine.batch_register(list(ptrs), list(lens))
+            if result != 0:
+                raise RuntimeError(
+                    f"Mooncake batch memory registration failed (ret={result})"
+                )
 
     def deregister_buffer_to_engine(self):
         regions = self._registerable_regions()
