@@ -64,3 +64,32 @@ model numerical equivalence or measure end-to-end inference throughput.
 The HTTP metadata service and its existing eviction/availability guarantees
 are unchanged. Native batching does not make the index highly available or
 solve concurrent page reuse between index lookup and I/O.
+
+## Optional aligned component slots
+
+For a 224,640-byte C2 component page, add `"aligned_slot_page_sizes": [224640]`
+to the native-backend JSON. This option defaults to an empty list and applies
+only to v2 component pools with an exact matching exported payload size; the
+logical anchor, v1 KV pool, and all other components keep their existing layout.
+It requires a native binding supporting the optional `payload_size` argument.
+
+Selected pages occupy 256 KiB slots. I/O length is rounded up to 4 KiB, so C2
+writes/read requests transfer 225,280 bytes (640 extra bytes, about 0.285%) but
+still report 224,640 logical bytes. The CPU staging buffer zeros write padding;
+user tensors and model geometry are unchanged. With 1 MiB storage chunks, a
+selected page no longer crosses a chunk boundary. Slot/file address space grows
+by about 16.70% for C2; this is a capacity tradeoff, not free sparse capacity.
+Other selected sizes must be in (0, 256 KiB]; measure their tradeoffs separately.
+
+Both the component filename and metadata namespace gain the suffix
+`slot256-4k-v1-p<PAYLOAD_BYTES>`. Existing packed files and indices remain intact.
+Enabling the option starts a cold component index; existing packed hits are not
+implicitly migrated. Disabling it selects the old file/index again, and keys
+written only to the new layout miss safely. All clients sharing a cache must use
+a consistent layout configuration. Do not delete either layout while readers
+can still reference it. Publication follows successful full I/O completion;
+short padded completions cannot publish a key as durable.
+
+This changes the CPU storage path only. It does not enable GPUDirect, change
+replication/checksums, or imply an inference-throughput improvement. Validate
+the model path before enabling it in a running engine.
