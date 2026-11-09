@@ -824,6 +824,12 @@ class DsparkStepObservers:
                 "accept-probability bookkeeping of the estimator)."
             )
         self._sts_collect_path = envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
+        if self._sts_collect_path:
+            if envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get():
+                raise ValueError("STS collection requires SGLANG_DSPARK_FOLDED_PROPOSAL=0")
+            if self._simulate_acc_len > 0:
+                raise ValueError("STS collection requires real acceptance labels")
+            self._sts_collect_path += f".rank{tp_rank}"
         self._sts_recorder: Optional[StsDataRecorder] = None
 
     # --- step lifecycle -------------------------------------------------
@@ -841,10 +847,16 @@ class DsparkStepObservers:
 
     def note_idle_decode_step(self) -> None:
         self._info_dumper.note_non_decode_step()
+        if self._sts_recorder is not None:
+            self._sts_recorder.flush()
 
     # --- scheduler-facing hooks ------------------------------------------
 
     def dump_info_records(self) -> Optional[dict]:
+        # The server-info snapshot closes a diagnostic collection interval,
+        # including ranks that did not enter the idle decode hook.
+        if self._sts_recorder is not None:
+            self._sts_recorder.flush()
         dumped = self._info_dumper.dump()
         if dumped is None:
             return None
@@ -898,9 +910,8 @@ class DsparkStepObservers:
         planner = self._planner
         if not proposal_folded:
             self._maybe_record_sts_collect(
-                verify_ids_2d=verify_ids_2d,
-                target_logits=target_logits,
-                bs=bs,
+                reqs=reqs, correct_len=correct_len, layout=layout,
+                prefix_lens=prefix_lens,
             )
             self._confidence_probe.maybe_observe(
                 carries_confidence=planner.carries_confidence,
@@ -990,33 +1001,23 @@ class DsparkStepObservers:
             )
 
     def _maybe_record_sts_collect(
-        self,
-        *,
-        verify_ids_2d: torch.Tensor,
-        target_logits: Optional[torch.Tensor],
-        bs: int,
+        self, *, reqs, correct_len, layout, prefix_lens,
     ) -> None:
-        if not self._sts_collect_path:
-            return
-        if not self._planner.carries_confidence:
+        if not self._sts_collect_path or not self._planner.carries_confidence:
             return
         confidence_raw = self._planner.last_confidence_raw
         if confidence_raw is None:
-            return
+            raise RuntimeError("STS collection is missing eager confidence logits")
         if self._sts_recorder is None:
             self._sts_recorder = StsDataRecorder(
                 path_stem=self._sts_collect_path,
                 gamma=self._gamma,
                 flush_every=_STS_COLLECT_FLUSH_EVERY,
             )
-        target_predict = torch.argmax(target_logits, dim=-1).view(
-            bs, self._verify_num_draft_tokens
-        )
-        num_correct_drafts, _ = compute_dflash_correct_drafts_and_bonus(
-            candidates=verify_ids_2d,
-            target_predict=target_predict,
-        )
         self._sts_recorder.record(
             confidence_raw=confidence_raw,
-            num_correct_drafts=num_correct_drafts,
+            num_correct_drafts=correct_len,
+            rids=[req.rid for req in reqs],
+            prefix_lens=prefix_lens,
+            verify_lens=layout.verify_lens if layout is not None else None,
         )

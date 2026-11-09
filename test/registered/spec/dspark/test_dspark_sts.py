@@ -137,6 +137,48 @@ class TestStsDataRecorder(CustomTestCase):
         self.assertTrue(torch.equal(shard["prefix_mask"], expected_prefix_mask))
         self.assertTrue(torch.equal(shard["logits"], confidence_raw.to(torch.float32)))
 
+    def test_censored_rows_are_excluded_and_metadata_stays_aligned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stem = str(Path(tmp) / "sample")
+            recorder = StsDataRecorder(path_stem=stem, gamma=2, flush_every=1)
+            recorder.record(confidence_raw=torch.tensor([[1., 2.], [3., 4.], [5., 6.]]),
+                            num_correct_drafts=torch.tensor([2, 0, 1]),
+                            verify_lens=torch.tensor([3, 1, 3]),
+                            rids=["a", "b", "c"], prefix_lens=torch.tensor([16000, 16001, 16002]))
+            shard = torch.load(f"{stem}.0.pt")
+            self.assertEqual(shard["logits"].tolist(), [[1., 2.], [5., 6.]])
+            self.assertEqual(shard["prefix_mask"].tolist(), [[1., 1.], [1., 0.]])
+            self.assertEqual([m["rid"] for m in shard["metadata"]], ["a", "c"])
+            self.assertEqual(shard["metadata"][1]["prefix_len"], 16002)
+
+    def test_buffer_owns_logits_and_all_censored_does_not_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stem = str(Path(tmp) / "sample")
+            recorder = StsDataRecorder(path_stem=stem, gamma=2, flush_every=10)
+            logits = torch.tensor([[1., 2.]])
+            recorder.record(confidence_raw=logits, num_correct_drafts=torch.tensor([1]))
+            logits.zero_()
+            recorder.flush()
+            self.assertEqual(torch.load(f"{stem}.0.pt")["logits"].tolist(), [[1., 2.]])
+            recorder.record(confidence_raw=logits, num_correct_drafts=torch.tensor([0]),
+                            verify_lens=torch.tensor([1]))
+            recorder.flush()
+            self.assertFalse(Path(f"{stem}.1.pt").exists())
+
+    def test_info_snapshot_flushes_pending_samples(self):
+        from types import SimpleNamespace
+        from sglang.srt.speculative.dspark_components.dspark_observability import DsparkStepObservers
+        with tempfile.TemporaryDirectory() as tmp:
+            stem = str(Path(tmp) / "sample")
+            recorder = StsDataRecorder(path_stem=stem, gamma=2, flush_every=100)
+            recorder.record(confidence_raw=torch.tensor([[1., 2.]]),
+                            num_correct_drafts=torch.tensor([1]))
+            observer = DsparkStepObservers.__new__(DsparkStepObservers)
+            observer._sts_recorder = recorder
+            observer._info_dumper = SimpleNamespace(dump=lambda: None)
+            self.assertIsNone(observer.dump_info_records())
+            self.assertTrue(Path(f"{stem}.0.pt").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

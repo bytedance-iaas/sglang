@@ -224,3 +224,31 @@ limit with this W4A8 path. The original triggering numerical difference remains
 unresolved; neither enabling thinking nor FP32 LM-head output is a validated
 fix. Record accuracy, length-limit hits, and throughput separately when
 comparing with FlashInfer W4A16.
+
+### Collecting STS labels on the compact path
+
+Use a separate diagnostic run with `SGLANG_RAGGED_VERIFY_MODE=compact`,
+`SGLANG_DSPARK_FOLDED_PROPOSAL=0`, and
+`SGLANG_DSPARK_STS_COLLECT_PATH=/absolute/fresh-directory/sample`.
+Omit `--speculative-dspark-sps-table-path` to select the built-in uniform
+verify-all layout while retaining the confidence head. A forced budget fraction
+of one with a calibrated cost table can still exclude negligible-probability
+positions; check the actual verification widths.
+
+The recorder uses the verifier's real acceptance counts and excludes rows whose
+verification window is shorter than `gamma + 1`. It writes separate TP-rank
+shards containing raw logits, prefix acceptance masks, request IDs, prefix
+lengths and local batch sizes. Use a fresh directory for each run. Collection
+rejects folded proposals and simulated acceptance; omit the STS calibration
+argument so the confidence temperatures remain the identity.
+
+After the workload finishes, fetch `/server_info` before reading the shards.
+This flushes pending samples on every rank, including ranks that did not execute
+the idle decode hook. Match recorded `(request ID, prefix length)` pairs against
+the request-level diagnostic records when validating a collection run.
+
+Split calibration training and validation by request ID, and use a separate
+workload seed for performance evaluation. Collection performs synchronous CPU
+copies and runs the proposal eagerly. Restore folded proposal execution and
+turn collection off for throughput comparisons; a lower training ECE alone does
+not establish a serving speedup.
