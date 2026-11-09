@@ -557,6 +557,101 @@ class TestDsparkKernelParity(CustomTestCase):
         self._eq(got, ref)
         return got, ref
 
+    def test_empty_verify_bonus_gathers_and_graph_replay(self):
+        """Empty rows have no bonus, including the first row of a graph bucket.
+
+        A nonzero guard before the table makes the old negative-index read fail
+        deterministically even when the allocator keeps that address mapped.
+        """
+        for width in (6, 7):
+            with self.subTest(width=width):
+                backing = torch.arange(1, 3 * width + 2, device=DEVICE)
+                table = backing[1:].view(3, width)
+                indices = torch.tensor([-1, -1, width - 1], device=DEVICE)
+                accept_index = torch.arange(3 * width, device=DEVICE).view(3, width)
+                predicts = torch.arange(101, 101 + 3 * width, device=DEVICE)
+
+                def run():
+                    return (
+                        dspark_accept.gather_row_bonus_triton(table=table, idx=indices),
+                        dspark_accept.gather_two_level_bonus_triton(
+                            accept_index=accept_index,
+                            predicts=predicts,
+                            correct_len=indices,
+                        ),
+                    )
+
+                got = run()
+                self._eq(got[0], torch.tensor([0, 0, 3 * width + 1], device=DEVICE))
+                self._eq(got[1], torch.tensor([0, 0, 100 + 3 * width], device=DEVICE))
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    run()
+                torch.cuda.current_stream().wait_stream(stream)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    captured = run()
+                for values in ([0, width - 1, -1], [-1, -1, -1]):
+                    indices.copy_(torch.tensor(values, device=DEVICE))
+                    graph.replay()
+                    rows = table.cpu().tolist()
+                    refs = predicts.cpu().view(3, width).tolist()
+                    self._eq(
+                        captured[0],
+                        torch.tensor(
+                            [0 if j < 0 else rows[i][j] for i, j in enumerate(values)],
+                            device=DEVICE,
+                        ),
+                    )
+                    self._eq(
+                        captured[1],
+                        torch.tensor(
+                            [0 if j < 0 else refs[i][j] for i, j in enumerate(values)],
+                            device=DEVICE,
+                        ),
+                    )
+
+    def test_empty_verify_acceptance_commits_nothing(self):
+        """Preserve the empty-row sentinel; clamping it would commit a fake token."""
+        for width in (6, 7):
+            with self.subTest(width=width):
+                candidates = torch.ones((3, width), dtype=torch.int64, device=DEVICE)
+                logits = torch.zeros((3 * width, 8), device=DEVICE)
+                logits[:, 1] = 1
+                (correct, bonus, trim), _ = self._parity(
+                    dspark_accept.AcceptGreedy,
+                    candidates=candidates,
+                    target_logits=logits,
+                    verify_num_draft_tokens=width,
+                    cutoff_verify_lens=torch.tensor([0, 1, width], device=DEVICE),
+                )
+                self._eq(
+                    correct,
+                    torch.tensor([-1, 0, width - 1], dtype=torch.int32, device=DEVICE),
+                )
+                self._eq(bonus, torch.tensor([0, 1, 1], device=DEVICE))
+                result = dspark_accept.finalize_accept_lens_triton(
+                    correct_len=correct,
+                    cap_trim_lens=trim,
+                    prefix_lens=torch.tensor([10, 20, 30], device=DEVICE),
+                )
+                self._eq(
+                    result.commit_lens,
+                    torch.tensor(
+                        [0, 1, width],
+                        dtype=torch.int32,
+                        device=DEVICE,
+                    ),
+                )
+                self._eq(
+                    result.new_seq_lens,
+                    torch.tensor(
+                        [10, 21, 30 + width],
+                        device=DEVICE,
+                    ),
+                )
+
     def test_all_kernels_triton_matches_torch(self):
         for name, case in _CASES:
             with self.subTest(kernel=name):

@@ -193,8 +193,12 @@ def accept_sampling(
         block_verification=block_verification,
     )
     row_ids = torch.arange(bs, dtype=torch.long, device=device)
-    accept_pos = accept_index[row_ids, correct_len.to(torch.long)].to(torch.long)
-    bonus = predicts[accept_pos].to(torch.int64)
+    active = correct_len >= 0
+    accept_pos = accept_index[row_ids, correct_len.clamp_min(0).to(torch.long)].to(
+        torch.long
+    )
+    accept_pos = torch.where(active, accept_pos, 0)
+    bonus = torch.where(active, predicts[accept_pos], 0).to(torch.int64)
     return correct_len, bonus, cap_trim_lens
 
 
@@ -211,10 +215,13 @@ def _gather_two_level_bonus_kernel(
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n
     cl = tl.load(correct_len_ptr + offs, mask=mask, other=0).to(tl.int64)
-    accept_pos = tl.load(accept_index_ptr + offs * cols + cl, mask=mask, other=0).to(
+    # Zero-length capture/padding rows retain correct_len=-1 so commit_len=0.
+    # They have no bonus; do not dereference either level of the lookup.
+    active = mask & (cl >= 0) & (cl < cols)
+    accept_pos = tl.load(accept_index_ptr + offs * cols + cl, mask=active, other=0).to(
         tl.int64
     )
-    bonus = tl.load(predicts_ptr + accept_pos, mask=mask, other=0)
+    bonus = tl.load(predicts_ptr + accept_pos, mask=active, other=0)
     tl.store(out_ptr + offs, bonus.to(tl.int64), mask=mask)
 
 
@@ -649,7 +656,11 @@ def accept_greedy(
             correct_len=correct_len, verify_lens=cutoff_verify_lens
         )
         row_ids = torch.arange(bs, device=target_predict.device)
-        bonus = target_predict[row_ids, correct_len.to(torch.long)].to(torch.int64)
+        bonus = torch.where(
+            correct_len >= 0,
+            target_predict[row_ids, correct_len.clamp_min(0).to(torch.long)],
+            0,
+        ).to(torch.int64)
     return correct_len, bonus, cap_trim_lens
 
 
@@ -665,7 +676,10 @@ def _gather_row_bonus_kernel(
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n
     idx = tl.load(idx_ptr + offs, mask=mask, other=0).to(tl.int64)
-    val = tl.load(table_ptr + offs * cols + idx, mask=mask, other=0)
+    # Empty verification rows use -1 to produce a zero commit length. In
+    # particular, row zero must not read before the table during graph warmup.
+    active = mask & (idx >= 0) & (idx < cols)
+    val = tl.load(table_ptr + offs * cols + idx, mask=active, other=0)
     tl.store(out_ptr + offs, val.to(tl.int64), mask=mask)
 
 
