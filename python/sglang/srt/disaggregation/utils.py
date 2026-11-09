@@ -180,9 +180,13 @@ def unified_memory_disagg_move_gate(scheduler):
     if scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
 
         def prefill_gate() -> bool:
+            control = getattr(scheduler, "pp_prefill_control", None)
             return not (
                 scheduler.disagg_prefill_inflight_queue
                 or scheduler.disagg_prefill_pending_chunk_rids
+                # Fence removes runnable queue entries before GPU/RDMA drain.
+                # Their retained source pages must stay at the same addresses.
+                or (control is not None and control.fenced)
             )
 
         return prefill_gate

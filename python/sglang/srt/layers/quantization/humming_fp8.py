@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec
 
 
@@ -25,7 +26,8 @@ class HummingFp8Weight(NamedTuple):
 
 def _requires_deterministic_gemm() -> bool:
     return (
-        is_batch_invariant_mode_enabled()
+        envs.SGLANG_HUMMING_USE_BATCH_INVARIANT.get()
+        or is_batch_invariant_mode_enabled()
         or get_exec().deterministic.enable_deterministic_inference
     )
 

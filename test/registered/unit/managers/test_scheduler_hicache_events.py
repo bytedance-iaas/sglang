@@ -129,16 +129,34 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s._pp_pd_get_prefill_transferred_ids = Mock(return_value=[])
         s._pp_commit_comm_work = Mock()
         s.get_new_batch_prefill = self.calls.admit
-        # Stop the infinite loop at admission; no PP transport or GPU is needed.
-        s.get_new_batch_prefill.side_effect = StopIteration
+        admitted_batch = SimpleNamespace(rid="cached-prefix")
+        prepared_batch = SimpleNamespace(rid="prepared-prefix")
+        s.get_new_batch_prefill.return_value = NextBatchPlan(
+            batch_to_run=admitted_batch, running_batch=self.running_batch
+        )
+        s.dp_attn_adapter.maybe_prepare_mlp_sync_batch.return_value = admitted_batch
+        s.ngram_embedding_manager = SimpleNamespace(
+            prepare_for_forward=self.calls.prepare
+        )
+        self.calls.prepare.return_value = prepared_batch
+        s.chunked_req = object()
+        s.mbs = [None]
+        # Stop before PP transport, after publishing the prepared batch.
+        s._pp_recv_proxy_tensors = Mock(side_effect=StopIteration)
 
         with self.assertRaises(StopIteration):
             s.event_loop_pp_disagg_prefill()
 
         self.assertEqual(
             self.calls.mock_calls,
-            [call.drain(), call.retry(), call.admit(self.running_batch)],
+            [
+                call.drain(),
+                call.retry(),
+                call.admit(self.running_batch),
+                call.prepare(admitted_batch, chunked_req=s.chunked_req),
+            ],
         )
+        self.assertIs(s.mbs[0], prepared_batch)
 
 
 if __name__ == "__main__":

@@ -117,7 +117,7 @@ jobs:
         run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.checkout_ref || github.ref }}
           fetch-depth: 0
@@ -199,7 +199,7 @@ jobs:
             --wheel-sha256 "$KERNEL_WHEEL_SHA256"
 
       - name: Set up Docker Buildx with local Docker Hub mirror
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         with:
           name: ${{ env.SGL_CACHE_BUILDER }}
           keep-state: false

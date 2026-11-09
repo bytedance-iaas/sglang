@@ -21,6 +21,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
+from sglang.srt.disaggregation.pp_prefill_control import TransferLeases
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -135,6 +136,7 @@ class TestAllocationIntegration(CustomTestCase):
         mgr.enable_staging = False
         mgr.is_dummy_cp_rank = False
         mgr._staging_outstanding = {}
+        mgr._pp_transfer_leases = TransferLeases()
         mgr._prefill_unique_rank = Mock(return_value=0)
         mgr.get_session_id = Mock(return_value="decode-session")
         mgr._send_multipart_locked = lambda endpoint, msg, **kw: self.wire.append(

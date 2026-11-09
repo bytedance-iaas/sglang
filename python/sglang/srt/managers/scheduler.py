@@ -2095,6 +2095,15 @@ class Scheduler(
         if recv_reqs:
             # Count successful receive/broadcast time as active; empty polls stay idle.
             self.metrics_reporter.record_scheduler_active(recv_start_ns)
+        control = getattr(self, "pp_prefill_control", None)
+        if control is not None:
+            from sglang.srt.disaggregation.pp_prefill_control import PPControlFrame
+
+            frames = [r for r in recv_reqs if isinstance(r, PPControlFrame)]
+            if len(frames) != int(not control.log.leader):
+                raise RuntimeError("Invalid PP request/control envelope")
+            control.log.begin(frames[0] if frames else None)
+            recv_reqs = [r for r in recv_reqs if not isinstance(r, PPControlFrame)]
         self.process_input_requests(recv_reqs)
         return recv_reqs
 
@@ -5077,6 +5086,11 @@ class Scheduler(
             idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
 
         if not for_health_check:
+            control = getattr(self, "pp_prefill_control", None)
+            if control is not None:
+                # Abort fences deliberately retain pool ownership. Neither idle
+                # leak checks nor cache flush may run before RetireCommit.
+                idle &= not control.proposals and not control.fenced
             # Grammar queue and prefill inflight queue may not produce batch
             # results instantly, but they still indicate the server is not idle.
             idle &= len(self.grammar_manager.grammar_queue) == 0
@@ -5335,6 +5349,22 @@ class Scheduler(
         return inflight_batches
 
     def abort_request(self, recv_req: AbortReq):
+        control = getattr(self, "pp_prefill_control", None)
+        if control is not None:
+            # Intake queues have no sender/KV owner yet, so they keep their
+            # existing cancellation path. Owned requests only publish proposals.
+            grammar_manager = getattr(self, "grammar_manager", None)
+            if grammar_manager is not None:
+                grammar_manager.abort_requests(recv_req)
+            if (mm_receiver := getattr(self, "mm_receiver", None)) is not None:
+                mm_receiver.abort_waiting_requests(recv_req)
+            for req in tuple(control.requests.values()):
+                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                    control.propose(
+                        req, recv_req.abort_message or "Aborted by AbortReq"
+                    )
+            return
+
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req

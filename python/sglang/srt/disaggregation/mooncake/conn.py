@@ -8,6 +8,7 @@ import struct
 import threading
 import time
 from collections import defaultdict
+from contextlib import nullcontext
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -48,6 +49,10 @@ from sglang.srt.disaggregation.common.utils import (
 from sglang.srt.disaggregation.mooncake.utils import (
     _validate_efa_allocator_compatibility,
     check_mooncake_custom_mem_pool_enabled,
+)
+from sglang.srt.disaggregation.pp_prefill_control import (
+    PPAbortNotifications,
+    TransferLeases,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -265,6 +270,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             enable_custom_mem_pool, custom_mem_pool_type
         )
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self._pp_transfer_leases = TransferLeases()
+        self._pp_abort_notifications = (
+            PPAbortNotifications(
+                max(
+                    self.bootstrap_timeout,
+                    envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get(),
+                )
+            )
+            if self.pp_size > 1 and disaggregation_mode == DisaggregationMode.PREFILL
+            else None
+        )
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -2401,6 +2417,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             thread_finish_flag=True,
                         )
                     self._staging_outstanding.pop(kv_chunk.room, None)
+                    if kv_chunk.pp_source_read_lease is not None:
+                        kv_chunk.pp_source_read_lease.release(kv_chunk.room)
                     if self.enable_deferred_decode_kv_release:
                         # Skipped => nothing written for this aborted room; ack.
                         self._maybe_ack_drained_abort(kv_chunk.room)
@@ -2708,6 +2726,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     # acknowledge Success while this worker can still erase
                     # bookkeeping for a subsequent transfer using the same room.
                     self._staging_outstanding.pop(kv_chunk.room, None)
+                if kv_chunk.pp_source_read_lease is not None:
+                    kv_chunk.pp_source_read_lease.release(kv_chunk.room)
 
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
@@ -2788,6 +2808,36 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         except Exception as exc:
             logger.debug("Failed to send ABORT_ACK for room %s: %s", room, exc)
 
+    def _register_decode_transfer_info(self, info, required_dst_info_num):
+        gate = getattr(self, "_pp_abort_notifications", None)
+        # Registration and commit share a lock; network I/O stays outside it.
+        with gate.lock if gate is not None else nullcontext():
+            retired = gate is not None and gate.register(
+                info.room, None if info.is_dummy else (info.endpoint, info.dst_port)
+            )
+            if not retired:
+                room = info.room
+                self.transfer_infos.setdefault(room, {})[
+                    info.mooncake_session_id
+                ] = info
+                if len(self.transfer_infos[room]) == required_dst_info_num:
+                    self.resolve_kv_replica_factor(self.transfer_infos[room])
+                    self.req_to_decode_prefix_len[room] = next(
+                        (
+                            item.decode_prefix_len
+                            for item in self.transfer_infos[room].values()
+                            if item.decode_prefix_len is not None
+                        ),
+                        0,
+                    )
+                    self.update_status(room, KVPoll.WaitingForInput)
+        if retired:
+            self.send_kv_status_message(
+                targets=[] if info.is_dummy else [(info.endpoint, info.dst_port)],
+                bootstrap_room=info.room,
+                status=KVPoll.Failed,
+            )
+
     def start_prefill_thread(self):
         recv = self._make_worker_recv(self.server_socket)
 
@@ -2848,24 +2898,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 else:
                     required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
                     room = int(room)
-                    if room not in self.transfer_infos:
-                        self.transfer_infos[room] = {}
-
-                    self.transfer_infos[room][mooncake_session_id] = (
-                        TransferInfo.from_zmq(waiting_req_bytes)
+                    self._register_decode_transfer_info(
+                        TransferInfo.from_zmq(waiting_req_bytes), required_dst_info_num
                     )
-                    # NOTE: after bootstrapping we can mark the req as waiting for input
-                    if len(self.transfer_infos[room]) == required_dst_info_num:
-                        self.resolve_kv_replica_factor(self.transfer_infos[room])
-                        self.req_to_decode_prefix_len[room] = next(
-                            (
-                                info.decode_prefix_len
-                                for info in self.transfer_infos[room].values()
-                                if info.decode_prefix_len is not None
-                            ),
-                            0,
-                        )
-                        self.update_status(room, KVPoll.WaitingForInput)
 
         t = threading.Thread(target=bootstrap_thread, daemon=True)
         t.start()
@@ -2968,6 +3003,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
 
+        leases = getattr(self, "_pp_transfer_leases", None)
+        if leases is not None and not leases.acquire(bootstrap_room):
+            return
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(
                 room=bootstrap_room,
@@ -2979,6 +3017,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=trace_ctx,
                 wait_event=wait_event,
+                pp_source_read_lease=leases,
             )
         )
 
@@ -3058,6 +3097,9 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         bootstrap_room: int,
         req_has_disagg_prefill_dp_rank: bool = False,
     ):
+        gate = getattr(mgr, "_pp_abort_notifications", None)
+        if gate is not None:
+            gate.open(bootstrap_room)
         super().__init__(
             mgr,
             bootstrap_addr,
@@ -3110,7 +3152,36 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         return self._poll_with_status(self.kv_mgr.check_status)
 
     def poll_pp_consensus(self) -> KVPoll:
-        return self._poll_with_status(self.kv_mgr.check_status_pp_consensus)
+        # conclude_state is a LOCAL observation. It cannot bypass collection of
+        # peer states when PP0 freezes a scheduler decision.
+        return self.kv_mgr.check_status_pp_consensus(self.bootstrap_room)
+
+    def pp_abort_fence(self):
+        self.kv_mgr._pp_transfer_leases.close(self.bootstrap_room)
+        self.abort()
+
+    def pp_abort_drained(self):
+        return self.kv_mgr._pp_transfer_leases.drained(self.bootstrap_room)
+
+    def pp_abort_notify(self):
+        if not self.pp_abort_drained():
+            raise RuntimeError("PP abort notification before local source drain")
+        gate = self.kv_mgr._pp_abort_notifications
+        if gate is None:
+            raise RuntimeError("PP abort notification gate is not initialized")
+        targets = gate.commit(self.bootstrap_room)
+        with self.kv_mgr.failure_lock:
+            reason = self.kv_mgr.failure_records.get(self.bootstrap_room)
+        self.kv_mgr.send_kv_status_message(
+            targets=targets,
+            bootstrap_room=self.bootstrap_room,
+            status=KVPoll.Failed,
+            failure_reason=reason,
+        )
+        logger.info("PP abort notify drained room=%s", self.bootstrap_room)
+
+    def pp_abort_forget(self):
+        self.kv_mgr._pp_transfer_leases.forget(self.bootstrap_room)
 
     def _poll_with_status(self, check_status) -> KVPoll:
         if self.conclude_state is not None:
@@ -3121,7 +3192,8 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         # allocation also wait for worker cleanup (the zero entry is only
         # removed after cleanup), before permitting the room to be reused.
         if status == KVPoll.Success and (
-            self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) > 0
+            not self.kv_mgr._pp_transfer_leases.idle(self.bootstrap_room)
+            or self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) > 0
             or (
                 self.kv_mgr.defer_decode_allocation
                 and self.bootstrap_room in self.kv_mgr._staging_outstanding

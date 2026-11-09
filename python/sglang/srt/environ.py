@@ -1080,6 +1080,7 @@ class Envs:
     SGLANG_HUMMING_ONLINE_QUANT_CONFIG = EnvJSON(None)
     SGLANG_HUMMING_INPUT_QUANT_CONFIG = EnvJSON(None)
     SGLANG_HUMMING_USE_F16_ACCUM = EnvBool(False)
+    SGLANG_HUMMING_USE_BATCH_INVARIANT = EnvBool(False)
     SGLANG_HUMMING_MOE_GEMM_TYPE = EnvStr("")
 
     # ===================================================================
@@ -1636,6 +1637,17 @@ class Envs:
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # Move the V4.1 SM90 consumer candidate mask before index-K reads/dots.
+    # Keep the dense logits + post-mask oracle available for validation and A/B.
+    SGLANG_DSV41_SM90_CANDIDATE_MASK = EnvBool(False)
+    # Compressed logits width / graph capacity; 0 restores always-on PR1.
+    SGLANG_DSV41_SM90_CANDIDATE_MASK_MIN_WIDTH = EnvInt(65536)
+    # Score source-selected blocks and scatter back to original dense logits.
+    # Experimental and independent from any custom/compact TopK implementation.
+    SGLANG_DSV41_SM90_CANDIDATE_COMPACT = EnvBool(False)
+    # Experimental: reuse index-K loading/dequantization for H32 verify queries.
+    # Request/slot equality is checked on device; compact consumers take priority.
+    SGLANG_DSV41_SM90_QUERY_K_REUSE = EnvBool(False)
     # DeepSeek-V4.1 ratio-1/2 index layers: the DeepGEMM fp4 logits kernels store bf16 instead
     # of fp32 (the reference ranks bf16 scores); every consumer of those logits must take bf16.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(False)
