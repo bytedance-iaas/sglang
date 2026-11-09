@@ -709,15 +709,15 @@ impl PDRouter {
         }
         .emit();
 
-        let prefill_fut = prefill_request.send();
-        let decode_fut = decode_request.send();
-        tokio::pin!(prefill_fut);
-        tokio::pin!(decode_fut);
+        // Own each future so a failed peer can cancel it before reading an
+        // error body, which may itself wait for that cancellation.
+        let mut prefill_fut = Box::pin(prefill_request.send());
+        let mut decode_fut = Box::pin(decode_request.send());
 
         // Poll both until prefill resolves; decode normally resolves later, but
         // may resolve first if it rejects the request outright.
         let prefill_result;
-        let mut decode_early: Option<Result<reqwest::Response, reqwest::Error>> = None;
+        let mut decode_early: Option<reqwest::Response> = None;
         loop {
             tokio::select! {
                 biased;
@@ -726,7 +726,31 @@ impl PDRouter {
                     break;
                 }
                 dr = &mut decode_fut, if decode_early.is_none() => {
-                    decode_early = Some(dr);
+                    match dr {
+                        Ok(res) if !res.status().is_success() => {
+                            drop(prefill_fut);
+                            if !context.is_stream {
+                                decode.record_outcome(res.status().is_client_error());
+                            }
+                            let mut response = self
+                                .handle_decode_error_response(res, &context, prefill, decode)
+                                .await;
+                            response.extensions_mut().insert(BreakerOutcomesRecorded);
+                            return response;
+                        }
+                        Err(e) => {
+                            drop(prefill_fut);
+                            error!(decode_url = %decode.url(), error = ?e, "Decode request failed");
+                            decode.record_outcome(false);
+                            let mut response = error::bad_gateway(
+                                "decode_server_error",
+                                format!("Decode server error: {}", e),
+                            );
+                            response.extensions_mut().insert(BreakerOutcomesRecorded);
+                            return response;
+                        }
+                        Ok(res) => decode_early = Some(res),
+                    }
                 }
             }
         }
@@ -742,6 +766,8 @@ impl PDRouter {
         };
 
         if prefill_failed {
+            drop(decode_fut);
+            drop(decode_early);
             warn!(
                 "Prefill failed, aborting paired decode request decode_url={} prefill_url={}",
                 decode.url(),
@@ -774,7 +800,7 @@ impl PDRouter {
 
         // Prefill ok: take decode's result, awaiting it if still pending.
         let decode_result = match decode_early {
-            Some(dr) => dr,
+            Some(res) => Ok(res),
             None => (&mut decode_fut).await,
         };
 
@@ -1277,7 +1303,7 @@ impl PDRouter {
             Ok(response) => response,
             Err(e) => {
                 error!(
-                    "Prefill server failed (CRITICAL) prefill_url={} error={}. Decode will timeout without prefill KV cache.",
+                    "Prefill server failed (CRITICAL) prefill_url={} error={:?}. Decode will timeout without prefill KV cache.",
                     prefill_url,
                     e
                 );

@@ -2711,4 +2711,107 @@ mod upstream_cancel_tests {
 
         ctx.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn test_pd_rejection_cancels_peer_before_error_body() {
+        use smg::core::{BasicWorkerBuilder, Worker, WorkerType};
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+            sync::Notify,
+        };
+
+        for prefill_rejects in [false, true] {
+            let peer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let rejected = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let peer_url = format!("http://{}", peer.local_addr().unwrap());
+            let rejected_url = format!("http://{}", rejected.local_addr().unwrap());
+            let started = Arc::new(Notify::new());
+            let cancelled = Arc::new(Notify::new());
+            let peer_started = started.clone();
+            let peer_cancelled = cancelled.clone();
+            let peer_task = tokio::spawn(async move {
+                let (mut socket, _) = peer.accept().await.unwrap();
+                assert!(socket.read(&mut [0; 4096]).await.unwrap() > 0);
+                peer_started.notify_one();
+                match socket.read_to_end(&mut Vec::new()).await {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+                    Err(e) => panic!("Reading the cancelled peer: {e}"),
+                }
+                peer_cancelled.notify_one();
+            });
+            let rejected_task = tokio::spawn(async move {
+                let (mut socket, _) = rejected.accept().await.unwrap();
+                assert!(socket.read(&mut [0; 4096]).await.unwrap() > 0);
+                started.notified().await;
+                let body = r#"{"error":{"message":"test rejection"}}"#;
+                let headers = format!(
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(headers.as_bytes()).await.unwrap();
+                // Returning the error body depends on cancellation of the peer.
+                cancelled.notified().await;
+                socket.write_all(body.as_bytes()).await.unwrap();
+            });
+            let (prefill_url, decode_url) = if prefill_rejects {
+                (&rejected_url, &peer_url)
+            } else {
+                (&peer_url, &rejected_url)
+            };
+            let config = RouterConfig::builder()
+                .prefill_decode_mode(
+                    vec![(prefill_url.to_string(), Some(8998))],
+                    vec![decode_url.to_string()],
+                )
+                .round_robin_policy()
+                .disable_retries()
+                .build_unchecked();
+            let ctx = AppTestContext::new_with_config(config, vec![]).await;
+            for (url, role) in [
+                (
+                    prefill_url,
+                    WorkerType::Prefill {
+                        bootstrap_port: Some(8998),
+                    },
+                ),
+                (decode_url, WorkerType::Decode),
+            ] {
+                let worker: Arc<dyn Worker> =
+                    Arc::new(BasicWorkerBuilder::new(url).worker_type(role).build());
+                worker.set_healthy(true);
+                ctx.app_context.worker_registry.register(worker);
+            }
+            let req = Request::builder()
+                .method("POST")
+                .uri("/generate")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "text": "x", "stream": false }).to_string(),
+                ))
+                .unwrap();
+            let response =
+                tokio::time::timeout(STREAM_FINISH_TIMEOUT, ctx.create_app().await.oneshot(req))
+                    .await
+                    .expect("Rejecting upstream must cancel its peer before reading the error body")
+                    .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(String::from_utf8_lossy(&body).contains("test rejection"));
+            let prefill_worker = pin_worker(&ctx, prefill_url);
+            let decode_worker = pin_worker(&ctx, decode_url);
+            let (failed, peer) = if prefill_rejects {
+                (&prefill_worker, &decode_worker)
+            } else {
+                (&decode_worker, &prefill_worker)
+            };
+            assert_eq!(breaker_counts(failed), (0, 1));
+            assert_eq!(breaker_counts(peer), (0, 0));
+            assert_eq!((prefill_worker.load(), decode_worker.load()), (0, 0));
+            peer_task.await.unwrap();
+            rejected_task.await.unwrap();
+            ctx.shutdown().await;
+        }
+    }
 }
