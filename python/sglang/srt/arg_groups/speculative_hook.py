@@ -398,9 +398,9 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 "--speculative-dspark-pp-replicated-draft currently requires "
                 "--pp-size greater than 1."
             )
-        if cfg.disaggregation_mode == "decode" and cfg.pp_size != 2:
+        if cfg.disaggregation_mode == "decode" and cfg.pp_size not in (2, 4):
             raise ValueError(
-                "PP DSpark Decode currently requires --pp-size 2; replicated "
+                "PP DSpark Decode currently requires --pp-size 2 or 4; replicated "
                 "PP DSpark Prefill supports larger pipeline sizes."
             )
         if cfg.disaggregation_mode not in ("prefill", "decode"):

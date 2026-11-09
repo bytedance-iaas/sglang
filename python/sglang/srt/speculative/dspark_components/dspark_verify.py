@@ -210,10 +210,12 @@ class TargetVerifyExecutor:
         if self.verify_epilogue is not None:
             self.verify_epilogue.begin_step(None, armed=False)
         num_dummy_slots = (
-            int(idle_layout.verify_lens.numel()) if idle_layout is not None else 0
+            int(idle_layout.verify_lens.numel()) if idle_layout is not None else 1
         )
         num_dummy_tokens = (
-            idle_layout.graph_num_tokens if idle_layout is not None else 0
+            idle_layout.graph_num_tokens
+            if idle_layout is not None
+            else self.verify_num_draft_tokens
         )
         verify_input = DFlashVerifyInput(
             draft_token=torch.zeros(
@@ -233,15 +235,14 @@ class TargetVerifyExecutor:
         # DP padding materializes this zero-token lane to the active verify
         # geometry. Keep the same model path even when no ragged layout is used.
         batch.forward_mode = ForwardMode.TARGET_VERIFY
-        if idle_layout is not None:
-            batch.seq_lens = torch.ones(
-                (num_dummy_slots,), dtype=torch.int64, device=device
-            )
-            batch.req_pool_indices = torch.zeros(
-                (num_dummy_slots,), dtype=torch.int64, device=device
-            )
-            batch.seq_lens_cpu = torch.ones((num_dummy_slots,), dtype=torch.int64)
-            batch.seq_lens_sum = num_dummy_slots
+        batch.seq_lens = torch.ones(
+            (num_dummy_slots,), dtype=torch.int64, device=device
+        )
+        batch.req_pool_indices = torch.zeros(
+            (num_dummy_slots,), dtype=torch.int64, device=device
+        )
+        batch.seq_lens_cpu = torch.ones((num_dummy_slots,), dtype=torch.int64)
+        batch.seq_lens_sum = num_dummy_slots
         verify_input.live_seq_lens_cpu = batch.seq_lens_cpu
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker

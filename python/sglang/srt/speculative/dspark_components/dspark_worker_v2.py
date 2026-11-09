@@ -216,6 +216,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             and self._is_pd_prefill
             and not get_memory().disable_radix_cache
         )
+        self._replicate_pp_decode_context = (
+            self._replicated_pp_decode
+            and envs.SGLANG_PP_DSPARK_PIPELINED_PROXY.get()
+            and parallel.pp_size == 4
+            and parallel.pp_rank == 0
+        )
         self._pp_candidates = weakref.WeakKeyDictionary()
         if not self._hosts_draft:
             return
@@ -1290,7 +1296,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def prepare_pp_draft(
-        self, batch: ScheduleBatch, draft_input: DFlashDraftInputV2
+        self,
+        batch: ScheduleBatch,
+        draft_input: DFlashDraftInputV2,
+        *,
+        all_rows: bool = False,
     ) -> dict:
         bs = len(batch.seq_lens)
         prefix_lens = draft_input.new_seq_lens
@@ -1307,11 +1317,15 @@ class DSparkWorkerV2(BaseSpecWorker):
         identities = tuple(
             PPDSparkIdentity.from_req(req).next_round() for req in batch.reqs
         )
-        rows = [
-            i
-            for i, req in enumerate(batch.reqs)
-            if draft_owner(req.rid, self.ps.pp_size) == self.ps.pp_rank
-        ]
+        rows = (
+            list(range(len(batch.reqs)))
+            if all_rows
+            else [
+                i
+                for i, req in enumerate(batch.reqs)
+                if draft_owner(req.rid, self.ps.pp_size) == self.ps.pp_rank
+            ]
+        )
         payload = {"identities": [identities[i].to_wire() for i in rows]}
         draft_batch = self._pp_draft_sync_batch(next_batch, local_bs=len(rows))
         if rows:
@@ -1367,16 +1381,17 @@ class DSparkWorkerV2(BaseSpecWorker):
                 payload["draft_hidden"] = proposal.draft_hidden.clone()
             if confidence is not None:
                 payload["confidence"] = confidence.clone()
-        elif self._pp_draft_dp_enabled:
+        elif self._pp_draft_dp_enabled and any(draft_batch.global_num_tokens):
             with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
                 self._proposer.run_idle_participation(draft_batch)
         return payload
 
     def prepare_pp_idle_draft(self, batch: ScheduleBatch) -> None:
+        draft_batch = self._pp_draft_sync_batch(batch, local_bs=0)
+        if not any(draft_batch.global_num_tokens):
+            return
         with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
-            self._proposer.run_idle_participation(
-                self._pp_draft_sync_batch(batch, local_bs=0)
-            )
+            self._proposer.run_idle_participation(draft_batch)
 
     def _pp_draft_sync_batch(
         self, batch: ScheduleBatch, *, local_bs: int
@@ -1421,6 +1436,48 @@ class DSparkWorkerV2(BaseSpecWorker):
                 ),
             )
             row += 1
+
+    def install_pp_draft_all(self, batch: ScheduleBatch, payload: dict) -> None:
+        expected = [PPDSparkIdentity.from_req(req) for req in batch.reqs]
+        validate_identities(expected, payload["identities"])
+        self.install_pp_draft_subset(batch, payload)
+
+    def install_pp_draft_subset(self, batch: ScheduleBatch, payload: dict) -> None:
+        expected_by_wire = {
+            identity.to_wire(): (req, identity)
+            for req in batch.reqs
+            for identity in [PPDSparkIdentity.from_req(req)]
+        }
+        received = [
+            (identity[0], tuple(identity[1]), identity[2])
+            for identity in payload["identities"]
+        ]
+        if len(received) != len(set(received)):
+            raise RuntimeError(f"Duplicate PP DSpark proposal identities: {received}.")
+        if len(received) != len(payload["draft_block_ids"]):
+            raise RuntimeError(
+                "PP DSpark proposal size mismatch: "
+                f"identities={len(received)}, blocks={len(payload['draft_block_ids'])}."
+            )
+        for row, wire_identity in enumerate(received):
+            matched = expected_by_wire.get(wire_identity)
+            if matched is None:
+                raise RuntimeError(
+                    "Stale or mismatched PP DSpark subset result: "
+                    f"received={wire_identity}, expected={tuple(expected_by_wire)}."
+                )
+            req, identity = matched
+            self._pp_candidates[req] = PPDSparkCandidate(
+                identity=identity,
+                draft_block_ids=payload["draft_block_ids"][row],
+                draft_tokens=payload["draft_tokens"][row],
+                draft_hidden=(
+                    payload["draft_hidden"][row] if "draft_hidden" in payload else None
+                ),
+                confidence=(
+                    payload["confidence"][row] if "confidence" in payload else None
+                ),
+            )
 
     def consume_pp_draft(self, batch: ScheduleBatch, sampling_info) -> DraftProposal:
         blocks, tokens, hidden_rows, hidden_indices, confidences = [], [], [], [], []
@@ -1615,10 +1672,13 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "Replicated PP DSpark result does not match the forward batch: "
                 f"forward_rids={state.rids}, result_rids={rids}."
             )
-        if self._replicate_pp_prefill_context:
+        replicate_context = self._replicate_pp_prefill_context or self.__dict__.get(
+            "_replicate_pp_decode_context", False
+        )
+        if replicate_context:
             # A later radix hit can be assigned to either rid-based draft owner.
-            # Keep both Prefill replicas complete while the target token slots
-            # (and the draft slots indexed by them) are retained by the tree.
+            # Pipelined PP4 decode also runs every Draft row on PP0. Keep the
+            # corresponding Draft context complete on that replica.
             rows = list(range(len(rids)))
         else:
             rows, token_rows = owned_token_rows(
@@ -1626,7 +1686,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         if not rows:
             return
-        if self._replicate_pp_prefill_context:
+        if replicate_context:
             row_index = torch.arange(len(rows), dtype=torch.int64, device=self.device)
             index = torch.arange(
                 sum(state.token_counts), dtype=torch.int64, device=self.device

@@ -643,6 +643,9 @@ class Envs:
     SGLANG_PP_DSPARK_PREPLAN_RESULT_APPLY = EnvBool(False)
     # Propagate committed content state to equivalent live scheduler slots.
     SGLANG_PP_DSPARK_SYNC_COMMITTED_SLOT_STATE = EnvBool(False)
+    # PP4 replicated DSpark: generate complete proposals on PP0 and carry them
+    # asynchronously with generation-tagged per-slot proxy messages.
+    SGLANG_PP_DSPARK_PIPELINED_PROXY = EnvBool(False)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
 
     # ===================================================================

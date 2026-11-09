@@ -51,12 +51,17 @@ from sglang.srt.sampling.sampling_observer_pp import (
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.dspark_components.dspark_pp import (
     pack_proposal,
+    pack_proxy_proposal,
+    pop_proxy_proposal,
 )
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
 from sglang.srt.utils.common import get_device_module, is_npu, is_xpu
 
 _is_npu = is_npu()
 logger = logging.getLogger(__name__)
+
+_PP_PD_FORWARD_CONTROL_TAG = 1
+_PP_PD_REVERSE_CONTROL_TAG = 2
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -89,7 +94,7 @@ def _pp_use_batched_result_relay() -> bool:
 def _pp_use_serial_dspark_generation() -> bool:
     return (
         envs.SGLANG_PP_DSPARK_SERIAL_GENERATION.get()
-        and get_parallel().pp_size == 2
+        and get_parallel().pp_size in (2, 4)
         and get_parallel().pp_async_batch_depth == 0
         and get_spec().speculative_dspark_pp_replicated_draft
         and get_spec().speculative_draft_scheduling_policy == "bubble"
@@ -128,6 +133,16 @@ def _pp_use_serial_dspark_sync_committed_slot_state() -> bool:
     return (
         envs.SGLANG_PP_DSPARK_SYNC_COMMITTED_SLOT_STATE.get()
         and _pp_use_serial_dspark_preplan_result_apply()
+    )
+
+
+def _pp_use_pipelined_dspark_proxy() -> bool:
+    return (
+        envs.SGLANG_PP_DSPARK_PIPELINED_PROXY.get()
+        and get_parallel().pp_size == 4
+        and get_parallel().pp_async_batch_depth == 0
+        and get_spec().speculative_dspark_pp_replicated_draft
+        and get_spec().speculative_draft_scheduling_policy == "bubble"
     )
 
 
@@ -173,6 +188,17 @@ class PPBatchMetadata:
     dspark_commit_state: Optional[object] = None
     speculative_num_draft_tokens: Optional[int] = None
     verify_out_cache_loc: Optional[torch.Tensor] = None
+
+
+@dataclass(frozen=True)
+class PPPDControlEnvelope:
+    phase: str
+    generation: int
+    slot_id: int
+    valid: bool
+    retract_rids: List[str]
+    prealloc_rids: List[List[str]]
+    transferred_rids: List[str]
 
 
 def _pp_get_dspark_draft_coordinator(
@@ -537,43 +563,53 @@ class SchedulerPPMixin:
                 "SGLANG_PP_DSPARK_OUTPUT_OVERLAP requires "
                 "SGLANG_PP_DSPARK_SERIAL_GENERATION."
             )
+        if (
+            envs.SGLANG_PP_DSPARK_SERIAL_GENERATION.get()
+            and envs.SGLANG_PP_DSPARK_PIPELINED_PROXY.get()
+        ):
+            raise RuntimeError(
+                "SGLANG_PP_DSPARK_PIPELINED_PROXY is incompatible with "
+                "SGLANG_PP_DSPARK_SERIAL_GENERATION."
+            )
         if envs.SGLANG_PP_DSPARK_SERIAL_GENERATION.get():
             if not _pp_use_serial_dspark_generation():
                 raise RuntimeError(
-                    "SGLANG_PP_DSPARK_SERIAL_GENERATION requires PP2, "
+                    "SGLANG_PP_DSPARK_SERIAL_GENERATION requires PP2 or PP4, "
                     "pp_async_batch_depth=0, replicated PP DSpark, and the "
                     "bubble draft scheduling policy."
                 )
             return self._event_loop_pp_disagg_decode_serial_generation()
-
+        if envs.SGLANG_PP_DSPARK_PIPELINED_PROXY.get():
+            if not _pp_use_pipelined_dspark_proxy():
+                raise RuntimeError(
+                    "SGLANG_PP_DSPARK_PIPELINED_PROXY requires PP4, "
+                    "pp_async_batch_depth=0, replicated PP DSpark, and the "
+                    "bubble draft scheduling policy."
+                )
         self.init_pp_loop_state()
 
         # PD additional state initialization
-        rmbs = [None] * self.pp_loop_size
-        pmbs = [None] * self.pp_loop_size
-        tmbs = [None] * self.pp_loop_size
-        consensus_retract_rids: Optional[List[str]] = None
-        consensus_prealloc_rids: Optional[List[str]] = None
-        release_rids: Optional[List[str]] = None  # consensus transferred rids
-        send_retract_work = []
-        send_prealloc_work = []
-        send_transfer_work = []
-        send_consensus_retract_work = []
-        send_consensus_prealloc_work = []
-        send_release_work = []
+        send_control_work = []
+        next_generation = 0
+        next_control_generation = 0
+        pending_proxy_send = None
+        reverse_control_outbox = self._pp_make_pd_control_heartbeat(
+            generation=-self.ps.pp_rank - 1,
+            slot_id=(-self.ps.pp_rank - 1) % self.pp_loop_size,
+        )
 
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                generation = None
+                control_generation = next_control_generation
+                next_control_generation += 1
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
 
                 next_pp_outputs = None
-                next_consensus_retract_rids = None
-                next_consensus_prealloc_rids = None
-                next_release_rids = None
                 d2h_event = None
                 next_batch_result = None
 
@@ -583,18 +619,61 @@ class SchedulerPPMixin:
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
 
-                # reaching consensus through PP ranks
-                retract_rids = self._pp_pd_get_retract_ids(mb_id)
-                rmbs[mb_id] = retract_rids
-                self._pp_commit_comm_work(send_retract_work)
+                # One fixed forward envelope per control generation. Empty
+                # queues still carry protocol-valid shapes.
+                incoming_control = None
+                if not self.pp_group.is_first_rank:
+                    incoming_control = self._pp_recv_pd_control_envelope(
+                        phase="forward",
+                        expected_generation=control_generation,
+                        expected_slot=mb_id,
+                        expected_valid=True,
+                    )
 
-                prealloc_rids = self._pp_pd_get_prealloc_ids()
-                pmbs[mb_id] = prealloc_rids
-                self._pp_commit_comm_work(send_prealloc_work)
+                retract_rids = self._pp_pd_get_retract_ids(
+                    mb_id,
+                    (
+                        incoming_control.retract_rids
+                        if incoming_control is not None
+                        else None
+                    ),
+                )
+                prealloc_rids = self._pp_pd_get_prealloc_ids(
+                    (
+                        incoming_control.prealloc_rids
+                        if incoming_control is not None
+                        else None
+                    )
+                )
+                transferred_rids = self._pp_pd_get_decode_transferred_ids(
+                    (
+                        incoming_control.transferred_rids
+                        if incoming_control is not None
+                        else None
+                    )
+                )
+                self._pp_commit_comm_work(send_control_work)
+                forward_control = self._pp_make_pd_control_envelope(
+                    phase="forward",
+                    generation=control_generation,
+                    slot_id=mb_id,
+                    retract_rids=retract_rids,
+                    prealloc_rids=prealloc_rids,
+                    transferred_rids=transferred_rids,
+                )
 
-                transferred_rids = self._pp_pd_get_decode_transferred_ids()
-                tmbs[mb_id] = transferred_rids
-                self._pp_commit_comm_work(send_transfer_work)
+                # Let the peer enter this control generation before this rank
+                # waits on the reverse ring or queues GPU proxy traffic.
+                if not self.pp_group.is_last_rank:
+                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                        recv_reqs, async_send=True
+                    )
+                    send_control_work = self._pp_send_pd_control_envelope(
+                        forward_control,
+                        async_send=True,
+                    )
+                    self._pp_commit_comm_work(self.send_req_work)
+                    self._pp_commit_comm_work(send_control_work)
 
                 # get batch to run and proxy tensors if needed
                 plan = self.get_next_disagg_decode_batch_to_run(
@@ -604,14 +683,79 @@ class SchedulerPPMixin:
                 batch = plan.batch_to_run
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
-
                 cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 self.cur_batch_for_debug = cur_batch
+                active = (
+                    cur_batch is not None and not cur_batch.forward_mode.is_prebuilt()
+                )
+                if _pp_use_pipelined_dspark_proxy():
+                    if active:
+                        generation = next_generation
+                        next_generation += 1
+                    self._pp_slot_generations[mb_id] = generation
+
+                # Complete fixed CPU control before entering any blocking GPU
+                # proxy edge. This keeps request/control state available to
+                # every peer that must post the matching proxy receive.
+                reverse_control = self._pp_exchange_reverse_pd_control(
+                    (
+                        self._pp_make_pd_control_envelope(
+                            phase="consensus",
+                            generation=control_generation,
+                            slot_id=mb_id,
+                            retract_rids=retract_rids,
+                            prealloc_rids=prealloc_rids,
+                            transferred_rids=transferred_rids,
+                        )
+                        if self.pp_group.is_last_rank
+                        else reverse_control_outbox
+                    ),
+                    expected_generation=control_generation - self.ps.pp_rank,
+                    expected_slot=(control_generation - self.ps.pp_rank)
+                    % self.pp_loop_size,
+                )
+                if not self.pp_group.is_last_rank:
+                    reverse_control_outbox = reverse_control
+                if reverse_control.valid:
+                    self.process_retract_queue(reverse_control.retract_rids)
+                    self.process_prealloc_queue(reverse_control.prealloc_rids)
+                    self.process_decode_transfer_queue(reverse_control.transferred_rids)
+
+                if _pp_use_pipelined_dspark_proxy() and pending_proxy_send is not None:
+                    (
+                        pending_proxy_tensors,
+                        pending_proxy_generation,
+                        pending_proxy_slot,
+                    ) = pending_proxy_send
+                    self._pp_queue_proxy_send(
+                        pending_proxy_tensors,
+                        generation=pending_proxy_generation,
+                        active=True,
+                        slot_id=pending_proxy_slot,
+                    )
+                    pending_proxy_send = None
+
+                proxy_proposal_relay = {}
                 if cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = None
-                    if not cur_batch.forward_mode.is_prebuilt():
-                        pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                if _pp_use_pipelined_dspark_proxy():
+                    if active and not self.pp_group.is_first_rank:
+                        pp_proxy_tensors = self._pp_recv_proxy_tensors(
+                            expected_generation=generation,
+                            expected_active=True,
+                            expected_slot=mb_id,
+                        )
+                    if active:
+                        proxy_proposal_relay = _pp_get_dspark_draft_coordinator(
+                            self
+                        ).prepare_proxy_proposal(
+                            cur_batch,
+                            slot_id=mb_id,
+                            proxy_tensors=pp_proxy_tensors,
+                        )
+                elif active:
+                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
 
                 # Keep zero-depth disaggregated PP launch-first so stage
                 # execution overlaps. Idle draft collectives are deferred
@@ -644,57 +788,18 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                _pp_get_dspark_draft_coordinator(self).drain()
+                if _pp_use_pipelined_dspark_proxy():
+                    draft_coordinator = _pp_get_dspark_draft_coordinator(self)
+                    if draft_coordinator.has_pending():
+                        draft_coordinator.drain_pipelined()
+                else:
+                    _pp_get_dspark_draft_coordinator(self).drain()
 
-                # reach consensus on last rank and send to PP=0
-                # otherwise, just pass along previous consensus
-                send_consensus_retract_work, consensus_retract_rids = (
-                    self._pp_pd_send_consensus_bootstrapped_ids(
-                        rmbs,
-                        next_first_rank_mb_id,
-                        consensus_retract_rids,
-                        retract_rids,
-                    )
-                )
-
-                send_consensus_prealloc_work, consensus_prealloc_rids = (
-                    self._pp_pd_send_consensus_bootstrapped_ids(
-                        pmbs,
-                        next_first_rank_mb_id,
-                        consensus_prealloc_rids,
-                        prealloc_rids,
-                    )
-                )
-
-                send_release_work, release_rids = (
-                    self._pp_pd_send_consensus_release_ids(
-                        tmbs, next_first_rank_mb_id, release_rids, transferred_rids
-                    )
-                )
+                if _pp_use_pipelined_dspark_proxy():
+                    _pp_get_dspark_draft_coordinator(self).commit_pipelined()
 
                 if get_disagg().disaggregation_decode_enable_offload_kvcache:
                     self.decode_offload_manager.check_offload_progress()
-
-                if rmbs[next_mb_id] is not None:
-                    next_consensus_retract_rids = self._pp_recv_pyobj_from_prev_stage()
-                    next_consensus_retract_rids = self.process_retract_queue(
-                        next_consensus_retract_rids
-                    )
-                self._pp_commit_comm_work(send_consensus_retract_work)
-
-                if pmbs[next_mb_id] is not None:
-                    next_consensus_prealloc_rids = self._pp_recv_pyobj_from_prev_stage()
-                    next_consensus_prealloc_rids = self.process_prealloc_queue(
-                        next_consensus_prealloc_rids
-                    )
-                self._pp_commit_comm_work(send_consensus_prealloc_work)
-
-                if tmbs[next_mb_id] is not None:
-                    next_release_rids = self._pp_recv_pyobj_from_prev_stage()
-                    next_release_rids = self.process_decode_transfer_queue(
-                        next_release_rids
-                    )
-                self._pp_commit_comm_work(send_release_work)
 
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
@@ -708,33 +813,33 @@ class SchedulerPPMixin:
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
                 if not self.pp_group.is_last_rank:
-                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
-                    )
-                    send_retract_work = self._pp_send_pyobj_to_next_stage(
-                        retract_rids, async_send=True
-                    )
-                    send_prealloc_work = self._pp_send_pyobj_to_next_stage(
-                        prealloc_rids, async_send=True
-                    )
-                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
-                        transferred_rids, async_send=True
-                    )
-                    if cur_batch and not cur_batch.forward_mode.is_prebuilt():
+                    if active:
                         # Match the prefill schedule: the next slot owns the
                         # completion because the peer has not posted its proxy
                         # receive while it is still in this slot's PD ring.
                         self.device_module.current_stream().wait_event(
                             self.launch_event
                         )
-                        self._pp_queue_proxy_send(
+                        proxy_tensors = dict(
                             result.pp_hidden_states_proxy_tensors.tensors
                         )
+                        proxy_tensors.update(proxy_proposal_relay)
+                        self._pp_retarget_proxy_proposal(
+                            proxy_tensors,
+                            next_mb_id,
+                        )
+                    else:
+                        proxy_tensors = {}
+                    if _pp_use_pipelined_dspark_proxy() and active:
+                        pending_proxy_send = (
+                            proxy_tensors,
+                            generation,
+                            next_mb_id,
+                        )
+                    elif active:
+                        self._pp_queue_proxy_send(proxy_tensors)
 
                 self.pp_outputs = next_pp_outputs
-                release_rids = next_release_rids
-                consensus_retract_rids = next_consensus_retract_rids
-                consensus_prealloc_rids = next_consensus_prealloc_rids
 
                 self.running_batch.batch_is_full = False
 
@@ -845,8 +950,6 @@ class SchedulerPPMixin:
                     next_batch_result, d2h_event = (
                         self._pp_preprocess_deferred_serial_output()
                     )
-                    dspark_draft = _pp_get_dspark_draft_coordinator(self)
-                    dspark_draft.drain()
                     completed_generation = self._pp_received_output_generation
                     proposal_batch = (
                         self._pp_generation_states[completed_generation][0]
@@ -857,6 +960,8 @@ class SchedulerPPMixin:
                         )
                         else None
                     )
+                    dspark_draft = _pp_get_dspark_draft_coordinator(self)
+                    dspark_draft.drain_aligned(completed_generation)
                     dspark_draft.relay_serial_proposals(
                         proposal_batch,
                         next_pp_outputs,
@@ -907,7 +1012,28 @@ class SchedulerPPMixin:
                 # PP2 reverse consensus is one direct, fixed triplet per
                 # generation. The last rank owns the consensus result; rank 0
                 # receives the same shapes even when all lists are empty.
-                if self.pp_group.is_last_rank:
+                if self.ps.pp_size > 2:
+                    consensus = self.pp_group.broadcast_object(
+                        (
+                            (
+                                retract_rids,
+                                prealloc_rids,
+                                transferred_rids,
+                            )
+                            if self.pp_group.is_last_rank
+                            else None
+                        ),
+                        src=self.ps.pp_size - 1,
+                    )
+                    (
+                        consensus_retract_rids,
+                        consensus_prealloc_rids,
+                        consensus_transferred_rids,
+                    ) = consensus
+                    self.process_retract_queue(consensus_retract_rids)
+                    self.process_prealloc_queue(consensus_prealloc_rids)
+                    self.process_decode_transfer_queue(consensus_transferred_rids)
+                elif self.pp_group.is_last_rank:
                     send_consensus_retract_work = self._pp_send_pyobj_to_next_stage(
                         retract_rids, async_send=True
                     )
@@ -1218,6 +1344,7 @@ class SchedulerPPMixin:
             int, Tuple[ScheduleBatch, Optional[PPBatchMetadata], int]
         ] = {}
         self._pp_received_output_generation: Optional[int] = None
+        self._pp_received_output_slot: Optional[int] = None
         self._pp_serial_generation: Optional[int] = None
         self._pp_local_output_to_process: Optional[PPProxyTensors] = None
         self._pp_local_output_ready_event: Optional[torch.Event] = None
@@ -1657,7 +1784,12 @@ class SchedulerPPMixin:
         )
         return next_pp_outputs, next_batch_result, d2h_event
 
-    def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
+    def _pp_send_pyobj_to_next_stage(
+        self: Scheduler,
+        data,
+        async_send: bool = False,
+        tag: int = 0,
+    ):
         p2p_work = []
         if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
             dp_offset = (
@@ -1670,10 +1802,166 @@ class SchedulerPPMixin:
                 self.ps.pp_rank * self.ps.tp_size + dp_offset,
                 ((self.ps.pp_rank + 1) % self.ps.pp_size) * self.ps.tp_size + dp_offset,
                 async_send=async_send,
+                tag=tag,
             )
         return p2p_work
 
-    def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
+    @staticmethod
+    def _pp_make_pd_control_envelope(
+        *,
+        phase: str,
+        generation: int,
+        slot_id: int,
+        retract_rids: List[str],
+        prealloc_rids: List[List[str]],
+        transferred_rids: List[str],
+    ) -> PPPDControlEnvelope:
+        return PPPDControlEnvelope(
+            phase=phase,
+            generation=generation,
+            slot_id=slot_id,
+            valid=True,
+            retract_rids=list(retract_rids),
+            prealloc_rids=[
+                list(prealloc_rids[0]),
+                list(prealloc_rids[1]),
+            ],
+            transferred_rids=list(transferred_rids),
+        )
+
+    @staticmethod
+    def _pp_make_pd_control_heartbeat(
+        *, generation: int, slot_id: int
+    ) -> PPPDControlEnvelope:
+        return PPPDControlEnvelope(
+            phase="consensus",
+            generation=generation,
+            slot_id=slot_id,
+            valid=False,
+            retract_rids=[],
+            prealloc_rids=[[], []],
+            transferred_rids=[],
+        )
+
+    @staticmethod
+    def _pp_validate_pd_control_envelope(
+        payload,
+        *,
+        phase: str,
+        expected_generation: int,
+        expected_slot: int,
+        expected_valid: bool,
+    ) -> PPPDControlEnvelope:
+        if (
+            not isinstance(payload, list)
+            or len(payload) != 1
+            or not isinstance(payload[0], PPPDControlEnvelope)
+        ):
+            raise RuntimeError(
+                "Invalid PP PD control envelope: "
+                f"expected=list[{PPPDControlEnvelope.__name__}] "
+                f"actual={type(payload).__name__}"
+            )
+        envelope = payload[0]
+        if (
+            envelope.phase != phase
+            or envelope.generation != expected_generation
+            or envelope.slot_id != expected_slot
+            or envelope.valid != expected_valid
+        ):
+            raise RuntimeError(
+                "Stale PP PD control envelope: "
+                f"expected=({phase}, generation={expected_generation}, "
+                f"slot={expected_slot}, valid={expected_valid}) "
+                f"actual=({envelope.phase}, generation={envelope.generation}, "
+                f"slot={envelope.slot_id}, valid={envelope.valid})"
+            )
+        if (
+            not isinstance(envelope.retract_rids, list)
+            or not isinstance(envelope.prealloc_rids, list)
+            or len(envelope.prealloc_rids) != 2
+            or not all(isinstance(rids, list) for rids in envelope.prealloc_rids)
+            or not isinstance(envelope.transferred_rids, list)
+        ):
+            raise RuntimeError(
+                "Invalid PP PD control payload shape: "
+                "expected retract=list, prealloc=[list, list], transfer=list"
+            )
+        if not envelope.valid and (
+            envelope.retract_rids
+            or envelope.prealloc_rids != [[], []]
+            or envelope.transferred_rids
+        ):
+            raise RuntimeError("PP PD control heartbeat must have empty payloads")
+        return envelope
+
+    def _pp_send_pd_control_envelope(
+        self: Scheduler,
+        envelope: PPPDControlEnvelope,
+        *,
+        async_send: bool,
+    ):
+        return self._pp_send_pyobj_to_next_stage(
+            [envelope],
+            async_send=async_send,
+            tag=(
+                _PP_PD_FORWARD_CONTROL_TAG
+                if envelope.phase == "forward"
+                else _PP_PD_REVERSE_CONTROL_TAG
+            ),
+        )
+
+    def _pp_recv_pd_control_envelope(
+        self: Scheduler,
+        *,
+        phase: str,
+        expected_generation: int,
+        expected_slot: int,
+        expected_valid: bool,
+    ) -> PPPDControlEnvelope:
+        return self._pp_validate_pd_control_envelope(
+            self._pp_recv_pyobj_from_prev_stage(
+                tag=(
+                    _PP_PD_FORWARD_CONTROL_TAG
+                    if phase == "forward"
+                    else _PP_PD_REVERSE_CONTROL_TAG
+                )
+            ),
+            phase=phase,
+            expected_generation=expected_generation,
+            expected_slot=expected_slot,
+            expected_valid=expected_valid,
+        )
+
+    def _pp_exchange_reverse_pd_control(
+        self: Scheduler,
+        outgoing: PPPDControlEnvelope,
+        *,
+        expected_generation: int,
+        expected_slot: int,
+    ) -> PPPDControlEnvelope:
+        send_work = self._pp_send_pd_control_envelope(
+            outgoing,
+            async_send=True,
+        )
+        incoming = self._pp_recv_pd_control_envelope(
+            phase="consensus",
+            expected_generation=expected_generation,
+            expected_slot=expected_slot,
+            expected_valid=expected_generation >= 0,
+        )
+        self._pp_commit_comm_work(send_work)
+        return incoming
+
+    @staticmethod
+    def _pp_retarget_proxy_proposal(tensors: dict, slot_id: int) -> None:
+        proposal = pop_proxy_proposal(tensors)
+        if proposal is None:
+            return
+        generation, _, payload = proposal
+        tensors.update(pack_proxy_proposal(generation, slot_id, payload))
+
+    def _pp_recv_pyobj_from_prev_stage(self: Scheduler, tag: int = 0):
         if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
             dp_offset = (
                 self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
@@ -1684,6 +1972,7 @@ class SchedulerPPMixin:
                 self.world_group.cpu_group,
                 ((self.ps.pp_rank - 1) % self.ps.pp_size) * self.ps.tp_size + dp_offset,
                 self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                tag=tag,
             )
         else:
             data = None
@@ -1752,7 +2041,9 @@ class SchedulerPPMixin:
                         "Replicated PP DSpark output is missing the next proposal."
                     )
                 if result.pp_dspark_next_proposal is not None:
-                    tensor_dict.update(pack_proposal(1, result.pp_dspark_next_proposal))
+                    tensor_dict.update(
+                        pack_proposal(self.ps.pp_rank, result.pp_dspark_next_proposal)
+                    )
                 tensor_dict["dspark_accept_lens"] = result.accept_lens
                 tensor_dict["dspark_block_accept_lens"] = result.block_accept_lens
                 if result.cap_lens is not None:
@@ -1802,6 +2093,8 @@ class SchedulerPPMixin:
         async_send: bool = True,
         msg_type: str = "default",
         ready_event: Optional[torch.Event] = None,
+        use_attn_tp_allgather: bool = True,
+        all_gather_exclude_keys: Optional[set[str]] = None,
     ):
         # Warn once if using default untyped messages
         if msg_type == "default":
@@ -1813,15 +2106,18 @@ class SchedulerPPMixin:
         if ready_event is not None:
             self.device_module.current_stream().wait_event(ready_event)
         p2p_work = []
-        p2p_work.extend(
-            self.pp_group.send_tensor_dict(
-                tensor_dict=tensor_dict,
-                all_gather_group=(
-                    self.attn_tp_group if self.require_attn_tp_allgather else None
-                ),
-                async_send=async_send,
-            )
-        )
+        send_kwargs = {
+            "tensor_dict": tensor_dict,
+            "all_gather_group": (
+                self.attn_tp_group
+                if use_attn_tp_allgather and self.require_attn_tp_allgather
+                else None
+            ),
+            "async_send": async_send,
+        }
+        if all_gather_exclude_keys:
+            send_kwargs["all_gather_exclude_keys"] = all_gather_exclude_keys
+        p2p_work.extend(self.pp_group.send_tensor_dict(**send_kwargs))
         return p2p_work
 
     def _pp_queue_proxy_send(
@@ -1829,22 +2125,37 @@ class SchedulerPPMixin:
         tensor_dict: Dict[str, torch.Tensor],
         generation: Optional[int] = None,
         active: Optional[bool] = None,
+        slot_id: Optional[int] = None,
     ) -> None:
         """Queue a proxy for the peer's next scheduler slot without waiting."""
         if generation is not None:
             tensor_dict = dict(tensor_dict)
             tensor_dict["__pp_generation__"] = generation
             tensor_dict["__pp_active__"] = bool(active)
+            tensor_dict["__pp_slot_id__"] = slot_id
+        pipelined_proxy = _pp_use_pipelined_dspark_proxy()
+        proposal_present = (
+            "__pp_dspark_proposal_identities" in tensor_dict
+            if pipelined_proxy
+            else False
+        )
+        if pipelined_proxy:
+            tensor_dict["__pp_has_dspark_proposal__"] = proposal_present
+        proposal_keys = {
+            key for key in tensor_dict if key.startswith("__pp_dspark_proposal_")
+        }
         self.send_proxy_work = self._pp_send_dict_to_next_stage(
             tensor_dict,
             async_send=True,
             msg_type="proxy",
+            all_gather_exclude_keys=proposal_keys,
         )
 
     def _pp_recv_typed_dict(
         self: Scheduler,
         expected_kind: str = "default",
         all_gather_group: Optional = None,
+        all_gather_exclude_keys: Optional[set[str]] = None,
     ) -> Dict[str, torch.Tensor]:
         """Receive a typed tensor dict, demultiplexing by msg_type.
 
@@ -1857,9 +2168,10 @@ class SchedulerPPMixin:
                 return inbox_queue.popleft()
 
         while True:
-            tensor_dict = self.pp_group.recv_tensor_dict(
-                all_gather_group=all_gather_group
-            )
+            recv_kwargs = {"all_gather_group": all_gather_group}
+            if all_gather_exclude_keys:
+                recv_kwargs["all_gather_exclude_keys"] = all_gather_exclude_keys
+            tensor_dict = self.pp_group.recv_tensor_dict(**recv_kwargs)
             received_kind = tensor_dict.get("__msg_type__", "default")
             if received_kind == expected_kind:
                 if received_kind == "default":
@@ -1878,6 +2190,7 @@ class SchedulerPPMixin:
         self: Scheduler,
         expected_generation: Optional[int] = None,
         expected_active: Optional[bool] = None,
+        expected_slot: Optional[int] = None,
     ) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
@@ -1886,10 +2199,18 @@ class SchedulerPPMixin:
                 all_gather_group=(
                     self.attn_tp_group if self.require_attn_tp_allgather else None
                 ),
+                all_gather_exclude_keys={
+                    "__pp_dspark_proposal_draft_block_ids",
+                    "__pp_dspark_proposal_draft_tokens",
+                    "__pp_dspark_proposal_draft_hidden",
+                    "__pp_dspark_proposal_confidence",
+                },
             )
             if expected_generation is not None:
                 generation = tensor_dict.pop("__pp_generation__", None)
                 active = tensor_dict.pop("__pp_active__", None)
+                slot_id = tensor_dict.pop("__pp_slot_id__", None)
+                has_proposal = tensor_dict.pop("__pp_has_dspark_proposal__", False)
                 if generation != expected_generation:
                     raise RuntimeError(
                         "Stale PP proxy envelope: "
@@ -1900,8 +2221,24 @@ class SchedulerPPMixin:
                         "PP proxy activity mismatch for generation "
                         f"{expected_generation}: expected {expected_active}, got {active}"
                     )
+                if expected_slot is not None and slot_id != expected_slot:
+                    raise RuntimeError(
+                        "PP proxy slot mismatch for generation "
+                        f"{expected_generation}: expected {expected_slot}, got {slot_id}"
+                    )
                 if not active:
+                    if has_proposal:
+                        raise RuntimeError(
+                            "Idle PP proxy unexpectedly carries a DSpark proposal."
+                        )
                     return None
+                proposal_present = any(
+                    key.startswith("__pp_dspark_proposal_") for key in tensor_dict
+                )
+                if has_proposal is not proposal_present:
+                    raise RuntimeError(
+                        "PP proxy proposal marker does not match its payload."
+                    )
             pp_proxy_tensors = PPProxyTensors(tensor_dict)
         return pp_proxy_tensors
 
@@ -2517,11 +2854,17 @@ class SchedulerPPMixin:
         with self.pp_comm_stream_ctx:
             if ready_event is not None:
                 self.device_module.current_stream().wait_event(ready_event)
-            received_dict = self.pp_group.send_recv_tensor_dict(
-                send_tensor_dict=send_dict,
-                send_all_gather_group=all_gather_group,
-                recv_all_gather_group=all_gather_group,
-            )
+            if self.ps.pp_size > 2:
+                received_dict = self.pp_group.broadcast_tensor_dict(
+                    send_dict if self.pp_group.is_last_rank else None,
+                    src=self.ps.pp_size - 1,
+                )
+            else:
+                received_dict = self.pp_group.send_recv_tensor_dict(
+                    send_tensor_dict=send_dict,
+                    send_all_gather_group=all_gather_group,
+                    recv_all_gather_group=all_gather_group,
+                )
             comm_done = self.device_module.Event()
             comm_done.record(self.device_module.current_stream())
 
@@ -2556,7 +2899,9 @@ class SchedulerPPMixin:
                 "Serial PP output exchange received a non-output envelope."
             )
 
-        if self.pp_group.is_last_rank:
+        if self.ps.pp_size > 2:
+            tensor_dict = received_dict
+        elif self.pp_group.is_last_rank:
             if received_dict.get("__pp_active__") is not False:
                 raise RuntimeError(
                     "The first PP rank sent data on the serial output ack channel."
@@ -2686,6 +3031,48 @@ class SchedulerPPMixin:
                 return
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
                 received_tensor_dict = self._pp_recv_dict_from_prev_stage()
+            if _pp_use_pipelined_dspark_proxy():
+                active = received_tensor_dict.get("__pp_active__")
+                generation = received_tensor_dict.get("__pp_generation__")
+                slot_id = received_tensor_dict.get("__pp_slot_id__")
+                expected_generation = self._pp_slot_generations[next_mb_id]
+                expected_source_slot = (
+                    next_mb_id - self.ps.pp_rank - 1
+                ) % self.pp_loop_size
+                expected_active = (
+                    target is not None and not target.forward_mode.is_prebuilt()
+                )
+                if generation != expected_generation or slot_id != expected_source_slot:
+                    raise RuntimeError(
+                        "Stale pipelined PP output envelope: "
+                        f"expected=({expected_generation}, "
+                        f"source_slot={expected_source_slot}, "
+                        f"local_slot={next_mb_id}), "
+                        f"received=({generation}, {slot_id})."
+                    )
+                if active is not expected_active:
+                    raise RuntimeError(
+                        "Pipelined PP output activity mismatch for "
+                        f"generation={generation}, slot={slot_id}: "
+                        f"expected={expected_active}, received={active}."
+                    )
+                next_pp_outputs = PPProxyTensors(received_tensor_dict)
+                self._pp_received_output_generation = generation
+                self._pp_received_output_slot = next_mb_id
+                if not active:
+                    return
+                target_metadata = mb_metadata[next_mb_id]
+                with self.copy_stream_ctx:
+                    self.copy_stream.wait_stream(self.schedule_stream)
+                    batch_result = self._pp_prep_batch_result(
+                        target,
+                        target_metadata,
+                        next_pp_outputs,
+                        local_output=self.pp_group.is_last_rank,
+                    )
+                    d2h_event = self.device_module.Event()
+                    d2h_event.record(self.device_module.current_stream())
+                return
             if serial_generation:
                 if self.pp_group.is_last_rank:
                     if received_tensor_dict.get("__pp_active__") is not False:
@@ -2918,10 +3305,19 @@ class SchedulerPPMixin:
                 if self.pp_group.is_last_rank:
                     # (last rank) buffer the outputs for async batch depth
                     output_tensors = self._pp_prepare_tensor_dict(result, cur_batch)
-                    generation = self._pp_slot_generations[mb_id]
-                    if generation is not None and _pp_use_serial_dspark_generation():
+                    slot_generations = getattr(self, "_pp_slot_generations", None)
+                    generation = (
+                        slot_generations[mb_id]
+                        if slot_generations is not None
+                        else None
+                    )
+                    if generation is not None and (
+                        _pp_use_serial_dspark_generation()
+                        or _pp_use_pipelined_dspark_proxy()
+                    ):
                         output_tensors["__pp_generation__"] = generation
                         output_tensors["__pp_active__"] = True
+                        output_tensors["__pp_slot_id__"] = mb_id
                     last_rank_comm_queue.append(
                         (
                             event,
@@ -2952,7 +3348,11 @@ class SchedulerPPMixin:
             )
         return tuple(rids) if len(rids) > 1 else rids[0]
 
-    def _pp_pd_get_retract_ids(self: Scheduler, mb_id: int):
+    def _pp_pd_get_retract_ids(
+        self: Scheduler,
+        mb_id: int,
+        prev_retract_rids: Optional[List[str]] = None,
+    ):
         # communicate pre-consensus retracted reqs
         for req in self.disagg_decode_prealloc_queue.retracted_queue:
             # assign retracted reqs to the current microbatch
@@ -2968,10 +3368,14 @@ class SchedulerPPMixin:
             return curr_retract_rids
         else:
             # Other ranks, receive the retracted reqs info from the previous rank and ensure the consensus
-            prev_retract_rids = self._pp_recv_pyobj_from_prev_stage()
+            if prev_retract_rids is None:
+                prev_retract_rids = self._pp_recv_pyobj_from_prev_stage()
             return list(set(prev_retract_rids) & set(curr_retract_rids))
 
-    def _pp_pd_get_prealloc_ids(self: Scheduler):
+    def _pp_pd_get_prealloc_ids(
+        self: Scheduler,
+        prev_prealloc_rids: Optional[List[List[str]]] = None,
+    ):
         # communicate pre-consensus prealloc reqs
         if self.pp_group.is_first_rank:
             # First rank, pop the preallocated reqs from the prealloc queue
@@ -2983,7 +3387,8 @@ class SchedulerPPMixin:
             )
         else:
             # Other ranks, receive the preallocated reqs info from the previous rank and ensure the consensus
-            prev_prealloc_rids = self._pp_recv_pyobj_from_prev_stage()
+            if prev_prealloc_rids is None:
+                prev_prealloc_rids = self._pp_recv_pyobj_from_prev_stage()
             prev_good_prealloc_rids, prev_bad_prealloc_rids = prev_prealloc_rids
             curr_good_prealloc_rids, curr_bad_prealloc_rids = self.get_rids(
                 self.disagg_decode_prealloc_queue.queue,
@@ -3022,7 +3427,10 @@ class SchedulerPPMixin:
         bad_rids = list(set(bad_rids) | set(aborted_rids))
         return good_rids, bad_rids
 
-    def _pp_pd_get_decode_transferred_ids(self: Scheduler):
+    def _pp_pd_get_decode_transferred_ids(
+        self: Scheduler,
+        prev_transferred_rids: Optional[List[str]] = None,
+    ):
         # get the current stage transfer success
         if self.pp_group.is_first_rank:
             transferred_rids = self.get_rids(
@@ -3034,7 +3442,8 @@ class SchedulerPPMixin:
         else:
             # 2 (Release): Receive the transferred rids from the previous rank
             # 1. recv previous stage's transferred reqs info
-            prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
+            if prev_transferred_rids is None:
+                prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
             # 2. get the current stage's transferred reqs info
             curr_transferred_rids = self.get_rids(
                 self.disagg_decode_transfer_queue.queue,

@@ -64,6 +64,36 @@ def _make_num_token_non_padded(
     ).to(device, non_blocking=True)
 
 
+def _localize_dp_hidden(
+    hidden_states: torch.Tensor,
+    *,
+    local_bs: int,
+    rows_per_req: int,
+    global_num_reqs: Optional[list[int]],
+    dp_rank: int,
+) -> torch.Tensor:
+    expected_local_rows = local_bs * rows_per_req
+    if hidden_states.shape[0] == expected_local_rows:
+        return hidden_states
+    if global_num_reqs is None or global_num_reqs[dp_rank] != local_bs:
+        raise RuntimeError(
+            "DSpark draft DP counts do not match the local batch: "
+            f"global_num_reqs={global_num_reqs}, dp_rank={dp_rank}, "
+            f"local_bs={local_bs}."
+        )
+    expected_padded_local_rows = max(global_num_reqs) * rows_per_req
+    if hidden_states.shape[0] == expected_padded_local_rows:
+        return hidden_states[:expected_local_rows]
+    expected_global_rows = sum(global_num_reqs) * rows_per_req
+    if hidden_states.shape[0] != expected_global_rows:
+        raise RuntimeError(
+            f"DSpark draft returned {hidden_states.shape[0]} hidden rows, "
+            f"expected local={expected_local_rows} or global={expected_global_rows}."
+        )
+    row_start = sum(global_num_reqs[:dp_rank]) * rows_per_req
+    return hidden_states.narrow(0, row_start, expected_local_rows)
+
+
 class DraftBlockResult(msgspec.Struct, frozen=True):
     draft_tokens: torch.Tensor
     corrected_logits: Optional[torch.Tensor]
@@ -368,22 +398,42 @@ class DraftBlockProposer:
         if not self._dp_moe_sync or batch.global_num_tokens is None:
             return
         device = self.draft_model_runner.device
-        empty_long = torch.empty((0,), dtype=torch.int64, device=device)
+        # Keep one physical request so fused MoE has a valid activation shape.
+        # Its token axis must still match the captured speculative width:
+        # graph replay derives raw_num_tokens from batch_size * query_token_num.
+        dummy_req = torch.zeros((1,), dtype=torch.int64, device=device)
+        dummy_tokens = torch.zeros(
+            (self.query_token_num,), dtype=torch.int64, device=device
+        )
         idle_batch = ForwardBatch(
             forward_mode=ForwardMode.IDLE,
-            batch_size=0,
-            input_ids=empty_long,
-            req_pool_indices=empty_long,
-            seq_lens=empty_long,
-            out_cache_loc=empty_long,
-            seq_lens_sum=0,
-            seq_lens_cpu=torch.empty((0,), dtype=torch.int64),
-            positions=empty_long,
+            batch_size=1,
+            input_ids=dummy_tokens,
+            req_pool_indices=dummy_req,
+            seq_lens=torch.ones_like(dummy_req),
+            out_cache_loc=dummy_tokens,
+            seq_lens_sum=1,
+            seq_lens_cpu=torch.ones((1,), dtype=torch.int64),
+            positions=dummy_tokens,
             spec_algorithm=SpeculativeAlgorithm.DSPARK,
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
         self._fill_dp_moe_sync_metadata(idle_batch, batch)
+        idle_batch.num_token_non_padded = _make_num_token_non_padded(0, device)
+        idle_batch.num_token_non_padded_cpu = 0
+        graph_runner = self.draft_model_runner.decode_cuda_graph_runner
+        use_graph_shape = bool(
+            batch.can_run_decode_cuda_graph
+            and graph_runner is not None
+            and graph_runner.can_run_graph(idle_batch)
+        )
+        if not use_graph_shape:
+            # DeepSeek-V4's eager idle path expects one MHC shape row. Graph
+            # replay instead needs the full captured speculative token width.
+            idle_batch.input_ids = idle_batch.input_ids[:1]
+            idle_batch.positions = idle_batch.positions[:1]
+            idle_batch.out_cache_loc = idle_batch.out_cache_loc[:1]
         with torch.inference_mode():
             self.draft_model_runner.forward(idle_batch)
 
@@ -469,6 +519,13 @@ class DraftBlockProposer:
         raw_hidden = logits_output.hidden_states
         if raw_hidden is None:
             raise RuntimeError("DSpark draft model returned no hidden states.")
+        raw_hidden = _localize_dp_hidden(
+            raw_hidden,
+            local_bs=bs,
+            rows_per_req=gamma if self.sample_from_anchor else query_token_num,
+            global_num_reqs=batch.global_num_tokens,
+            dp_rank=get_parallel().attn_dp_rank,
+        )
         if self.sample_from_anchor:
             expected_rows = bs * gamma
             if raw_hidden.shape[0] != expected_rows:

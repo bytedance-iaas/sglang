@@ -146,14 +146,12 @@ class TestDsparkReplicatedPPDraft(CustomTestCase):
                 self.assertFalse(resolution_result(args, "enable_mixed_chunk"))
                 self.assertEqual(args.speculative_draft_scheduling_policy, "tail")
 
-    def test_pp4_prefill_is_admitted_but_decode_is_rejected(self):
+    def test_pp4_prefill_and_decode_are_admitted(self):
         with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
-            prefill_args = self._replicated_args("prefill", pp_size=4)
-            _handle_dspark(prefill_args)
-            self.assertFalse(resolution_result(prefill_args, "enable_mixed_chunk"))
-
-            with self.assertRaisesRegex(ValueError, "Decode.*pp-size 2"):
-                _handle_dspark(self._replicated_args("decode", pp_size=4))
+            for mode in ("prefill", "decode"):
+                args = self._replicated_args(mode, pp_size=4)
+                _handle_dspark(args)
+                self.assertFalse(resolution_result(args, "enable_mixed_chunk"))
 
     def test_replicated_draft_requires_pipeline_parallelism(self):
         with (

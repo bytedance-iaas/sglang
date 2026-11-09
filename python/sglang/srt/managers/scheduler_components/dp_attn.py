@@ -101,6 +101,7 @@ class MLPSyncBatchInfo:
     local_forward_mode: int
     prefill_cuda_graph_max_prefix_len: int = 0
     pp_dspark_owned_num_tokens: int = 0
+    pp_dspark_all_num_tokens: int = 0
     include_pp_dspark_owner_counts: bool = False
 
     # some gathered elements
@@ -108,6 +109,7 @@ class MLPSyncBatchInfo:
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
     global_pp_dspark_owned_num_tokens: list[int] = None
+    global_pp_dspark_all_num_tokens: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
@@ -126,6 +128,7 @@ class MLPSyncBatchInfo:
         ]
         if self.include_pp_dspark_owner_counts:
             values.append(self.pp_dspark_owned_num_tokens)
+            values.append(self.pp_dspark_all_num_tokens)
         return torch.tensor(values, device=device, dtype=dtype)
 
     def _get_fallback_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
@@ -142,6 +145,7 @@ class MLPSyncBatchInfo:
         ]
         if self.include_pp_dspark_owner_counts:
             values.append(0)  # pp_dspark_owned_num_tokens
+            values.append(0)  # pp_dspark_all_num_tokens
         return torch.tensor(values, device=device, dtype=dtype)
 
     def finalize_local(self):
@@ -151,6 +155,7 @@ class MLPSyncBatchInfo:
         self.global_num_tokens_for_logprob = [self.num_tokens_for_logprob]
         if self.include_pp_dspark_owner_counts:
             self.global_pp_dspark_owned_num_tokens = [self.pp_dspark_owned_num_tokens]
+            self.global_pp_dspark_all_num_tokens = [self.pp_dspark_all_num_tokens]
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 self.tp0_info_cpu[:, 5].tolist()
@@ -221,6 +226,7 @@ class MLPSyncBatchInfo:
         self.global_num_tokens_for_logprob = tp0_info_cpu[:, 1].tolist()
         if self.include_pp_dspark_owner_counts:
             self.global_pp_dspark_owned_num_tokens = tp0_info_cpu[:, 9].tolist()
+            self.global_pp_dspark_all_num_tokens = tp0_info_cpu[:, 10].tolist()
         self.can_run_decode_cuda_graph = bool(tp0_info_cpu[:, 2].min())
         self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
         self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())
@@ -262,10 +268,13 @@ def _update_gather_batch(
                 mlp_sync_info.num_tokens_for_logprob
             ]
     if mlp_sync_info.include_pp_dspark_owner_counts:
-        batch.draft_global_num_tokens = mlp_sync_info.global_pp_dspark_owned_num_tokens
-        batch.draft_global_num_tokens_for_logprob = (
-            mlp_sync_info.global_pp_dspark_owned_num_tokens
+        draft_counts = (
+            mlp_sync_info.global_pp_dspark_all_num_tokens
+            if _pp_dspark_uses_all_rows()
+            else mlp_sync_info.global_pp_dspark_owned_num_tokens
         )
+        batch.draft_global_num_tokens = draft_counts
+        batch.draft_global_num_tokens_for_logprob = draft_counts
     if not skip_global_metadata:
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
@@ -294,6 +303,39 @@ def _pp_dspark_owned_num_tokens(
     pp_rank = get_parallel().pp_rank
     pp_size = get_parallel().pp_size
     return sum(draft_owner(req.rid, pp_size) == pp_rank for req in local_batch.reqs)
+
+
+def _pp_dspark_all_num_tokens(local_batch: Optional[ScheduleBatch]) -> int:
+    if local_batch is None or local_batch.forward_mode.is_idle():
+        return 0
+    return local_batch.batch_size()
+
+
+def _pp_dspark_uses_all_rows() -> bool:
+    return (
+        envs.SGLANG_PP_DSPARK_PIPELINED_PROXY.get()
+        and get_parallel().pp_size == 4
+        and get_spec().speculative_dspark_pp_replicated_draft
+    )
+
+
+def _scheduler_metadata_collective_target(
+    tp_group: GroupCoordinator,
+    *,
+    disable_overlap_schedule: bool,
+    offload_tags: set[str],
+):
+    use_device_group = (
+        len(offload_tags) == 0
+        and (
+            disable_overlap_schedule
+            or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
+        )
+        and not _pp_dspark_uses_all_rows()
+    )
+    if use_device_group:
+        return tp_group.device_group, tp_group.device
+    return tp_group.cpu_group, "cpu"
 
 
 def should_skip_scheduler_all_gather(dp_size: int) -> bool:
@@ -474,15 +516,12 @@ def prepare_mlp_sync_batch_raw(
         world = get_world_group()
         group = torch.distributed.group.WORLD
         device = world.device
-    elif len(offload_tags) == 0 and (
-        disable_overlap_schedule
-        or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
-    ):
-        group = tp_group.device_group
-        device = tp_group.device
     else:
-        group = tp_group.cpu_group
-        device = "cpu"
+        group, device = _scheduler_metadata_collective_target(
+            tp_group,
+            disable_overlap_schedule=disable_overlap_schedule,
+            offload_tags=offload_tags,
+        )
 
     local_can_run_tbo, local_forward_mode = tbo_preparer.prepare_all_gather(local_batch)
     if use_world_group:
@@ -508,6 +547,7 @@ def prepare_mlp_sync_batch_raw(
         local_forward_mode=local_forward_mode,
         prefill_cuda_graph_max_prefix_len=0,
         pp_dspark_owned_num_tokens=_pp_dspark_owned_num_tokens(local_batch),
+        pp_dspark_all_num_tokens=_pp_dspark_all_num_tokens(local_batch),
         include_pp_dspark_owner_counts=(
             get_spec().speculative_dspark_pp_replicated_draft
         ),

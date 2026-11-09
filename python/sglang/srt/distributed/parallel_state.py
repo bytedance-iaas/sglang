@@ -1712,6 +1712,7 @@ class GroupCoordinator:
         dst: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
         async_send: bool = False,
+        all_gather_exclude_keys: Optional[set[str]] = None,
     ) -> Optional[List[P2PWork]]:
         """Send the input tensor dictionary.
         NOTE: `dst` is the local rank of the source rank.
@@ -1736,6 +1737,9 @@ class GroupCoordinator:
             tensor_dict, dict
         ), f"Expecting a dictionary, got {type(tensor_dict)}"
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
+        tensor_keys = [
+            key for key, value in metadata_list if isinstance(value, TensorMetadata)
+        ]
         # Note: While switching to Device-to-Device (D2D) would introduce an extra
         # Device-to-Host (D2H) memory copy overhead for serialization, our benchmarks
         # show better overall transmission performance with D2D due to:
@@ -1746,13 +1750,17 @@ class GroupCoordinator:
         send_func = torch.distributed.isend if async_send else torch.distributed.send
         p2p_works = self.send_object(metadata_list, dst=dst, async_send=async_send)
 
-        for tensor in tensor_list:
+        for key, tensor in zip(tensor_keys, tensor_list):
             if tensor.numel() == 0:
                 # Skip sending empty tensors.
                 continue
 
             # send-allgather: send only a slice, then do allgather.
-            if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
+            if (
+                all_gather_group is not None
+                and key not in (all_gather_exclude_keys or ())
+                and tensor.numel() % all_gather_size == 0
+            ):
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
             comm_group = metadata_group if tensor.is_cpu else group
@@ -1765,6 +1773,7 @@ class GroupCoordinator:
         self,
         src: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
+        all_gather_exclude_keys: Optional[set[str]] = None,
     ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
         """Recv the input tensor dictionary.
         NOTE: `src` is the local rank of the source rank.
@@ -1798,6 +1807,7 @@ class GroupCoordinator:
                 # send-allgather: send only a slice, then do allgather.
                 use_all_gather = (
                     all_gather_group is not None
+                    and key not in (all_gather_exclude_keys or ())
                     and tensor.numel() % all_gather_size == 0
                 )
 
