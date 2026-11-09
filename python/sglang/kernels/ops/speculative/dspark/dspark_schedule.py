@@ -30,8 +30,14 @@ class ScheduleVerifyLensTopk:
         confidence: torch.Tensor,
         budget: int,
         cfg: DSparkScheduleConfig,
+        request_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return schedule_verify_lens_topk(confidence=confidence, budget=budget, cfg=cfg)
+        return schedule_verify_lens_topk(
+            confidence=confidence,
+            budget=budget,
+            cfg=cfg,
+            request_weights=request_weights,
+        )
 
     @classmethod
     def triton(
@@ -40,9 +46,13 @@ class ScheduleVerifyLensTopk:
         confidence: torch.Tensor,
         budget: int,
         cfg: DSparkScheduleConfig,
+        request_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return schedule_verify_lens_topk_triton(
-            confidence=confidence, budget=budget, cfg=cfg
+            confidence=confidence,
+            budget=budget,
+            cfg=cfg,
+            request_weights=request_weights,
         )
 
 
@@ -55,9 +65,13 @@ def schedule_verify_lens_topk(
     confidence: torch.Tensor,
     budget: int,
     cfg: DSparkScheduleConfig,
+    request_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return schedule_verify_lens_topk_from_survival(
-        survival_probs=compute_sort_survival(confidence), budget=budget, cfg=cfg
+        survival_probs=compute_sort_survival(confidence),
+        budget=budget,
+        cfg=cfg,
+        request_weights=request_weights,
     )
 
 
@@ -66,6 +80,7 @@ def schedule_verify_lens_topk_from_survival(
     survival_probs: torch.Tensor,
     budget: int,
     cfg: DSparkScheduleConfig,
+    request_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     num_requests, _gamma = survival_probs.shape
     max_len = cfg.resolved_max_verify_len()
@@ -88,7 +103,12 @@ def schedule_verify_lens_topk_from_survival(
             )
             valid = candidate_window >= cfg.survival_eps
 
-            flat_prob = candidate_window.reshape(-1).to(torch.float64)
+            scores = (
+                candidate_window
+                if request_weights is None
+                else candidate_window * request_weights[:, None]
+            )
+            flat_prob = scores.reshape(-1).to(torch.float64)
             flat_request = request_index.reshape(-1)
             flat_position = position_index.reshape(-1)
             flat_valid = valid.reshape(-1)
@@ -136,6 +156,9 @@ def _schedule_topk_prep_kernel(
     confidence_ptr,
     survival_ptr,
     selected_extra_ptr,
+    weights_ptr,
+    survival_eps,
+    HAS_WEIGHTS: tl.constexpr,
     gamma,
     cols,
     G_P2: tl.constexpr,
@@ -146,6 +169,10 @@ def _schedule_topk_prep_kernel(
         confidence_ptr + row.to(tl.int64) * gamma + g, mask=g < gamma, other=1.0
     ).to(tl.float32)
     surv = tl.cumprod(conf, axis=0)
+    if HAS_WEIGHTS:
+        weight = tl.load(weights_ptr + row)
+        # Preserve raw-survival eligibility even when the ranking weight > 1.
+        surv = tl.where(surv >= survival_eps, surv * weight, -1.0)
     tl.store(survival_ptr + row.to(tl.int64) * cols + g, surv, mask=g < cols)
     tl.store(selected_extra_ptr + row, 0)
 
@@ -214,6 +241,7 @@ def schedule_verify_lens_topk_triton(
     confidence: torch.Tensor,
     budget: int,
     cfg: DSparkScheduleConfig,
+    request_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     num_requests, gamma = confidence.shape
     max_len = cfg.resolved_max_verify_len()
@@ -227,6 +255,9 @@ def schedule_verify_lens_topk_triton(
         confidence.contiguous(),
         survival,
         selected_extra,
+        request_weights,
+        float(cfg.survival_eps),
+        request_weights is not None,
         gamma,
         cols,
         G_P2=triton.next_power_of_2(max(gamma, 1)),

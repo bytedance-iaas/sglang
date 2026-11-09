@@ -22,8 +22,8 @@ from sglang.srt.utils import is_cuda
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-# The c2 JIT kernels are the SM100 build; the only Blackwell runner config is the
-# four-GPU one.
+# Both Hopper compact verify and Blackwell extend use these fused kernels.
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 HEAD_DIM = 512
@@ -36,8 +36,8 @@ EPS = 1e-6
 SLOT_BASE = 64
 
 
-def _sm100() -> bool:
-    return is_cuda() and torch.cuda.get_device_capability()[0] == 10
+def _supported_cuda() -> bool:
+    return is_cuda() and torch.cuda.get_device_capability()[0] in (9, 10)
 
 
 class Stream:
@@ -167,7 +167,7 @@ class TestC2PrefillRing(CustomTestCase):
             )
         return caches, latents
 
-    @unittest.skipUnless(_sm100(), "the c2 JIT kernels are the SM100 build")
+    @unittest.skipUnless(_supported_cuda(), "requires Hopper or Blackwell")
     def test_chunked_extend_matches_decode(self):
         # Request 0 starts even, request 1 odd and spans more rows than the ring,
         # request 2 odd with a single row in its first chunk.
@@ -185,6 +185,134 @@ class TestC2PrefillRing(CustomTestCase):
                         f"{caches[0].numel()}",
                     )
                     self.assertTrue(torch.equal(latents[0], latents[1]))
+
+    @unittest.skipUnless(_supported_cuda(), "requires Hopper or Blackwell")
+    def test_compact_verify_graph_replay(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+            DSV4Metadata,
+        )
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        gen = torch.Generator(device="cuda").manual_seed(23)
+        ring_size, rows, num_reqs = 8, 32, 4
+        weight = torch.randn(HEAD_DIM, device="cuda", generator=gen).bfloat16()
+        angles = torch.randn(4096, ROPE_DIM // 2, device="cuda", generator=gen)
+        freqs = torch.view_as_real(
+            torch.polar(torch.ones_like(angles), angles)
+        ).flatten(-2)
+        kv = _make_inputs(gen, rows)
+        req = torch.zeros(rows, device="cuda", dtype=torch.int64)
+        pos, loc = (
+            torch.zeros(rows, device="cuda", dtype=torch.int32) for _ in range(2)
+        )
+        starts, lens = (
+            torch.zeros(num_reqs, device="cuda", dtype=torch.int32) for _ in range(2)
+        )
+        state = _make_inputs(gen, (num_reqs + 1) * ring_size)
+        cache = torch.zeros(
+            NUM_PAGES,
+            KVLayout.V41_FP4.page_bytes(PAGE_SIZE),
+            device="cuda",
+            dtype=torch.uint8,
+        )
+        core = SimpleNamespace(
+            copy_=lambda other: None,
+            refresh_for_breakable_cuda_graph_replay_=lambda other: None,
+        )
+        metadata = DSV4Metadata(
+            core_attn_metadata=core,
+            indexer_metadata=None,
+            low_ratio_verify_start_loc=starts,
+            low_ratio_verify_lens=lens,
+        )
+        addresses = (starts.data_ptr(), lens.data_ptr())
+        backend = SimpleNamespace(is_dspark_draft=False, forward_metadata=metadata)
+        layer = SimpleNamespace(
+            compress_ratio=2, compressor=SimpleNamespace(use_fused_compress=True)
+        )
+        batch = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
+        result = None
+
+        def fused(layer, x, req, pos, *, extend_offsets):
+            nonlocal result
+            result = c2_prefill_norm_rope_store(
+                x,
+                state,
+                weight,
+                pos,
+                req,
+                loc,
+                EPS,
+                freqs,
+                cache,
+                *extend_offsets,
+                page_size=PAGE_SIZE,
+                ring_size=ring_size,
+                layout=KVLayout.V41_FP4,
+            )
+
+        backend._low_ratio_compress_fused = fused
+
+        def run():
+            DeepseekV4AttnBackend._low_ratio_compress(
+                backend, layer, kv, req, pos, batch
+            )
+
+        for _ in range(3):
+            run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        for counts in ((7, 1, 3, 6), (1, 7, 2, 5), (0, 0, 0, 0), (2, 3, 7, 1)):
+            stream = Stream(prefixes=[7, 2, 5, 14], chunks=[list(counts)])
+            packed = stream.chunk_rows(0)
+            r, p, l = _row_tensors(packed, rows - len(packed))
+            req.copy_(r)
+            pos.copy_(p)
+            loc.copy_(l)
+            live_lens = torch.tensor(counts, device="cuda", dtype=torch.int32)
+            live = DSV4Metadata(
+                core_attn_metadata=core,
+                indexer_metadata=None,
+                low_ratio_verify_start_loc=(live_lens.cumsum(0) - live_lens).int(),
+                low_ratio_verify_lens=live_lens,
+            )
+            if counts[0] % 2:
+                metadata.copy_(live)
+            else:
+                metadata.refresh_for_breakable_cuda_graph_replay_(live)
+            self.assertEqual(addresses, (starts.data_ptr(), lens.data_ptr()))
+            kv.copy_(_make_inputs(gen, rows))
+            state.copy_(_make_inputs(gen, state.shape[0]))
+            reference_state, reference_cache = state.clone(), cache.clone()
+            expected = []
+            for i, (_, position) in enumerate(packed):
+                latent = c2_decode_norm_rope_store(
+                    kv[i : i + 1],
+                    reference_state,
+                    weight,
+                    pos[i : i + 1],
+                    req[i : i + 1],
+                    loc[i : i + 1],
+                    EPS,
+                    freqs,
+                    reference_cache,
+                    page_size=PAGE_SIZE,
+                    ring_size=ring_size,
+                    layout=KVLayout.V41_FP4,
+                )
+                if position % 2:
+                    expected.append((i, latent[0].clone()))
+            graph.replay()
+            self.assertTrue(torch.equal(cache, reference_cache))
+            for i, latent in expected:
+                self.assertTrue(torch.equal(result[i], latent))
+            # Only even positions are ever read as a pending pair partner.
+            self.assertTrue(torch.equal(state[::2], reference_state[::2]))
+        graph.reset()
 
 
 if __name__ == "__main__":

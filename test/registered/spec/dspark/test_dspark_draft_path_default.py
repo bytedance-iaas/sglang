@@ -21,6 +21,7 @@ _PLAIN_MODEL_PATH = "deepseek-ai/DeepSeek-V4-Flash"
 
 def _bundled_hf_config() -> SimpleNamespace:
     return SimpleNamespace(
+        model_type="deepseek_v4",
         architectures=["DeepseekV4ForCausalLM"],
         dspark_block_size=5,
         dspark_markov_rank=256,
@@ -119,6 +120,30 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
         with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
             with self.assertRaisesRegex(ValueError, "static"):
                 _handle_dspark(server_args)
+
+    def test_v41_compact_pd_decode_keeps_megamoe(self):
+        """The compact exception must admit decode without opening prefill/CP."""
+        args = self._dp_server_args(moe_a2a_backend="megamoe")
+        args._model_config.hf_config.model_type = "deepseek_v41"
+        args.disaggregation_mode = "decode"
+        args.attention_backend = "dsv4"
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
+            _handle_dspark(args)
+            for field, value in (
+                ("disaggregation_mode", "prefill"),
+                ("disable_overlap_schedule", True),
+                ("attn_cp_size", 2),
+            ):
+                original = getattr(args, field)
+                setattr(args, field, value)
+                try:
+                    with (
+                        self.subTest(field=field),
+                        self.assertRaisesRegex(ValueError, "static"),
+                    ):
+                        _handle_dspark(args)
+                finally:
+                    setattr(args, field, original)
 
 
 class TestDsparkFoldedSamplingDefault(CustomTestCase):

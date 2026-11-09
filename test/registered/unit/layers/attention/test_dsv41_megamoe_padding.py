@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
@@ -17,7 +17,36 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
-class TestV41MegaMoEPadding(unittest.TestCase):
+class TestV41MegaMoEPadding(CustomTestCase):
+    def test_compact_verify_sources_follow_packed_request_boundaries(self):
+        """A shortened verify prefix must move the next request's source rows."""
+        backend = backend_module.DeepseekV4AttnBackend.__new__(
+            backend_module.DeepseekV4AttnBackend
+        )
+        backend.speculative_num_draft_tokens = 6
+        backend.MAX_SEQ_LEN_FOR_CAPTURE = 64
+        backend.has_c4 = backend.has_c128 = False
+        backend.req_to_token = torch.empty(8, 64, dtype=torch.int64)
+        backend.token_to_kv_pool = object()
+        backend.init_forward_metadata_indexer = lambda *args, **kwargs: None
+        backend.make_core_attn_metadata = lambda **kw: SimpleNamespace(
+            low_ratios=[1, 2], positions_casual=kw["seq_lens_casual"] - 1
+        )
+        raw = backend_module.DSV4RawVerifyMetadata(
+            req_pool_indices=torch.tensor([2, 5, 0]),
+            seq_lens=torch.tensor([10, 30, 1]),
+            out_cache_loc=torch.zeros(12, dtype=torch.int64),
+            extend_seq_lens=torch.tensor([1, 4, 7], dtype=torch.int32),
+            seq_lens_cpu=None,
+            c128_compress_metadata=None,
+            extend_start_loc=torch.tensor([0, 1, 5], dtype=torch.int32),
+            verify_lens=torch.tensor([1, 4, 7], dtype=torch.int32),
+            total_verify_tokens=12,
+        )
+        metadata = backend.make_forward_metadata_from_raw_verify(raw)
+        self.assertEqual(metadata.low_ratio_req_indices[:5].tolist(), [2, 5, 5, 5, 5])
+        self.assertEqual(metadata.low_ratio_pos_i64[:5].tolist(), [10, 30, 31, 32, 33])
+
     def test_target_verify_keeps_all_rows_with_or_without_extend_lengths(self):
         for extend_lengths in (None, [1, 1]):
             with self.subTest(extend_lengths=extend_lengths):

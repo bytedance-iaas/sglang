@@ -56,6 +56,7 @@ class DFlashDraftInputV2(SpecInput):
     future_indices: Optional[torch.Tensor] = None
 
     verify_token_budget: Optional[int] = None
+    verify_budget_survival: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_DRAFT)

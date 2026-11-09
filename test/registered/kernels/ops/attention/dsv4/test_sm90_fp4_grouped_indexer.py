@@ -444,7 +444,14 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
                 if enabled:
                     self.assertEqual(
                         state._low_ratio_index_topk_sm90_decode.call_args.kwargs,
-                        {"group_size": expected},
+                        {
+                            "group_size": expected,
+                            "ragged_verify": (
+                                mode.is_target_verify()
+                                and not draft
+                                and ragged == "compact"
+                            ),
+                        },
                     )
                     state.full_topk_indexer.topk_decode.assert_not_called()
                 else:
@@ -496,9 +503,16 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
         )
         pos = x.lens * x.ratio - 1
 
-        def run(group_size=x.group):
+        def run(group_size=x.group, ragged_verify=False):
             backend.DeepseekV4AttnBackend._low_ratio_index_topk_sm90_decode(
-                state, layer, x.weights, x.q, x.req, pos, group_size=group_size
+                state,
+                layer,
+                x.weights,
+                x.q,
+                x.req,
+                pos,
+                group_size=group_size,
+                ragged_verify=ragged_verify,
             )
 
         def run_verify():
@@ -507,8 +521,8 @@ class TestSm90Fp4GroupedIndexer(CustomTestCase):
             state.is_dspark_draft = False
             state.speculative_num_draft_tokens = x.group
             state.forward_metadata.late_layer_tail = None
-            state._low_ratio_index_topk_sm90_decode = lambda *args, group_size: run(
-                group_size
+            state._low_ratio_index_topk_sm90_decode = lambda *args, **kwargs: run(
+                **kwargs
             )
             batch = SimpleNamespace(
                 forward_mode=ForwardMode.TARGET_VERIFY,

@@ -168,6 +168,75 @@ class TestSm90LengthAwareIndexer(CustomTestCase):
                 want = want[want > -torch.inf]
                 torch.testing.assert_close(selected, want, atol=0, rtol=0)
 
+    def test_ragged_verify_graph_request_boundaries(self):
+        # Width 7 is BlockSize=6 plus the bonus token. Packed requests have
+        # different lengths; the last rows are graph padding with no visibility.
+        # Changing the packing at replay must not use a fixed-width paired path.
+        from sglang.kernels.ops.attention.dsv4 import sm90_paired_indexer as paired
+
+        for ratio in (1, 2):
+            x = self.fixture.make_inputs(
+                rows=23, width=16385, ratio=ratio, group=1, heads=32
+            )
+            x.group = 7
+            source = self.fixture.make_backend_case(x, "source", 512)
+            consumer = self.fixture.make_backend_case(x, "consumer", 512)
+
+            def update(lengths):
+                ids, visible = [], []
+                for rid, count in zip((9, 4, 15, 2, 7), lengths):
+                    ids.extend([rid] * count)
+                    visible.extend(8192 + i for i in range(count))
+                ids.extend([0] * (23 - len(ids)))
+                visible.extend([0] * (23 - len(visible)))
+                x.req.copy_(torch.tensor(ids, device="cuda"))
+                x.lens.copy_(torch.tensor(visible, device="cuda"))
+                x.slots.copy_(x.mapping[x.req][:, ::ratio].long() // ratio)
+                for case in (source, consumer):
+                    case.pos.copy_(x.lens * ratio - 1)
+
+            def run():
+                source.run_verify()
+                consumer.state.forward_metadata.candidate_metadata = (
+                    source.state.forward_metadata.candidate_metadata
+                )
+                consumer.run_verify()
+
+            with (
+                envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"),
+                envs.SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER.override(True),
+                envs.SGLANG_OPT_DSV41_SM90_LENGTH_AWARE_INDEXER.override(True),
+                envs.SGLANG_OPT_DSV41_SM90_COMPACT_CANDIDATES.override(True),
+                envs.SGLANG_OPT_DSV41_SM90_PREFIX_LOGITS.override(True),
+                patch.object(
+                    paired,
+                    "paired_prefix_logits",
+                    side_effect=AssertionError("ragged rows entered fixed pairing"),
+                ),
+            ):
+                update((7, 1, 3, 6, 2))
+                for _ in range(3):
+                    run()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    run()
+                self.assertIsInstance(
+                    source.state.forward_metadata.candidate_metadata, CandidateBlocks
+                )
+                for lengths in ((1, 7, 2, 3, 6), (0, 0, 0, 0, 0), (5, 2, 7, 1, 4)):
+                    update(lengths)
+                    graph.replay()
+                    self.check_outputs(x, source, "source")
+                    self.check_outputs(
+                        x,
+                        consumer,
+                        "consumer",
+                        published_masks(
+                            source.state.forward_metadata.candidate_metadata
+                        ).mask,
+                    )
+                graph.reset()
+
     def test_prefix_scores_and_poisoned_tail(self):
         for width, page, ratio in ((257, 16, 1), (65536, 64, 2)):
             x = self.fixture.make_inputs(width=width, page=page, ratio=ratio, heads=32)

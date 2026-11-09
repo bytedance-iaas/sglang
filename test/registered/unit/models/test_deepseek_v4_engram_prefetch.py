@@ -616,6 +616,43 @@ class TestDeepseekV4EngramPrefetch(CustomTestCase):
             self.assertEqual(hashes.count_nonzero().item(), 0)
             torch.testing.assert_close(hasher.history, before)
 
+    def test_compact_verify_hashes_match_uniform_prefixes_without_commit(self):
+        """Trimming a request must not feed its neighbor's tokens to Engram."""
+        from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+
+        hasher = EngramHasher.__new__(EngramHasher)
+        nn.Module.__init__(hasher)
+        hasher.max_ngram_size = 4
+        hasher.pad_id = 0
+        hasher.image_token_id = None
+        hasher.token_map = torch.arange(64)
+        hasher.multipliers = torch.tensor([[3, 5, 7, 11]])
+        hasher.primes = torch.full((1, 3, 8), 61, dtype=torch.int64)
+        hasher.offsets = (torch.arange(24) * 61).unsqueeze(0)
+        hasher.init_history(8, "cpu")
+        hasher.history[1:4] = torch.tensor([[2, 3, 4], [5, 6, 7], [8, 9, 10]])
+        history = hasher.history.clone()
+        ids = torch.arange(11, 29).view(3, 6)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            req_pool_indices=torch.tensor([1, 2, 3]),
+            positions=(torch.arange(6) + 10).repeat(3),
+            spec_info=SimpleNamespace(draft_token_num=6, ragged_verify_layout=None),
+        )
+        expected = hasher(ids.flatten(), batch).view(3, 6, 1, 24)
+        lens = [1, 4, 2]
+        layout = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=lens, device=torch.device("cpu"), grid=[12]
+        )
+        packed = torch.cat([ids[i, :n] for i, n in enumerate(lens)])
+        batch.spec_info.ragged_verify_layout = layout
+        batch.positions = torch.cat([torch.arange(n) + 10 for n in lens])
+        actual = hasher(packed, batch)
+        torch.testing.assert_close(
+            actual, torch.cat([expected[i, :n] for i, n in enumerate(lens)])
+        )
+        torch.testing.assert_close(hasher.history, history)
+
 
 if __name__ == "__main__":
     unittest.main()

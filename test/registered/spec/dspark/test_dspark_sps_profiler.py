@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import Mock, patch
 
 from sglang.benchmark.dspark_sps_profiler import (
     LoadInfo,
@@ -7,6 +8,7 @@ from sglang.benchmark.dspark_sps_profiler import (
     build_request_count_sweep,
     build_table_from_summaries,
     count_aligned_steps,
+    fetch_server_context,
     postprocess_round,
     resolve_cuda_graph_max_bs,
     round_summary_dict,
@@ -272,6 +274,44 @@ class TestMinSteadySteps(CustomTestCase):
                 min_steady_steps=32,
                 load_info=make_load_info(),
             )
+
+
+class TestServerContext(CustomTestCase):
+    def test_attention_dp_groups_determine_global_request_count(self):
+        """New server args separate replica DP from attention DP; both count."""
+        for replica_dp, attention_dp in [(1, 8), (8, 1)]:
+            with self.subTest(replica_dp=replica_dp, attention_dp=attention_dp):
+                state = {
+                    "dp_size": replica_dp,
+                    "attn_dp_size": attention_dp,
+                    "effective_max_running_requests_per_dp": 32,
+                    "memory_usage": {"token_capacity": 10000},
+                    "dspark_info_record": {
+                        "mode": "compact",
+                        "components": ["core", "step_cpu_time"],
+                        "simulate_acc_len": 1.0,
+                        "verify_num_draft_tokens": 7,
+                    },
+                }
+                response = Mock()
+                response.json.return_value = {
+                    "speculative_algorithm": "DSPARK",
+                    "tokenizer_path": "dummy",
+                    "tp_size": 8,
+                    "internal_states": [state.copy() for _ in range(8)],
+                }
+                with patch(
+                    "sglang.benchmark.dspark_sps_profiler.requests.get",
+                    return_value=response,
+                ):
+                    context = fetch_server_context(
+                        base_url="http://decode",
+                        local_tokenizer_path=None,
+                        allowed_modes=("compact",),
+                    )
+                self.assertEqual(context.dp_size, 8)
+                self.assertEqual(context.skip_max_running_requests_threshold, 256)
+                self.assertEqual(context.skip_token_capacity_threshold, 80000)
 
 
 if __name__ == "__main__":

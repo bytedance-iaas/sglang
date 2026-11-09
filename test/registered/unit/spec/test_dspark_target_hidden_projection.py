@@ -39,6 +39,35 @@ class _Attention:
 
 
 class DSparkTargetHiddenProjectionTest(CustomTestCase):
+    def test_v4_confidence_preserves_prefix_when_runtime_block_is_shorter(self):
+        """A runtime gamma override must keep the hidden feature width intact."""
+        from sglang.srt.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
+        from sglang.srt.models.dspark import DSparkConfidenceHead
+
+        model = SimpleNamespace(
+            gamma=5,
+            confidence_head=DSparkConfidenceHead(hidden_size=10, markov_rank=3),
+            markov_head=SimpleNamespace(get_prev_embeddings=torch.nn.Embedding(32, 3)),
+        )
+        hidden = torch.randn(3, 5, 10)
+        anchors = torch.tensor([1, 2, 3])
+        tokens = torch.arange(15).view(3, 5)
+        full = DeepseekV4ForCausalLMDSpark.compute_confidence(
+            model,
+            anchor_tokens=anchors,
+            sampled_tokens=tokens,
+            x_post_hc=hidden.flatten(0, 1),
+        )
+        for gamma in (1, 4):
+            with self.subTest(gamma=gamma):
+                short = DeepseekV4ForCausalLMDSpark.compute_confidence(
+                    model,
+                    anchor_tokens=anchors,
+                    sampled_tokens=tokens[:, :gamma],
+                    x_post_hc=hidden[:, :gamma].contiguous().flatten(0, 1),
+                )
+                torch.testing.assert_close(short, full[:, :gamma])
+
     def test_nonfinal_prefill_stage_only_forwards_target_proxies(self) -> None:
         proxy = object()
         target = SimpleNamespace(

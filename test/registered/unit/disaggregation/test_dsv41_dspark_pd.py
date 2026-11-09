@@ -1,4 +1,4 @@
-"""Static DSpark PD validation and heterogeneous attention-TP rank mapping."""
+"""DSpark PD validation and heterogeneous attention-TP rank mapping."""
 
 import copy
 import unittest
@@ -62,6 +62,11 @@ class TestDSV41DSparkPD(CustomTestCase):
         from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
 
         cfg = SimpleNamespace(
+            device="cuda",
+            tp_size=8,
+            attention_backend="dsv4",
+            moe_a2a_backend="megamoe",
+            disable_overlap_schedule=False,
             enable_encoder_swa_bounded_replay=False,
             enable_decoder_swa_bounded_replay=True,
             enable_dp_attention=True,
@@ -119,6 +124,13 @@ class TestDSV41DSparkPD(CustomTestCase):
                     with self.assertRaisesRegex(ValueError, "DSpark PD requires"):
                         hook.validate_deepseek_v41_features(object())
             verify_mode.return_value = RaggedVerifyMode.COMPACT
+            cfg.enable_decoder_swa_bounded_replay = False
+            hook.validate_deepseek_v41_features(object())
+            cfg.disaggregation_mode = "prefill"
+            with self.assertRaisesRegex(ValueError, "DSpark PD requires"):
+                hook.validate_deepseek_v41_features(object())
+            cfg.disaggregation_mode = "decode"
+            verify_mode.return_value = RaggedVerifyMode.CAP_ACCEPT
             with self.assertRaisesRegex(ValueError, "DSpark PD requires"):
                 hook.validate_deepseek_v41_features(object())
 

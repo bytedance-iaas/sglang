@@ -14,6 +14,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import InvariantCheckLevel, envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.managers.overlap_utils import (
     CONFIDENCE_RELAY_RING_LAG,
     FutureMap,
@@ -24,6 +25,9 @@ from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
 from sglang.srt.runtime_context import get_disagg, get_parallel, get_schedule, get_spec
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
+from sglang.srt.speculative.dspark_components.dspark_compensation import (
+    CappedRequestCompensation,
+)
 from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
     SpsCostTable,
@@ -140,6 +144,25 @@ class DSparkVerifyPlanner:
         self._dp_tier_gather_enabled = False
         self._is_verify_all = True
         self._uniform_layout_cache: dict = {}
+        self._record_req_details = bool(
+            {"reqs", "all"} & {x.strip() for x in envs.SGLANG_DSPARK_DEBUG_DUMP.get()}
+        )
+        self.compensation_credit = None
+        self.compensation_weights = None
+        self.baseline_verify_lens = None
+        self.aligned_budget = None
+        boost = envs.SGLANG_DSPARK_VERIFY_COMPENSATION_MAX_BOOST.get()
+        self._compensation = None
+        if boost != 0:
+            if self._ragged_verify_mode is not RaggedVerifyMode.COMPACT:
+                raise ValueError("verify compensation requires compact mode")
+            self._compensation = CappedRequestCompensation(
+                # Scheduler creates the request pool after the draft worker.
+                # Bind storage at the first real verify step, outside graphs.
+                pool_size=0,
+                device=device,
+                max_boost=boost,
+            )
         if self._ragged_verify_mode is not RaggedVerifyMode.STATIC:
             if self._confidence_head is None:
                 raise ValueError(
@@ -175,10 +198,10 @@ class DSparkVerifyPlanner:
                 and is_dp_attention_enabled()
                 and get_parallel().attn_tp_size == 1
                 and get_parallel().attn_cp_size == 1
-                and require_mlp_tp_gather()
+                and (require_mlp_tp_gather() or get_moe_a2a_backend().is_megamoe())
                 and not get_schedule().disable_overlap_schedule
                 and not get_spec().speculative_skip_dp_mlp_sync
-                and get_disagg().disaggregation_mode == "null"
+                and get_disagg().disaggregation_mode in ("null", "decode")
                 and get_parallel().pp_size == 1
                 and not envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
             )
@@ -303,6 +326,10 @@ class DSparkVerifyPlanner:
         draft_input.verify_token_budget = self._budget_from_resolved(
             resolved=resolved, req_pool_indices_cpu=batch.req_pool_indices_cpu
         )
+        decision = self._budget_planner.last_decision
+        draft_input.verify_budget_survival = (
+            None if decision is None else decision.history_survival
+        )
         batch.spec_verify_tier_num_tokens = local_verify_tier_num_tokens(
             bs=batch.batch_size(),
             verify_token_budget=draft_input.verify_token_budget,
@@ -381,6 +408,10 @@ class DSparkVerifyPlanner:
             prefix_lens=prefix_lens,
             req_pool_indices=req_pool_indices,
         )
+        decision = self._budget_planner.last_decision
+        draft_input.verify_budget_survival = (
+            None if decision is None else decision.history_survival
+        )
         return draft_input.verify_token_budget
 
     def confidence_budget_prepare(self):
@@ -408,6 +439,38 @@ class DSparkVerifyPlanner:
                 req_pool_indices_cpu=req_pool_indices_cpu,
             )
         )
+
+    def prepare_compensation(self, *, reqs, req_pool_indices, req_pool_indices_cpu):
+        self.compensation_credit = None
+        self.compensation_weights = None
+        self.baseline_verify_lens = None
+        self.aligned_budget = None
+        if self._compensation is not None:
+            if self._compensation.credit.numel() == 0:
+                self._compensation.initialize_pool(
+                    self.model_runner.req_to_token_pool.req_to_token.shape[0]
+                )
+            self.compensation_credit, self.compensation_weights = (
+                self._compensation.prepare(
+                    reqs=reqs,
+                    req_pool_indices=req_pool_indices,
+                    req_pool_indices_cpu=req_pool_indices_cpu,
+                )
+            )
+
+    def update_compensation(self, *, req_pool_indices, layout, commit_lens):
+        if self._compensation is not None:
+            lens = (
+                layout.verify_lens
+                if layout is not None
+                else torch.full_like(commit_lens, self.verify_num_draft_tokens)
+            )
+            self._compensation.update(
+                req_pool_indices=req_pool_indices,
+                verify_lens=lens,
+                commit_lens=commit_lens,
+                full_width=self.verify_num_draft_tokens,
+            )
 
     def schedule_layout(
         self,
@@ -578,11 +641,21 @@ class DSparkVerifyPlanner:
     ) -> Optional[torch.Tensor]:
         if self._budget_planner is None or confidence is None or budget is None:
             return None
+        self.aligned_budget = budget
         verify_lens = ScheduleVerifyLensTopk.execute(
             confidence=confidence,
             budget=budget,
             cfg=self._schedule_cfg,
+            request_weights=self.compensation_weights,
         ).to(device=device, dtype=torch.int32)
+        if self._record_req_details:
+            self.baseline_verify_lens = (
+                ScheduleVerifyLensTopk.execute(
+                    confidence=confidence, budget=budget, cfg=self._schedule_cfg
+                )
+                if self.compensation_weights is not None
+                else verify_lens
+            )
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_PLAN, verify_lens)
 
         if resolve_level() >= InvariantCheckLevel.WARN:
@@ -941,6 +1014,7 @@ class VerifyBudgetDecision(msgspec.Struct):
     budget: int
     predicted_step_seconds: Optional[float] = None
     predicted_theta: Optional[float] = None
+    history_survival: Optional[torch.Tensor] = None
 
 
 def compute_verify_token_budget(
@@ -1027,6 +1101,9 @@ class HostConfidenceBudgetPlanner:
         self._model_runner = model_runner
         self.forced_budget_frac: Optional[float] = None
         self.last_decision: Optional[VerifyBudgetDecision] = None
+        self._record_req_details = bool(
+            {"reqs", "all"} & {x.strip() for x in envs.SGLANG_DSPARK_DEBUG_DUMP.get()}
+        )
         self.lag_steps = max(
             int(envs.SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS.get()), 1
         )
@@ -1057,13 +1134,18 @@ class HostConfidenceBudgetPlanner:
         if forced_frac is not None:
             full_budget = int(survival[:, : self.cfg.resolved_max_verify_len()].numel())
             forced_budget = max(0, int(float(forced_frac) * full_budget))
-            self.last_decision = VerifyBudgetDecision(budget=forced_budget)
+            self.last_decision = VerifyBudgetDecision(
+                budget=forced_budget,
+                history_survival=survival.clone() if self._record_req_details else None,
+            )
             return forced_budget
         decision = compute_verify_token_budget(
             history_survival_probs=survival,
             sps_table=self.sps_table,
             cfg=self.cfg,
         )
+        if self._record_req_details:
+            decision.history_survival = survival.clone()
         self.last_decision = decision
         return decision.budget
 

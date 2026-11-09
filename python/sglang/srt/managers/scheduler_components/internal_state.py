@@ -147,6 +147,8 @@ class SchedulerInternalStateController:
         requested = recv_req.server_args
         try:
             for key, value in requested.items():
+                if value is None and key != "dspark_force_budget_frac":
+                    raise UpdateRejected(f"Updating {key} to null is not supported.")
                 handler = handlers.get(key)
                 if handler is None:
                     raise UpdateRejected(f"Updating {key} is not supported.")

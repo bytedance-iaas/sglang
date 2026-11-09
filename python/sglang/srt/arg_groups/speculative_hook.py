@@ -628,10 +628,24 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 read_ragged_verify_mode,
             )
 
-            if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+            from sglang.srt.arg_groups.deepseek_v4_hook import (
+                dsv41_compact_decode_supported,
+            )
+
+            verify_mode = read_ragged_verify_mode()
+            compact_decode = (
+                verify_mode is RaggedVerifyMode.COMPACT
+                and not envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
+                and dsv41_compact_decode_supported(
+                    cfg, model_config_of(server_args).hf_config
+                )
+            )
+            if verify_mode is not RaggedVerifyMode.STATIC and not compact_decode:
                 raise ValueError(
                     "DSpark DP MoE or prefill coordination requires "
-                    "SGLANG_RAGGED_VERIFY_MODE=static."
+                    "SGLANG_RAGGED_VERIFY_MODE=static, except compact "
+                    "DeepSeek-V4.1 Mooncake MegaMoE decode with attention TP=1, "
+                    "PP=CP=DCP=1, overlap, and no prefill coordination."
                 )
         if cfg.attn_cp_size > 1:
             raise ValueError(

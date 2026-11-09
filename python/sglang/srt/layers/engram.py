@@ -317,12 +317,31 @@ class EngramHasher(nn.Module):
             kmode = MODE_DECODE
             commit_rows, commit_last = req_slots, None
         elif mode.is_target_verify():
-            block = int(forward_batch.spec_info.draft_token_num)
-            assert num_tokens == bs * block, (
-                "engram target-verify expects one equal block per request, got "
-                f"{num_tokens} tokens for {bs} requests of {block}"
-            )
-            kmode = MODE_VERIFY
+            layout = forward_batch.spec_info.ragged_verify_layout
+            if layout is None:
+                block = int(forward_batch.spec_info.draft_token_num)
+                assert num_tokens == bs * block, (
+                    "engram target-verify expects one equal block per request, got "
+                    f"{num_tokens} tokens for {bs} requests of {block}"
+                )
+                kmode = MODE_VERIFY
+            else:
+                from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
+                    CompactRowIndex,
+                )
+
+                if layout.bs != bs:
+                    layout = layout.padded_to_bucket(padded_bs=bs)
+                row, _, _ = CompactRowIndex.execute(
+                    verify_lens=layout.verify_lens,
+                    padded_total=num_tokens,
+                    device=device,
+                )
+                row = row.clamp(max=bs - 1)
+                starts = layout.extend_start_loc
+                # Reuse the variable-length hash path, with history committed
+                # only after target verification determines the accept lengths.
+                kmode = MODE_EXTEND
             commit_rows = commit_last = None
         else:
             assert mode.is_extend(), (

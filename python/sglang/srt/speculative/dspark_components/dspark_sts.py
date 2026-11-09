@@ -44,18 +44,54 @@ class StsDataRecorder:
         self._logits_buffer: list[torch.Tensor] = []
         self._prefix_mask_buffer: list[torch.Tensor] = []
         self._shard_ct = 0
+        self._metadata_buffer = []
 
     def record(
-        self, *, confidence_raw: torch.Tensor, num_correct_drafts: torch.Tensor
+        self,
+        *,
+        confidence_raw: torch.Tensor,
+        num_correct_drafts: torch.Tensor,
+        rids=None,
+        prefix_lens=None,
+        verify_lens=None,
     ) -> None:
-        logits = confidence_raw.detach().to(device="cpu", dtype=torch.float32)
-        positions = torch.arange(self.gamma).view(1, -1)
+        # Collection is diagnostic: synchronize here and reject censored rows.
+        logits = confidence_raw.detach().to(device="cpu", dtype=torch.float32).clone()
         counts = (
-            num_correct_drafts.detach().to(device="cpu", dtype=torch.int64).view(-1, 1)
+            num_correct_drafts.detach().to(device="cpu", dtype=torch.int64).view(-1)
         )
-        prefix_mask = (positions < counts).to(torch.float32)
-        self._logits_buffer.append(logits)
-        self._prefix_mask_buffer.append(prefix_mask)
+        if logits.ndim != 2 or logits.shape != (counts.numel(), self.gamma):
+            raise ValueError("STS logits/acceptance shape mismatch")
+        if (
+            not torch.isfinite(logits).all()
+            or not ((counts >= 0) & (counts <= self.gamma)).all()
+        ):
+            raise ValueError("Invalid STS logits or acceptance counts")
+        keep = torch.ones(counts.numel(), dtype=torch.bool)
+        if verify_lens is not None:
+            widths = verify_lens.detach().cpu().view(-1)
+            if widths.numel() != counts.numel():
+                raise ValueError("STS verify length shape mismatch")
+            keep = widths == self.gamma + 1
+        if not keep.any():
+            return
+        if rids is not None:
+            if len(rids) != counts.numel() or prefix_lens is None:
+                raise ValueError("STS request metadata shape mismatch")
+            contexts = prefix_lens.detach().cpu().view(-1).tolist()
+            if len(contexts) != len(rids):
+                raise ValueError("STS prefix length shape mismatch")
+            metadata = [
+                dict(rid=rid, prefix_len=int(ctx), local_bs=len(rids))
+                for rid, ctx, valid in zip(rids, contexts, keep.tolist())
+                if valid
+            ]
+        else:
+            metadata = [None] * int(keep.sum())
+        positions = torch.arange(self.gamma).view(1, -1)
+        self._logits_buffer.append(logits[keep])
+        self._prefix_mask_buffer.append((positions < counts[keep, None]).float())
+        self._metadata_buffer.extend(metadata)
         if len(self._logits_buffer) >= self.flush_every:
             self.flush()
 
@@ -68,9 +104,11 @@ class StsDataRecorder:
             {
                 "logits": torch.cat(self._logits_buffer, dim=0),
                 "prefix_mask": torch.cat(self._prefix_mask_buffer, dim=0),
+                "metadata": self._metadata_buffer,
             },
             shard_path,
         )
         self._logits_buffer.clear()
         self._prefix_mask_buffer.clear()
+        self._metadata_buffer.clear()
         self._shard_ct += 1

@@ -565,5 +565,68 @@ class TestEngramHostPrefetch(CustomTestCase):
                 torch.testing.assert_close(oracle.history, committed, rtol=0, atol=0)
 
 
+class TestEngramCompactVerify(CustomTestCase):
+    def test_compact_verify_graph_replays_changed_request_boundaries(self):
+        """Engram must refresh packed boundaries without committing draft history."""
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+
+        hasher = TestEngramHostPrefetch._hasher("cuda")
+        hasher.history[1:4] = torch.tensor(
+            [[2, 3, 4], [5, 6, 7], [8, 9, 10]], device="cuda"
+        )
+        history = hasher.history.clone()
+        ids = torch.zeros(12, dtype=torch.int64, device="cuda")
+        positions = torch.zeros_like(ids)
+        layout = RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=[1, 4, 2], device=torch.device("cuda"), grid=[12]
+        ).padded_to_bucket(padded_bs=4)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            req_pool_indices=torch.tensor([1, 2, 3, 0], device="cuda"),
+            positions=positions,
+            spec_info=SimpleNamespace(draft_token_num=6, ragged_verify_layout=layout),
+        )
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                hasher(ids, batch)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            output = hasher(ids, batch)
+
+        for lens in ([1, 4, 2], [5, 1, 3], [2, 2, 1]):
+            full_ids = torch.arange(11, 29, device="cuda").view(3, 6)
+            uniform = SimpleNamespace(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                req_pool_indices=batch.req_pool_indices[:3],
+                positions=(torch.arange(6, device="cuda") + 10).repeat(3),
+                spec_info=SimpleNamespace(draft_token_num=6, ragged_verify_layout=None),
+            )
+            expected = hasher(full_ids.flatten(), uniform).view(3, 6, 2, 24)
+            packed = torch.cat([full_ids[i, :n] for i, n in enumerate(lens)])
+            ids.zero_()
+            ids[: packed.numel()].copy_(packed)
+            positions.zero_()
+            positions[: packed.numel()].copy_(
+                torch.cat([torch.arange(n, device="cuda") + 10 for n in lens])
+            )
+            updated = RaggedVerifyLayout.from_verify_lens(
+                verify_lens_cpu=lens, device=torch.device("cuda"), grid=[12]
+            ).padded_to_bucket(padded_bs=4)
+            layout.verify_lens.copy_(updated.verify_lens)
+            layout.extend_start_loc.copy_(updated.extend_start_loc)
+            graph.replay()
+            torch.testing.assert_close(
+                output[: packed.numel()],
+                torch.cat([expected[i, :n] for i, n in enumerate(lens)]),
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(hasher.history, history, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     unittest.main()

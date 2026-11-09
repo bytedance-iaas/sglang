@@ -40,6 +40,21 @@ def _dsv41_dspark_pd_parallelism_supported(cfg) -> bool:
     )
 
 
+def dsv41_compact_decode_supported(cfg, hf_config) -> bool:
+    """Compact PD decode needs one attention rank per DP group and no PP/CP."""
+    return (
+        hf_config.model_type == "deepseek_v41"
+        and cfg.device.startswith("cuda")
+        and cfg.disaggregation_mode == "decode"
+        and cfg.disaggregation_transfer_backend == "mooncake"
+        and cfg.pp_size == cfg.attn_cp_size == cfg.dcp_size == 1
+        and cfg.attn_dp_size == cfg.tp_size
+        and cfg.attention_backend == "dsv4"
+        and cfg.moe_a2a_backend == "megamoe"
+        and not cfg.disable_overlap_schedule
+    )
+
+
 def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None:
     """Apply DeepSeek V4 environment defaults, request limits, and validation."""
     cfg = resolving_view(server_args)
@@ -312,13 +327,18 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             read_ragged_verify_mode,
         )
 
+        verify_mode = read_ragged_verify_mode()
+        compact_decode = verify_mode is RaggedVerifyMode.COMPACT and (
+            dsv41_compact_decode_supported(cfg, model_config_of(server_args).hf_config)
+        )
         if (
-            read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
+            (verify_mode is not RaggedVerifyMode.STATIC and not compact_decode)
             or cfg.disaggregation_transfer_backend != "mooncake"
             or not _dsv41_dspark_pd_parallelism_supported(cfg)
         ):
             raise ValueError(
-                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, "
+                "DeepSeek-V4.1 DSpark PD requires static verify (or compact "
+                "MegaMoE decode with attention TP=1, PP=CP=DCP=1 and overlap), Mooncake, "
                 "DCP=1, and Decode CP=1. Prefill may use canonical interleave "
                 "CP with DP=1. Both servers must use the same block size "
                 "and target/draft KV layout."

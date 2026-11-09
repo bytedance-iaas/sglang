@@ -10,8 +10,10 @@ type-specific decisions (the `ExpertWeightPointer` narrowing, the
 
 import dataclasses
 import unittest
+from types import SimpleNamespace
 
 import msgspec
+from pydantic import TypeAdapter
 
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.io_struct import (
@@ -33,6 +35,9 @@ from sglang.srt.managers.io_struct import (
     VertexGenerateReqInput,
     msgpack_decode,
     msgpack_encode,
+)
+from sglang.srt.managers.scheduler_components.internal_state import (
+    SchedulerInternalStateController,
 )
 from sglang.srt.managers.scheduler_components.weight_updater import (
     _merge_checksum_payloads,
@@ -152,6 +157,20 @@ NARROWED_BACKUP_KEYS = ("name", "shape", "numel", "dtype", "element_size")
 
 
 class TestMsgpackIpcRoundtrip(CustomTestCase):
+    def test_dspark_budget_reset_survives_http_and_ipc(self):
+        """A null reset must reach the scheduler instead of failing HTTP validation."""
+        request = TypeAdapter(SetInternalStateReq).validate_json(
+            '{"server_args":{"dspark_force_budget_frac":null}}'
+        )
+        self.assertEqual(
+            _double_hop(request).server_args, {"dspark_force_budget_frac": None}
+        )
+        controller = SchedulerInternalStateController(SimpleNamespace(), False)
+        rejected = controller.set_internal_state(
+            SetInternalStateReq(server_args={"pp_max_micro_batch_size": None})
+        )
+        self.assertFalse(rejected.updated)
+
     def test_registry_is_empty(self):
         # `getattr(..., ())` is deliberate: the acceptance criterion for Task 4 is
         # that the symbol is *deleted*, so this asserts its absence rather than
