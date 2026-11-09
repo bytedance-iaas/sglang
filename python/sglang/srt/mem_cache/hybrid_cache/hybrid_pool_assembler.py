@@ -849,9 +849,9 @@ def build_deepseek_v4_hicache_stack(
 
     is_unified_kv = getattr(kvcache, "_unified_kv", False)
     has_paged_swa = not is_unified_kv and kvcache.swa_kv_pool is not None
-    mtp_swa_device_buffers = []
+    swa_device_buffers = []
     if not has_paged_swa:
-        # Unified KV and encoder replay rebuild SWA state; keep it out of host cache.
+        # The target ring is rebuilt by replay; the draft may still use paged SWA.
         swa_layer_mapping = {}
     else:
         _require_single_row_dsv4_swa_pages(
@@ -866,8 +866,11 @@ def build_deepseek_v4_hicache_stack(
                 f"{transfer_layer_id_max} local layers"
             )
         swa_layer_mapping = layer_mappings.swa
-        # Keep every uncompressed draft SWA layer after the target SWA layers.
-        # NextN has one layer per pool, while DSpark keeps all stages in one pool.
+        swa_device_buffers = list(kvcache.swa_kv_pool.kv_buffer)
+
+    mtp_swa_device_buffers = []
+    if not is_unified_kv:
+        # DSpark keeps paged draft SWA even when the target uses request_window.
         mtp_swa_device_buffers = [
             buffer
             for pool in params.mtp_draft_device_pools
@@ -876,9 +879,10 @@ def build_deepseek_v4_hicache_stack(
         swa_layer_mapping = with_packed_draft_layer_mapping(
             swa_layer_mapping,
             transfer_layer_start=transfer_layer_id_max,
-            target_device_layer_num=transfer_layer_id_max,
+            target_device_layer_num=len(swa_device_buffers),
             draft_layer_num=len(mtp_swa_device_buffers),
         )
+    swa_device_buffers.extend(mtp_swa_device_buffers)
 
     c4_layer_mapping = layer_mappings.c4
     c128_layer_mapping = layer_mappings.c128
@@ -909,19 +913,21 @@ def build_deepseek_v4_hicache_stack(
         ),
     ]
 
-    if has_paged_swa:
+    if swa_device_buffers:
+        swa_pool = (
+            kvcache.swa_kv_pool
+            if has_paged_swa
+            else params.mtp_draft_device_pools[0].swa_kv_pool
+        )
         swa_host_pool = DeepSeekV4PagedHostPool(
             pool_name=str(PoolName.SWA),
-            device_buffers=[
-                *kvcache.swa_kv_pool.kv_buffer,
-                *mtp_swa_device_buffers,
-            ],
-            item_bytes=kvcache.swa_kv_pool.bytes_per_page_padded,
+            device_buffers=swa_device_buffers,
+            item_bytes=swa_pool.bytes_per_page_padded,
             num_host_pages=swa_num_host_pages,
             slot_page_size=kvcache.swa_page_size,
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
-            page_aligned_only=_dsv4_page_aligned_only(kvcache.swa_kv_pool),
+            page_aligned_only=_dsv4_page_aligned_only(swa_pool),
         )
         swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
         entries.append(
