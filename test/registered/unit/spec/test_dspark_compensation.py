@@ -9,7 +9,10 @@ from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
 from sglang.srt.speculative.dspark_components.dspark_compensation import (
     CappedRequestCompensation,
 )
-from sglang.srt.speculative.dspark_components.dspark_planner import DSparkScheduleConfig
+from sglang.srt.speculative.dspark_components.dspark_planner import (
+    DSparkScheduleConfig,
+    DSparkVerifyPlanner,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -17,6 +20,41 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestCompensation(CustomTestCase):
+    def test_pool_binding_preserves_credit_and_rejects_resize(self):
+        state = CappedRequestCompensation(pool_size=0, device="cpu", max_boost=0.25)
+        self.assertEqual(state.credit.numel(), 0)
+        state.initialize_pool(4)
+        state.credit[2] = 3
+        state.initialize_pool(4)
+        self.assertEqual(state.credit.tolist(), [0, 0, 3, 0])
+        with self.assertRaises(ValueError):
+            state.initialize_pool(5)
+        with self.assertRaises(ValueError):
+            state.initialize_pool(0)
+
+    def test_first_verify_binds_late_created_request_pool(self):
+        planner = DSparkVerifyPlanner.__new__(DSparkVerifyPlanner)
+        planner.model_runner = types.SimpleNamespace(req_to_token_pool=None)
+        planner._compensation = CappedRequestCompensation(
+            pool_size=0, device="cpu", max_boost=0.5
+        )
+        # This is the scheduler ordering used by the full model: the pool is
+        # attached after constructing the worker, before serving requests.
+        planner.model_runner.req_to_token_pool = types.SimpleNamespace(
+            req_to_token=torch.empty((4, 8), dtype=torch.int32)
+        )
+        slots = torch.tensor([2])
+        reqs = [object()]
+        planner.prepare_compensation(
+            reqs=reqs, req_pool_indices=slots, req_pool_indices_cpu=slots
+        )
+        self.assertEqual(planner.compensation_weights.tolist(), [1.0])
+        planner._compensation.credit[2] = 4
+        planner.prepare_compensation(
+            reqs=reqs, req_pool_indices=slots, req_pool_indices_cpu=slots
+        )
+        self.assertEqual(planner.compensation_weights.tolist(), [1.25])
+
     def test_cap_hit_rejection_and_slot_reuse(self):
         state = CappedRequestCompensation(pool_size=4, device="cpu", max_boost=0.5)
         reqs = [

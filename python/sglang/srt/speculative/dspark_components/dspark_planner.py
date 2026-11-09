@@ -157,7 +157,9 @@ class DSparkVerifyPlanner:
             if self._ragged_verify_mode is not RaggedVerifyMode.COMPACT:
                 raise ValueError("verify compensation requires compact mode")
             self._compensation = CappedRequestCompensation(
-                pool_size=self.model_runner.req_to_token_pool.req_to_token.shape[0],
+                # Scheduler creates the request pool after the draft worker.
+                # Bind storage at the first real verify step, outside graphs.
+                pool_size=0,
                 device=device,
                 max_boost=boost,
             )
@@ -444,6 +446,10 @@ class DSparkVerifyPlanner:
         self.baseline_verify_lens = None
         self.aligned_budget = None
         if self._compensation is not None:
+            if self._compensation.credit.numel() == 0:
+                self._compensation.initialize_pool(
+                    self.model_runner.req_to_token_pool.req_to_token.shape[0]
+                )
             self.compensation_credit, self.compensation_weights = (
                 self._compensation.prepare(
                     reqs=reqs,

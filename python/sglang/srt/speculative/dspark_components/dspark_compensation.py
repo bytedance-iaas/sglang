@@ -23,6 +23,17 @@ class CappedRequestCompensation:
         self.credit = torch.zeros(pool_size, device=device, dtype=torch.float32)
         self._owners = {}
 
+    def initialize_pool(self, pool_size):
+        """Bind late-created request storage without resetting accumulated credit."""
+        if pool_size <= 0:
+            raise ValueError("compensation request pool must have positive size")
+        if self.credit.numel() == 0:
+            self.credit = torch.zeros(
+                pool_size, device=self.credit.device, dtype=self.credit.dtype
+            )
+        elif self.credit.numel() != pool_size:
+            raise ValueError("compensation request pool size changed after binding")
+
     def prepare(self, *, reqs, req_pool_indices, req_pool_indices_cpu):
         owners = dict(zip(req_pool_indices_cpu.tolist(), reqs))
         reset = [
