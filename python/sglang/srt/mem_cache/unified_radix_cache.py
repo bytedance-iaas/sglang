@@ -2958,11 +2958,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
                 self.revoke_pending_prefetch(request)
                 return True
+            # Keep component state at the recovery boundary established by the query.
+            allow_partial = not buffer_mode and not info.comp_xfers
             host_indices, alloc_len = cc.allocate_storage_hit(
                 operation,
                 hit_tokens,
-                allow_partial=not buffer_mode,
-                min_tokens=self.prefetch_threshold,
+                allow_partial=allow_partial,
+                min_tokens=self.prefetch_threshold if allow_partial else hit_tokens,
                 evict_host=self.evict_host,
             )
             if host_indices is None:
