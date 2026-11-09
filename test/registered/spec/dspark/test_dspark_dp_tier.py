@@ -1,11 +1,14 @@
 import random
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockProposer
+from sglang.srt.speculative.dspark_components.dspark_draft import (
+    DraftBlockProposer,
+    _localize_dp_hidden,
+)
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     dp_global_verify_tier_num_tokens,
     local_verify_tier_num_tokens,
@@ -54,6 +57,32 @@ class TestDpGlobalVerifyTierNumTokens(CustomTestCase):
 
 
 class TestDraftDpSyncMetadata(CustomTestCase):
+    def test_localizes_global_hidden_rows_by_dp_rank(self):
+        hidden = torch.arange(10).view(10, 1)
+
+        local = _localize_dp_hidden(
+            hidden,
+            local_bs=1,
+            rows_per_req=5,
+            global_num_reqs=[1, 1],
+            dp_rank=1,
+        )
+
+        self.assertEqual(local.view(-1).tolist(), [5, 6, 7, 8, 9])
+
+    def test_localizes_max_len_padded_hidden_rows(self):
+        hidden = torch.arange(10).view(10, 1)
+
+        local = _localize_dp_hidden(
+            hidden,
+            local_bs=1,
+            rows_per_req=5,
+            global_num_reqs=[1, 2],
+            dp_rank=0,
+        )
+
+        self.assertEqual(local.view(-1).tolist(), [0, 1, 2, 3, 4])
+
     def test_preserves_unscaled_request_counts_for_cuda_graph_admission(self):
         proposer = DraftBlockProposer.__new__(DraftBlockProposer)
         proposer._dp_moe_sync = True
@@ -85,6 +114,73 @@ class TestDraftDpSyncMetadata(CustomTestCase):
         self.assertEqual(forward_batch.num_token_non_padded.dtype, torch.int32)
         self.assertEqual(forward_batch.num_token_non_padded_cpu, 6)
         self.assertTrue(forward_batch.can_run_decode_cuda_graph)
+
+    def _make_idle_proposer(self, graph_runner=None):
+        proposer = DraftBlockProposer.__new__(DraftBlockProposer)
+        proposer._dp_moe_sync = True
+        proposer.query_token_num = 6
+        proposer._draft_block_spec_info = SimpleNamespace(
+            num_tokens_per_req=6,
+            num_tokens_for_logprob_per_req=1,
+        )
+        forward = Mock()
+        proposer.draft_model_runner = SimpleNamespace(
+            device="cpu",
+            forward=forward,
+            decode_cuda_graph_runner=graph_runner,
+        )
+        return proposer, forward
+
+    def test_idle_participation_uses_one_shape_only_row_for_eager(self):
+        proposer, forward = self._make_idle_proposer()
+        batch = SimpleNamespace(
+            global_num_tokens=[0, 2],
+            global_num_tokens_for_logprob=[0, 2],
+            can_run_decode_cuda_graph=False,
+        )
+
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_draft.enable_num_token_non_padded",
+            return_value=True,
+        ):
+            proposer.run_idle_participation(batch)
+
+        idle_batch = forward.call_args.args[0]
+        self.assertEqual(idle_batch.batch_size, 1)
+        self.assertEqual(idle_batch.input_ids.numel(), 1)
+        self.assertEqual(idle_batch.positions.numel(), 1)
+        self.assertEqual(idle_batch.out_cache_loc.numel(), 1)
+        self.assertEqual(idle_batch.original_global_num_tokens_cpu, [0, 2])
+        self.assertEqual(idle_batch.num_token_non_padded.item(), 0)
+        self.assertEqual(idle_batch.num_token_non_padded_cpu, 0)
+        self.assertEqual(idle_batch.global_num_tokens_cpu, [0, 12])
+        self.assertFalse(idle_batch.can_run_decode_cuda_graph)
+
+    def test_idle_participation_uses_captured_width_for_graph(self):
+        graph_runner = Mock()
+        graph_runner.can_run_graph.return_value = True
+        proposer, forward = self._make_idle_proposer(graph_runner)
+        batch = SimpleNamespace(
+            global_num_tokens=[0, 2],
+            global_num_tokens_for_logprob=[0, 2],
+            can_run_decode_cuda_graph=True,
+        )
+
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_draft.enable_num_token_non_padded",
+            return_value=True,
+        ):
+            proposer.run_idle_participation(batch)
+
+        idle_batch = forward.call_args.args[0]
+        graph_runner.can_run_graph.assert_called_once_with(idle_batch)
+        self.assertEqual(idle_batch.input_ids.numel(), 6)
+        self.assertEqual(idle_batch.positions.numel(), 6)
+        self.assertEqual(idle_batch.out_cache_loc.numel(), 6)
+        self.assertEqual(idle_batch.original_global_num_tokens_cpu, [0, 2])
+        self.assertEqual(idle_batch.num_token_non_padded.item(), 0)
+        self.assertEqual(idle_batch.num_token_non_padded_cpu, 0)
+        self.assertTrue(idle_batch.can_run_decode_cuda_graph)
 
 
 class TestBusyIdleGraphKeyIdentity(CustomTestCase):

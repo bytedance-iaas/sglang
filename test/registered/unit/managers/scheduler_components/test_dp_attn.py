@@ -37,6 +37,7 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
             local_can_run_tbo=True,
             local_forward_mode=ForwardMode.DECODE.value,
             pp_dspark_owned_num_tokens=3,
+            pp_dspark_all_num_tokens=5,
         )
 
         local = sync_info._get_local_tensor(device="cpu")
@@ -48,11 +49,13 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
         sync_info.include_pp_dspark_owner_counts = True
         local = sync_info._get_local_tensor(device="cpu")
         fallback = sync_info._get_fallback_tensor(device="cpu")
-        self.assertEqual(local.shape[0], 10)
+        self.assertEqual(local.shape[0], 11)
         self.assertEqual(local[8].item(), 0)
         self.assertEqual(local[9].item(), 3)
+        self.assertEqual(local[10].item(), 5)
         self.assertEqual(fallback[8].item(), 1)
         self.assertEqual(fallback[9].item(), 0)
+        self.assertEqual(fallback[10].item(), 0)
 
     def test_dp1_skip_preserves_local_tbo_metadata(self):
         batch = SimpleNamespace(
@@ -139,6 +142,66 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
             owned,
             sum(draft_owner(req.rid, 2) == 1 for req in batch.reqs),
         )
+        batch.batch_size = lambda: len(batch.reqs)
+        self.assertEqual(dp_attn._pp_dspark_all_num_tokens(batch), 8)
+
+    def test_pp4_pipelined_dspark_uses_cpu_scheduler_metadata_collective(self):
+        tp_group = SimpleNamespace(
+            device_group=object(),
+            device="cuda",
+            cpu_group=object(),
+        )
+        with (
+            envs.SGLANG_PP_DSPARK_PIPELINED_PROXY.override(True),
+            patch.object(
+                dp_attn,
+                "get_parallel",
+                return_value=SimpleNamespace(pp_size=4),
+            ),
+            patch.object(
+                dp_attn,
+                "get_spec",
+                return_value=SimpleNamespace(
+                    speculative_dspark_pp_replicated_draft=True
+                ),
+            ),
+        ):
+            group, device = dp_attn._scheduler_metadata_collective_target(
+                tp_group,
+                disable_overlap_schedule=True,
+                offload_tags=set(),
+            )
+
+        self.assertIs(group, tp_group.cpu_group)
+        self.assertEqual(device, "cpu")
+
+    def test_pp4_pipelined_dspark_keeps_gathered_all_row_counts(self):
+        batch = SimpleNamespace()
+        sync_info = SimpleNamespace(
+            num_tokens=3,
+            num_tokens_for_logprob=3,
+            global_num_tokens=[3, 5],
+            global_num_tokens_for_logprob=[3, 5],
+            include_pp_dspark_owner_counts=True,
+            global_pp_dspark_owned_num_tokens=[1, 2],
+            global_pp_dspark_all_num_tokens=[3, 5],
+            is_extend_in_batch=False,
+            tbo_split_seq_index=None,
+            global_forward_mode=ForwardMode.DECODE,
+            can_run_decode_cuda_graph=True,
+            can_run_prefill_cuda_graph=False,
+            can_run_draft_cuda_graph=True,
+            prefill_cuda_graph_max_prefix_len=0,
+        )
+        with patch.object(dp_attn, "_pp_dspark_uses_all_rows", return_value=True):
+            dp_attn._update_gather_batch(
+                batch,
+                sync_info,
+                require_mlp_tp_gather=True,
+            )
+
+        self.assertEqual(batch.draft_global_num_tokens, [3, 5])
+        self.assertEqual(batch.draft_global_num_tokens_for_logprob, [3, 5])
 
 
 class TestDecodeToExtendConversionVote(CustomTestCase):
