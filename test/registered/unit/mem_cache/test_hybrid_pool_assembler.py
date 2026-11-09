@@ -49,6 +49,65 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDeepSeekV4SWAPageLayout(CustomTestCase):
+    def test_request_window_keeps_paged_draft_swa(self):
+        draft_buffers = [object(), object()]
+        draft_swa = SimpleNamespace(
+            kv_buffer=draft_buffers, page_size=256, bytes_per_page_padded=512
+        )
+        allocator = SimpleNamespace(alloc=MagicMock(), free=MagicMock())
+        params = SimpleNamespace(
+            page_size=256,
+            mtp_draft_device_pools=(SimpleNamespace(swa_kv_pool=draft_swa),),
+            token_to_kv_pool_allocator=SimpleNamespace(swa_attn_allocator=allocator),
+            tp_cache_group=None,
+            attn_cp_cache_group=None,
+            attn_tp_cache_group=None,
+            pp_cache_group=None,
+        )
+        mappings = hybrid_pool_assembler._DeepSeekV4LayerMappings(
+            transfer_layer_id_max=2,
+            full={0: 0, 1: 1},
+            swa={},
+            c4={},
+            c128={},
+            c4_state={},
+            c4_state_global_layers=[],
+        )
+        with (
+            patch.object(hybrid_pool_assembler, "get_memory"),
+            patch.object(hybrid_pool_assembler, "_get_allocator_type"),
+            patch.object(
+                hybrid_pool_assembler,
+                "_deepseek_v4_num_host_pages",
+                return_value=(8, 4, 4),
+            ),
+            patch.object(hybrid_pool_assembler, "LogicalHostPool"),
+            patch.object(hybrid_pool_assembler, "DeepSeekV4PagedHostPool") as host,
+            patch.object(hybrid_pool_assembler, "build_pool_entry") as entry,
+            patch.object(hybrid_pool_assembler, "HostPoolGroup"),
+            patch.object(hybrid_pool_assembler, "HybridCacheController"),
+            patch.object(
+                hybrid_pool_assembler, "_dsv4_low_ratio_entries", return_value=[]
+            ),
+        ):
+            hybrid_pool_assembler.build_deepseek_v4_hicache_stack(
+                params=params,
+                kvcache=SimpleNamespace(swa_kv_pool=None, swa_page_size=256),
+                load_cache_event=None,
+                storage_backend=None,
+                layer_mappings=mappings,
+            )
+
+        host.assert_called_once()
+        self.assertEqual(host.call_args.kwargs["device_buffers"], draft_buffers)
+        self.assertEqual(host.call_args.kwargs["item_bytes"], 512)
+        swa_entry = next(
+            c.kwargs for c in entry.call_args_list if c.kwargs["name"] == PoolName.SWA
+        )
+        self.assertEqual(swa_entry["layer_mapping"], {2: 0, 3: 1})
+        self.assertEqual(swa_entry["transfer_layer_id_max"], 4)
+        self.assertEqual(swa_entry["packed_draft_device_pools"], tuple(draft_buffers))
+
     def test_split_physical_rows_are_rejected_for_hicache_consumers(self):
         with self.assertRaisesRegex(ValueError, "direct SWA KV layout"):
             _require_single_row_dsv4_swa_pages(
