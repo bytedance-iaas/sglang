@@ -140,6 +140,44 @@ class StorageTests(unittest.TestCase):
         self.assertTrue(torch.equal(component.buffer, expected))
         self.assertEqual(store.batch_exists_v2(keys, [transfer]).kv_hit_pages, 3)
 
+    @unittest.skipUnless(os.getenv("HF3FS_TEST_DIRECTORY"), "real native binding required")
+    def test_aligned_c2_component_and_legacy_isolation(self):
+        store, _ = self.backend(page_bytes=0, aligned_slot_page_sizes=[224640])
+        pool = Pool(224640)
+        pool.buffer[:3] = torch.arange(3).reshape(-1, 1) + 47
+        expected = pool.buffer.clone()
+        store.register_mem_host_pool_v2(pool, PoolName.SWA)
+        ctx = store._pool_storage_ctx[PoolName.SWA]
+        self.assertIn("slot256-4k-v1-p224640", ctx.namespace)
+        self.assertEqual(ctx.bytes_per_page, 224640)
+        keys, indices = ["c0", "c1", "c2"], torch.arange(6)
+        transfer = PoolTransfer(PoolName.SWA, host_indices=indices, keys=keys)
+        self.assertEqual(store.batch_set_v1(keys, indices), [True] * 3)
+        self.assertEqual(store.batch_set_v2([transfer])[PoolName.SWA], [True] * 3)
+        pool.buffer.zero_()
+        self.assertEqual(store.batch_get_v2([transfer])[PoolName.SWA], [True] * 3)
+        self.assertTrue(torch.equal(pool.buffer, expected))
+        self.assertEqual(store.batch_exists_v2(keys, [transfer]).kv_hit_pages, 3)
+        # Disabling the option reopens the legacy layout and its separate index.
+        old_path = Path(f"{store.file_path}.{PoolName.SWA}")
+        self.assertFalse(old_path.exists())
+        store.aligned_slot_page_sizes = frozenset()
+        for client in ctx.clients:
+            client.close()
+        store.register_mem_host_pool_v2(pool, PoolName.SWA)
+        self.assertEqual(store.batch_exists_v2(keys, [transfer]).kv_hit_pages, 0)
+        pool.buffer.fill_(81)
+        self.assertEqual(store.batch_set_v2([transfer])[PoolName.SWA], [True] * 3)
+        self.assertTrue(old_path.exists())
+        # Reopen the new format; neither old writes nor metadata overwrite it.
+        for client in store._pool_storage_ctx[PoolName.SWA].clients:
+            client.close()
+        store.aligned_slot_page_sizes = frozenset([224640])
+        store.register_mem_host_pool_v2(pool, PoolName.SWA)
+        pool.buffer.zero_()
+        self.assertEqual(store.batch_get_v2([transfer])[PoolName.SWA], [True] * 3)
+        self.assertTrue(torch.equal(pool.buffer, expected))
+
     def test_worker_failure_drains_siblings_before_return(self):
         store, _ = self.backend()
         entered, release, finished = (

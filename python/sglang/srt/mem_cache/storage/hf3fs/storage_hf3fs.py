@@ -148,6 +148,7 @@ def create_hf3fs_client(
     io_backend: str = "python",
     read_entries: Optional[int] = None,
     write_entries: Optional[int] = None,
+    aligned_slot: bool = False,
 ) -> Hf3fsClient:
     """Factory function to create appropriate HF3FS client.
 
@@ -162,6 +163,8 @@ def create_hf3fs_client(
     """
     read_entries = entries if read_entries is None else read_entries
     write_entries = entries if write_entries is None else write_entries
+    if aligned_slot and (use_mock or io_backend != "native"):
+        raise ValueError("Aligned slots require the real native HF3FS backend")
     if use_mock:
         from sglang.srt.mem_cache.storage.hf3fs.hf3fs_client import Hf3fsMockClient
 
@@ -175,7 +178,7 @@ def create_hf3fs_client(
         )
 
         return Hf3fsNativeClient(
-            path, size, bytes_per_page, read_entries, write_entries
+            path, size, bytes_per_page, read_entries, write_entries, aligned_slot=aligned_slot
         )
     else:
         from sglang.srt.mem_cache.storage.hf3fs.hf3fs_usrbio_client import (
@@ -222,6 +225,7 @@ class HiCacheHF3FS(HiCacheStorage):
         read_entries: Optional[int] = None,
         write_entries: Optional[int] = None,
         io_backend: str = "python",
+        aligned_slot_page_sizes: Optional[List[int]] = None,
     ):
         self._logical_anchor = bytes_per_page == 0
         bytes_per_page = bytes_per_page or 4096
@@ -243,6 +247,12 @@ class HiCacheHF3FS(HiCacheStorage):
             raise ValueError("HF3FS read_entries/write_entries must be in [1, 4096]")
         if io_backend not in ("python", "native"):
             raise ValueError(f"Unknown HF3FS io_backend: {io_backend}")
+        self.aligned_slot_page_sizes = frozenset(aligned_slot_page_sizes or [])
+        if self.aligned_slot_page_sizes and (
+            io_backend != "native" or use_mock_client
+            or any(type(n) is not int or not 0 < n <= 256 * 1024 for n in self.aligned_slot_page_sizes)
+        ):
+            raise ValueError("aligned_slot_page_sizes requires native IO and sizes in (0, 256 KiB]")
         self.io_backend = io_backend
         self.client_timeout = client_timeout
         self.dtype = dtype
@@ -417,6 +427,7 @@ class HiCacheHF3FS(HiCacheStorage):
             read_entries=config.get("read_entries"),
             write_entries=config.get("write_entries"),
             io_backend=config.get("io_backend", "python"),
+            aligned_slot_page_sizes=config.get("aligned_slot_page_sizes"),
         )
 
     def _run_io(self, clients, method, offsets, values, entries):
@@ -649,6 +660,11 @@ class HiCacheHF3FS(HiCacheStorage):
         pool_num_pages = self.file_size // pool_bytes_per_page
         pool_file_path = f"{self.file_path}.{host_pool_name}"
         namespace = host_pool_name  # e.g. PoolName.MAMBA, PoolName.INDEXER
+        aligned_slot = pool_bytes_per_page in self.aligned_slot_page_sizes
+        if aligned_slot:
+            # Existing packed-page metadata must never point into a new layout.
+            # Rollback selects the untouched old namespace; new keys miss safely.
+            namespace = f"{host_pool_name}:slot256-4k-v1-p{pool_bytes_per_page}"
 
         pool_clients = [
             create_hf3fs_client(
@@ -661,6 +677,7 @@ class HiCacheHF3FS(HiCacheStorage):
                 io_backend=self.io_backend,
                 read_entries=self.read_entries,
                 write_entries=self.write_entries,
+                aligned_slot=aligned_slot,
             )
             for _ in range(self.numjobs)
         ]

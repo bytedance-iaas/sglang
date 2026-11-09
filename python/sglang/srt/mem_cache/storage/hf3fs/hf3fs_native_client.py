@@ -10,7 +10,7 @@ from sglang.srt.mem_cache.storage.hf3fs.hf3fs_client import Hf3fsClient
 
 
 class Hf3fsNativeClient(Hf3fsClient):
-    def __init__(self, path, size, bytes_per_page, read_entries, write_entries):
+    def __init__(self, path, size, bytes_per_page, read_entries, write_entries, *, aligned_slot=False):
         try:
             from hf3fs_py_batch import Batch, Buffers
         except ImportError as exc:
@@ -22,9 +22,24 @@ class Hf3fsNativeClient(Hf3fsClient):
         self._buffers = Buffers
         self.size = size
         self.bytes_per_page = bytes_per_page
-        self.reader = Batch(path, size, bytes_per_page, read_entries, True)
+        self.aligned_slot = aligned_slot
+        self.slot_stride = bytes_per_page
+        io_bytes = bytes_per_page
+        physical_size = size
+        payload_args = ()
+        if aligned_slot:
+            if not 0 < bytes_per_page <= 256 * 1024 or size < bytes_per_page:
+                raise ValueError("Aligned slots require full pages of at most 256 KiB")
+            self.slot_stride = 256 * 1024
+            io_bytes = (bytes_per_page + 4095) // 4096 * 4096
+            physical_size = (size // bytes_per_page) * self.slot_stride
+            # Separate files and metadata namespaces are both required. This
+            # suffix also encodes geometry so legacy files are never repacked.
+            path += f".slot256-4k-v1-p{bytes_per_page}"
+            payload_args = (bytes_per_page,)
+        self.reader = Batch(path, physical_size, io_bytes, read_entries, True, *payload_args)
         try:
-            self.writer = Batch(path, size, bytes_per_page, write_entries, False)
+            self.writer = Batch(path, physical_size, io_bytes, write_entries, False, *payload_args)
         except BaseException:
             self.reader.close()
             raise
@@ -42,6 +57,8 @@ class Hf3fsNativeClient(Hf3fsClient):
                 or not 0 <= offset <= self.size - size
             ):
                 raise ValueError("HF3FS page is outside the file or staging buffer")
+            if self.aligned_slot and (offset % self.bytes_per_page or size != self.bytes_per_page):
+                raise ValueError("Aligned slots require complete, page-aligned logical pages")
 
     def _io(self, ring, offsets, tensors):
         self.check(offsets, tensors)
@@ -49,6 +66,8 @@ class Hf3fsNativeClient(Hf3fsClient):
         buffers = self._buffers(
             [tensor.detach().view(torch.uint8).numpy() for tensor in tensors]
         )
+        if self.aligned_slot:
+            offsets = [offset // self.bytes_per_page * self.slot_stride for offset in offsets]
         return ring.io(offsets, buffers)
 
     def batch_read(self, offsets, tensors):
