@@ -826,7 +826,9 @@ class DsparkStepObservers:
         self._sts_collect_path = envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
         if self._sts_collect_path:
             if envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get():
-                raise ValueError("STS collection requires SGLANG_DSPARK_FOLDED_PROPOSAL=0")
+                raise ValueError(
+                    "STS collection requires SGLANG_DSPARK_FOLDED_PROPOSAL=0"
+                )
             if self._simulate_acc_len > 0:
                 raise ValueError("STS collection requires real acceptance labels")
             self._sts_collect_path += f".rank{tp_rank}"
@@ -910,7 +912,9 @@ class DsparkStepObservers:
         planner = self._planner
         if not proposal_folded:
             self._maybe_record_sts_collect(
-                reqs=reqs, correct_len=correct_len, layout=layout,
+                reqs=reqs,
+                correct_len=correct_len,
+                layout=layout,
                 prefix_lens=prefix_lens,
             )
             self._confidence_probe.maybe_observe(
@@ -1001,7 +1005,12 @@ class DsparkStepObservers:
             )
 
     def _maybe_record_sts_collect(
-        self, *, reqs, correct_len, layout, prefix_lens,
+        self,
+        *,
+        reqs,
+        correct_len,
+        layout,
+        prefix_lens,
     ) -> None:
         if not self._sts_collect_path or not self._planner.carries_confidence:
             return

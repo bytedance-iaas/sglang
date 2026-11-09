@@ -38,7 +38,9 @@ class TestCompensation(CustomTestCase):
                 return_value=types.SimpleNamespace(disable_overlap_schedule=True),
             ),
             patch.object(dspark_planner, "build_sps_cost_table"),
-            patch.object(dspark_planner, "is_uninitialized_sps_table", return_value=False),
+            patch.object(
+                dspark_planner, "is_uninitialized_sps_table", return_value=False
+            ),
             patch.object(dspark_planner, "HostConfidenceBudgetPlanner"),
             patch.object(dspark_planner, "is_dp_attention_enabled", return_value=False),
         ):

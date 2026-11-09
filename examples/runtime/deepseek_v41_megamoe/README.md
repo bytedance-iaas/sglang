@@ -197,6 +197,49 @@ counterfactual, not a replay of the output trajectory without compensation.
 Detailed recording performs extra copies and an extra top-k with compensation;
 use `core,step_cpu_time` only for performance measurements.
 
+### Follow-up comparison (2026-11-09)
+
+Two mirrored-order repetitions compared six configurations on two eight-H20
+hosts with the 1017 checkpoint, B6, attention-DP8 decode, the same cost table,
+and graph-tier fill. Each run used 1,024 requests at concurrency 256 with about
+16.7K input tokens and exactly 1,024 output tokens. The generated workload used
+one shared prefix (seed 42), with a 99.5% prefix-cache hit rate. Each decode
+process was restarted; only the shared prefix was warmed before measurement.
+Core and CPU-step diagnostics were enabled, but detailed request recording was
+disabled. All 12,288 requests succeeded.
+
+| Configuration | Output tokens/s | Request P99 TPOT (ms) | Token P99 ITL (ms) |
+|---|---:|---:|---:|
+| Static | 15,756.54 | 25.16 | 40.32 |
+| Compact | 16,373.17 | 17.95 | 38.06 |
+| Compact + compensation 0.25 | 14,299.58 | 18.93 | 37.02 |
+| Compact + compensation 0.5 | 15,794.08 | 17.70 | 36.04 |
+| Compact + STS | 15,800.03 | 19.50 | 39.60 |
+| Compact + STS + compensation 0.25 | 15,534.75 | 20.87 | 41.37 |
+
+These are arithmetic means of two runs, including run-level P99s, not pooled
+P99s or statistical significance claims. Compact improved mean throughput by
+3.91% and request P99 TPOT by 28.68% against the same-version static control.
+The compensation-0.25 second run had a large first-token delay with a prefill
+bootstrap backlog and decode transfer waits; the exact cause remains unresolved,
+so its full throughput deficit cannot be attributed to compensation. The run
+was retained rather than replaced with a selected rerun.
+
+Neither STS nor compensation improved both throughput and request P99 in these
+means; keep both disabled by default. STS reduced request-held-out calibration
+ECE, but training and holdout requests shared one long prefix. This does not
+establish cross-prefix generalization or a serving-speed improvement. All
+recorded final single-request compact steps already used the full width of
+seven; tail differences primarily appeared in the number of remaining steps.
+Core records cannot separate remaining output work from actual rejection rates.
+
+Stable eight-step windows in the dominant 224-token graph bucket had cost-table
+overestimation of 2.68% and 1.49% in the two compact runs. Smaller buckets had
+too few stable windows to justify replacing the table. CPU step intervals
+include host scheduling and overlap effects and are not GPU-event timings.
+These synthetic results and functional generation checks do not replace a
+representative workload benchmark or a full model-accuracy evaluation.
+
 ## Optional ReduceScatter path
 
 For ordinary decode without DSPARK, remove all three `--speculative-*`

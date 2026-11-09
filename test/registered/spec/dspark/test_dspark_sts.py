@@ -141,13 +141,16 @@ class TestStsDataRecorder(CustomTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             stem = str(Path(tmp) / "sample")
             recorder = StsDataRecorder(path_stem=stem, gamma=2, flush_every=1)
-            recorder.record(confidence_raw=torch.tensor([[1., 2.], [3., 4.], [5., 6.]]),
-                            num_correct_drafts=torch.tensor([2, 0, 1]),
-                            verify_lens=torch.tensor([3, 1, 3]),
-                            rids=["a", "b", "c"], prefix_lens=torch.tensor([16000, 16001, 16002]))
+            recorder.record(
+                confidence_raw=torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]),
+                num_correct_drafts=torch.tensor([2, 0, 1]),
+                verify_lens=torch.tensor([3, 1, 3]),
+                rids=["a", "b", "c"],
+                prefix_lens=torch.tensor([16000, 16001, 16002]),
+            )
             shard = torch.load(f"{stem}.0.pt")
-            self.assertEqual(shard["logits"].tolist(), [[1., 2.], [5., 6.]])
-            self.assertEqual(shard["prefix_mask"].tolist(), [[1., 1.], [1., 0.]])
+            self.assertEqual(shard["logits"].tolist(), [[1.0, 2.0], [5.0, 6.0]])
+            self.assertEqual(shard["prefix_mask"].tolist(), [[1.0, 1.0], [1.0, 0.0]])
             self.assertEqual([m["rid"] for m in shard["metadata"]], ["a", "c"])
             self.assertEqual(shard["metadata"][1]["prefix_len"], 16002)
 
@@ -155,24 +158,34 @@ class TestStsDataRecorder(CustomTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             stem = str(Path(tmp) / "sample")
             recorder = StsDataRecorder(path_stem=stem, gamma=2, flush_every=10)
-            logits = torch.tensor([[1., 2.]])
+            logits = torch.tensor([[1.0, 2.0]])
             recorder.record(confidence_raw=logits, num_correct_drafts=torch.tensor([1]))
             logits.zero_()
             recorder.flush()
-            self.assertEqual(torch.load(f"{stem}.0.pt")["logits"].tolist(), [[1., 2.]])
-            recorder.record(confidence_raw=logits, num_correct_drafts=torch.tensor([0]),
-                            verify_lens=torch.tensor([1]))
+            self.assertEqual(
+                torch.load(f"{stem}.0.pt")["logits"].tolist(), [[1.0, 2.0]]
+            )
+            recorder.record(
+                confidence_raw=logits,
+                num_correct_drafts=torch.tensor([0]),
+                verify_lens=torch.tensor([1]),
+            )
             recorder.flush()
             self.assertFalse(Path(f"{stem}.1.pt").exists())
 
     def test_info_snapshot_flushes_pending_samples(self):
         from types import SimpleNamespace
-        from sglang.srt.speculative.dspark_components.dspark_observability import DsparkStepObservers
+        from sglang.srt.speculative.dspark_components.dspark_observability import (
+            DsparkStepObservers,
+        )
+
         with tempfile.TemporaryDirectory() as tmp:
             stem = str(Path(tmp) / "sample")
             recorder = StsDataRecorder(path_stem=stem, gamma=2, flush_every=100)
-            recorder.record(confidence_raw=torch.tensor([[1., 2.]]),
-                            num_correct_drafts=torch.tensor([1]))
+            recorder.record(
+                confidence_raw=torch.tensor([[1.0, 2.0]]),
+                num_correct_drafts=torch.tensor([1]),
+            )
             observer = DsparkStepObservers.__new__(DsparkStepObservers)
             observer._sts_recorder = recorder
             observer._info_dumper = SimpleNamespace(dump=lambda: None)

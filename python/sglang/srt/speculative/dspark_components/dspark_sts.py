@@ -47,15 +47,25 @@ class StsDataRecorder:
         self._metadata_buffer = []
 
     def record(
-        self, *, confidence_raw: torch.Tensor, num_correct_drafts: torch.Tensor,
-        rids=None, prefix_lens=None, verify_lens=None,
+        self,
+        *,
+        confidence_raw: torch.Tensor,
+        num_correct_drafts: torch.Tensor,
+        rids=None,
+        prefix_lens=None,
+        verify_lens=None,
     ) -> None:
         # Collection is diagnostic: synchronize here and reject censored rows.
         logits = confidence_raw.detach().to(device="cpu", dtype=torch.float32).clone()
-        counts = num_correct_drafts.detach().to(device="cpu", dtype=torch.int64).view(-1)
+        counts = (
+            num_correct_drafts.detach().to(device="cpu", dtype=torch.int64).view(-1)
+        )
         if logits.ndim != 2 or logits.shape != (counts.numel(), self.gamma):
             raise ValueError("STS logits/acceptance shape mismatch")
-        if not torch.isfinite(logits).all() or not ((counts >= 0) & (counts <= self.gamma)).all():
+        if (
+            not torch.isfinite(logits).all()
+            or not ((counts >= 0) & (counts <= self.gamma)).all()
+        ):
             raise ValueError("Invalid STS logits or acceptance counts")
         keep = torch.ones(counts.numel(), dtype=torch.bool)
         if verify_lens is not None:
@@ -71,8 +81,11 @@ class StsDataRecorder:
             contexts = prefix_lens.detach().cpu().view(-1).tolist()
             if len(contexts) != len(rids):
                 raise ValueError("STS prefix length shape mismatch")
-            metadata = [dict(rid=rid, prefix_len=int(ctx), local_bs=len(rids))
-                        for rid, ctx, valid in zip(rids, contexts, keep.tolist()) if valid]
+            metadata = [
+                dict(rid=rid, prefix_len=int(ctx), local_bs=len(rids))
+                for rid, ctx, valid in zip(rids, contexts, keep.tolist())
+                if valid
+            ]
         else:
             metadata = [None] * int(keep.sum())
         positions = torch.arange(self.gamma).view(1, -1)
