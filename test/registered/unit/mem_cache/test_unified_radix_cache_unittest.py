@@ -10748,6 +10748,77 @@ class TestReturnedValuesDrain(_InsertWalkSuite):
 class TestPrefetchCommitOrdering(CustomTestCase):
     """The prefetch commit's action ordering (mock-based)."""
 
+    def test_storage_hit_allocation_preserves_hybrid_boundary(self):
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+
+        for component, pool in (
+            (None, None),
+            (ComponentType.SWA, PoolName.SWA),
+            (ComponentType.MAMBA, PoolName.MAMBA),
+        ):
+            with self.subTest(component=component):
+                cache = mock.MagicMock()
+                cache.host_memory_mode = "cache"
+                cache.page_size = cache.prefetch_threshold = 2
+                cache.storage_prefetch_retries = StoragePrefetchRetries()
+                cache._alloc_prefetch_aux_staging.return_value = True
+                operation = SimpleNamespace(
+                    handle=CacheRequestHandle("host-shortfall", 0),
+                    storage_start=0,
+                    storage_hit_count=8,
+                    hash_value=[f"h{i}" for i in range(4)],
+                    host_indices=None,
+                    is_terminated=lambda: False,
+                )
+                cache.ongoing_prefetch = {
+                    operation.handle: _OngoingPrefetch(
+                        0,
+                        RadixKey(array("q", range(8))),
+                        None,
+                        operation,
+                        None,
+                        {}
+                        if component is None
+                        else {component: [PoolTransfer(name=pool)]},
+                    )
+                }
+                controller = cache.cache_controller
+                controller.page_size = 2
+                controller.mem_pool_host.available_size.return_value = 4
+                controller.alloc_prefetch_host_buffers.side_effect = (
+                    lambda operation, count: torch.arange(count) if count <= 4 else None
+                )
+                controller.allocate_storage_hit = (
+                    HybridCacheController.allocate_storage_hit.__get__(controller)
+                )
+                controller.prefetch_hit_queue.get.return_value = operation
+
+                UnifiedRadixCache._drain_storage_control_queues_impl(
+                    cache, 1, 0, 0, 0, None, False
+                )
+
+                if component is None:
+                    controller.prefetch_buffer.put.assert_called_once_with(operation)
+                    self.assertEqual(operation.storage_hit_count, 4)
+                    self.assertEqual(operation.hash_value, ["h0", "h1"])
+                    self.assertEqual(len(operation.host_indices), 4)
+                else:
+                    controller.prefetch_buffer.put.assert_not_called()
+                    self.assertEqual(operation.storage_hit_count, 8)
+                    self.assertEqual(operation.hash_value, [f"h{i}" for i in range(4)])
+                    self.assertIsNone(operation.host_indices)
+                    cache.revoke_pending_prefetch.assert_called_once_with(
+                        operation.handle
+                    )
+                    self.assertEqual(
+                        cache.storage_prefetch_retries._pending[
+                            operation.handle.rid
+                        ].storage_hit_end,
+                        8,
+                    )
+
     def test_prefetch_commit_applies_host_insert_actions_before_transfers(self):
         """The prefetch commit applies the host-insert walk's actions before
         commit_hicache_transfers, whose emissions ride a fresh list."""
