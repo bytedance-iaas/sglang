@@ -8,6 +8,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
+    model_config_of,
     resolving_view,
     use_mla_backend,
 )
@@ -53,6 +54,7 @@ def handle_hicache(server_args: Any):
         return
 
     validate_hicache_host_memory_mode(server_args)
+    _validate_hicache_swa_host_ratio(server_args)
 
     if cfg.disaggregation_decode_host_receive_threshold > 0:
         # The shared host pool must match KV transfer's per-layer buffers.
@@ -76,6 +78,36 @@ def handle_hicache(server_args: Any):
 
     # Step 3: DCP compatibility for the L2 (device<->host) path.
     resolve_hicache_dcp_compatibility(server_args)
+
+
+def _validate_hicache_swa_host_ratio(server_args: Any):
+    cfg = resolving_view(server_args)
+    ratio = cfg.hicache_swa_host_ratio
+    if ratio == 0:
+        return
+    if not 0 < ratio <= 1:
+        raise ValueError(f"--hicache-swa-host-ratio must be in (0, 1], got {ratio}.")
+    from sglang.srt.configs.hybrid_arch import mambaish_config
+
+    model_config = model_config_of(server_args)
+    if cfg.enable_unified_memory or mambaish_config(model_config) is not None:
+        raise ValueError(
+            "--hicache-swa-host-ratio is not supported with --enable-unified-memory "
+            "or on a hybrid linear-attention model."
+        )
+    if model_config.is_deepseek_v4_arch:
+        # DSV4's FULL tier is logical and has several compressed sidecars; it
+        # does not use the generic two-pool byte split.
+        if cfg.hicache_host_memory_fraction is not None:
+            raise ValueError(
+                "DeepSeek V4 --hicache-swa-host-ratio requires explicit "
+                "--hicache-ratio; the enlarged SWA tier adds host memory."
+            )
+    elif cfg.hicache_size <= 0:
+        raise ValueError(
+            "--hicache-swa-host-ratio splits --hicache-size, so it needs "
+            "--hicache-size > 0."
+        )
 
 
 def handle_hicache_ratio_default(server_args: Any):

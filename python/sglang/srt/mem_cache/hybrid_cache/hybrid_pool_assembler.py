@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
@@ -196,6 +197,51 @@ def _split_hicache_size(
         hicache_size * size_bytes / total_device_pool_size
         for size_bytes in device_pool_sizes
     )
+
+
+def _swa_host_shares(
+    hicache_size: int,
+    full_kv_pool: Any,
+    swa_kv_pool: Any,
+    swa_host_ratio: float,
+    *,
+    mtp_swa_device_pools: tuple[Any, ...] = (),
+) -> Optional[tuple[float, float]]:
+    """Split a fixed host budget using the requested SWA/full token ratio."""
+    if not swa_host_ratio > 0:
+        return None
+    if any(
+        getattr(pool, "host_capacity_bytes", None) is not None
+        for pool in (full_kv_pool, swa_kv_pool)
+    ):
+        return None
+    device_ratio = swa_kv_pool.size / full_kv_pool.size
+    if not swa_host_ratio > device_ratio:
+        return None
+
+    def per_token(pool: Any) -> float:
+        size_bytes = pool.get_kv_size_bytes()
+        if isinstance(size_bytes, tuple):
+            # Post-capture MHA may serve fewer rows than were allocated.
+            return sum(size_bytes) / pool.k_buffer[0].shape[0]
+        return size_bytes / (pool.size + pool.page_size)
+
+    full_bytes = per_token(full_kv_pool) * full_kv_pool.size
+    swa_bytes = (
+        (per_token(swa_kv_pool) + sum(per_token(p) for p in mtp_swa_device_pools))
+        * full_kv_pool.size
+        * swa_host_ratio
+    )
+    total = full_bytes + swa_bytes
+    logger.info(
+        "HiCache SWA host split: host ratio %.4f over device ratio %.4f; "
+        "%.1f%% full / %.1f%% SWA of --hicache-size",
+        swa_host_ratio,
+        device_ratio,
+        100 * full_bytes / total,
+        100 * swa_bytes / total,
+    )
+    return hicache_size * full_bytes / total, hicache_size * swa_bytes / total
 
 
 def build_pool_entry(
@@ -481,7 +527,14 @@ def build_hybrid_swa_stack(
     if memory.hicache_size > 0 and not _uses_unified_page_envelope_host(
         full_kv_pool, swa_kv_pool, use_mla, mtp_swa_device_pools
     ):
-        kv_host_size, swa_host_size = _split_hicache_size(
+        shares = _swa_host_shares(
+            memory.hicache_size,
+            full_kv_pool,
+            swa_kv_pool,
+            memory.hicache_swa_host_ratio,
+            mtp_swa_device_pools=mtp_swa_device_pools,
+        )
+        kv_host_size, swa_host_size = shares or _split_hicache_size(
             memory.hicache_size, (full_kv_pool, swa_kv_pool)
         )
 
@@ -555,6 +608,23 @@ def _deepseek_v4_num_host_pages(
     ratio = get_memory().hicache_ratio
     full_host_pages = int(device_full_pages * ratio)
     swa_host_pages = int(device_swa_pages * ratio)
+
+    host_ratio = get_memory().hicache_swa_host_ratio
+    if host_ratio > kvcache.swa_size / device_full_size:
+        # DSV4 has logical FULL anchors, not a single full-KV byte pool. Keep
+        # their capacity (and PP agreement) while growing only SWA-indexed pools.
+        # The stack also sizes packed draft SWA and C4 state from this count.
+        swa_host_pages = max(
+            swa_host_pages,
+            math.ceil(full_host_pages * page_size * host_ratio / swa_page_size),
+        )
+        logger.info(
+            "DeepSeek V4 HiCache host ratio %.4f: FULL %d pages, SWA %d pages; "
+            "SWA and its state/draft mirrors require additional host RAM.",
+            host_ratio,
+            full_host_pages,
+            swa_host_pages,
+        )
 
     # NPU sizes the independent C128 host pool from its device page count.
     # For example, host pages = device pages * hicache_ratio.

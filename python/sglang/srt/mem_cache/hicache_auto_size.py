@@ -83,13 +83,26 @@ def _estimate_hicache_bytes(
 def auto_size_hicache(
     params: CacheInitParams, draft_plan: HiCacheDraftPlan | None, *, enabled: bool
 ):
-    """Reduce the default HiCache ratio until this machine's host pools fit.
+    """Budget all target/draft host pools against one pre-allocation snapshot.
 
     Resolution nulls the fraction for an explicit --hicache-ratio/--hicache-size.
     """
     fraction = get_memory().hicache_host_memory_fraction
-    if not enabled or fraction is None:
+    if not enabled:
         yield
+        return
+    if fraction is None:
+        # Explicit sizing still needs one snapshot: otherwise an early rank's
+        # pinned pools shrink the RAM a slower rank samples for the same pools.
+        # PP stages can own different pool counts, so synchronize once here.
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier(group=get_parallel().world_group.cpu_group)
+        budget = max(host_memory_budget_bytes(), 0)
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier(group=get_parallel().world_group.cpu_group)
+        logger.info("HiCache host budget snapshot: %.2f GB per rank.", budget / 1e9)
+        with host_memory_budget_scope(budget):
+            yield
         return
     requested = get_memory().hicache_ratio
     device_bytes = _estimate_hicache_bytes(params, draft_plan)
