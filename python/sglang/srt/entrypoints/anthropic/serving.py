@@ -577,6 +577,15 @@ class AnthropicServing:
         chat_request = ChatCompletionRequest(**request_data)
 
         if anthropic_request.thinking is not None:
+            # The protocol layer already enforces SDK shape:
+            #   enabled  -> budget_tokens required (>=1024), display optional
+            #   disabled -> neither budget_tokens nor display allowed
+            #   adaptive -> budget_tokens forbidden, display optional
+            # So by the time we get here ``budget_tokens`` can only be
+            # set on ``enabled``. The local backend has no equivalent
+            # hard-cap knob, so we log a WARNING instead of rejecting —
+            # the Anthropic SDK would have accepted the request and we
+            # mirror that. Operators see the unenforced budget in logs.
             if anthropic_request.thinking.budget_tokens is not None:
                 logger.warning(
                     "Anthropic thinking.budget_tokens=%d is accepted for "
@@ -584,15 +593,19 @@ class AnthropicServing:
                     "equivalent hard-cap knob — the budget is not enforced",
                     anthropic_request.thinking.budget_tokens,
                 )
-            # The backend has no adaptive throttle, so ``adaptive`` runs as ``enabled``.
+            # Claude 4.7's ``adaptive`` is treated identically to ``enabled``
+            # because the local backend has no auto-throttle equivalent.
+            # Anything other than ``disabled`` enables reasoning.
             enabled = anthropic_request.thinking.type != "disabled"
-            display = anthropic_request.thinking.display
-            if display in ("omitted", "updates"):
+            if anthropic_request.thinking.display == "omitted":
+                # Anthropic 4.7 spec: keep reasoning ON but hide reasoning
+                # text from the client. The OpenAI streaming pipeline has
+                # no equivalent suppress knob — log so operators can see
+                # the request, then proceed with normal reasoning emission.
                 logger.warning(
-                    "Anthropic thinking.display=%r is accepted for "
+                    "Anthropic thinking.display='omitted' is accepted for "
                     "SDK compatibility but reasoning text will still be "
-                    "emitted to the client",
-                    display,
+                    "emitted to the client"
                 )
             self.openai_serving_chat.apply_reasoning_enabled(chat_request, enabled)
 
