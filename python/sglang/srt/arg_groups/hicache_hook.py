@@ -95,15 +95,7 @@ def _validate_hicache_swa_host_ratio(server_args: Any):
             "--hicache-swa-host-ratio is not supported with --enable-unified-memory "
             "or on a hybrid linear-attention model."
         )
-    if model_config.is_deepseek_v4_arch:
-        # DSV4's FULL tier is logical and has several compressed sidecars; it
-        # does not use the generic two-pool byte split.
-        if cfg.hicache_host_memory_fraction is not None:
-            raise ValueError(
-                "DeepSeek V4 --hicache-swa-host-ratio requires explicit "
-                "--hicache-ratio; the enlarged SWA tier adds host memory."
-            )
-    elif cfg.hicache_size <= 0:
+    if not model_config.is_deepseek_v4_arch and cfg.hicache_size <= 0:
         raise ValueError(
             "--hicache-swa-host-ratio splits --hicache-size, so it needs "
             "--hicache-size > 0."

@@ -10,6 +10,8 @@ from sglang.srt.arg_groups import hicache_hook
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.mem_cache import hicache_auto_size as sizing
 from sglang.srt.mem_cache import kv_cache_configurator as configurator
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.memory_pool_host import (
@@ -515,8 +517,40 @@ def test_cli_and_dsv4_ratio_mode():
         hicache_hook.handle_hicache(args)
         assert resolution_result(args, "hicache_ratio") == 5
         assert resolution_result(args, "hicache_host_memory_fraction") is None
-        with pytest.raises(ValueError, match="requires explicit --hicache-ratio"):
-            hicache_hook.handle_hicache(_ratio_args(hicache_swa_host_ratio=0.2))
+
+
+@pytest.mark.parametrize("host_ratio", [0, 0.2])
+def test_dsv4_auto_size_uses_existing_pool_boundary(host_ratio):
+    args = _ratio_args(hicache_swa_host_ratio=host_ratio)
+    with (
+        patch.object(
+            hicache_hook,
+            "model_config_of",
+            return_value=SimpleNamespace(is_deepseek_v4_arch=True),
+        ),
+        patch("sglang.srt.configs.hybrid_arch.mambaish_config", return_value=None),
+    ):
+        hicache_hook.handle_hicache(args)
+    fraction = resolution_result(args, "hicache_host_memory_fraction")
+    assert fraction == 0.8
+    # The existing estimator rejects the actual DSV4 pool type before reading
+    # its buffers, so no device allocation or replacement estimator is needed.
+    pool = object.__new__(DeepSeekV4TokenToKVPool)
+    params = CacheInitParams(
+        disable=False,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=Mock(get_kvcache=Mock(return_value=pool)),
+        page_size=256,
+    )
+    with get_context().override_server_args(
+        hicache_swa_host_ratio=host_ratio, hicache_host_memory_fraction=fraction
+    ):
+        with pytest.raises(
+            ValueError,
+            match="HiCache auto-sizing does not support DeepSeekV4TokenToKVPool",
+        ):
+            with sizing.auto_size_hicache(params, None, enabled=True):
+                pytest.fail("unsupported DSV4 auto-sizing reached host allocation")
 
 
 def test_runtime_memory_bag_carries_new_flag_without_resizing_device_ratio():
