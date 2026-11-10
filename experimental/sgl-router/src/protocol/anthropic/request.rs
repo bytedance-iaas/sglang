@@ -184,9 +184,9 @@ fn thinking_enabled(thinking: &Value) -> Result<bool, String> {
     let budget = field("budget_tokens");
     let display = field("display");
     if let Some(d) = display {
-        if !matches!(d.as_str(), Some("summarized" | "omitted")) {
+        if !matches!(d.as_str(), Some("summarized" | "omitted" | "updates")) {
             return Err(format!(
-                "thinking.display: expected summarized or omitted, got {d}"
+                "thinking.display: expected summarized, omitted or updates, got {d}"
             ));
         }
     }
@@ -944,6 +944,12 @@ mod tests {
             with(json!({"type": "adaptive", "display": "omitted"})),
             Ok(json!(true))
         );
+        for thinking in [
+            json!({"type": "adaptive", "display": "updates"}),
+            json!({"type": "enabled", "budget_tokens": 1024, "display": "updates"}),
+        ] {
+            assert_eq!(with(thinking), Ok(json!(true)));
+        }
         assert_eq!(with(json!({"type": "disabled"})), Ok(json!(false)));
         for (thinking, needle) in [
             (json!({"type": "enabled"}), "required"),
@@ -954,6 +960,10 @@ mod tests {
             ),
             (
                 json!({"type": "disabled", "display": "summarized"}),
+                "not allowed",
+            ),
+            (
+                json!({"type": "disabled", "display": "updates"}),
                 "not allowed",
             ),
             (

@@ -138,6 +138,35 @@ async fn buffered_message() {
 }
 
 #[tokio::test]
+async fn claude_code_thinking_updates_reaches_the_worker() {
+    let mock = MockWorker::start(vec![]).await;
+    let (status, _, body) = post(
+        build_ctx(mock.url.clone()),
+        "/v1/messages?beta=true",
+        json!({"model": MODEL, "max_tokens": 512,
+               "messages": [{"role": "user", "content": "reply OK"}],
+               "thinking": {"type": "adaptive", "display": "updates"},
+               "output_config": {"effort": "high"},
+               "context_management": {
+                   "edits": [{"type": "clear_thinking_20251015", "keep": "all"}]
+               },
+               "metadata": {"user_id": "session"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let message: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(message["type"], "message");
+    assert_eq!(message["content"], json!([{"type": "text", "text": "ok"}]));
+
+    let sent = captured(&mock).unwrap();
+    assert_eq!(
+        sent["chat_template_kwargs"],
+        json!({"thinking": true, "enable_thinking": true})
+    );
+    assert_eq!(sent["reasoning_effort"], "high");
+}
+
+#[tokio::test]
 async fn streaming_event_sequence() {
     let mock = MockWorker::start(vec![
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n",

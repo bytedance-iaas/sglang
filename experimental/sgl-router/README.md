@@ -558,6 +558,10 @@ engine's own `/v1/messages` also adapts it per reasoning parser (for example
 `reasoning_effort` for Hunyuan), which the router cannot see; on such models
 use `output_config.effort` or `chat_template_kwargs` directly.
 
+`thinking.display` accepts `summarized`, `omitted` and `updates`, including
+Claude Code's beta requests. As with the engine adapter, `omitted` and `updates`
+do not suppress reasoning text; the chat backend still emits it normally.
+
 ## DeepSeek V4
 
 Native V4 rendering comes from `rust/sglang-processor`, shared with SGLang's Rust
