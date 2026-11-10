@@ -12,6 +12,7 @@ import sglang.srt.models.deepseek_v4 as deepseek_v4
 from sglang.srt.environ import envs
 from sglang.srt.layers.engram import EngramEmbedding, EngramHasher
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -176,6 +177,7 @@ class TestDeepseekV4EngramPrefetch(CustomTestCase):
             hidden = hidden[1::2]
         main_stream = Mock()
         with (
+            get_parallel().override(tp_group=SimpleNamespace(torch_symm_mem_comm=None)),
             patch.object(deepseek_v4, "is_cp_active", return_value=cp),
             patch.object(
                 deepseek_v4,

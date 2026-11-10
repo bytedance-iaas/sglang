@@ -235,6 +235,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         self.tp_size = get_parallel().tp_size
         self.pp_group = get_parallel().pp_group
         self.quant_config = quant_config
+        self.capture_aux_hidden_states = False
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
         self.determine_num_fused_shared_experts()
 
