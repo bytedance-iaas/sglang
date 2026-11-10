@@ -59,7 +59,7 @@ class TestLateLayerRows(CustomTestCase):
             torch.cat(
                 (
                     torch.full((128,), 172, dtype=torch.int32),
-                    torch.full((50,), 30, dtype=torch.int32),
+                    torch.full((50,), 0, dtype=torch.int32),
                 )
             ),
         )
