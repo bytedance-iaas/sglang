@@ -3,7 +3,7 @@ import json
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede imports that may pull in sgl_kernel
 
@@ -142,7 +142,7 @@ async def _collect_anthropic_events(serving, anthropic_request):
     return events
 
 
-class TestAnthropicServing(unittest.TestCase):
+class TestAnthropicServing(CustomTestCase):
     # Renders system at any position (GLM/Kimi/Qwen3) → can pass through.
     INLINE_SYSTEM_TEMPLATE = (
         "{%- for message in messages %}"
