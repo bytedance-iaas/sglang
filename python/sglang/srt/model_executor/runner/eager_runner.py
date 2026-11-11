@@ -429,17 +429,15 @@ class EagerRunner(BaseRunner):
                 forward_batch,
                 **model_kwargs,
             )
+        # Intermediate PP stages return PPProxyTensors with packed auxiliary
+        # state, not the last stage's (hidden, aux) output tuple.
+        if not model.pp_group.is_last_rank:
+            return hidden_states
+
         capture_aux_hidden_states = getattr(model, "capture_aux_hidden_states", False)
         aux_hidden_states = None
         if capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
-
-        if not model.pp_group.is_last_rank:
-            return (
-                (hidden_states, aux_hidden_states)
-                if capture_aux_hidden_states
-                else hidden_states
-            )
 
         tail = None
         if aux_hidden_states is not None:

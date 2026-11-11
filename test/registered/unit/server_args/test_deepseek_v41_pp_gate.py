@@ -96,6 +96,24 @@ class TestDeepSeekV41PPGate(unittest.TestCase):
                             )
                         )
 
+    def test_pp2_cp4_decoder_replay_still_rejects_prefill_graphs(self):
+        cfg = _config(
+            pp_size=2,
+            tp_size=4,
+            attn_cp_size=4,
+            enable_prefill_cp=True,
+            enable_hierarchical_cache=True,
+            disable_radix_cache=False,
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(
+                    backend=Backend.BREAKABLE,
+                    max_seq_len=16384,
+                )
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "prefill CUDA graph"):
+            _validate(cfg)
+
     def test_execution_options_do_not_restrict_pp_deployment(self):
         self.assertFalse(
             _validate(

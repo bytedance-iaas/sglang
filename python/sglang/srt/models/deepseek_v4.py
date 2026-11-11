@@ -5016,16 +5016,6 @@ class DeepseekV4Model(nn.Module):
                 tail=tail, rows=pre_hc_head, num_tokens=num_tokens
             )
 
-        if tail is not None and not capture_dspark:
-            # The logits processor indexes rows by the full extend layout.
-            num_tokens = input_ids.shape[0]
-            hidden_states = _scatter_tail_rows(
-                tail=tail, rows=hidden_states, num_tokens=num_tokens
-            )
-            pre_hc_head = _scatter_tail_rows(
-                tail=tail, rows=pre_hc_head, num_tokens=num_tokens
-            )
-
         if capture_dspark:
             return (hidden_states, pre_hc_head), dspark_aux_hidden_states
 
