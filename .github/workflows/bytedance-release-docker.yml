@@ -99,6 +99,7 @@ jobs:
       tag_value: ${{ needs.resolve-volcengine-release.outputs.internal-version }}
       use_environment: prod
       extra_build_args: >-
+        --build-arg EIC_SDK_IMAGE=iaas-gpu-cn-beijing.cr.volces.com/serving/sglang@sha256:7fcf0c14f1a81df692615bf33d6a37be401e81588cec2164f895eb6b61207605
         --build-arg HTTP_PROXY=http://100.68.162.211:3128
         --build-arg HTTPS_PROXY=http://100.68.162.211:3128
         --build-arg ALL_PROXY=http://100.68.162.211:3128
