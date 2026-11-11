@@ -1,4 +1,5 @@
 ARG CUDA_VERSION=13.0.3
+ARG EIC_SDK_IMAGE=eic_sdk_download
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
 
 ARG TARGETARCH
@@ -163,13 +164,25 @@ ENV LANG=en_US.UTF-8 \
     LANGUAGE=en_US:en \
     LC_ALL=en_US.UTF-8
 
+# Keep the SDK in its own stage so private builds can reuse a known image
+# while the upstream EIC wheel endpoint is unavailable.
+FROM base AS eic_sdk_download
+
+ARG EIC_SDK_VERSION
+ARG EIC_SDK_RELEASE_ROOT
+RUN retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; } \
+    && retry python3 -m pip install --force-reinstall \
+        "${EIC_SDK_RELEASE_ROOT}/eic-${EIC_SDK_VERSION}-py3-none-any.whl" \
+        --no-cache-dir
+
+FROM ${EIC_SDK_IMAGE} AS eic_sdk
+
 # Lightweight private-delivery dependency smoke target. This intentionally
 # stops before the full SGLang framework build so CI can validate the private
 # apt repository and EIC SDK within the runner time limit.
 FROM base AS private_dependency_smoke
 
 ARG EIC_SDK_VERSION
-ARG EIC_SDK_RELEASE_ROOT
 ARG BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=http://mirrors.ivolces.com/extra-tools/ubuntu
 ARG BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system
 
@@ -184,11 +197,9 @@ RUN VERSION_CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME}")" \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-RUN retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; } \
-    && retry python3 -m pip install --force-reinstall \
-        "${EIC_SDK_RELEASE_ROOT}/eic-${EIC_SDK_VERSION}-py3-none-any.whl" \
-        --no-cache-dir \
-    && command -v oniond \
+COPY --from=eic_sdk /opt/sglang/lib/python3.12/site-packages/eic /opt/sglang/lib/python3.12/site-packages/eic
+COPY --from=eic_sdk /opt/sglang/lib/python3.12/site-packages/eic-${EIC_SDK_VERSION}.dist-info /opt/sglang/lib/python3.12/site-packages/eic-${EIC_SDK_VERSION}.dist-info
+RUN command -v oniond \
     && python3 -c 'import eic; print(f"eic-module={eic.__file__}")'
 
 ########################################################
@@ -539,7 +550,6 @@ ARG GITHUB_ARTIFACTORY
 ARG MOONCAKE_VERSION
 ARG MSCCLPP_VERSION
 ARG EIC_SDK_VERSION
-ARG EIC_SDK_RELEASE_ROOT
 ARG INSTALL_AI_DYNAMO
 ARG INSTALL_IAAS_KERNELS
 # Renamed from NCCL_VERSION: the nvidia/cuda base image sets ENV NCCL_VERSION
@@ -696,12 +706,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     tabulate \
     termplotlib
 
-# Install the EIC SDK required by the EIC HiCache backend. framework_final
+# Include the EIC SDK required by the EIC HiCache backend. framework_final
 # inherits it directly, and runtime copies framework_final's site-packages.
-RUN retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "attempt $i failed; sleeping 15s"; sleep 15; done; return 1; } \
-    && retry python3 -m pip install --force-reinstall \
-    "${EIC_SDK_RELEASE_ROOT}/eic-${EIC_SDK_VERSION}-py3-none-any.whl" \
-    --no-cache-dir
+COPY --from=eic_sdk /opt/sglang/lib/python3.12/site-packages/eic /opt/sglang/lib/python3.12/site-packages/eic
+COPY --from=eic_sdk /opt/sglang/lib/python3.12/site-packages/eic-${EIC_SDK_VERSION}.dist-info /opt/sglang/lib/python3.12/site-packages/eic-${EIC_SDK_VERSION}.dist-info
 
 # PyTorch 2.13 requires nvidia-nccl-cu13==2.29.7, so keep that version while
 # resolving dependencies and generating constraints.txt. DeepEP needs 2.30.7

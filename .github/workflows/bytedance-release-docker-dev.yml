@@ -331,9 +331,11 @@ jobs:
       artifact_run_id: ${{ inputs.kernel_artifact_run_id }}
       kernel_tos_uri: ${{ inputs.kernel_artifact_run_id == '' && needs.build-dev-kernel-wheel.outputs.kernel_tos_uri || '' }}
       kernel_wheel_sha256: ${{ inputs.kernel_artifact_run_id == '' && needs.build-dev-kernel-wheel.outputs.kernel_wheel_sha256 || '' }}
+      # The EIC 1.5.2 wheel endpoint returns 403; use the verified SDK-only image.
       extra_build_args: >-
         --build-arg BRANCH_TYPE=local
         --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
+        --build-arg EIC_SDK_IMAGE=iaas-gpu-cn-beijing.cr.volces.com/serving/sglang@sha256:7fcf0c14f1a81df692615bf33d6a37be401e81588cec2164f895eb6b61207605
         --build-arg INSTALL_LOCAL_SGL_KERNEL_WHEEL=${{ (inputs.kernel_artifact_run_id != '' || github.event_name == 'schedule' || inputs.compile_kernel) && '1' || '0' }}
         --build-arg HTTP_PROXY=http://100.68.162.211:3128
         --build-arg HTTPS_PROXY=http://100.68.162.211:3128
@@ -385,6 +387,7 @@ jobs:
       extra_build_args: >-
         --build-arg BRANCH_TYPE=local
         --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
+        --build-arg EIC_SDK_IMAGE=iaas-gpu-cn-beijing.cr.volces.com/serving/sglang@sha256:7fcf0c14f1a81df692615bf33d6a37be401e81588cec2164f895eb6b61207605
         --build-arg INSTALL_LOCAL_SGL_KERNEL_WHEEL=${{ (inputs.kernel_artifact_run_id != '' || github.event_name == 'schedule' || inputs.compile_kernel) && '1' || '0' }}
         --build-arg HTTP_PROXY=http://100.68.162.211:3128
         --build-arg HTTPS_PROXY=http://100.68.162.211:3128
@@ -414,6 +417,7 @@ jobs:
       extra_build_args: >-
         --build-arg BRANCH_TYPE=local
         --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
+        --build-arg EIC_SDK_IMAGE=iaas-gpu-cn-beijing.cr.volces.com/serving/sglang@sha256:7fcf0c14f1a81df692615bf33d6a37be401e81588cec2164f895eb6b61207605
         --build-arg INSTALL_LOCAL_SGL_KERNEL_WHEEL=0
         --build-arg INSTALL_AI_DYNAMO=0
         --build-arg HTTP_PROXY=http://100.68.162.211:3128
