@@ -2109,6 +2109,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--hicache-swa-host-ratio`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Host SWA/full token ratio. <code>0</code> preserves the stock device-proportional split. Values in (0, 1] above the realized device ratio enlarge host SWA without changing GPU pools. Generic full + SWA models require <code>--hicache-size</code> and redistribute that fixed budget. DeepSeek V4 requires explicit <code>--hicache-ratio</code>: FULL capacity stays fixed, while SWA, packed draft SWA and SWA-indexed state use additional host RAM; <code>--hicache-size</code> remains unsupported for V4. Not supported with <code>--enable-unified-memory</code> or hybrid linear attention.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0.0`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: float</td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--hicache-write-policy`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The write policy of hierarchical cache.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`write_through`</td>
