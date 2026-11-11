@@ -1584,8 +1584,7 @@ class DeepseekV4AttnBackend(
     def _build_late_layer_tail_metadata(
         self, forward_batch: ForwardBatch
     ) -> DSV4Metadata:
-        # Each request contributes only its last SWA_WINDOW extend tokens, with the
-        # window floored at the tail start: window KV before it is never written here.
+        # Short extends also read late-layer SWA written by earlier chunks.
         extend_lens_cpu = forward_batch.extend_seq_lens_cpu
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert extend_lens_cpu is not None and seq_lens_cpu is not None
