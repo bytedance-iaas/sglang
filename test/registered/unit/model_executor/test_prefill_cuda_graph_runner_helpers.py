@@ -52,6 +52,28 @@ def _make_pp_buffers_and_registry():
 
 
 class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
+    def test_qwen4_varlen_prefill_dispatch_contract(self):
+        from sglang.srt.models import qwen4_exp
+
+        args = (object(),) * 7
+        with (
+            patch.object(
+                qwen4_exp.envs.SGLANG_ENABLE_QWEN4_PLE_FUSION,
+                "get",
+                return_value=True,
+            ),
+            patch.object(qwen4_exp, "is_cuda", return_value=True),
+            patch(
+                "sglang.kernels.ops.mamba.qwen4_short_conv.can_fuse_qwen4_varlen_conv",
+                return_value=True,
+            ),
+        ):
+            self.assertTrue(
+                qwen4_exp._use_qwen4_varlen_prefill(
+                    ForwardMode.EXTEND, object(), *args
+                )
+            )
+
     def test_pp_proxy_stable_buffers_accept_full_and_hidden_only_contracts(self):
         buffers, registry = _make_pp_buffers_and_registry()
         full_proxy = PPProxyTensors(

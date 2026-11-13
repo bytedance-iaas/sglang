@@ -114,3 +114,13 @@ for _mod, _fn in [
         )
     )
 del _mod, _fn
+
+
+register_kernel(
+    KernelSpec(
+        op="mamba.fused_qwen4_varlen_conv",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.mamba.qwen4_short_conv:fused_qwen4_varlen_conv",
+        capabilities=_CUDA,
+    )
+)
