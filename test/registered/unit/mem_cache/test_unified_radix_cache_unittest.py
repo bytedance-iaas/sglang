@@ -49,7 +49,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import available_and_evictable_str, release_kv_cache
+from sglang.srt.mem_cache.common import (
+    available_and_evictable_str,
+    free_swa_out_of_window_slots,
+    release_kv_cache,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -7731,6 +7735,130 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(
             torch.count_nonzero(mapping[kv_indices[expected_evicted:]]).item(),
             forward_len - expected_evicted,
+        )
+
+    def _check_branch_checkpoint_keeps_prompt_end(self, *, tail_len, chunked):
+        """Keep the prompt's last full page matchable after decode moves past
+        its SWA window, including partial pages and multiple prefill chunks."""
+        if not self.cfg.has_swa or self.cfg.has_mamba or self.cfg.is_eagle:
+            self.skipTest("requires non-EAGLE Full+SWA")
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        ps = self.cfg.page_size
+        window_pages = -(-self.cfg.sliding_window_size // ps)
+        full_total = allocator.full_available_size()
+        swa_total = allocator.swa_available_size()
+
+        # An earlier turn has Full KV but no live SWA at the shared prefix.
+        shared = self._make_seq(1, window_pages + 1)
+        branching_seqlen = len(shared)
+        earlier = shared + self._make_seq(1000, window_pages + 1)
+        earlier_kv = self._alloc(allocator, len(earlier))
+        allocator.free_swa_segment(earlier_kv[:branching_seqlen], start_pos=0)
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", earlier)),
+                value=earlier_kv,
+                component_evicted_seqlens={ComponentType.SWA: branching_seqlen},
+            )
+        )
+
+        prompt = (
+            shared
+            + self._make_seq(2000, 2 * window_pages + 2)
+            + list(range(7000, 7000 + tail_len))
+        )
+        prompt_floor = len(prompt) // ps * ps
+        output = self._make_seq(3000, window_pages + 1)
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", prompt))))
+        self.assertEqual(match.swa_branching_seqlen, branching_seqlen)
+
+        req = self._make_req(req_to_token_pool)
+        req.origin_input_ids = array("q", prompt)
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", prompt)
+        req.swa_branching_seqlen = match.swa_branching_seqlen
+        self._apply_match_to_req(req, match)
+        req.kv.cache_protected_len = match.device_prefix_len
+        req.lock = cache.lock(req.last_node)
+        owned = len(prompt) + len(output)
+        # Allocate the decode tail with the prompt so a partial page is shared
+        # exactly as in serving, rather than allocating a second tail page.
+        prefix_kv = cache.path_device_indices(req.last_node)
+        new_kv = self._alloc(allocator, owned - len(prefix_kv))
+        self.assertIsNotNone(new_kv)
+        req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(0, owned)),
+            torch.cat((prefix_kv, new_kv)),
+        )
+        req.kv.kv_allocated_len = owned
+        chunk_ends = [len(prompt)]
+        if chunked:
+            chunk_ends.insert(0, branching_seqlen + (window_pages + 1) * ps)
+        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
+            for end in chunk_ends:
+                req.extend_end = end
+                req.kv.kv_committed_len = end
+                cache.checkpoint(req, up_to=end)
+                # Non-final chunks stop at the branch; the final one protects
+                # both the branch and the prompt end before decode starts.
+                protected = prompt_floor if end == len(prompt) else branching_seqlen
+                self.assertEqual(req.kv.cache_protected_len, protected)
+                self.assertEqual(
+                    cache.match_prefix(
+                        MatchPrefixParams(key=RadixKey(array("q", prompt)))
+                    ).device_prefix_len,
+                    protected,
+                )
+                cache.sanity_check()
+
+        req.output_ids = array("q", output)
+        req.kv.kv_committed_len = owned
+        free_swa_out_of_window_slots(
+            req,
+            owned - 1,
+            sliding_window_size=self.cfg.sliding_window_size,
+            page_size=ps,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
+            retain_floor=cache.swa_retain_floor(req),
+        )
+        req.finished_reason = FINISH_LENGTH(length=len(output))
+        release_kv_cache(req, cache, checkpoint=True)
+
+        follow_up = prompt + self._make_seq(4000, 1)
+        self.assertEqual(
+            cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", follow_up)))
+            ).device_prefix_len,
+            prompt_floor,
+        )
+        sibling = shared + self._make_seq(5000, 1)
+        self.assertEqual(
+            cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", sibling)))
+            ).device_prefix_len,
+            branching_seqlen,
+        )
+        self.assertEqual(
+            allocator.full_available_size() + cache.full_evictable_size(), full_total
+        )
+        self.assertEqual(
+            allocator.swa_available_size() + cache.swa_evictable_size(), swa_total
+        )
+        cache.sanity_check()
+
+    def test_swa_branch_checkpoint_keeps_prompt_end_window(self):
+        self._check_branch_checkpoint_keeps_prompt_end(tail_len=0, chunked=False)
+
+    def test_swa_branch_checkpoint_keeps_unaligned_prompt_end_window(self):
+        self._check_branch_checkpoint_keeps_prompt_end(
+            tail_len=max(1, self.cfg.page_size // 2), chunked=False
+        )
+
+    def test_swa_branch_checkpoint_keeps_prompt_end_window_across_chunks(self):
+        self._check_branch_checkpoint_keeps_prompt_end(
+            tail_len=max(1, self.cfg.page_size // 2), chunked=True
         )
 
     def test_mamba_branching_seqlen_disabled_under_hicache(self):
