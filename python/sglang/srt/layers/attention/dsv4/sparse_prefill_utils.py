@@ -355,6 +355,8 @@ class SparsePrefillChunkCache:
         max_seq_len: int,
         total_swa: int,
         request_window_layout=None,
+        request_window_indices=None,
+        request_window_lengths=None,
     ) -> "SparsePrefillChunkCache":
         """``query_lens`` / ``query_pos``: the rows this forward runs (the extend, or
         a CP rank's interleaved share of it); the SWA gather spans the whole extend."""
@@ -385,8 +387,16 @@ class SparsePrefillChunkCache:
             swa_gather_lens = torch.zeros_like(seq_lens)
             # RequestWindow indices already address the shared workspace.
             swa_offsets = torch.zeros(num_reqs + 1, dtype=torch.int32, device=device)
-            swa_indices = request_window_layout.indices
-            swa_lengths = request_window_layout.lengths
+            swa_indices = (
+                request_window_layout.indices
+                if request_window_indices is None
+                else request_window_indices
+            )
+            swa_lengths = (
+                request_window_layout.lengths
+                if request_window_lengths is None
+                else request_window_lengths
+            )
 
         cache = cls(
             num_reqs=num_reqs,

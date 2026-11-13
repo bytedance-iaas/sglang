@@ -1317,7 +1317,7 @@ class TestSWAPoolFloor(CustomTestCase):
                 0.1 * cfg.bytes_per_swa_token + 585 / 4 + 864 / 128 + 132 / 4,
             )
 
-    def test_dsv4_paged_dspark_budget_reserves_window_and_draft_layers(self):
+    def _dspark_replay_planner(self, *, draft_ring):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 
         _publish_config(

@@ -2008,8 +2008,9 @@ def _make_dsv4_target(*, unified, mapping=None):
     return pool
 
 
-def _make_dsv4_draft(*, unified, mapping=None):
+def _make_dsv4_draft(*, unified, mapping=None, swa_valid_from=None):
     pool = object.__new__(DeepSeekV4TokenToKVPool)
+    pool.swa_valid_from = swa_valid_from
     pool._unified_kv = unified
     pool._stage_start = 0
     pool._stage_end = 1
@@ -2035,7 +2036,23 @@ def _make_dsv4_draft(*, unified, mapping=None):
     return pool
 
 
-class TestDSV4DraftStateRegistration(unittest.TestCase):
+class TestDSV4DraftStateRegistration(CustomTestCase):
+    def test_pd_registers_draft_valid_from_as_one_request_row(self):
+        mapping = torch.arange(16)
+        mark = torch.tensor([0, 512, 0], dtype=torch.int64)
+        draft = _make_dsv4_draft(unified=False, mapping=mapping, swa_valid_from=mark)
+        kv_args = KVArgs()
+        setup_state_kv_args(
+            kv_args,
+            _make_dsv4_target(unified=False, mapping=mapping),
+            draft,
+            total_kv_layers=40,
+        )
+        i = kv_args.state_types.index(StateType.REQUEST_ROW)
+        self.assertEqual(kv_args.state_data_ptrs[i], [mark.data_ptr()])
+        self.assertEqual(kv_args.state_data_lens[i], [24])
+        self.assertEqual(kv_args.state_item_lens[i], [8])
+
     def test_draft_state_is_packed_into_swa_component(self):
         mapping = torch.arange(16)
         cases = [

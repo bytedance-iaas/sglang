@@ -5,9 +5,6 @@ from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkabl
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-    is_unified_kv_triton,
-)
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
@@ -903,7 +900,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             int(sum(batch.extend_lens)),
         )
         state_slot = final_pos = None
-        if is_unified_kv_triton():
+        if self._kv_injector.swa_ring_size is not None:
             repeats = ctx_lens.to(torch.int64)
             num_tokens = sum(batch.extend_lens)
             state_slot = torch.repeat_interleave(
@@ -916,6 +913,21 @@ class DSparkWorkerV2(BaseSpecWorker):
                 repeats,
                 output_size=num_tokens,
             )
+        draft_pool = self._kv_injector.draft_model_runner.token_to_kv_pool
+        if (
+            getattr(draft_pool, "swa_valid_from", None) is not None
+            and batch.encoder_swa_reset is not None
+        ):
+            placed = [i for i, reset in enumerate(batch.encoder_swa_reset) if reset]
+            if placed:
+                draft_pool.set_swa_valid_from(
+                    batch.req_pool_indices[placed],
+                    torch.tensor(
+                        [batch.prefix_lens[i] for i in placed],
+                        dtype=torch.int64,
+                        device=device,
+                    ),
+                )
         cache_loc = self._kv_injector.ids_for(batch_output.kv_loc_plan)
         batch_output.kv_loc_plan = None
         token_indices = (

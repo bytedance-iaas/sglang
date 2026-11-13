@@ -48,6 +48,8 @@ class CacheInitParams:
 
     sliding_window_size: Optional[int] = None
     decoder_swa_bounded_replay: bool = False
+    # Request-scoped SWA is rebuilt instead of being owned by prefix-tree nodes.
+    swa_gates_prefix_match: bool = True
 
     # Time-to-live for cache entries in seconds. If None, TTL is disabled.
     cache_ttl_seconds: Optional[float] = None

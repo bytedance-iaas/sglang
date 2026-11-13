@@ -940,10 +940,12 @@ def build_deepseek_v4_hicache_stack(
 
     mtp_swa_device_buffers = []
     if not is_unified_kv:
-        # DSpark keeps paged draft SWA even when the target uses request_window.
+        # A request-scoped draft ring is rebuilt from target hidden states;
+        # only tree-owned paged draft SWA belongs in the host prefix cache.
         mtp_swa_device_buffers = [
             buffer
             for pool in params.mtp_draft_device_pools
+            if getattr(pool, "swa_req_ring_size", None) is None
             for buffer in pool.swa_kv_pool.kv_buffer
         ]
         swa_layer_mapping = with_packed_draft_layer_mapping(

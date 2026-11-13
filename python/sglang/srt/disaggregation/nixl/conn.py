@@ -2787,6 +2787,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 StateType.QSA_COMPRESSED,
                 StateType.SWA_RING,
                 StateType.DSV4_REQUEST_STATE,
+                StateType.REQUEST_ROW,
             ):
                 if not self.is_mla_backend and self.attn_tp_size != decode_tp_size:
                     raise RuntimeError(
