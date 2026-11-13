@@ -1852,6 +1852,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.QSA_COMPRESSED,
             StateType.SWA_RING,
             StateType.DSV4_REQUEST_STATE,
+            StateType.REQUEST_ROW,
             StateType.BLOCK_SCALE,
             StateType.BLOCK_SCALE_SWA,
         )
@@ -1863,6 +1864,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.QSA_COMPRESSED,
             StateType.SWA_RING,
             StateType.DSV4_REQUEST_STATE,
+            StateType.REQUEST_ROW,
         )
 
     def maybe_send_extra(
@@ -2817,9 +2819,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
             if not retired:
                 room = info.room
-                self.transfer_infos.setdefault(room, {})[
-                    info.mooncake_session_id
-                ] = info
+                self.transfer_infos.setdefault(room, {})[info.mooncake_session_id] = (
+                    info
+                )
                 if len(self.transfer_infos[room]) == required_dst_info_num:
                     self.resolve_kv_replica_factor(self.transfer_infos[room])
                     self.req_to_decode_prefix_len[room] = next(

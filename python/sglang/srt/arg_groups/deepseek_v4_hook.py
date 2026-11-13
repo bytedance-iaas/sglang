@@ -273,10 +273,27 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
             ("DP attention", attn_dp_enabled_of(cfg)),
-            ("context parallelism", cfg.attn_cp_size > 1),
+            (
+                "encoder replay CP outside CUDA interleave prefill",
+                cfg.attn_cp_size > 1
+                and not (
+                    cfg.device.startswith("cuda")
+                    and cfg.cp_strategy == "interleave"
+                    and cfg.disaggregation_mode == "prefill"
+                    and cfg.disaggregation_transfer_backend == "mooncake"
+                    and cfg.dcp_size == 1
+                    and not cfg.enable_dsa_cache_layer_split
+                ),
+            ),
             ("external cache linker", cfg.enable_unified_cache_external_linker),
             ("unified memory", cfg.enable_unified_memory),
-            ("PD disaggregation", cfg.disaggregation_mode != "null"),
+            # Decode receives the last SWA window from prefill and never replays.
+            ("PD decode", cfg.disaggregation_mode == "decode"),
+            # On ROCm the draft keeps paged SWA, so it cannot share the window's pages.
+            (
+                "PD prefill on ROCm",
+                cfg.disaggregation_mode == "prefill" and get_platform().is_hip,
+            ),
             ("mixed prefill/decode", cfg.enable_mixed_chunk),
             ("LoRA", cfg.enable_lora),
             ("radix sessions", cfg.enable_session_radix_cache),

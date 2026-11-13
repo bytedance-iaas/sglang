@@ -225,6 +225,69 @@ class TestC128L2Ownership(CustomTestCase):
 
 
 class TestDSV4PoolAssembly(CustomTestCase):
+    def test_encoder_request_rings_do_not_allocate_swa_host_pages(self):
+        # A CPU stack build with a real draft buffer and zero paged SWA budget:
+        # request rings must not register any SWA host pool or allocator.
+        kvcache = SimpleNamespace(
+            _unified_kv=False, size=256, swa_size=0, swa_page_size=256, swa_kv_pool=None
+        )
+        draft = SimpleNamespace(
+            swa_req_ring_size=256,
+            swa_kv_pool=SimpleNamespace(kv_buffer=[torch.empty(2, 16)]),
+        )
+        params = SimpleNamespace(
+            page_size=256,
+            mtp_draft_device_pools=[draft],
+            token_to_kv_pool_allocator=SimpleNamespace(size_full=256),
+            tp_cache_group=None,
+            attn_cp_cache_group=None,
+            attn_tp_cache_group=None,
+            pp_cache_group=None,
+        )
+        mappings = assembler._DeepSeekV4LayerMappings(
+            transfer_layer_id_max=1,
+            full={0: 0},
+            swa={},
+            c4={},
+            c128={},
+            c4_state={},
+            c4_state_global_layers=[],
+        )
+        memory = SimpleNamespace(
+            hicache_mem_layout="page_first_direct",
+            hicache_write_policy="write_through",
+            hicache_io_backend="direct",
+            hicache_host_memory_mode="cache",
+        )
+        logical = SimpleNamespace(
+            layout=memory.hicache_mem_layout,
+            page_size=256,
+            device="cpu",
+            size=512,
+            logical_size=512,
+            can_use_write_back_jit=False,
+        )
+        with (
+            patch.object(assembler, "get_memory", return_value=memory),
+            patch.object(
+                assembler, "_deepseek_v4_num_host_pages", return_value=(2, 0, 0)
+            ),
+            patch.object(assembler, "_get_allocator_type", return_value="default"),
+            patch.object(assembler, "LogicalHostPool", return_value=logical),
+            patch.object(assembler, "_dsv4_low_ratio_entries", return_value=[]),
+            patch.object(assembler, "DeepSeekV4PagedHostPool") as paged,
+            patch.object(assembler, "HybridCacheController", return_value=object()),
+        ):
+            group, _ = assembler.build_deepseek_v4_hicache_stack(
+                params=params,
+                kvcache=kvcache,
+                load_cache_event=None,
+                storage_backend=None,
+                layer_mappings=mappings,
+            )
+        paged.assert_not_called()
+        self.assertEqual(set(group.entry_map), {PoolName.KV})
+
     def test_v41_pp2_stage_uses_local_transfer_layers(self):
         layer_mapping = [None] * 40
         for layer_id in range(20, 40):
