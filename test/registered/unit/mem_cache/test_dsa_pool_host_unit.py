@@ -1,5 +1,6 @@
 import inspect
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -23,6 +24,57 @@ class TestDSAOffloadSignatures(unittest.TestCase):
             with self.subTest(method_name=method_name):
                 signature = inspect.signature(getattr(DSATokenToKVPool, method_name))
                 self.assertIn("mamba_indices", signature.parameters)
+
+
+class TestDSAProducerHostLayout(unittest.TestCase):
+    def test_compacts_shared_layers_and_keeps_packed_draft_tail(self):
+        target_buffers = [
+            torch.empty((2, 132), dtype=torch.uint8),
+            torch.empty((0, 132), dtype=torch.uint8),
+            torch.empty((2, 132), dtype=torch.uint8),
+        ]
+        draft_buffer = torch.empty((2, 132), dtype=torch.uint8)
+        target = SimpleNamespace(
+            store_dtype=torch.bfloat16,
+            start_layer=0,
+            end_layer=3,
+            layer_num=3,
+            layer_shard_enabled=False,
+            skip_topk_layers=[False, True, False],
+            index_head_dim=128,
+            quant_block_size=128,
+            index_k_with_scale_buffer=target_buffers,
+            device="cpu",
+        )
+        draft = SimpleNamespace(index_k_with_scale_buffer=[draft_buffer])
+        anchor = SimpleNamespace(
+            page_size=64,
+            layout="layer_first",
+            size=64,
+            page_num=1,
+            mtp_draft_device_pools=[draft],
+        )
+
+        host = DSAIndexerPoolHost(
+            device_pool=target,
+            anchor_host=anchor,
+            layout="layer_first",
+            pin_memory=False,
+            device="cpu",
+            allocator_type="default",
+        )
+
+        self.assertEqual(host._live_target_layers, [0, 2])
+        self.assertEqual(host._device_to_host_layer, {0: 0, 2: 1})
+        self.assertEqual(host.target_layer_num, 2)
+        self.assertEqual(host.layer_num, 3)
+        self.assertFalse(host._is_device_layer_owned(target, 1))
+        self.assertEqual(host._host_layer_index(2), 1)
+        self.assertEqual(host._draft_host_layer(3), 2)
+        self.assertEqual(len(host.packed_device_index_buffers), 3)
+        self.assertIs(host.packed_device_index_buffers[0], target_buffers[0])
+        self.assertIs(host.packed_device_index_buffers[1], target_buffers[2])
+        self.assertIs(host.packed_device_index_buffers[2], draft_buffer)
 
 
 class TestDSAHiCacheTransfer(unittest.TestCase):

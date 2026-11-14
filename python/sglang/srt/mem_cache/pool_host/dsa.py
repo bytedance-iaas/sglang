@@ -69,7 +69,20 @@ class DSAIndexerPoolHost(HostKVCache):
         self.dtype = device_pool.store_dtype
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
-        self.target_layer_num = self._effective_host_layer_num()
+        # Shared-topk layers own a zero-row device placeholder and never
+        # produce index-K state. Keep their device-layer ids for controller
+        # routing, but compact them out of the host payload.
+        owned_start, owned_end = self._device_owned_layer_range()
+        self._live_target_layers = [
+            layer_id
+            for layer_id in range(owned_start, owned_end)
+            if not device_pool.skip_topk_layers[layer_id]
+        ]
+        self._device_to_host_layer = {
+            layer_id: host_layer_id
+            for host_layer_id, layer_id in enumerate(self._live_target_layers)
+        }
+        self.target_layer_num = len(self._live_target_layers)
         self.mtp_draft_device_pools = anchor_host.mtp_draft_device_pools
         self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
 
@@ -134,11 +147,29 @@ class DSAIndexerPoolHost(HostKVCache):
     def get_ksize_per_token(self):
         return self.get_size_per_token()
 
+    def _is_device_layer_owned(self, device_pool, layer_id: int) -> bool:
+        return layer_id in self._device_to_host_layer
+
+    def _host_layer_index(self, layer_id: int, device_pool=None) -> int:
+        return self._device_to_host_layer[layer_id]
+
+    def _owned_device_layer_ids(self, device_pool) -> list[int]:
+        return list(self._live_target_layers)
+
+    def _draft_host_layer(self, layer_id: int) -> int:
+        # The controller numbers packed draft layers after every target layer;
+        # the compact host layout numbers them after producer layers only.
+        return self.target_layer_num + (layer_id - self.device_pool.layer_num)
+
     def init_kv_buffer(self):
         alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
-        device_pools = (self.device_pool, *self.mtp_draft_device_pools)
         self.packed_device_index_buffers = [
-            buffer for pool in device_pools for buffer in pool.index_k_with_scale_buffer
+            self.device_pool.index_k_with_scale_buffer[layer_id]
+            for layer_id in self._live_target_layers
+        ] + [
+            buffer
+            for pool in self.mtp_draft_device_pools
+            for buffer in pool.index_k_with_scale_buffer
         ]
         self.index_k_device_ptrs = torch.tensor(
             [x.data_ptr() for x in self.packed_device_index_buffers],
@@ -231,7 +262,11 @@ class DSAIndexerPoolHost(HostKVCache):
         if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
             return
         # MTP draft layers do not participate in CP layer sharding.
-        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
+        host_layer_id = (
+            self._draft_host_layer(layer_id)
+            if is_draft
+            else self._host_layer_index(layer_id)
+        )
         device_layer_id = 0 if is_draft else layer_id
 
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
@@ -293,7 +328,11 @@ class DSAIndexerPoolHost(HostKVCache):
         is_draft: bool = False,
     ):
         # MTP draft layers do not participate in CP layer sharding.
-        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
+        host_layer_id = (
+            self._draft_host_layer(layer_id)
+            if is_draft
+            else self._host_layer_index(layer_id)
+        )
         device_layer_id = 0 if is_draft else layer_id
 
         host_page_indices, device_page_indices = self._get_indexer_page_indices(

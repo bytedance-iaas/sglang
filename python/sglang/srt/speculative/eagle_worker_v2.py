@@ -195,6 +195,91 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
+        self.target_embed_and_head_shared = False
+        self._maybe_share_embed_before_pool_sizing()
+
+    @staticmethod
+    def _weight_layout_signature(module, weight):
+        if weight is None:
+            return None
+        shard = getattr(module, "shard_indices", None)
+        shard_signature = (
+            None
+            if shard is None
+            else (
+                shard.org_vocab_start_index,
+                shard.org_vocab_end_index,
+                shard.added_vocab_start_index,
+                shard.added_vocab_end_index,
+                shard.num_org_vocab_padding,
+            )
+        )
+        return (
+            type(module),
+            tuple(weight.shape),
+            weight.dtype,
+            weight.device,
+            tuple(weight.stride()),
+            type(getattr(module, "quant_method", None)),
+            getattr(module, "num_embeddings", None),
+            getattr(module, "enable_tp", None),
+            getattr(module, "tp_size", None),
+            getattr(module, "use_attn_tp_group", None),
+            shard_signature,
+        )
+
+    def _can_share_embed_before_pool_sizing(self) -> bool:
+        parallel = get_parallel()
+        if not (
+            envs.SGLANG_ENABLE_EMBED_REPLICATION.get() or parallel.attn_tp_size == 1
+        ):
+            return False
+
+        target_model = self.target_worker.model_runner.model
+        draft_model = self.draft_runner.model
+        if not (
+            hasattr(target_model, "get_embed_and_head")
+            and hasattr(draft_model, "get_embed_and_head")
+            and hasattr(draft_model, "set_embed_and_head")
+        ):
+            return False
+
+        target_embed, target_head = target_model.get_embed_and_head()
+        draft_embed, draft_head = draft_model.get_embed_and_head()
+        target_embed_module = getattr(
+            getattr(target_model, "model", None), "embed_tokens", None
+        )
+        draft_embed_module = getattr(
+            getattr(draft_model, "model", None), "embed_tokens", None
+        )
+        target_head_module = getattr(target_model, "lm_head", None)
+        draft_head_module = getattr(draft_model, "lm_head", None)
+
+        compatible = self._weight_layout_signature(
+            target_embed_module, target_embed
+        ) == self._weight_layout_signature(
+            draft_embed_module, draft_embed
+        ) and self._weight_layout_signature(
+            target_head_module, target_head
+        ) == self._weight_layout_signature(
+            draft_head_module, draft_head
+        )
+        if not compatible:
+            logger.info_once(
+                "Deferring target/draft embedding sharing until after KV pool sizing: "
+                "the loaded embedding or lm_head layouts differ."
+            )
+        return compatible
+
+    def _maybe_share_embed_before_pool_sizing(self):
+        if self._can_share_embed_before_pool_sizing():
+            self._share_target_embed_and_head()
+
+    def _share_target_embed_and_head(self):
+        self.init_token_map()
+        self.init_lm_head()
+        self.target_embed_and_head_shared = True
+
     def alloc_memory_pool(
         self,
         memory_pool_config=None,
@@ -209,8 +294,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
-        self.init_token_map()
-        self.init_lm_head()
+        if not self.target_embed_and_head_shared:
+            self._share_target_embed_and_head()
 
         if get_spec().speculative_use_rejection_sampling:
             target_vocab_size = self.target_worker.model_config.vocab_size

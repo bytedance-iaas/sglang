@@ -76,6 +76,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
                 host.device_pool = SimpleNamespace(
                     device="cpu", index_k_with_scale_buffer=target_buffers
                 )
+                host._live_target_layers = [0, 1, 2]
                 host.mtp_draft_device_pools = [
                     SimpleNamespace(index_k_with_scale_buffer=[draft_buffer])
                 ]

@@ -98,13 +98,14 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     disagg = get_disagg()
     supports_layout = disagg.disaggregation_mode == "null" or (
         disagg.disaggregation_transfer_backend == "nixl"
-        and not memory_config.enable_hierarchical_cache
     )
+    # NPU PD and HiCache still consume the positional full-layer layout.
+    if _is_npu and (
+        disagg.disaggregation_mode != "null" or memory_config.enable_hierarchical_cache
+    ):
+        return False
     enabled = (
-        not memory_config.enable_hisparse
-        and not is_draft_worker
-        and not memory_config.enable_hierarchical_cache
-        and supports_layout
+        not memory_config.enable_hisparse and not is_draft_worker and supports_layout
     )
     if enabled and disagg.disaggregation_mode != "null":
         logger.info_once("NIXL PD uses producer-only DSA index-K state buffers.")
