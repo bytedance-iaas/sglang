@@ -1468,6 +1468,9 @@ class Envs:
     SGLANG_DSA_FUSE_TOPK = EnvBoolWithAlias(
         True, deprecated_name="SGLANG_NSA_FUSE_TOPK"
     )
+    # Opt-in SM100 FP8 prefill indexer that avoids materializing dense logits.
+    # Exceptional sampled-threshold rows recover exact top-k entirely on GPU.
+    SGLANG_OPT_USE_PREFILL_LITE_TOPK = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(
