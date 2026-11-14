@@ -754,10 +754,18 @@ class ServerArgs:
                 "lof",
                 "priority",
                 "routing-key",
+                "shortest-prefill-first",
             ],
         ),
         NS("schedule"),
     ] = "fcfs"
+    shortest_prefill_aging_factor: A[
+        float,
+        "Token-based aging factor for shortest-prefill-first. Rank is residual "
+        "prefill work minus this factor times prefill tokens processed while "
+        "waiting. Zero disables aging.",
+        NS("schedule"),
+    ] = 0.0
     enable_priority_scheduling: A[
         bool,
         "Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default.",

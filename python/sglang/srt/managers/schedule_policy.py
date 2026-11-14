@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from array import array
 
 from sglang.srt.environ import envs
@@ -205,6 +206,7 @@ class CacheAwarePolicy(Enum):
 
     LPM = "lpm"  # longest prefix match
     DFS_WEIGHT = "dfs-weight"  # depth-first search weighting
+    SHORTEST_PREFILL_FIRST = "shortest-prefill-first"
 
 
 class CacheAgnosticPolicy(Enum):
@@ -226,21 +228,46 @@ class SchedulePolicy:
         enable_hierarchical_cache: bool,
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
+        shortest_prefill_aging_factor: float = 0.0,
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
+        if not math.isfinite(shortest_prefill_aging_factor) or (
+            shortest_prefill_aging_factor < 0
+        ):
+            raise ValueError(
+                "shortest_prefill_aging_factor must be finite and >= 0, "
+                f"got {shortest_prefill_aging_factor}"
+            )
+        if (
+            shortest_prefill_aging_factor
+            and self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+        ):
+            raise ValueError(
+                "shortest_prefill_aging_factor requires "
+                "schedule_policy=shortest-prefill-first"
+            )
         self.tree_cache = tree_cache
         self.enable_hierarchical_cache = enable_hierarchical_cache
         self.enable_priority_scheduling = enable_priority_scheduling
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
+        self.shortest_prefill_aging_factor = shortest_prefill_aging_factor
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
 
     def calc_priority(
-        self, waiting_queue: List[Req], running_batch: Optional[ScheduleBatch] = None
+        self,
+        waiting_queue: List[Req],
+        running_batch: Optional[ScheduleBatch] = None,
+        processed_tokens: int = 0,
     ) -> None:
         policy = self._determine_active_policy(waiting_queue)
+
+        if policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
+            for req in waiting_queue:
+                if req.arrival_processed_tokens is None:
+                    req.arrival_processed_tokens = processed_tokens
 
         # Populate req.num_matched_prefix_tokens at schedule time. Cache-aware policies
         # set it in _compute_prefix_matches; do the same full match for
@@ -271,6 +298,12 @@ class SchedulePolicy:
                 )
             elif policy == CacheAwarePolicy.DFS_WEIGHT:
                 SchedulePolicy._sort_by_dfs_weight(waiting_queue, self.tree_cache)
+            elif policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
+                self._sort_by_shortest_prefill(
+                    waiting_queue,
+                    temporary_deprioritized,
+                    processed_tokens=processed_tokens,
+                )
             else:
                 raise ValueError(f"Unknown CacheAware Policy: {policy=}")
         else:
@@ -312,6 +345,8 @@ class SchedulePolicy:
         try:
             policy_enum = CacheAwarePolicy(policy)
             if getattr(tree_cache, "disable", True):
+                if policy_enum == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
+                    raise ValueError("shortest-prefill-first requires prefix caching")
                 # If tree_cache is disabled, using CacheAgnosticPolicy policy
                 return CacheAgnosticPolicy.FCFS
             return policy_enum
@@ -379,6 +414,90 @@ class SchedulePolicy:
                         )
                     )
         return temporary_deprioritized
+
+    @staticmethod
+    def _shortest_prefill_work(req: Req) -> int:
+        return max(
+            1,
+            len(req.origin_input_ids)
+            + len(req.output_ids)
+            - req.num_matched_prefix_tokens,
+        )
+
+    def _shortest_prefill_rank(self, req: Req, processed_tokens: int) -> float:
+        arrival = (
+            processed_tokens
+            if req.arrival_processed_tokens is None
+            else req.arrival_processed_tokens
+        )
+        waited_tokens = max(0, processed_tokens - arrival)
+        return (
+            self._shortest_prefill_work(req)
+            - self.shortest_prefill_aging_factor * waited_tokens
+        )
+
+    def _sort_by_shortest_prefill(
+        self,
+        waiting_queue: List[Req],
+        temporary_deprioritized: Set[int],
+        *,
+        processed_tokens: int,
+    ) -> None:
+        # Prefer requests that can complete in this prefill pass. Token-based
+        # aging bounds bypass without depending on rank-local wall clocks.
+        waiting_queue.sort(
+            key=lambda req: (
+                req.rid in temporary_deprioritized,
+                self._shortest_prefill_rank(req, processed_tokens),
+                req.time_stats.wait_queue_entry_time,
+            )
+        )
+
+    def shortest_prefill_chunk_limit(
+        self,
+        chunked_req: Req,
+        waiting_queue: List[Req],
+        budget: int,
+        page_size: int,
+        *,
+        processed_tokens: int,
+    ) -> Optional[int]:
+        """Reserve page-aligned room for shorter requests that can finish now.
+
+        The active continuation always keeps at least one page, so it makes
+        bounded progress. Requests are already sorted by the same aged rank;
+        once a candidate no longer outranks the continuation, no later one may
+        bypass it in this pass.
+        """
+        if (
+            self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+            or budget < 2 * page_size
+        ):
+            return None
+        remaining = len(chunked_req.full_untruncated_fill_ids) - len(
+            chunked_req.prefix_indices
+        )
+        arrival = (
+            processed_tokens
+            if chunked_req.arrival_processed_tokens is None
+            else chunked_req.arrival_processed_tokens
+        )
+        chunked_rank = remaining - self.shortest_prefill_aging_factor * max(
+            0, processed_tokens - arrival
+        )
+        reserved = 0
+        for req in waiting_queue:
+            work = self._shortest_prefill_work(req)
+            charge = -(-work // page_size) * page_size
+            if (
+                self._shortest_prefill_rank(req, processed_tokens) >= chunked_rank
+                or reserved + charge > budget - page_size
+            ):
+                break
+            reserved += charge
+        if not reserved:
+            return None
+        return (budget - reserved) // page_size * page_size
 
     @staticmethod
     def _sort_by_longest_prefix(
@@ -504,6 +623,7 @@ class PrefillAdder:
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
+        self.chunked_req_limit: Optional[int] = None
         self.dllm_config = dllm_config
 
         if self.dllm_config is not None:
@@ -1001,6 +1121,10 @@ class PrefillAdder:
                 waiting_queue_len=self.waiting_queue_len,
             )
 
+        if self.chunked_req_limit is not None:
+            assert self.chunked_req_limit > 0
+            _rem_tokens = min(_rem_tokens, self.chunked_req_limit)
+
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
@@ -1040,7 +1164,7 @@ class PrefillAdder:
             else:
                 self.tree_cache.dec_lock_ref(last_node)
 
-    def add_one_req_ignore_eos(self, req: Req):
+    def add_one_req_ignore_eos(self, req: Req, has_chunked_req: bool = False):
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
@@ -1154,6 +1278,12 @@ class PrefillAdder:
             if self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
 
+            if (
+                has_chunked_req
+                and get_schedule().schedule_policy == "shortest-prefill-first"
+            ):
+                return AddReqResult.OTHER
+
             # Chunked prefill
             trunc_len = self.rem_chunk_tokens
 
@@ -1189,7 +1319,7 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
-            return self.add_one_req_ignore_eos(req)
+            return self.add_one_req_ignore_eos(req, has_chunked_req)
 
         # Reserve page_size for page-alignment overhead: the paged allocator may
         # consume one extra page per request (see alloc_extend), which
@@ -1243,6 +1373,16 @@ class PrefillAdder:
                 if self.rem_chunk_tokens is None or swa_cap <= 0:
                     return AddReqResult.NO_TOKEN
                 chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
+
+        if (
+            has_chunked_req
+            and chunk_tokens_limit is not None
+            and real_input_tokens > chunk_tokens_limit
+            and get_schedule().schedule_policy == "shortest-prefill-first"
+        ):
+            # This request cannot finish beside the active continuation. Keep
+            # it queued; the policy order makes later candidates no better.
+            return AddReqResult.OTHER
 
         if (
             self.rem_chunk_tokens is None
@@ -1312,6 +1452,16 @@ class PrefillAdder:
             )
 
             if (
+                has_chunked_req
+                and chunk_tokens_limit is not None
+                and input_tokens > chunk_tokens_limit
+                and get_schedule().schedule_policy == "shortest-prefill-first"
+            ):
+                # A promised host hit may load fewer pages than estimated.
+                # Recheck the residual before creating a second continuation.
+                return AddReqResult.OTHER
+
+            if (
                 self.rem_chunk_tokens is None
                 and len(self.can_run_list) != 0
                 and input_tokens >= self.rem_input_tokens
@@ -1362,6 +1512,11 @@ class PrefillAdder:
                     storage_hit_len=req.storage_hit_length,
                 )
             else:
+                if (
+                    has_chunked_req
+                    and get_schedule().schedule_policy == "shortest-prefill-first"
+                ):
+                    return AddReqResult.OTHER
                 # Make sure at least one page is available
                 trunc_len = chunk_tokens_limit // self.page_size * self.page_size
 

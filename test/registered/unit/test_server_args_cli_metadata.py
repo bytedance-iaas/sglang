@@ -36,6 +36,7 @@ MIGRATED_OPTIONS = frozenset(
         "--enable-dynamic-chunking",
         "--max-prefill-tokens",
         "--schedule-policy",
+        "--shortest-prefill-aging-factor",
         "--enable-priority-scheduling",
         "--disable-priority-preemption",
         "--default-priority-value",
@@ -111,7 +112,16 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
         )
         self.assertEqual(
             self.actions_by_option["--schedule-policy"].choices,
-            ["lpm", "random", "fcfs", "dfs-weight", "lof", "priority", "routing-key"],
+            [
+                "lpm",
+                "random",
+                "fcfs",
+                "dfs-weight",
+                "lof",
+                "priority",
+                "routing-key",
+                "shortest-prefill-first",
+            ],
         )
         self.assertEqual(
             self.actions_by_option["--load-balance-method"].choices,

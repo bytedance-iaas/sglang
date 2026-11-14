@@ -1086,6 +1086,10 @@ class Req(ReqDllmMixin):
         # time and used to estimate uncached tokens / sort by longest prefix for
         # load reporting.
         self.num_matched_prefix_tokens = 0
+        # Prefill tokens completed by this scheduler when the request first
+        # entered the waiting policy. It is initialized lazily because PD
+        # bootstrap precedes the waiting queue.
+        self.arrival_processed_tokens: Optional[int] = None
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
         # Storage prefetch retry state while queued

@@ -2,11 +2,14 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 import sglang.srt.managers.schedule_policy as schedule_policy
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
+    SchedulePolicy,
     estimate_prefill_extend_tile_metrics,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -485,6 +488,96 @@ class TestPrefillAdder(CustomTestCase):
             )
         )
         return adder, req
+
+    def create_shortest_prefill_adder(self, *, chunk_tokens=4096):
+        override = get_context().override_server_args(
+            schedule_policy="shortest-prefill-first"
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        self.mock_token_allocator.available_size.return_value = 32768
+        self.mock_token_allocator.full_available_size.return_value = 32768
+        return self.create_adder(
+            self.create_running_batch(),
+            page_size=256,
+            rem_chunk_tokens=chunk_tokens,
+        )
+
+    def create_shortest_prefill_req(self, rid, length):
+        req = self.create_mock_req(rid, priority=0, max_new_tokens=4)
+        req.sampling_params.ignore_eos = False
+        req.last_node = MagicMock()
+        req.origin_input_ids = list(range(length))
+        req.full_untruncated_fill_ids = list(range(length))
+        req.num_matched_prefix_tokens = len(req.prefix_indices)
+        req.arrival_processed_tokens = 0
+        req.kv = SimpleNamespace(cache_protected_len=0)
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+        return req
+
+    def test_shortest_prefill_reserves_complete_waiting_requests(self):
+        adder = self.create_shortest_prefill_adder()
+        policy = SchedulePolicy(
+            policy="shortest-prefill-first",
+            tree_cache=self.mock_tree_cache,
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+        continuation = self.create_shortest_prefill_req("continuation", 16384)
+        waiting = [
+            self.create_shortest_prefill_req("a", 512),
+            self.create_shortest_prefill_req("b", 1024),
+        ]
+        adder.chunked_req_limit = policy.shortest_prefill_chunk_limit(
+            continuation,
+            waiting,
+            adder.rem_chunk_tokens,
+            adder.page_size,
+            processed_tokens=0,
+        )
+        self.assertIs(adder.add_chunked_req(continuation), continuation)
+        self.assertEqual(continuation.extend_range.length, 2560)
+        for req in waiting:
+            adder.add_one_req(req, has_chunked_req=True, truncation_align_size=None)
+        self.assertEqual(adder.can_run_list, [continuation, *waiting])
+        self.assertIsNone(adder.new_chunked_req)
+        self.assertEqual(adder.rem_chunk_tokens, 0)
+
+    def test_shortest_prefill_rejects_second_unfinished_chunk(self):
+        adder = self.create_shortest_prefill_adder(chunk_tokens=512)
+        req = self.create_shortest_prefill_req("second-chunk", 1024)
+        self.assertEqual(
+            adder.add_one_req(req, has_chunked_req=True, truncation_align_size=None),
+            AddReqResult.OTHER,
+        )
+        self.assertEqual(adder.can_run_list, [])
+        self.assertIsNone(adder.new_chunked_req)
+        req.set_extend_range.assert_not_called()
+        self.mock_tree_cache.init_load_back.assert_not_called()
+
+    def test_shortest_prefill_rechecks_after_incomplete_host_load(self):
+        adder = self.create_shortest_prefill_adder(chunk_tokens=512)
+        req = self.create_shortest_prefill_req("host-miss", 1024)
+        req.prefix_indices = torch.empty(0, dtype=torch.int64)
+        req.host_hit_length = 768
+        req.best_match_node = req.last_node
+        req.needs_host_load_back.return_value = True
+        self.mock_tree_cache.init_load_back.return_value = (
+            torch.empty(0, dtype=torch.int64),
+            req.last_node,
+        )
+        self.assertEqual(
+            adder.add_one_req(req, has_chunked_req=True, truncation_align_size=None),
+            AddReqResult.OTHER,
+        )
+        self.mock_tree_cache.init_load_back.assert_called_once()
+        self.assertEqual(adder.can_run_list, [])
+        req.set_extend_range.assert_not_called()
 
     def test_add_chunked_req_hybrid_swa_reserves_page_for_alloc_extend(self):
         # alloc_extend needs extend_num_tokens + page_size per request. If the
