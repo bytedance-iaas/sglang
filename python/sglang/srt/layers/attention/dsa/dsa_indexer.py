@@ -7,14 +7,26 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 import torch
 from einops import rearrange
 
+from sglang.kernels.ops.attention.dsa.litetopk_prefill import (
+    MAX_KEYS as PREFILL_LITE_TOPK_MAX_KEYS,
+)
+from sglang.kernels.ops.attention.dsa.litetopk_prefill import (
+    fp8_indexer_topk_recovery,
+    is_fp8_recovery_supported,
+    min_profitable_keys,
+)
 from sglang.kernels.ops.attention.fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
 )
+from sglang.kernels.ops.attention.topk_page_table import topk_page_table_transform_
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
+from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
+    BaseIndexerMetadata,
+    DSAIndexerMetadata,
+)
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import DSANPUIndexerMixin
 from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     GRAPH_WEIGHTS_PROJ_LORA_ERROR,
@@ -22,6 +34,7 @@ from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     bcg_dsa_indexer_prefill_split,
     pcg_dsa_indexer_prefill_split,
 )
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
@@ -323,6 +336,16 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
         if config is not None:
             self.num_init_tokens = getattr(config, "index_init_tokens", 0)
             self.num_local_tokens = getattr(config, "index_local_tokens", 0)
+        self.use_prefill_lite_topk = (
+            envs.SGLANG_OPT_USE_PREFILL_LITE_TOPK.get()
+            and envs.SGLANG_DSA_FUSE_TOPK.get()
+            and is_fp8_recovery_supported()
+            and self.n_heads in (32, 64)
+            and self.head_dim == 128
+            and self.index_topk in (512, 1024, 2048)
+            and self.num_init_tokens == 0
+            and self.num_local_tokens == 0
+        )
 
         self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
             get_exec().kernel.dsa_paged_mqa_logits_backend
@@ -736,6 +759,24 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
             logits.scatter_(dim=1, index=local_idxs, value=float("inf"))
         return logits
 
+    def _can_use_prefill_lite_topk(
+        self,
+        metadata: BaseIndexerMetadata,
+        *,
+        max_visible_len: int,
+        num_keys: int,
+        num_rows: int,
+    ) -> bool:
+        return (
+            self.use_prefill_lite_topk
+            and max_visible_len
+            >= min_profitable_keys(self.index_topk, self.n_heads, num_rows)
+            and num_keys <= PREFILL_LITE_TOPK_MAX_KEYS
+            and isinstance(metadata, DSAIndexerMetadata)
+            and metadata.topk_backend.is_sgl_kernel()
+            and not metadata.force_unfused_topk
+        )
+
     def _get_topk_paged(
         self,
         forward_batch: ForwardBatch,
@@ -1046,6 +1087,23 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
+        if self._can_use_prefill_lite_topk(
+            metadata,
+            max_visible_len=max_seq_len,
+            num_keys=k_offset,
+            num_rows=q_offset,
+        ):
+            self._prefill_lite_topk(
+                q_fp8[:q_offset].contiguous(),
+                weights[:q_offset].contiguous(),
+                k_fp8.contiguous(),
+                k_scale.contiguous(),
+                ks.contiguous(),
+                ke.contiguous(),
+                metadata,
+                topk_result[:q_offset],
+            )
+            return topk_result
         need_chunk, logits_budget_bytes = self._should_chunk_mqa_logits(
             q_offset, k_offset, device_index
         )
@@ -1279,6 +1337,7 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
         offset = 0
         actual_seq_q_list = []
         batch_idx_list = []
+        max_visible_len = 0
 
         block_tables = metadata.get_page_table_64()
 
@@ -1295,6 +1354,7 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
                 )
                 start_seq_position += pre_chunk_offset
                 end_seq_position += pre_chunk_offset
+                max_visible_len = max(max_visible_len, end_seq_position)
                 if offset == 0 and batch_idx != 0:
                     offset += forward_batch.extend_seq_lens_cpu[batch_idx - 1]
                 k_fp8 = get_token_to_kv_pool().get_index_k_continuous(
@@ -1335,6 +1395,29 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
             ke_offset = torch.cat(ke_offset_list, dim=0)
             ke = ks + ke_offset
             actual_seq_q = torch.cat(actual_seq_q_list, dim=0)
+            if self._can_use_prefill_lite_topk(
+                metadata,
+                max_visible_len=max_visible_len,
+                num_keys=k_fp8.shape[0],
+                num_rows=q_fp8.shape[0],
+            ):
+                topk_result = torch.empty(
+                    (q_fp8.shape[0], self.index_topk),
+                    dtype=torch.int32,
+                    device=q_fp8.device,
+                )
+                return self._prefill_lite_topk(
+                    q_fp8.contiguous(),
+                    weights.contiguous(),
+                    k_fp8.contiguous(),
+                    k_scale.contiguous(),
+                    ks.contiguous(),
+                    ke.contiguous(),
+                    metadata,
+                    topk_result,
+                    cu_seqlens_q=actual_seq_q,
+                    batch_idx_list=batch_idx_list,
+                )
             with self._with_real_sm_count():
                 q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(q_fp8, weights)
                 logits = deep_gemm.fp8_mqa_logits(
@@ -1382,6 +1465,32 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
             )
             ke = ks + ke_offset
 
+            actual_seq_q_tensor = torch.tensor(
+                [actual_seq_q], dtype=torch.int32, device=q_fp8.device
+            )
+            if self._can_use_prefill_lite_topk(
+                metadata,
+                max_visible_len=kv_len,
+                num_keys=k_fp8.shape[0],
+                num_rows=q_fp8.shape[0],
+            ):
+                topk_result = torch.empty(
+                    (q_fp8.shape[0], self.index_topk),
+                    dtype=torch.int32,
+                    device=q_fp8.device,
+                )
+                return self._prefill_lite_topk(
+                    q_fp8.contiguous(),
+                    weights.contiguous(),
+                    k_fp8.contiguous(),
+                    k_scale.contiguous(),
+                    ks.contiguous(),
+                    ke.contiguous(),
+                    metadata,
+                    topk_result,
+                    cu_seqlens_q=actual_seq_q_tensor,
+                )
+
             with self._with_real_sm_count():
                 q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(q_fp8, weights)
                 logits = deep_gemm.fp8_mqa_logits(
@@ -1392,9 +1501,7 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
                     ke,
                     clean_logits=False,
                 )
-            actual_seq_q = torch.tensor([actual_seq_q], dtype=torch.int32).to(
-                device="cuda", non_blocking=True
-            )
+            actual_seq_q = actual_seq_q_tensor
             topk_result = metadata.topk_transform(
                 logits,
                 self.index_topk,
@@ -1404,6 +1511,89 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
             )
 
         return topk_result
+
+    def _prefill_lite_topk(
+        self,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        k_fp8: torch.Tensor,
+        k_scale: torch.Tensor,
+        ks: torch.Tensor,
+        ke: torch.Tensor,
+        metadata: DSAIndexerMetadata,
+        out: torch.Tensor,
+        *,
+        cu_seqlens_q: Optional[torch.Tensor] = None,
+        batch_idx_list: Optional[List[int]] = None,
+        topk_indices_offset: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Exact-recovery LiteTopK plus the runtime's output-ID transform."""
+        if metadata.topk_transform_method == TopkTransformMethod.RAGGED:
+            offsets = topk_indices_offset
+            if offsets is None and cu_seqlens_q is not None:
+                cu_seqlens_q = cu_seqlens_q.to(torch.int32)
+                cu_offsets = torch.zeros(
+                    cu_seqlens_q.shape[0] + 1,
+                    dtype=torch.int32,
+                    device=cu_seqlens_q.device,
+                )
+                torch.cumsum(cu_seqlens_q, dim=0, out=cu_offsets[1:])
+                offsets = torch.repeat_interleave(
+                    cu_offsets[:-1],
+                    cu_seqlens_q,
+                    output_size=out.shape[0],
+                )
+            if offsets is None:
+                offsets = metadata.attn_metadata.topk_indices_offset
+            if offsets is None:
+                raise RuntimeError("LiteTopK RAGGED output requires row offsets")
+            fp8_indexer_topk_recovery(
+                q_fp8,
+                weights,
+                k_fp8,
+                k_scale,
+                ks,
+                ke,
+                self.index_topk,
+                out_offsets=offsets,
+                out=out,
+            )
+            return out
+
+        if metadata.topk_transform_method != TopkTransformMethod.PAGED:
+            raise RuntimeError(
+                f"Unsupported LiteTopK transform {metadata.topk_transform_method}"
+            )
+        fp8_indexer_topk_recovery(
+            q_fp8,
+            weights,
+            k_fp8,
+            k_scale,
+            ks,
+            ke,
+            self.index_topk,
+            out=out,
+        )
+        if batch_idx_list is None:
+            row_batch = metadata.get_token_to_batch_idx()[: out.shape[0]]
+        else:
+            if cu_seqlens_q is None:
+                raise RuntimeError("PAGED CP LiteTopK requires query lengths")
+            seq_rows = torch.tensor(
+                batch_idx_list, dtype=torch.int32, device=out.device
+            )
+            row_batch = torch.repeat_interleave(
+                seq_rows,
+                cu_seqlens_q.to(torch.int32),
+                output_size=out.shape[0],
+            )
+        topk_page_table_transform_(
+            out,
+            metadata.get_page_table_64(),
+            row_batch,
+            metadata.attn_metadata.page_size,
+        )
+        return out
 
     def _store_index_k_cache(
         self,

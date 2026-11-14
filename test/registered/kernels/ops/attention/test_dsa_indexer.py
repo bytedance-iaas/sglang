@@ -11,6 +11,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 _parallel_override = get_parallel().override(attn_tp_size=1)
 _parallel_override.__enter__()
 
+from sglang.kernels.ops.attention.dsa.litetopk_prefill import MAX_KEYS
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer, rotate_activation
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
@@ -338,6 +339,75 @@ class TestDSAIndexer(CustomTestCase):
                     module.to(dtype=self.dtype)
 
         return indexer
+
+    def test_prefill_lite_topk_dispatch_gate(self):
+        indexer = Indexer.__new__(Indexer)
+        indexer.use_prefill_lite_topk = True
+        indexer.index_topk = 512
+        indexer.n_heads = 32
+        metadata = DSAIndexerMetadata(
+            attn_metadata=MagicMock(),
+            topk_transform_method=TopkTransformMethod.RAGGED,
+        )
+        self.assertTrue(
+            indexer._can_use_prefill_lite_topk(
+                metadata,
+                max_visible_len=20480,
+                num_keys=MAX_KEYS,
+                num_rows=1024,
+            )
+        )
+        self.assertFalse(
+            indexer._can_use_prefill_lite_topk(
+                metadata,
+                max_visible_len=20479,
+                num_keys=MAX_KEYS,
+                num_rows=1024,
+            )
+        )
+        self.assertFalse(
+            indexer._can_use_prefill_lite_topk(
+                metadata,
+                max_visible_len=20480,
+                num_keys=MAX_KEYS + 1,
+                num_rows=1024,
+            )
+        )
+        for backend in (DSATopKBackend.TORCH, DSATopKBackend.FLASHINFER):
+            alternative = DSAIndexerMetadata(
+                attn_metadata=MagicMock(),
+                topk_transform_method=TopkTransformMethod.RAGGED,
+                topk_backend=backend,
+            )
+            self.assertFalse(
+                indexer._can_use_prefill_lite_topk(
+                    alternative,
+                    max_visible_len=20480,
+                    num_keys=MAX_KEYS,
+                    num_rows=1024,
+                )
+            )
+        forced_unfused = DSAIndexerMetadata(
+            attn_metadata=MagicMock(),
+            topk_transform_method=TopkTransformMethod.RAGGED,
+            force_unfused_topk=True,
+        )
+        self.assertFalse(
+            indexer._can_use_prefill_lite_topk(
+                forced_unfused,
+                max_visible_len=20480,
+                num_keys=MAX_KEYS,
+                num_rows=1024,
+            )
+        )
+        self.assertFalse(
+            indexer._can_use_prefill_lite_topk(
+                metadata,
+                max_visible_len=65535,
+                num_keys=MAX_KEYS,
+                num_rows=1023,
+            )
+        )
 
     def _create_forward_batch(
         self, mode, batch_size=None, seq_len=None, extend_len=None
