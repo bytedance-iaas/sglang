@@ -1,5 +1,6 @@
 import unittest
 
+from sglang.srt.layers.attention.dsa.dosa_cp import build_dosa_cp_layout
 from sglang.srt.layers.attention.dsa.pivot_candidate import (
     PivotFallbackReason,
     PivotPlannerConfig,
@@ -11,7 +12,9 @@ from sglang.srt.layers.attention.dsa.pivot_candidate import (
     build_pivot_rows_from_cp_layout,
     plan_pivot_candidates,
 )
-from sglang.srt.layers.attention.dsa.dosa_cp import build_dosa_cp_layout
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestPivotCandidateContract(unittest.TestCase):

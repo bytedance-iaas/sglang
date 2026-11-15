@@ -11,6 +11,9 @@ from sglang.srt.layers.attention.dsa.pivot_reference import (
     PivotReferenceConfig,
     pivot_refine_reference,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestPivotReference(unittest.TestCase):

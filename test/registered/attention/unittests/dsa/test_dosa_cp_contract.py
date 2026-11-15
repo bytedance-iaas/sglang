@@ -8,6 +8,9 @@ from sglang.srt.layers.attention.dsa.dosa_cp import (
     map_logical_topk_to_physical,
     validate_dosa_cp_layouts,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class _FakeEvent:
