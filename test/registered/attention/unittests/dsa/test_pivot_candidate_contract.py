@@ -8,12 +8,10 @@ from sglang.srt.layers.attention.dsa.pivot_candidate import (
     PivotQueryRow,
     PivotShareIdentity,
     audit_pivot_recall,
+    build_pivot_rows_from_cp_layout,
     plan_pivot_candidates,
 )
-
-
-def _heads(values, count=4):
-    return tuple(tuple(values) for _ in range(count))
+from sglang.srt.layers.attention.dsa.dosa_cp import build_dosa_cp_layout
 
 
 class TestPivotCandidateContract(unittest.TestCase):
@@ -45,7 +43,7 @@ class TestPivotCandidateContract(unittest.TestCase):
             self.row(rank=rank, group="same", position=15 + rank) for rank in range(8)
         ]
         proposals = {
-            PivotProposalKey(self.identity, "same", rank): _heads(range(8))
+            PivotProposalKey(self.identity, "same", rank): tuple(range(8))
             for rank in range(8)
         }
         plans = plan_pivot_candidates(
@@ -56,7 +54,7 @@ class TestPivotCandidateContract(unittest.TestCase):
             context=self.context,
         )
         self.assertTrue(all(plan.accepted for plan in plans))
-        self.assertEqual([plan.valid_counts[0] for plan in plans], [8] * 8)
+        self.assertEqual([plan.valid_count for plan in plans], [8] * 8)
 
         unrelated = self.row(rank=0, group="other", position=23)
         plan = plan_pivot_candidates(
@@ -68,11 +66,38 @@ class TestPivotCandidateContract(unittest.TestCase):
         )[0]
         self.assertEqual(plan.fallback_reason, PivotFallbackReason.MISSING_PROPOSAL)
 
+    def test_cp_layout_bridge_never_crosses_segment_or_request(self):
+        layout = build_dosa_cp_layout(
+            cp_rank=0,
+            cp_size=2,
+            request_generations=[11, 22],
+            rids=["req-a", "req-b"],
+            seq_lens=[14, 11],
+            extend_seq_lens=[10, 7],
+            query_layout_version="zigzag-2cp-v1",
+            cache_versions=[3, 4],
+        )
+        rows = build_pivot_rows_from_cp_layout(
+            layout,
+            group_size=2,
+            producer_layer_id=7,
+            index_share_id="share-7",
+            key_representation_version="fp8-index-k-v1",
+        )
+        self.assertEqual(len(rows), layout.local_row_count)
+        for previous, current in zip(rows, rows[1:]):
+            if previous.query_group == current.query_group:
+                self.assertEqual(previous.cp_rank, current.cp_rank)
+                self.assertEqual(previous.identity, current.identity)
+                self.assertEqual(
+                    current.absolute_position, previous.absolute_position + 1
+                )
+
         rank1 = self.row(rank=1, group="rank-local", position=23)
         plan = plan_pivot_candidates(
             rows=[rank1],
             pivot_proposals={
-                PivotProposalKey(self.identity, "rank-local", 0): _heads(range(8))
+                PivotProposalKey(self.identity, "rank-local", 0): tuple(range(8))
             },
             row_refinements=None,
             config=self.config,
@@ -85,14 +110,14 @@ class TestPivotCandidateContract(unittest.TestCase):
         key = PivotProposalKey(self.identity, "qg-0", 0)
         plans = plan_pivot_candidates(
             rows=[row],
-            pivot_proposals={key: _heads([0, 1, 8, 9, 10, -1])},
-            row_refinements={0: _heads([2, 3, 9, 11])},
+            pivot_proposals={key: (0, 1, 8, 9, 10, -1)},
+            row_refinements={0: (2, 3, 9, 11)},
             config=self.config,
             context=self.context,
         )
         self.assertTrue(plans[0].accepted)
-        self.assertEqual(plans[0].valid_counts, (6, 6, 6, 6))
-        self.assertEqual(plans[0].candidates[0], (0, 1, 8, 9, 2, 3, -1, -1))
+        self.assertEqual(plans[0].valid_count, 6)
+        self.assertEqual(plans[0].candidates, (0, 1, 8, 9, 2, 3, -1, -1))
 
     def test_cache_generation_and_index_share_identity_do_not_alias(self):
         stale = PivotShareIdentity(11, 3, "share-0", 6, "fp8-index-k-v1")
@@ -100,7 +125,7 @@ class TestPivotCandidateContract(unittest.TestCase):
         plan = plan_pivot_candidates(
             rows=[row],
             pivot_proposals={
-                PivotProposalKey(stale, "qg-0", 0): _heads(range(8)),
+                PivotProposalKey(stale, "qg-0", 0): tuple(range(8)),
             },
             row_refinements=None,
             config=self.config,
@@ -112,9 +137,9 @@ class TestPivotCandidateContract(unittest.TestCase):
         row = self.row()
         key = PivotProposalKey(self.identity, "qg-0", 0)
         cases = [
-            (_heads([0, 1, 2]), PivotFallbackReason.CANDIDATE_UNDERFILL),
-            (_heads(range(9)), PivotFallbackReason.CANDIDATE_OVERFLOW),
-            (_heads([0, 1, 2, -2]), PivotFallbackReason.INVALID_CANDIDATE),
+            ((0, 1, 2), PivotFallbackReason.CANDIDATE_UNDERFILL),
+            (tuple(range(9)), PivotFallbackReason.CANDIDATE_OVERFLOW),
+            ((0, 1, 2, -2), PivotFallbackReason.INVALID_CANDIDATE),
         ]
         for proposal, reason in cases:
             with self.subTest(reason=reason):
@@ -138,19 +163,19 @@ class TestPivotCandidateContract(unittest.TestCase):
         key = PivotProposalKey(self.identity, "qg-0", 0)
         plan = plan_pivot_candidates(
             rows=[row],
-            pivot_proposals={key: _heads(range(4), count=32)},
+            pivot_proposals={key: tuple(range(4))},
             row_refinements=None,
             config=config,
             context=self.context,
         )[0]
         self.assertTrue(plan.accepted)
-        self.assertEqual(len(plan.candidates), 32)
-        self.assertEqual(plan.valid_counts, (4,) * 32)
+        self.assertEqual(plan.scoring_heads, 32)
+        self.assertEqual(plan.candidates, (0, 1, 2, 3))
 
     def test_unsupported_routes_and_short_context_fall_back(self):
         row = self.row(position=3)
         key = PivotProposalKey(self.identity, "qg-0", 0)
-        proposals = {key: _heads(range(8))}
+        proposals = {key: tuple(range(8))}
         plan = plan_pivot_candidates(
             rows=[row],
             pivot_proposals=proposals,
@@ -186,18 +211,18 @@ class TestPivotCandidateContract(unittest.TestCase):
         key = PivotProposalKey(self.identity, "qg-0", 0)
         plan = plan_pivot_candidates(
             rows=[row],
-            pivot_proposals={key: _heads(range(8))},
+            pivot_proposals={key: tuple(range(8))},
             row_refinements=None,
             config=self.config,
             context=self.context,
         )[0]
         audit = audit_pivot_recall(
             [plan],
-            {0: ((0, 1, 2, 99),) * 4},
+            {0: (0, 1, 2, 99)},
         )
         self.assertEqual(audit.accepted_rows, 1)
-        self.assertEqual(audit.evaluated_heads, 4)
-        self.assertEqual(audit.severe_omissions, 4)
+        self.assertEqual(audit.evaluated_rows, 1)
+        self.assertEqual(audit.severe_omissions, 1)
         self.assertEqual(audit.recall, 0.75)
 
 
