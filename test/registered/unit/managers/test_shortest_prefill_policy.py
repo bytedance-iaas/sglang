@@ -89,6 +89,97 @@ class TestShortestPrefillPolicy(CustomTestCase):
             )
         )
 
+    def test_multi_round_timeline_recomputes_hits_and_bounds_aging(self):
+        policy = self.create_policy(aging=0.5)
+        page_size = 64
+        budget = 256
+        processed_tokens = 0
+        continuation = make_req("continuation", 1024, arrived=0)
+        waiting = [
+            make_req("short-0", 64, arrived=0),
+            make_req("host-hit", 320, arrived=0),
+        ]
+        timeline = []
+
+        def run_round(round_id):
+            nonlocal processed_tokens
+            policy._sort_by_shortest_prefill(
+                waiting, set(), processed_tokens=processed_tokens
+            )
+            chunk_limit = policy.shortest_prefill_chunk_limit(
+                continuation,
+                waiting,
+                budget,
+                page_size,
+                processed_tokens=processed_tokens,
+            )
+            chunk_tokens = budget if chunk_limit is None else chunk_limit
+            chunk_tokens = min(
+                chunk_tokens,
+                len(continuation.full_untruncated_fill_ids)
+                - len(continuation.prefix_indices),
+            )
+            continuation.prefix_indices = list(
+                range(len(continuation.prefix_indices) + chunk_tokens)
+            )
+
+            remaining = budget - chunk_tokens
+            admitted = []
+            for req in list(waiting):
+                work = policy._shortest_prefill_work(req)
+                charge = -(-work // page_size) * page_size
+                if charge > remaining:
+                    break
+                remaining -= charge
+                admitted.append(req.rid)
+                waiting.remove(req)
+
+            processed_tokens += chunk_tokens + (budget - chunk_tokens - remaining)
+            timeline.append(
+                (
+                    round_id,
+                    chunk_tokens,
+                    tuple(admitted),
+                    len(continuation.prefix_indices),
+                )
+            )
+
+        run_round(1)
+        self.assertEqual(timeline[-1], (1, 192, ("short-0",), 192))
+
+        # Model an asynchronous HiCache load-back before the next round. The
+        # policy must rank the refreshed residual work, not the stale 320-token
+        # miss observed in round 1.
+        waiting[0].num_matched_prefix_tokens = 256
+        waiting[0].prefix_indices = list(range(256))
+        waiting.append(make_req("short-1", 64, arrived=processed_tokens))
+        run_round(2)
+        self.assertEqual(timeline[-1], (2, 128, ("host-hit", "short-1"), 320))
+
+        for round_id in (3, 4):
+            waiting.append(
+                make_req(f"short-{round_id - 1}", 64, arrived=processed_tokens)
+            )
+            run_round(round_id)
+            self.assertGreaterEqual(timeline[-1][1], page_size)
+            self.assertEqual(timeline[-1][2], (f"short-{round_id - 1}",))
+
+        waiting.append(make_req("short-4", 64, arrived=processed_tokens))
+        run_round(5)
+        self.assertEqual(timeline[-1], (5, 256, (), 960))
+
+        # Aging eventually makes the original continuation outrank a newly
+        # arrived short request. Removing the cancelled continuation leaves no
+        # policy-side reservation: the waiting request can run immediately.
+        cancelled = continuation
+        continuation = None
+        self.assertEqual(cancelled.rid, "continuation")
+        policy._sort_by_shortest_prefill(
+            waiting, set(), processed_tokens=processed_tokens
+        )
+        self.assertEqual([req.rid for req in waiting], ["short-4"])
+        self.assertLessEqual(policy._shortest_prefill_work(waiting[0]), budget)
+
     def test_invalid_policy_configuration_is_rejected(self):
         for schedule_policy, factor in [
             ("shortest-prefill-first", -0.5),
