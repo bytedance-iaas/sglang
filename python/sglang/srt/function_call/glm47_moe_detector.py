@@ -764,6 +764,16 @@ class Glm47MoeDetector(BaseFormatDetector):
                         current_text,
                     )
                     calls.extend(finalize_calls)
+                    # Speculative decoding or a terminal tokenizer delta can
+                    # contain several complete calls back-to-back.  Finalizing
+                    # the first call leaves the unconsumed suffix in _buffer;
+                    # drain it now instead of waiting for another model delta
+                    # that may never arrive.  The recursive call also preserves
+                    # an incomplete next call in _buffer for the next chunk.
+                    if self._buffer:
+                        tail = self.parse_streaming_increment("", tools)
+                        normal_text += tail.normal_text
+                        calls.extend(tail.calls)
                     return StreamingParseResult(normal_text=normal_text, calls=calls)
 
         except Exception as e:
