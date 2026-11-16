@@ -53,6 +53,9 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
             write_back_duplicate_reclaim_digest=0,
         )
         cache._pp_storage_ack_control = None
+        cache._prefetch_expired_handles = set()
+        cache.ongoing_prefetch = {}
+        cache.prefetch_stop_policy = "wait_complete"
         cache.pp_rank = pp_rank
         cache.pp_size = 2
         cache.host_memory_mode = "cache"

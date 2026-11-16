@@ -4,6 +4,7 @@ import atexit
 import logging
 import threading
 import time
+import zlib
 from dataclasses import replace
 from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
@@ -412,6 +413,7 @@ class UnifiedRadixCache(BasePrefixCache):
             CacheRequestHandle, int
         ] = {}
         self.storage_prefetch_retries = StoragePrefetchRetries()
+        self._prefetch_expired_handles: set[CacheRequestHandle] = set()
         self.ongoing_backup: dict[int, tuple[NodeId, DecLockRefParams]] = {}
         self._backup_requested_tokens: dict[int, int] = {}
         if self.buffer_pipeline is not None:
@@ -2209,16 +2211,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # progress, rank-min queue drain); a vote here only adds collectives.
             return False
         if self.prefetch_stop_policy == "timeout":
-            # Wall clocks differ across ranks: PP0 decides, TP takes MAX (any
-            # rank timed out) and _all_reduce broadcasts the verdict along PP.
-            should_terminate = False
-            if self.pp_rank == 0:
-                should_terminate = self._prefetch_timeout_check_linear_func(operation)
-            should_terminate_tensor = torch.tensor(
-                int(should_terminate), dtype=torch.int, device="cpu"
-            )
-            self._all_reduce(should_terminate_tensor, torch.distributed.ReduceOp.MAX)
-            return should_terminate_tensor.item() == 1
+            return operation.handle in self._prefetch_expired_handles
         return True
 
     def has_ongoing_prefetch(self, handle: CacheRequestHandle) -> bool:
@@ -3436,8 +3429,8 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
         # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
-        # equal iff reclaim victim order matched on every rank.
-        digest = self.tree_core.write_back_duplicate_reclaim_digest
+        # equal iff reclaim victim order and live prefetch set matched on every rank.
+        digest = self._hicache_sync_digest()
         ready_counts = torch.tensor(
             [
                 write_acks,
@@ -3456,7 +3449,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         count_values = list(map(int, ready_counts.tolist()))
         assert digest == count_values[-2] and digest == -count_values[-1], (
-            "write_back duplicate-reclaim victims diverged across PP/TP ranks"
+            "write_back duplicate-reclaim victims or live storage prefetches "
+            "diverged across PP/TP ranks"
         )
         return (
             count_values[0],
@@ -3535,7 +3529,7 @@ class UnifiedRadixCache(BasePrefixCache):
             if self.pp_rank == 0:
                 finish_count = self._count_ready_acks(cc.ack_load_queue)
             # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
-            # equal iff reclaim victim order matched on every rank.
+            # equal iff reclaim victim order and live prefetch set matched on every rank.
             digest = self.tree_core.write_back_duplicate_reclaim_digest
             sync_tensor = torch.tensor(
                 [finish_count, digest, -digest], dtype=torch.int64, device="cpu"
@@ -3673,6 +3667,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 extra_release_counts=extra_release_counts,
                 log_metrics=True,
             )
+        if self.enable_storage:
+            self._vote_prefetch_deadlines()
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.flush_pending_writes()
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
@@ -4033,3 +4029,43 @@ class UnifiedRadixCache(BasePrefixCache):
             self._all_reduce_attn_groups(data, torch.distributed.ReduceOp.MIN)
         else:
             self._all_reduce(data, torch.distributed.ReduceOp.MIN)
+
+    def _vote_prefetch_deadlines(self) -> None:
+        if self.prefetch_stop_policy != "timeout":
+            return
+        self._prefetch_expired_handles.intersection_update(self.ongoing_prefetch)
+        if not self.ongoing_prefetch:
+            return
+        operations = [info.operation for info in self.ongoing_prefetch.values()]
+        expired = [
+            int(self._prefetch_timeout_check_linear_func(op))
+            if self.pp_rank == 0
+            else 0
+            for op in operations
+        ]
+        verdicts = torch.tensor(expired, dtype=torch.int, device="cpu")
+        self._all_reduce(verdicts, torch.distributed.ReduceOp.MAX)
+        for op, expired in zip(operations, verdicts.tolist()):
+            if expired:
+                self._prefetch_expired_handles.add(op.handle)
+                self.cache_controller.terminate_prefetch(op)
+
+    def _hicache_sync_digest(self) -> int:
+        """Value piggybacked on the ready-count MIN sync: equal on every rank
+        iff the write_back reclaim victim order matched and, when the deadline
+        vote reads it, so did the live prefetch set (`ongoing_prefetch` in
+        insertion order). The admission polls retire per request, so a rank
+        that left the loop earlier than its peers (#30760) is caught here, in
+        the same tick on every rank, instead of hanging in a vote of a
+        different length. Fits int64: 42-bit digest * 1000003 + crc32."""
+        digest = self.tree_core.write_back_duplicate_reclaim_digest
+        if (
+            self.enable_storage
+            and self.prefetch_stop_policy == "timeout"
+            and self.ongoing_prefetch
+        ):
+            live = "\0".join(
+                f"{handle.rid}\0{handle.attempt_id}" for handle in self.ongoing_prefetch
+            )
+            digest = digest * 1000003 + zlib.crc32(live.encode()) + 1
+        return digest

@@ -5182,7 +5182,12 @@ fn prefetch_commit_attaches_a_sub_window_hit_under_a_non_root_anchor() {
         Some(&mut insert_result),
         Some(&storage_result),
     );
-    assert!(tc.arena.node(c).host_value(SWA).equal(&Tensor::from_slice(&[31i64])));
+    assert!(
+        tc.arena
+            .node(c)
+            .host_value(SWA)
+            .equal(&Tensor::from_slice(&[31i64]))
+    );
     assert!(tc.host_lru_list(SWA).in_list(Some(c)));
     assert!(!tc.arena.node(b).has_host_value(SWA));
     assert!(!tc.arena.node(a).has_host_value(SWA));
