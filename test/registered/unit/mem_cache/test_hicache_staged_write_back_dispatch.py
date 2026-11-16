@@ -1142,6 +1142,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.mem_pool_device = None
         controller.mem_pool_device_allocator = mock.Mock()
         controller.ack_write_queue = []
+        controller.write_fence_stream = None
         controller.move_hybrid_indices = mock.Mock(
             side_effect=AssertionError(
                 "write-back JIT kernel write should not move indices"
@@ -1177,6 +1178,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.mem_pool_device = None
         controller.mem_pool_device_allocator = mock.Mock()
         controller.ack_write_queue = []
+        controller.write_fence_stream = None
         controller.move_hybrid_indices = mock.Mock(
             return_value=(op.host_indices, op.device_indices, op.pool_transfers)
         )
@@ -1235,6 +1237,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.mem_pool_device = None
         controller.mem_pool_device_allocator = mock.Mock()
         controller.ack_write_queue = []
+        controller.write_fence_stream = None
         with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
             controller.l2_transfer_engine = L2TransferEngine("kernel")
         return controller
@@ -1303,6 +1306,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.mem_pool_device_allocator = mock.Mock()
         controller.device = "cuda"
         controller.ack_write_queue = []
+        controller.write_fence_stream = None
         controller.move_indices = mock.Mock(
             side_effect=AssertionError(
                 "write-back JIT kernel write should not move indices"
@@ -1340,6 +1344,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.mem_pool_device_allocator = mock.Mock()
         controller.device = "cuda"
         controller.ack_write_queue = []
+        controller.write_fence_stream = None
         controller.move_indices = mock.Mock(
             return_value=(op.host_indices, op.device_indices)
         )
@@ -1348,6 +1353,31 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
 
         controller.move_indices.assert_called_once()
         self.assertEqual(captured["host_indices"].device.type, "cpu")
+
+    def test_write_copy_waits_for_queued_forwards(self):
+        # Under overlap scheduling a finished request is cached while the next
+        # forward still writes its last token's KV; the D2H copy must start
+        # after that forward, or the host keeps a half-written token.
+        events = []
+
+        class RecordingStream:
+            def __init__(self, name):
+                self.name = name
+
+            def wait_stream(self, other):
+                events.append(f"{self.name} waits {other.name}")
+
+        controller = self._chain_write_controller(events)
+        controller.l2_transfer_engine.device_to_host_stream = RecordingStream("d2h")
+        controller.write_fence_stream = RecordingStream("forward")
+
+        with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
+            controller.write(_indices(4, 8), node_id=1)
+
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0], "d2h waits forward")
+        # Then the write's one copy, of the node's device slots.
+        self.assertEqual(events[1][1].tolist(), [4, 5, 6, 7])
 
 
 if __name__ == "__main__":
