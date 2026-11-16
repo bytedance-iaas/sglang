@@ -1313,6 +1313,10 @@ class BufferModePipeline:
             )
             self._refetch_staged(f)
             return False
+        head_end = self._window_head_end(f)
+        if joint_len < head_end:
+            self._refetch_staged(f)
+            return False
         req.prefix_len = matched_len
         req.last_node = node_id
         req.kv.cache_protected_len = matched_len
@@ -1773,3 +1777,17 @@ class BufferModePipeline:
         self._free_staging_now(staged.host_indices, staged.aux_xfers)
         self._cache.cache_controller.prefetch_tokens_occupied -= staged.occupied_tokens
         return True
+
+    def _window_head_end(self, f: _StagedPrefetch) -> int:
+        span_end = f.matched_len + f.num_tokens
+        component = self._cache.components.get(ComponentType.SWA)
+        if component is None:
+            return 0
+        staged_tokens = sum(
+            len(t.host_indices)
+            for t in f.aux_xfers
+            if t.name == PoolName.SWA and t.host_indices is not None
+        )
+        if 0 < staged_tokens < component.full_window_pages * self._cache.page_size:
+            return span_end - staged_tokens
+        return 0
