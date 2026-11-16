@@ -10,6 +10,8 @@
 
 #include <tvm/ffi/container/tensor.h>
 
+#include <atomic>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <utility>
@@ -188,6 +190,42 @@ inline auto get_max_smem_per_block(int device_id, bool opt_in = true, bool use_c
     CHECK_CUDA(cudaDeviceGetAttribute(&value, attr, device_id));
     return value;
   });
+}
+
+namespace details {
+
+struct MaybeDevice {
+  MaybeDevice(DLDevice device) : device_id(device.device_id) {}
+  MaybeDevice(int32_t device_id_) : device_id(device_id_) {}
+  uint32_t device_id;
+};
+
+}  // namespace details
+
+inline constexpr uint32_t kNumStaticMaxDevice = DeviceCacheMap<uint32_t, 0>::kNumStaticMaxDevice;
+
+/// \brief Run `fn` on the first call per device, keyed off the uniqueness of (`Tag`, `Fn`).
+/// \note Relaxed on purpose, to keep the hot path a single atomic load: concurrent first callers
+/// may all run `fn`, so it must be idempotent (e.g. setting a function attribute). A throwing `fn`
+/// leaves the device uninitialized, and devices past `kNumStaticMaxDevice` rerun `fn` every call.
+template <typename Tag = void, std::invocable Fn>
+inline void init_per_device(int device_id, bool use_cache, Fn&& fn) {
+  static_assert(kNumStaticMaxDevice % 8 == 0);
+  constexpr uint32_t kNumBytes = kNumStaticMaxDevice / 8;
+  static std::atomic_uint8_t s_initialized[kNumBytes]{};
+  const auto device = static_cast<uint32_t>(device_id);
+  const auto can_use_cache = use_cache && device < kNumStaticMaxDevice;
+  const auto mask = static_cast<uint8_t>(1u << (device % 8));
+  if (can_use_cache && s_initialized[device / 8].load() & mask) return;
+  std::forward<Fn>(fn)();
+  if (can_use_cache) s_initialized[device / 8].fetch_or(mask);
+}
+
+// Some wrappers of the above functions
+
+template <typename Tag = void, std::invocable Fn>
+inline void init_per_device(details::MaybeDevice device, Fn&& fn) {
+  return init_per_device<Tag>(device.device_id, true, std::forward<Fn>(fn));
 }
 
 }  // namespace host::runtime
