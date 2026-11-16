@@ -1,7 +1,7 @@
 """Readback and runtime updates for the scheduler's internal state.
 
-Holds the live ``Scheduler`` because both sides answer about the state at call
-time; it only reads it.
+Holds the live ``Scheduler`` so readback and validated updates use its current
+state.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReqOutput,
 )
 from sglang.srt.managers.scheduler_components.memory_usage import build_memory_usage
-from sglang.srt.runtime_context import get_context, get_exec, get_parallel
+from sglang.srt.runtime_context import get_context, get_exec, get_parallel, get_schedule
 from sglang.srt.server_args import compute_world_size
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
@@ -39,6 +39,11 @@ class SchedulerInternalStateController:
     def __init__(self, scheduler: Scheduler, record_step_time: bool) -> None:
         self.scheduler = scheduler
         self.record_step_time = record_step_time
+        # Buffers and activation memory were sized for this per-rank budget.
+        # Keep the ceiling stable when the live budget is reduced.
+        self._startup_chunked_prefill_size = getattr(
+            scheduler, "chunked_prefill_size", None
+        )
 
     # ---------------------------------------------------------------- readback
 
@@ -168,6 +173,9 @@ class SchedulerInternalStateController:
 
     def _update_handlers(self) -> Dict[str, _UpdateHandler]:
         return {
+            "chunked_prefill_size": _UpdateHandler(
+                self._validate_chunked_prefill_size, self._apply_chunked_prefill_size
+            ),
             "pp_max_micro_batch_size": _UpdateHandler(
                 self._validate_pp_micro_batch_size, _override
             ),
@@ -184,6 +192,40 @@ class SchedulerInternalStateController:
                 self._validate_dspark_clear_records, self._apply_dspark_clear_records
             ),
         }
+
+    def _validate_chunked_prefill_size(self, key: str, value: Any) -> None:
+        scheduler = self.scheduler
+        if type(value) is not int or value <= 0:
+            raise UpdateRejected(f"{key} must be a positive integer, got {value}.")
+        ceiling = self._startup_chunked_prefill_size
+        if ceiling is None or ceiling <= 0 or scheduler.chunked_prefill_size is None:
+            raise UpdateRejected(f"Updating {key} requires chunked prefill at startup.")
+        if value > ceiling:
+            raise UpdateRejected(
+                f"{key} must not exceed the startup per-rank budget of {ceiling}."
+            )
+        if value % scheduler.page_size != 0:
+            raise UpdateRejected(f"{key} must be divisible by page_size.")
+        align = scheduler.truncation_align_size
+        if align is not None and value < align:
+            raise UpdateRejected(
+                f"{key} must be at least the truncation alignment of {align}."
+            )
+        if get_schedule().enable_dynamic_chunking:
+            raise UpdateRejected(
+                f"Updating {key} is incompatible with dynamic chunking."
+            )
+        if scheduler.dllm_config is not None:
+            raise UpdateRejected(f"Updating {key} is not supported for diffusion LLMs.")
+        if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
+            # The transfer protocol uses a fixed chunk grid on both P and D.
+            raise UpdateRejected(f"Updating {key} is incompatible with KV staging.")
+
+    def _apply_chunked_prefill_size(self, key: str, value: Any) -> Dict[str, Any]:
+        # Already-built batches and chunked requests keep their progress. The
+        # next PrefillAdder reads this budget, including for an unfinished prompt.
+        self.scheduler.chunked_prefill_size = value
+        return {key: value}
 
     def _validate_pp_micro_batch_size(self, key: str, value: Any) -> None:
         upper = self.scheduler.max_running_requests // get_parallel().pp_size
