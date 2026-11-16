@@ -278,6 +278,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         self.work_list: list[torch.distributed.Work] = []
+        self._pp_storage_ack_control = None
+        self._pp_storage_ack_generation = 0
+        self._pp_storage_ack_consumed = 0
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
@@ -390,6 +393,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        self._reset_pp_storage_ack_prefix()
         self.tree_core.reset()
         self.session_refs.reset()
 
@@ -409,6 +413,7 @@ class UnifiedRadixCache(BasePrefixCache):
         ] = {}
         self.storage_prefetch_retries = StoragePrefetchRetries()
         self.ongoing_backup: dict[int, tuple[NodeId, DecLockRefParams]] = {}
+        self._backup_requested_tokens: dict[int, int] = {}
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.reset()
             # The dropped writes' content no longer reaches a storage ack.
@@ -1969,6 +1974,9 @@ class UnifiedRadixCache(BasePrefixCache):
             node_id,
             self.inc_host_lock_ref(node_id).to_dec_params(),
         )
+        self._backup_requested_tokens[operation_id] = (
+            len(spec.hash_value) * self.page_size
+        )
 
     def is_backuped(self, node_id: NodeId) -> bool:
         return self.tree_core.is_backuped(node_id)
@@ -2894,6 +2902,7 @@ class UnifiedRadixCache(BasePrefixCache):
         n_release: Optional[int],
         extra_release_counts: Optional[dict[PoolName, int]],
         log_metrics: bool,
+        agreed_backup_tokens: Optional[list[int]] = None,
     ) -> None:
         cc = self.cache_controller
 
@@ -3138,26 +3147,41 @@ class UnifiedRadixCache(BasePrefixCache):
                         )
 
         def _drain_backup():
-            drained = 0
-            for operation in _drain_queue(cc.ack_backup_queue, n_backup):
-                drained += 1
-                if buffer_mode:
-                    # Storage write acked: free the staging.
-                    self.buffer_pipeline.finish_storage_write_ack(operation.id)
+            acked = list(_drain_queue(cc.ack_backup_queue, n_backup))
+            if not acked:
+                return 0
+            requested = [self._backup_requested_tokens_of(op.id) for op in acked]
+            if agreed_backup_tokens is not None:
+                written = agreed_backup_tokens
+            else:
+                if cc.backup_skip:
+                    written = [req or 0 for req in requested]
                 else:
-                    entry = self.ongoing_backup.pop(operation.id, None)
-                    if entry is not None:
-                        node_id, lock_params = entry
-                        self.dec_host_lock_ref(node_id, lock_params)
-                if (
-                    log_metrics
-                    and self.enable_storage_metrics
-                    and self.storage_metrics_collector is not None
+                    written = [
+                        min(op.completed_tokens, req or 0)
+                        for op, req in zip(acked, requested)
+                    ]
+                if n_backup is not None:
+                    votes = torch.tensor(written, dtype=torch.int64)
+                    self._all_reduce_storage_drain(votes)
+                    written = votes.tolist()
+            for op, req, done in zip(acked, requested, written):
+                if req is not None and not (
+                    0 <= done <= req and done % self.page_size == 0
                 ):
-                    self.storage_metrics_collector.log_backuped_tokens(
-                        operation.completed_tokens
+                    raise RuntimeError(
+                        f"HiCache storage backup operation {op.id} reported "
+                        f"{done} written tokens of {req} (page size {self.page_size})"
                     )
-            return drained
+                self._finish_backup_ack(
+                    op,
+                    requested_tokens=req,
+                    agreed_tokens=done,
+                    log_metrics=log_metrics,
+                )
+            if self._pp_storage_ack_control is not None:
+                self._pp_storage_ack_consumed += len(acked)
+            return len(acked)
 
         def _drain_release():
             host_indices_list = []
@@ -3282,7 +3306,10 @@ class UnifiedRadixCache(BasePrefixCache):
         """Detach (disable) the HiCache storage backend at runtime."""
         if self._storage_attachment is None:
             return False, "HiCache storage backend is not initialized."
-        return self._storage_attachment.detach()
+        result = self._storage_attachment.detach()
+        if result[0]:
+            self._reset_pp_storage_ack_prefix()
+        return result
 
     def shutdown(self) -> None:
         """Best-effort auto-detach of the storage backend on process shutdown."""
@@ -3301,6 +3328,70 @@ class UnifiedRadixCache(BasePrefixCache):
 
     # ---- HiCache: Async Event Management ----
 
+    def _reset_pp_storage_ack_prefix(self) -> None:
+        control = self._pp_storage_ack_control
+        if control is not None:
+            control.store.pop(
+                control._key("hicache-backup", self._pp_storage_ack_generation), None
+            )
+        self._pp_storage_ack_generation += 1
+        self._pp_storage_ack_consumed = 0
+
+    def _publish_pp_storage_ack_prefix(self) -> None:
+        cc = self.cache_controller
+        count = torch.tensor(cc.ack_backup_queue.qsize(), dtype=torch.int64)
+        self._all_reduce_attn_groups(count, torch.distributed.ReduceOp.MIN)
+        with cc.ack_backup_queue.mutex:
+            acked = list(cc.ack_backup_queue.queue)[: int(count.item())]
+        requested = [self._backup_requested_tokens_of(op.id) for op in acked]
+        written = [
+            (req or 0) if cc.backup_skip else min(op.completed_tokens, req or 0)
+            for op, req in zip(acked, requested)
+        ]
+        if written:
+            votes = torch.tensor(written, dtype=torch.int64)
+            self._all_reduce_attn_groups(votes, torch.distributed.ReduceOp.MIN)
+            written = votes.tolist()
+        control = self._pp_storage_ack_control
+        key = control._key("hicache-backup", self._pp_storage_ack_generation)
+        value = (self._pp_storage_ack_consumed, written)
+        if control.store.get(key) != value:
+            control.store[key] = value
+
+    def _apply_pp_storage_ack_prefix(self) -> None:
+        control = self._pp_storage_ack_control
+        if control is None or not self.enable_storage:
+            return
+        generation = self._pp_storage_ack_generation
+        start = self._pp_storage_ack_consumed
+
+        def produce():
+            values = control.store.collect(control._key("hicache-backup", generation))
+            if any(value is None for value in values):
+                return None
+            end = min(offset + len(written) for offset, written in values)
+            # The tape retains earlier verdicts until followers consume them.
+            # Only the pending interval needs to remain in the proposal store.
+            return start, [
+                min(written[seq - offset] for offset, written in values)
+                for seq in range(start, end)
+            ]
+
+        verdict = control.log.decide("hicache-backup", (generation,), produce)
+        if verdict is None:
+            return
+        offset, written = verdict
+        written = written[max(0, self._pp_storage_ack_consumed - offset) :]
+        self._drain_storage_control_queues_impl(
+            n_storage_hit=0,
+            n_ack_prefetch=0,
+            n_backup=len(written),
+            n_release=0,
+            extra_release_counts={},
+            log_metrics=True,
+            agreed_backup_tokens=written,
+        )
+
     def _count_ready_acks(self, ack_queue) -> int:
         ready_count = 0
         for ack in ack_queue:
@@ -3313,6 +3404,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self,
     ) -> tuple[int, int, tuple[int, ...], tuple[PoolName, ...]]:
         cc = self.cache_controller
+        if self._pp_storage_ack_control is not None and self.enable_storage:
+            self._publish_pp_storage_ack_prefix()
         extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
         extra_pool_names = tuple(extra_release_queues) if self.enable_storage else ()
         if cc is None or (self.pp_rank > 0 and self.host_memory_mode != "buffer_only"):
@@ -3337,6 +3430,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
                 if self.enable_storage
                 else ()
+            )
+
+        if self._pp_storage_ack_control is not None and storage_queue_sizes:
+            # The ordered PP boundary owns storage-backup ACKs. PP0's local
+            # count must not make a follower wait for its slower SSD writer.
+            storage_queue_sizes = (
+                *storage_queue_sizes[:2],
+                0,
+                *storage_queue_sizes[3:],
             )
 
         # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
@@ -3862,3 +3964,78 @@ class UnifiedRadixCache(BasePrefixCache):
                 + ", ".join(dead)
             )
 
+    def _backup_requested_tokens_of(self, operation_id: int) -> Optional[int]:
+        """Requested KV tokens of an acked storage write; None for a write no
+        longer tracked (dropped by reset or detach) and for a buffer-mode
+        write of another pool, which carries no KV pages and settles whole."""
+        if self.buffer_pipeline is None:
+            return self._backup_requested_tokens.get(operation_id)
+        entry = self.buffer_pipeline.ongoing_backup.get(operation_id)
+        if entry is None or entry.intent.pool != PoolName.KV:
+            return None
+        return len(entry.keys_by_pool[PoolName.KV]) * self.page_size
+
+    def _finish_backup_ack(
+        self,
+        operation,
+        *,
+        requested_tokens: Optional[int],
+        agreed_tokens: int,
+        log_metrics: bool,
+    ) -> None:
+        """Settle one acked storage write at its agreed written prefix.
+
+        Buffer mode believes only the written keys; the unwritten tail is
+        neither believed nor in flight, so the next write-through piece that
+        covers it writes it. Cache mode releases the host lock as before:
+        the span is sent again when the node's host copy is evicted and the
+        node is hit again, the existing write-through cycle. Nothing is
+        retried here; a shortfall is logged and counted.
+        """
+        page_size = self.page_size
+        short = requested_tokens is not None and agreed_tokens < requested_tokens
+        if self.buffer_pipeline is not None:
+            self.buffer_pipeline.finish_storage_write_ack(
+                operation.id,
+                written_pages=(
+                    None if requested_tokens is None else agreed_tokens // page_size
+                ),
+            )
+        else:
+            self._backup_requested_tokens.pop(operation.id, None)
+            entry = self.ongoing_backup.pop(operation.id, None)
+            if entry is not None:
+                node_id, lock_params = entry
+                self.dec_host_lock_ref(node_id, lock_params)
+        if short:
+            logger.warning(
+                "HiCache storage backup operation %d wrote %d of %d tokens; the "
+                "tail stays un-backed until a later write-through covers it.",
+                operation.id,
+                agreed_tokens,
+                requested_tokens,
+            )
+        if (
+            log_metrics
+            and self.enable_storage_metrics
+            and self.storage_metrics_collector is not None
+        ):
+            collector = self.storage_metrics_collector
+            # What this rank wrote of the agreed prefix.
+            collector.log_backuped_tokens(
+                min(operation.completed_tokens, agreed_tokens)
+            )
+            if short:
+                collector.log_storage_backup_failed_tokens(
+                    requested_tokens - agreed_tokens
+                )
+
+    def _all_reduce_storage_drain(self, data: torch.Tensor) -> None:
+        """MIN-reduce a per-drain tensor over the ranks whose storage drain
+        runs in lockstep, as _sync_hicache_ready_counts reduces the counts:
+        every TP rank of each PP stage in buffer_only mode (each stage drains
+        its own completions), else PP0's TP verdict propagated along PP."""
+        if self.host_memory_mode == "buffer_only" and self.pp_size > 1:
+            self._all_reduce_attn_groups(data, torch.distributed.ReduceOp.MIN)
+        else:
+            self._all_reduce(data, torch.distributed.ReduceOp.MIN)

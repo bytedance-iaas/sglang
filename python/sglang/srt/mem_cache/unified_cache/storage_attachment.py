@@ -411,6 +411,7 @@ class StorageAttachment:
         """
         cache = self._cache
         controller = cache.cache_controller
+        cache._backup_requested_tokens.clear()
 
         for handle in list(cache.ongoing_prefetch):
             info = cache.ongoing_prefetch[handle]
