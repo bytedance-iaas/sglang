@@ -201,6 +201,7 @@ class HiCacheHF3FS(HiCacheStorage):
         is_page_first_layout: bool = False,
         use_mock_client: bool = False,
         enable_storage_metrics: bool = False,
+        metadata_rank: Optional[int] = None,
     ):
         self.rank = rank
         self.file_path = file_path
@@ -217,11 +218,15 @@ class HiCacheHF3FS(HiCacheStorage):
         self.enable_storage_metrics = enable_storage_metrics
         self.use_mock_client = use_mock_client
         self.numel = self.bytes_per_page // self.dtype.itemsize
-        self.num_pages = self.file_size // self.bytes_per_page
+        self.num_pages = (
+            self.file_size // self.bytes_per_page if self.bytes_per_page else 0
+        )
         self.skip_backup = False
         if self.is_mla_model and self.rank != 0:
             self.skip_backup = True
             self.rank = 0
+        if metadata_rank is not None:
+            self.rank = metadata_rank
 
         self.is_zero_copy = False
 
@@ -243,13 +248,14 @@ class HiCacheHF3FS(HiCacheStorage):
                 self.client_timeout,
                 use_mock_client,
             )
-            for _ in range(numjobs)
+            for _ in range(numjobs if self.bytes_per_page else 0)
         ]
         self.executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=self.numjobs, thread_name_prefix=f"HiCacheHF3FS-Rank{self.rank}"
         )
 
-        self.metadata_client.initialize(self.rank, self.num_pages)
+        if self.bytes_per_page:
+            self.metadata_client.initialize(self.rank, self.num_pages)
         self.lock = threading.RLock()
         self._pool_storage_ctx: dict = {}
 
@@ -359,10 +365,19 @@ class HiCacheHF3FS(HiCacheStorage):
             metadata_client = Hf3fsLocalMetadataClient()
 
         rank_for_path = 0 if is_mla_model else rank
+        pp_rank = storage_config.pp_rank if storage_config else 0
+        pp_suffix = (
+            f".pp{pp_rank}" if storage_config and storage_config.pp_size > 1 else ""
+        )
+        metadata_rank = (
+            pp_rank * storage_config.tp_size + rank_for_path
+            if storage_config
+            else rank_for_path
+        )
         return HiCacheHF3FS(
             rank=rank,
             # Let all ranks use the same file path for MLA model
-            file_path=f"{config['file_path_prefix']}.{rank_for_path}.bin",
+            file_path=f"{config['file_path_prefix']}{pp_suffix}.{rank_for_path}.bin",
             file_size=int(config["file_size"]),
             numjobs=int(config["numjobs"]),
             bytes_per_page=bytes_per_page,
@@ -374,6 +389,7 @@ class HiCacheHF3FS(HiCacheStorage):
             is_page_first_layout=is_page_first_layout,
             use_mock_client=use_mock_client,
             enable_storage_metrics=storage_config.enable_storage_metrics,
+            metadata_rank=metadata_rank,
         )
 
     def _batch_get(
@@ -581,7 +597,7 @@ class HiCacheHF3FS(HiCacheStorage):
         super().register_mem_host_pool_v2(host_pool, host_pool_name)
 
         pool_page_size = getattr(host_pool, "page_size", 1) or 1
-        pool_bytes_per_page = host_pool.get_ksize_per_token() * pool_page_size
+        pool_bytes_per_page = host_pool.get_dummy_flat_data_page().nbytes
         pool_num_pages = self.file_size // pool_bytes_per_page
         pool_file_path = f"{self.file_path}.{host_pool_name}"
         namespace = host_pool_name  # e.g. PoolName.MAMBA, PoolName.INDEXER
@@ -679,19 +695,23 @@ class HiCacheHF3FS(HiCacheStorage):
         pool_transfers: Optional[List[PoolTransfer]] = None,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> PoolTransferResult:
-        kv_pages = self.batch_exists(keys, extra_info)
+        kv_pages = (
+            len(keys)
+            if self.mem_pool_host.kv_buffer is None
+            else self.batch_exists(keys, extra_info)
+        )
 
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
-        final_pages = kv_pages
+        restorable = list(range(1, kv_pages + 1))
 
         for transfer in pool_transfers or []:
-            if final_pages == 0:
+            if not restorable:
                 break
 
             pool_name = transfer.name
             ctx = self._pool_storage_ctx.get(pool_name)
             if ctx is None:
-                final_pages = 0
+                restorable = []
                 break
 
             component_keys = [f"{key}_{pool_name}" for key in keys[:kv_pages]]
@@ -700,11 +720,13 @@ class HiCacheHF3FS(HiCacheStorage):
             )
 
             boundary = 0
+            pool_restorable = []
             if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
                 try:
                     boundary = exists_results.index(False)
                 except ValueError:
                     boundary = kv_pages
+                pool_restorable = list(range(1, boundary + 1))
             elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
                 trailing = max(1, len(transfer.keys) if transfer.keys else 1)
                 for prefix_len in range(kv_pages, 0, -1):
@@ -712,14 +734,18 @@ class HiCacheHF3FS(HiCacheStorage):
                         exists_results[i]
                         for i in range(max(0, prefix_len - trailing), prefix_len)
                     ):
-                        boundary = prefix_len
-                        break
+                        pool_restorable.append(prefix_len)
+                        if boundary == 0:
+                            boundary = prefix_len
 
             if boundary:
                 hit_count[pool_name] = boundary
-            final_pages = min(final_pages, boundary)
+            pool_restorable_set = set(pool_restorable)
+            restorable = [p for p in restorable if p in pool_restorable_set]
 
-        return PoolTransferResult(final_pages, hit_count)
+        return PoolTransferResult(
+            restorable[-1] if restorable else 0, hit_count, restorable
+        )
 
     def _pool_batch_get(self, transfer: PoolTransfer) -> List[bool]:
         pool_name = transfer.name
@@ -885,6 +911,8 @@ class HiCacheHF3FS(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        if self.mem_pool_host.kv_buffer is None:
+            return [True] * len(keys)
         keys, values = self._batch_get_preprocess(keys, host_indices)
         results = self._batch_get(keys, values)
         return self._batch_get_postprocess(host_indices, values, results)
@@ -912,6 +940,8 @@ class HiCacheHF3FS(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        if self.mem_pool_host.kv_buffer is None:
+            return [True] * len(keys)
         len_keys = len(keys)
         keys, values = self._batch_set_preprocess(keys, host_indices)
         results = self._batch_set(keys, values)

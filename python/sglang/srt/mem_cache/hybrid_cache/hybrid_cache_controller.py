@@ -309,6 +309,13 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend_extra_config: Optional[dict] = None,
         host_pools: Optional[list[PoolEntry]] = None,
     ):
+        self.storage_host_pool = self.mem_pool_host.anchor_entry.host_pool
+        if storage_backend == "mooncake" and self.storage_host_pool.kv_buffer is None:
+            # Logical V4 anchors own no tensors; dummy setup needs every side pool.
+            self.mem_pool_host.storage_format_tag = (
+                self.storage_host_pool.storage_format_tag
+            )
+            self.storage_host_pool = self.mem_pool_host
         if isinstance(
             self.storage_host_pool, UnifiedPageEnvelopeHostPool
         ) and not self.supports_page_envelope_host(storage_backend):

@@ -77,6 +77,7 @@ class TestMooncakeStandaloneDummyMamba(CustomTestCase):
                 def __init__(self):
                     self.temporal_buffer = torch.empty((64,), dtype=torch.uint8)
                     self.conv_buffer = [torch.empty((32,), dtype=torch.uint8)]
+                    self.allocator = FakeAllocator()
 
                 def get_hybrid_pool_buffer(self):
                     return [self.temporal_buffer, *self.conv_buffer]
@@ -102,7 +103,7 @@ class TestMooncakeStandaloneDummyMamba(CustomTestCase):
 
                 @property
                 def allocator(self):
-                    return self.kv.allocator
+                    raise AssertionError("the group itself has no tensor allocator")
 
                 @property
                 def size(self):
