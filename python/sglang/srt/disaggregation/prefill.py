@@ -159,6 +159,15 @@ def maybe_release_metadata_buffer(
         req.metadata_buffer_index = -1
 
 
+def max_bootstrap_input_len(*, capacity: int, page_size: int, shard_size: int) -> int:
+    """Bootstrap prompt limit: the longest prompt admission can ever fit on an
+    empty pool. Nothing downstream drops a longer one; it would wait at the
+    head of the queue forever."""
+    # Strictest path, add_one_req_ignore_eos: page-rounded prompt, one page per
+    # shard, 1 new token and 1 spare token must stay below capacity.
+    return (capacity - shard_size * page_size - 3) // page_size * page_size
+
+
 class PrefillBootstrapQueue:
     """
     Store the requests in bootstrapping
@@ -191,8 +200,10 @@ class PrefillBootstrapQueue:
         self.queue: List[Req] = []
         self.scheduler = scheduler
         self.scheduler_stage_metrics = scheduler_stage_metrics
-        self.max_total_num_tokens = (
-            self.scheduler.tp_worker.model_runner.effective_logical_max_total_num_tokens
+        self.max_total_num_tokens = max_bootstrap_input_len(
+            capacity=self.scheduler.tp_worker.model_runner.effective_logical_max_total_num_tokens,
+            page_size=self.scheduler.token_to_kv_pool_allocator.page_size,
+            shard_size=self.scheduler.kv_shard_widening,
         )
         self.transfer_backend = transfer_backend
         self.pp_poll_sync_work_list: List = []
