@@ -89,6 +89,40 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
 
 Please consult the documentation below and [server_args.py](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/server_args.py) to learn more about the arguments you may provide when launching a server.
 
+## Update the prefill chunk size at runtime
+
+If you started the server with chunked prefill enabled, you can change its token
+budget without restarting the server or reloading model weights:
+
+```bash
+curl -X POST http://HOST:PORT/set_internal_state \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" \
+  -d '{"server_args": {"chunked_prefill_size": 2048}}'
+```
+
+Replace `HOST` and `PORT` with the server address. If you configured
+`--admin-api-key`, set `SGLANG_ADMIN_API_KEY` to that key; otherwise omit the
+authorization header. The response contains one boolean per scheduler response;
+check that every value is `true`.
+
+The new size applies to subsequent prefill batches, including the remaining
+chunks of an unfinished prompt. Already-built batches keep their original size.
+You can read the current value in each `internal_states` entry of `/server_info`.
+
+- Use a positive integer divisible by `--page-size` and at least as large as the
+  scheduler's truncation alignment, when one is configured.
+- The size cannot exceed the effective chunk size at startup, because buffers
+  and activation memory were allocated for that budget. You can reduce it and
+  later increase it back to the startup value.
+- With attention data parallelism, the API value is the budget **per attention
+  DP rank**. The startup CLI value is divided across those ranks; the API value
+  is used directly.
+- Runtime updates cannot enable or disable chunked prefill. They are rejected
+  with `--enable-dynamic-chunking` or `SGLANG_DISAGG_STAGING_BUFFER=1`, because
+  those modes manage chunk sizes or transfer grids separately. Diffusion LLM
+  scheduling is also unsupported.
+
 ## Model and tokenizer
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
