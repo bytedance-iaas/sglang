@@ -1348,6 +1348,9 @@ class Envs:
     # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
+    # Exactness of top-k v2, compiled once per process: 0 fast, 1 exact,
+    # 2 exact with deterministic smallest-index ties.
+    SGLANG_TOPK_V2_MODE = EnvInt(1)
 
     # ===================================================================
     # Kernel selection and fused backends

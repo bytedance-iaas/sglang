@@ -90,6 +90,9 @@ def generate_clangd():
         compile_flags.append("-D_CG_LIMIT_INCLUDED_DEPENDENCIES=1")
         compile_flags.append("-D_CG_HAS_CLUSTER_GROUP=1")
 
+    # Defaults for JIT-passed macros while indexing headers in the IDE.
+    compile_flags.append("-DSGL_TYPE_CHECKING=1")
+
     # NOTE: skip these flags because clangd don't recognize them
     UNSUPPORTED_FLAGS = {"--expt-relaxed-constexpr"}
     compile_flags = [flag for flag in compile_flags if flag not in UNSUPPORTED_FLAGS]
