@@ -41,7 +41,6 @@ from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.runtime_context import get_memory
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -269,22 +268,31 @@ class HybridCacheController(BaseHiCacheController):
         if self.pp_prefetch_command_group is not None:
             self.pp_prefetch_command_queue = Queue()
             self.pp_prefetch_command_thread = threading.Thread(
-                target=self.pp_prefetch_command_thread_func, daemon=True
+                target=self.pp_prefetch_command_thread_func,
+                name="hicache-pp-ticket",
+                daemon=True,
             )
             self.pp_prefetch_command_thread.start()
 
     def _stop_pp_prefetch_thread(self) -> None:
+        # reset() stops the ticket thread before the workers: set the event
+        # here too, so the ticket thread answers the tickets in flight as
+        # misses and the workers issue no backend call meanwhile.
+        self.storage_stop_event.set()
         thread = self.pp_prefetch_command_thread
         if thread is None:
             return
         if thread.is_alive() and getattr(self, "pp_rank", 0) == 0:
             self.pp_prefetch_command_queue.put(None)
-        thread.join(timeout=10)
+        self._join_storage_threads([thread])
         if thread.is_alive():
             raise RuntimeError("Failed to stop PP HiCache ticket thread cleanly.")
         self.pp_prefetch_command_thread = None
 
     def _stop_storage_threads(self):
+        # Set first so the four workers stop issuing backend calls even when
+        # the ticket thread's join below hits its bound (the base sets it too).
+        self.storage_stop_event.set()
         self._stop_pp_prefetch_thread()
         super()._stop_storage_threads()
 
@@ -489,7 +497,9 @@ class HybridCacheController(BaseHiCacheController):
         if self.enable_storage and self.pp_prefetch_command_group is not None:
             self.pp_prefetch_command_queue = Queue()
             self.pp_prefetch_command_thread = threading.Thread(
-                target=self.pp_prefetch_command_thread_func, daemon=True
+                target=self.pp_prefetch_command_thread_func,
+                name="hicache-pp-ticket",
+                daemon=True,
             )
             self.pp_prefetch_command_thread.start()
         if self.enable_storage:
@@ -1310,7 +1320,10 @@ class HybridCacheController(BaseHiCacheController):
                 operation.storage_hit_count = ticket.storage_hit_count
                 operation.storage_start = len(ticket.matched_prefix_tokens)
                 operation.pool_storage_result = PoolTransferResult.empty()
-                if not self._allocate_pp_prefetch_buffers(ticket, operation):
+                if (
+                    self.storage_stop_event.is_set()
+                    or not self._allocate_pp_prefetch_buffers(ticket, operation)
+                ):
                     operation.host_indices = torch.empty(0, dtype=torch.int64)
                     operation.mark_terminate()
                 self.prefetch_buffer.put(operation)
@@ -1481,8 +1494,10 @@ class HybridCacheController(BaseHiCacheController):
         # (IO failure, timeout, TP mismatch), skip extra IO entirely to avoid
         # data misalignment.
         pool_hits: dict[str, int] = {}
-        if not operation.is_terminated() and kv_completed_pages == len(
-            operation.hash_value
+        if (
+            not operation.is_terminated()
+            and not self.storage_stop_event.is_set()
+            and kv_completed_pages == len(operation.hash_value)
         ):
             # KV-derived sidecar pools are handled in CacheController._page_transfer_kv_batch.
             # Only handle non-KV-derived sidecar pools here.
@@ -1513,8 +1528,6 @@ class HybridCacheController(BaseHiCacheController):
                     )
                 pool_hits = count_pool_hits(results)
             except Exception:
-                if not get_memory().enable_unified_memory:
-                    raise
                 logger.exception(
                     "HiCache sidecar prefetch failed for request %s",
                     operation.request_id,
@@ -1552,6 +1565,8 @@ class HybridCacheController(BaseHiCacheController):
             return self._page_backup_with_stable_layout(operation)
 
     def _page_backup_with_stable_layout(self, operation):
+        if self.storage_stop_event.is_set():
+            return
         # MLA KV is replicated across TP ranks and should still be written only
         # by TP0. Rank-sharded sidecars still need every TP rank.
         backup_transfers = [
@@ -1567,6 +1582,8 @@ class HybridCacheController(BaseHiCacheController):
             for extra_info, transfers in _trailing_chain_groups(
                 operation.prefix_keys, operation.hash_value, backup_transfers
             ):
+                if self.storage_stop_event.is_set():
+                    break
                 results.update(
                     self.storage_backend.batch_set_v2(transfers, extra_info=extra_info)
                 )
@@ -1630,7 +1647,7 @@ class HybridCacheController(BaseHiCacheController):
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                self._page_backup(operation)
+                self._page_backup_or_log(operation)
                 self.ack_backup_queue.put(operation)
             except Empty:
                 continue
@@ -1827,7 +1844,7 @@ class HybridCacheController(BaseHiCacheController):
 
     def prefetch_sync_thread_func(self) -> None:
         """Synchronize progressive ACKs and publish PP ticket completion."""
-        while not self.storage_stop_event.is_set():
+        while self._sync_thread_should_run():
             try:
                 ack = self.prefetch_sync_queue.get(block=True, timeout=1)
                 if ack is None:
@@ -1862,3 +1879,7 @@ class HybridCacheController(BaseHiCacheController):
                         self.pp_prefetch_states.pop(operation.request_id, None)
             except Empty:
                 continue
+
+    def _prefetch_producers_alive(self) -> bool:
+        thread = self.pp_prefetch_command_thread
+        return thread is not None and thread.is_alive()
