@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -273,6 +274,10 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         handle = CacheRequestHandle("r", 0)
         pipeline = BufferModePipeline.__new__(BufferModePipeline)
         pipeline._cache = mock.Mock()
+        pipeline._cache.page_size = 2
+        pipeline._cache.components = {
+            ComponentType.SWA: SimpleNamespace(full_window_pages=2)
+        }
         pipeline._cache.cache_controller.mem_pool_host.entry_map = {
             PoolName.SWA: SimpleNamespace(
                 host_pool=SimpleNamespace(page_size=swa_page_size)

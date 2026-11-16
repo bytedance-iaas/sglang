@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedRadixCache,
     _OngoingPrefetch,
@@ -63,6 +64,7 @@ def _staged_fixture(full_match=2):
     cache.ongoing_prefetch = {}
     cache._prefetch_outcome_stats = defaultdict(int)
     cache.tree_components = []
+    cache.components = {ComponentType.SWA: SimpleNamespace(full_window_pages=2)}
     cache.prefetch_threshold = 2
     cache._build_sidecar_transfers = Mock(return_value=[])
     cache.supports_swa = lambda: True

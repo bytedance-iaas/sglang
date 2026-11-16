@@ -135,7 +135,6 @@ class StorageAttachment:
             cache.is_write_back,
         )
         try:
-            prefetch_threshold = self.resolve_prefetch_threshold(prefetch_threshold)
             if cache.host_memory_mode == "buffer_only":
                 validate_buffer_only_stack(
                     sidecar_pool_specs=cache.sidecar_pool_specs,
@@ -289,16 +288,6 @@ class StorageAttachment:
             )
         else:
             cache.storage_metrics_collector = None
-
-    def resolve_prefetch_threshold(self, configured: int) -> int:
-        """Use the same complete-window minimum for every buffer-mode anchor."""
-        cache = self._cache
-        window = cache.sliding_window_size
-        if not window or cache.host_memory_mode != "buffer_only":
-            return configured
-        page_size = cache.page_size
-        window_tokens = ((window + page_size - 1) // page_size) * page_size
-        return max(configured, window_tokens)
 
     def _resolve_metrics_collector(
         self,
