@@ -2655,7 +2655,8 @@ def hc_mix_stats_sinkhorn_bf16x3(
     mix = (2 + hc_mult) * hc_mult
     slices = _HC_MIX_COMPENSATED_SLICES
     hopper_medium = get_platform().is_sm90 and 32 <= m < 4096
-    block_m = 64 if hopper_medium else _HC_MIX_BF16X3_BLOCK_M
+    # Keep medium SM90 projections on synchronous MMA for repeatable accumulation.
+    block_m = 32 if hopper_medium else _HC_MIX_BF16X3_BLOCK_M
     assert x.is_contiguous() and x.dtype == torch.bfloat16
     assert hopper_medium or 4096 <= m <= 65536
     assert k % (slices * _HC_MIX_BLOCK_K) == 0
