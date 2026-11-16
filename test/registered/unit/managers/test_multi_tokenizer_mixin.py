@@ -1,7 +1,10 @@
 import unittest
+from unittest import mock
 
 import numpy as np
 
+from sglang.srt.entrypoints import http_server
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.utils.weight_versions import WeightVersionSpan
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -101,6 +104,43 @@ def _make_batch_str_output() -> BatchStrOutput:
 
 
 class TestMultiTokenizerMixin(unittest.TestCase):
+    def test_each_tokenizer_worker_freezes_locally(self):
+        server_args = mock.Mock()
+        timeline = mock.Mock()
+        execution = mock.Mock(moe=mock.Mock(is_ep_scale_joiner=False))
+        with (
+            get_context().override_server_args(
+                checkpoint_engine_wait_weights_before_ready=False,
+                delete_ckpt_after_loading=False,
+                skip_server_warmup=False,
+                debug_tensor_dump_input_file=None,
+            ),
+            mock.patch.object(http_server, "get_exec", return_value=execution),
+            mock.patch.object(http_server, "freeze_gc", side_effect=timeline.worker),
+            mock.patch.object(
+                http_server,
+                "_freeze_gc_after_server_warmup",
+                side_effect=timeline.routed,
+            ),
+        ):
+            for worker_id in range(4):
+                timeline.reset_mock()
+                kwargs = http_server._multi_tokenizer_warmup_kwargs(
+                    server_args, worker_id
+                )
+                http_server._wait_and_warmup(
+                    **kwargs,
+                    execute_warmup_func=lambda _: timeline.warmup() or True,
+                )
+                self.assertEqual(
+                    timeline.mock_calls,
+                    [
+                        mock.call.warmup(),
+                        mock.call.worker(f"Tokenizer worker {worker_id}"),
+                        mock.call.routed(server_args),
+                    ],
+                )
+
     def test_batch_str_output_preserves_cached_tokens_details(self):
         output = _make_batch_str_output()
 
