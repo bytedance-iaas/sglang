@@ -3980,8 +3980,13 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
+        chunk_parked = (
+            self.chunked_req is not None and self.chunked_req not in adder.can_run_list
+        )
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            if chunk_parked or adder.budget_state() == AddReqResult.OTHER:
+                break
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
 
