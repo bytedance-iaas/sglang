@@ -174,10 +174,10 @@ class TestPPPrefillControl(CustomTestCase):
         def advance_clock(_):
             pipeline.now += 11
 
-        with patch.object(
-            module.time, "sleep", side_effect=advance_clock
-        ), patch.object(module.os, "kill") as kill, patch.object(
-            module.os, "_exit", side_effect=SystemExit("group fail-stop")
+        with (
+            patch.object(module.time, "sleep", side_effect=advance_clock),
+            patch.object(module.os, "kill") as kill,
+            patch.object(module.os, "_exit", side_effect=SystemExit("group fail-stop")),
         ):
             with self.assertLogs(module.logger, level="CRITICAL"):
                 with self.assertRaisesRegex(SystemExit, "group fail-stop"):
@@ -208,17 +208,21 @@ class TestPPPrefillControl(CustomTestCase):
             schedulers.append(
                 NS(
                     pp_prefill_control=control,
+                    enable_hierarchical_cache=False,
                     attn_cp_cpu_group=None,
                     attn_tp_cpu_group=None,
                 )
             )
         local = [KVPoll.WaitingForInput]
-        with patch(
-            "sglang.srt.disaggregation.utils.poll_and_all_reduce_attn_cp_tp_group",
-            side_effect=lambda *args: local,
-        ), patch(
-            "sglang.srt.disaggregation.utils._all_reduce_polls",
-            side_effect=lambda polls, group: polls,
+        with (
+            patch(
+                "sglang.srt.disaggregation.utils.poll_and_all_reduce_attn_cp_tp_group",
+                side_effect=lambda *args: local,
+            ),
+            patch(
+                "sglang.srt.disaggregation.utils._all_reduce_polls",
+                side_effect=lambda polls, group: polls,
+            ),
         ):
             leader, follower = pipeline.controls
             leader.log.begin()
@@ -400,12 +404,15 @@ class TestPPPrefillControl(CustomTestCase):
         for req in pipeline.reqs:
             req.disagg_kv_sender = NS(poll_pp_consensus=lambda: KVPoll.WaitingForInput)
             req.metadata_buffer_index = -1
-        with patch(
-            "sglang.srt.disaggregation.utils.poll_and_all_reduce_attn_cp_tp_group",
-            return_value=[KVPoll.WaitingForInput],
-        ), patch(
-            "sglang.srt.disaggregation.utils._all_reduce_polls",
-            side_effect=lambda polls, group: polls,
+        with (
+            patch(
+                "sglang.srt.disaggregation.utils.poll_and_all_reduce_attn_cp_tp_group",
+                return_value=[KVPoll.WaitingForInput],
+            ),
+            patch(
+                "sglang.srt.disaggregation.utils._all_reduce_polls",
+                side_effect=lambda polls, group: polls,
+            ),
         ):
             for rank in range(2):
 
@@ -437,10 +444,9 @@ class TestPPPrefillControl(CustomTestCase):
                 NS(
                     scheduler=schedulers[1],
                     queue=[pipeline.reqs[1]],
-                    ensure_metadata_buffer=lambda req: setattr(
-                        req, "metadata_buffer_index", 1
-                    )
-                    or True,
+                    ensure_metadata_buffer=lambda req: (
+                        setattr(req, "metadata_buffer_index", 1) or True
+                    ),
                 )
             )
             pipeline.deliver()
@@ -468,6 +474,7 @@ class TestPPPrefillControl(CustomTestCase):
             pp_group=NS(broadcast_object=lambda value, src: value),
             policy=NS(),
             server_args=NS(watchdog_timeout=3600),
+            enable_hierarchical_cache=False,
         )
 
         def list_broadcast(data):
@@ -475,14 +482,16 @@ class TestPPPrefillControl(CustomTestCase):
             self.assertEqual(len(data), 1)
             return data
 
-        with patch(
-            "sglang.srt.runtime_context.get_parallel",
-            return_value=NS(pp_rank=0, pp_size=2),
-        ), patch(
-            "sglang.srt.distributed.communication_op.attn_cp_tp_broadcast_pyobj",
-            side_effect=list_broadcast,
-        ), patch.object(
-            module.PPPrefillControl, "start_watchdog"
+        with (
+            patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=NS(pp_rank=0, pp_size=2),
+            ),
+            patch(
+                "sglang.srt.distributed.communication_op.attn_cp_tp_broadcast_pyobj",
+                side_effect=list_broadcast,
+            ),
+            patch.object(module.PPPrefillControl, "start_watchdog"),
         ):
             module.init_pp_prefill_control(scheduler)
             log = scheduler.pp_prefill_control.log
@@ -518,6 +527,7 @@ class TestPPPrefillControl(CustomTestCase):
             schedulers.append(
                 NS(
                     pp_prefill_control=control,
+                    enable_hierarchical_cache=False,
                     waiting_queue=[req],
                     disagg_prefill_bootstrap_queue=NS(queue=[]),
                     disagg_prefill_inflight_queue=[],
@@ -634,16 +644,23 @@ class TestPPPrefillControl(CustomTestCase):
             NS(rid=str(i), bootstrap_room=i, origin_input_ids=[i]) for i in range(200)
         ]
         touched = []
-        with patch.object(
-            module, "get_disagg", return_value=NS(disaggregation_mode="prefill")
-        ), patch.object(
-            module, "get_memory", return_value=NS(radix_eviction_policy="lru")
-        ), patch.object(
-            module,
-            "touch_waiting_prefix",
-            side_effect=lambda req, cache: touched.append(req.rid),
-        ), patch.object(
-            module.envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH, "get", return_value=True
+        with (
+            patch.object(
+                module, "get_disagg", return_value=NS(disaggregation_mode="prefill")
+            ),
+            patch.object(
+                module, "get_memory", return_value=NS(radix_eviction_policy="lru")
+            ),
+            patch.object(
+                module,
+                "touch_waiting_prefix",
+                side_effect=lambda req, cache: touched.append(req.rid),
+            ),
+            patch.object(
+                module.envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH,
+                "get",
+                return_value=True,
+            ),
         ):
             policy.pp_decision_log.begin()
             policy._touch_waiting_prefixes(module.CacheAgnosticPolicy.FCFS, requests)
@@ -673,18 +690,27 @@ class TestPPPrefillControl(CustomTestCase):
             policy.pp_decision_log = log
             policy._last_waiting_prefix_refresh = 10
             policies.append(policy)
-        with patch.object(
-            policy_module, "get_disagg", return_value=NS(disaggregation_mode="prefill")
-        ), patch.object(
-            policy_module, "get_memory", return_value=NS(radix_eviction_policy="lru")
-        ), patch.object(
-            policy_module,
-            "touch_waiting_prefix",
-            side_effect=lambda req, cache: cache.pages.move_to_end(req.rid),
-        ), patch.object(
-            policy_module.envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH,
-            "get",
-            return_value=True,
+        with (
+            patch.object(
+                policy_module,
+                "get_disagg",
+                return_value=NS(disaggregation_mode="prefill"),
+            ),
+            patch.object(
+                policy_module,
+                "get_memory",
+                return_value=NS(radix_eviction_policy="lru"),
+            ),
+            patch.object(
+                policy_module,
+                "touch_waiting_prefix",
+                side_effect=lambda req, cache: cache.pages.move_to_end(req.rid),
+            ),
+            patch.object(
+                policy_module.envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH,
+                "get",
+                return_value=True,
+            ),
         ):
             for leader_now, follower_now, expected_victim in (
                 (10.169, 10.648, "hot"),

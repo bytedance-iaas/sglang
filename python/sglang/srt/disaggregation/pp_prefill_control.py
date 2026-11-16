@@ -414,10 +414,17 @@ def init_pp_prefill_control(scheduler):
     )
     scheduler.pp_prefill_control = control
     scheduler.policy.pp_decision_log = control.log
+    if (
+        scheduler.enable_hierarchical_cache
+        and scheduler.tree_cache.host_memory_mode == "cache"
+    ):
+        scheduler.tree_cache._pp_storage_ack_control = control
     control.start_watchdog(
-        lambda req: getattr(req.disagg_kv_sender, "kv_mgr", None) is not None
-        and req.disagg_kv_sender.kv_mgr.request_status.get(req.bootstrap_room)
-        == KVPoll.Failed
+        lambda req: (
+            getattr(req.disagg_kv_sender, "kv_mgr", None) is not None
+            and req.disagg_kv_sender.kv_mgr.request_status.get(req.bootstrap_room)
+            == KVPoll.Failed
+        )
     )
     return control
 
@@ -534,4 +541,6 @@ def apply_pp_boundary(scheduler):
             if KVPoll.Failed in control.store.collect(req.bootstrap_room)
         )
 
+    if scheduler.enable_hierarchical_cache:
+        scheduler.tree_cache._apply_pp_storage_ack_prefix()
     control.boundary(fence, retire, locally_ready, peer_failures)

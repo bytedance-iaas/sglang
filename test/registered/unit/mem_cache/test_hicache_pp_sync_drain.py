@@ -52,6 +52,7 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
             enable_storage=False,
             write_back_duplicate_reclaim_digest=0,
         )
+        cache._pp_storage_ack_control = None
         cache.pp_rank = pp_rank
         cache.pp_size = 2
         cache.host_memory_mode = "cache"
@@ -65,6 +66,7 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
         cache.loading_check = MagicMock()
         cache.cache_controller = SimpleNamespace(
             start_writing=MagicMock(),
+            dead_storage_workers=lambda: [],
             ack_write_queue=[
                 SimpleNamespace(
                     finish_event=SimpleNamespace(query=MagicMock(return_value=ready))
