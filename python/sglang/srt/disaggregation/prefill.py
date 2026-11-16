@@ -1541,7 +1541,9 @@ class SchedulerDisaggregationPrefillMixin:
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
 
-    def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
+    def maybe_send_cached_prefix_chunk(
+        self: Scheduler, req: Req, allow_send: bool = True
+    ) -> None:
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
             return
 
@@ -1551,7 +1553,7 @@ class SchedulerDisaggregationPrefillMixin:
         if self.enable_staging and req.early_send_prefix_end is None:
             req.early_send_prefix_end = max(0, req.prefix_len - req.host_hit_length)
 
-        if req.pending_bootstrap:
+        if req.pending_bootstrap or not allow_send:
             return
 
         # Device-resident prefix only; page-aligned so start_send_idx stays exact.

@@ -4428,8 +4428,9 @@ class Scheduler(
 
         # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            load_pending = batch.hicache_consumer_index >= 0
             for req in batch.reqs:
-                self.maybe_send_cached_prefix_chunk(req)
+                self.maybe_send_cached_prefix_chunk(req, allow_send=not load_pending)
 
         # Run forward
         if self.is_generation:
