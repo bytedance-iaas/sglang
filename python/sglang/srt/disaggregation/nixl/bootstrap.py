@@ -30,11 +30,9 @@ class PrefillPeerRegistrar:
         self.backend = backend
         self._lock = threading.Lock()
         self._accepted: Dict[str, str] = {}
+        self._trusted: Dict[str, str] = {}
 
-    def register(self, metadata: Optional[Dict[str, str]]) -> bool:
-        # Older producers and other backends retain their existing protocol.
-        if metadata is None or self.backend != "UCX":
-            return False
+    def _decode(self, metadata: Dict[str, str]) -> bytes:
         if not isinstance(metadata, dict):
             raise ValueError("NIXL bootstrap transfer metadata must be an object")
         if metadata.get("version") != "1" or metadata.get("backend") != self.backend:
@@ -50,6 +48,42 @@ class PrefillPeerRegistrar:
             raise ValueError("Invalid NIXL bootstrap metadata encoding") from error
         if not raw:
             raise ValueError("Empty NIXL bootstrap metadata")
+        return raw
+
+    @staticmethod
+    def _name(peer: Any) -> str:
+        return peer.decode("ascii") if isinstance(peer, bytes) else peer
+
+    def accepted_peer(self, metadata: Dict[str, str]) -> Optional[str]:
+        raw = self._decode(metadata)
+        with self._lock:
+            return self._trusted.get(hashlib.sha256(raw).hexdigest())
+
+    def refresh_known(self, metadata: Dict[str, str], expected_peer: str) -> None:
+        """Refresh a previously accepted producer, even if its MD is valid.
+
+        UCX endpoint health is distinct from metadata availability. The sender
+        must have drained its writes before requesting this operation.
+        """
+        raw = self._decode(metadata)
+        digest = hashlib.sha256(raw).hexdigest()
+        with self._lock:
+            if self._trusted.get(digest) != expected_peer:
+                raise ValueError("Refresh metadata does not match an accepted peer")
+            self._accepted.pop(digest, None)
+            if self.agent.check_remote_metadata(expected_peer):
+                self.agent.remove_remote_agent(expected_peer)
+            peer = self._name(self.agent.add_remote_agent(raw))
+            if peer != expected_peer:
+                self.agent.remove_remote_agent(peer)
+                raise ValueError("Refreshed peer identity changed")
+            self._accepted[digest] = peer
+
+    def register(self, metadata: Optional[Dict[str, str]]) -> bool:
+        # Older producers and other backends retain their existing protocol.
+        if metadata is None or self.backend != "UCX":
+            return False
+        raw = self._decode(metadata)
         digest = hashlib.sha256(raw).hexdigest()
         with self._lock:
             peer = self._accepted.get(digest)
@@ -57,6 +91,7 @@ class PrefillPeerRegistrar:
                 return False
             # loadRemoteMD returns the identity encoded in the NIXL metadata.
             # Do not publish a cache entry before this operation succeeds.
-            peer = self.agent.add_remote_agent(raw)
+            peer = self._name(self.agent.add_remote_agent(raw))
             self._accepted[digest] = peer
+            self._trusted[digest] = peer
             return True

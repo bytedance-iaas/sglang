@@ -49,6 +49,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.network import NetworkAddress
 
 try:
     from nixl._bindings import (
@@ -480,6 +481,19 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         from sglang.srt.disaggregation.nixl.bootstrap import PrefillPeerRegistrar
 
         self._prefill_peer_registrar = PrefillPeerRegistrar(self.agent, backend)
+        self._notification_lock = threading.Lock()
+        self._preserved_notifications: Dict[str, List[bytes]] = defaultdict(list)
+        self._peer_recovery = None
+        if backend == "UCX":
+            from sglang.srt.disaggregation.nixl.recovery import UCXPeerRecovery
+
+            self._peer_recovery = UCXPeerRecovery(
+                self.agent,
+                NetworkAddress(self.local_ip, self.rank_port).to_tcp(),
+                self._send_multipart_locked,
+                self._prefill_peer_registrar,
+                self._refresh_producer_endpoint,
+            )
 
         available_plugins = self.agent.get_plugin_list()
         if backend not in available_plugins:
@@ -547,7 +561,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             if self.enable_staging:
                 self._init_staging_decode_ctx()
                 self._staging_handler = None
-            if self.enable_staging or self.enable_deferred_decode_kv_release:
+            if (
+                self.enable_staging
+                or self.enable_deferred_decode_kv_release
+                or self._peer_recovery is not None
+            ):
                 self._start_decode_listener_thread()
             self._start_heartbeat_checker_thread()
         else:
@@ -625,6 +643,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         def decode_listener_thread():
             while True:
                 msg = self.server_socket.recv_multipart()
+                if self._peer_recovery is not None and self._peer_recovery.handle(msg):
+                    continue
                 if msg[0] == b"STAGING_REQ":
                     self._handle_staging_req(msg)
                     continue
@@ -641,6 +661,15 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 )
 
         threading.Thread(target=decode_listener_thread, daemon=True).start()
+
+    def _refresh_producer_endpoint(self, metadata: Dict[str, str], peer: str) -> None:
+        # Preserve already queued completion messages without parsing scheduler
+        # state from the control thread. NIXL serializes native calls internally;
+        # this lock also protects our handoff to the scheduler's notification poll.
+        with self._notification_lock:
+            for name, messages in self.agent.get_new_notifs().items():
+                self._preserved_notifications[name].extend(messages)
+            self._prefill_peer_registrar.refresh_known(metadata, peer)
 
     def _prefetch_staging_reqs(self, room: int):
         """Send STAGING_REQ for all chunks before the prefill forward starts.
@@ -1197,13 +1226,46 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     self.prep_handles_slice_dst.pop(agent_name, None)
                     peer_info.kv_xfer_segments = None
                     try:
-                        self.agent.add_remote_agent(peer_info.agent_metadata)
+                        recovery = getattr(self, "_peer_recovery", None)
+                        if recovery is not None:
+                            # This worker has released all old writes. Do not
+                            # create a new endpoint until the consumer refreshed
+                            # its reciprocal connection and acknowledged it.
+                            transfer_info = room_transfer_infos[agent_name]
+                            metadata = recovery.request(
+                                agent_name,
+                                NetworkAddress(
+                                    transfer_info.endpoint, transfer_info.dst_port
+                                ).to_tcp(),
+                            )
+                            raw = self._prefill_peer_registrar._decode(metadata)
+                            loaded_peer = self.agent.add_remote_agent(raw)
+                            loaded_peer = (
+                                loaded_peer.decode("ascii")
+                                if isinstance(loaded_peer, bytes)
+                                else loaded_peer
+                            )
+                            if loaded_peer != agent_name:
+                                self.agent.remove_remote_agent(loaded_peer)
+                                raise ValueError("Consumer refresh identity changed")
+                            peer_info.agent_metadata = raw
+                        else:
+                            self.agent.add_remote_agent(peer_info.agent_metadata)
                         self._prepare_payload_xfer(peer_info)
                     except Exception:
                         self.prep_handles.pop(agent_name, None)
                         self.prep_handles_slice_dst.pop(agent_name, None)
                         peer_info.kv_xfer_segments = None
-                        self.agent.remove_remote_agent(agent_name)
+                        # A failed reciprocal fence must never permit later
+                        # requests to fall back to an unprepared live peer.
+                        if recovery is not None:
+                            self._unsettled_peers.add(agent_name)
+                        try:
+                            self.agent.remove_remote_agent(agent_name)
+                        except Exception:
+                            logger.warning(
+                                "Could not invalidate failed NIXL peer %s", agent_name
+                            )
                         raise
             except Exception:
                 logger.exception("Failed to reload NIXL remote agent %s", agent_name)
@@ -2659,7 +2721,15 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
     def update_transfer_status(self):
         # Process notifications from received transfers.
-        notif_map = self.agent.get_new_notifs()
+        lock = getattr(self, "_notification_lock", None)
+        if lock is None:
+            notif_map = self.agent.get_new_notifs()
+        else:
+            with lock:
+                notif_map = self._preserved_notifications
+                self._preserved_notifications = defaultdict(list)
+                for name, messages in self.agent.get_new_notifs().items():
+                    notif_map[name].extend(messages)
         for peer_name, messages in notif_map.items():
             for msg in messages:
                 # Notification tag layouts (underscore-separated):
@@ -2903,6 +2973,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             """This thread recvs transfer info from the decode engine"""
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
+                if self._peer_recovery is not None and self._peer_recovery.handle(
+                    waiting_req_bytes
+                ):
+                    continue
                 logger.debug(
                     f"Received multipart with total byte size {sum(len(x) for x in waiting_req_bytes)}"
                 )
@@ -3202,6 +3276,15 @@ class NixlKVReceiver(CommonKVReceiver):
             if transfer_metadata is not None:
                 try:
                     self.kv_mgr._prefill_peer_registrar.register(transfer_metadata)
+                    recovery = getattr(self.kv_mgr, "_peer_recovery", None)
+                    if recovery is not None:
+                        recovery.remember_producer(
+                            transfer_metadata,
+                            NetworkAddress(
+                                bootstrap_info["rank_ip"],
+                                int(bootstrap_info["rank_port"]),
+                            ).to_tcp(),
+                        )
                 except Exception as error:
                     # Fail this room before the producer can enqueue a write.
                     self.kv_mgr.record_failure(
