@@ -1137,13 +1137,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 dst_mem_kind=dst_mem_kind,
             )
 
-    def _post_xfer(self, handle: Any, error_msg: str) -> None:
+    def _post_xfer(
+        self, handle: Any, error_msg: str, *, payload_tag: Optional[str] = None
+    ) -> None:
         # Own before posting: nested state/mixed transfers can raise before
         # returning their partially built handle list to transfer_worker.
         owner = getattr(self, "_transfer_handle_owner", None)
         handles = getattr(owner, "handles", None)
         if handles is not None and not any(h is handle for h in handles):
             handles.append(handle)
+        if owner is not None and hasattr(owner, "payload_tags"):
+            owner.payload_tags[id(handle)] = payload_tag
         try:
             state = self.agent.transfer(handle)
         except Exception as error:
@@ -1172,6 +1176,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         transfers retain their normal wait; any failure arms a bounded drain.
         """
         handles = self._unique_handles(handles)
+        owner = getattr(self, "_transfer_handle_owner", None)
+        poll_errors = getattr(owner, "poll_errors", {})
         deadline = time.monotonic() + _ERR_SETTLE_TIMEOUT_S if failure_seen else None
         while True:
             settled = True
@@ -1179,7 +1185,25 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             for handle in handles:
                 try:
                     state = self.agent.check_xfer_state(handle)
-                except Exception:
+                except Exception as error:
+                    # NIXL 1.4's binding raises typed exceptions for negative
+                    # getXferStatus results. Keep the first native cause, but
+                    # never infer quiescence from an exception alone.
+                    if id(handle) not in poll_errors:
+                        poll_errors[id(handle)] = error
+                        if owner is not None and hasattr(owner, "poll_errors"):
+                            if owner.first_poll_error is None:
+                                owner.first_poll_error = error
+                        logger.exception(
+                            "NIXL status read failed room=%s worker=%s chunk=%s "
+                            "handle=%s payload=%s error_type=%s",
+                            getattr(owner, "room", None),
+                            getattr(owner, "worker_index", None),
+                            getattr(owner, "chunk_id", None),
+                            handle,
+                            getattr(owner, "payload_tags", {}).get(id(handle)),
+                            type(error).__name__,
+                        )
                     settled = False
                     failed = True
                     continue
@@ -1283,6 +1307,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             room = kv_chunk.room
             handles: List[Any] = []
             self._transfer_handle_owner.handles = handles
+            self._transfer_handle_owner.payload_tags = {}
+            self._transfer_handle_owner.poll_errors = {}
+            self._transfer_handle_owner.first_poll_error = None
+            self._transfer_handle_owner.room = room
+            self._transfer_handle_owner.worker_index = worker_index
+            self._transfer_handle_owner.chunk_id = kv_chunk.chunk_id
             room_transfer_infos = None
             settle_timed_out = False
             try:
@@ -1550,7 +1580,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 settled, any_failed = self._await_handles(handles, failure_seen=False)
                 if not settled:
                     settle_timed_out = True
-                    raise RuntimeError(f"NIXL transfer drain timed out room={room}")
+                    raise RuntimeError(
+                        f"NIXL transfer drain timed out room={room}"
+                    ) from self._transfer_handle_owner.first_poll_error
                 if any_failed:
                     raise RuntimeError(f"NIXL transfer encountered ERR room={room}")
 
@@ -1629,6 +1661,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     self._reload_invalidated_peers(room_transfer_infos or {})
             finally:
                 del self._transfer_handle_owner.handles
+                del self._transfer_handle_owner.payload_tags
+                del self._transfer_handle_owner.poll_errors
+                del self._transfer_handle_owner.first_poll_error
+                del self._transfer_handle_owner.room
+                del self._transfer_handle_owner.worker_index
+                del self._transfer_handle_owner.chunk_id
 
     def get_bootstrap_transfer_metadata(self) -> Optional[Dict[str, str]]:
         from sglang.srt.disaggregation.nixl.bootstrap import publish_peer_metadata
@@ -1765,7 +1803,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             if not xfer_handle:
                 raise Exception("KVSender failed to create prepped transfer")
-            self._post_xfer(xfer_handle, "KVSender failed to post prepped transfer")
+            self._post_xfer(
+                xfer_handle,
+                "KVSender failed to post prepped transfer",
+                payload_tag=notif,
+            )
             return xfer_handle
 
         # Non-prepped path: used for state transfers (SWA/NSA) via maybe_send_extra.
@@ -1895,7 +1937,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
-        self._post_xfer(xfer_handle, "KVSender failed to post transfer")
+        self._post_xfer(
+            xfer_handle, "KVSender failed to post transfer", payload_tag=notif
+        )
         return xfer_handle
 
     def send_kvcache(
@@ -2032,7 +2076,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             if not xfer_handle:
                 raise Exception("KVSender failed to create mixed prepped transfer")
             self._post_xfer(
-                xfer_handle, "KVSender failed to post mixed prepped transfer"
+                xfer_handle,
+                "KVSender failed to post mixed prepped transfer",
+                payload_tag=part_notif,
             )
             handles.append(xfer_handle)
         return handles
@@ -2078,7 +2124,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create prepped slice transfer")
-        self._post_xfer(xfer_handle, "KVSender failed to post prepped slice transfer")
+        self._post_xfer(
+            xfer_handle,
+            "KVSender failed to post prepped slice transfer",
+            payload_tag=notif,
+        )
         return xfer_handle
 
     def send_kvcache_staged(
@@ -2188,7 +2238,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 f"(src=0x{staging_buffer.get_ptr():x}, dst=0x{dst_write_ptr:x}, "
                 f"size={per_rank_bytes})"
             )
-        self._post_xfer(xfer_handle, "[Staging] NIXL bulk transfer failed to post")
+        self._post_xfer(
+            xfer_handle,
+            "[Staging] NIXL bulk transfer failed to post",
+            payload_tag=notif,
+        )
         return xfer_handle
 
     def _try_create_staging_strategy(self, staging_buffer):
@@ -2321,7 +2375,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
-        self._post_xfer(xfer_handle, "KVSender failed to post transfer")
+        self._post_xfer(
+            xfer_handle, "KVSender failed to post transfer", payload_tag=notif
+        )
         return xfer_handle
 
     def _send_mamba_state(
@@ -2375,7 +2431,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("Failed to create Mamba state transfer")
-        self._post_xfer(xfer_handle, "Failed to post Mamba state transfer")
+        self._post_xfer(
+            xfer_handle, "Failed to post Mamba state transfer", payload_tag=notif
+        )
         return xfer_handle
 
     def _send_mamba_state_slice(
@@ -2502,7 +2560,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("Failed to create Mamba state slice transfer")
-        self._post_xfer(xfer_handle, "Failed to post Mamba state slice transfer")
+        self._post_xfer(
+            xfer_handle, "Failed to post Mamba state slice transfer", payload_tag=notif
+        )
         return xfer_handle
 
     def maybe_send_extra(

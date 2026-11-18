@@ -12,7 +12,11 @@ import numpy as np
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
-from sglang.srt.disaggregation.nixl.conn import NixlKVManager, _NixlPostError
+from sglang.srt.disaggregation.nixl.conn import (
+    _NIXL_TRANSPORT_ERRORS,
+    NixlKVManager,
+    _NixlPostError,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -217,6 +221,41 @@ class TestTransferOwnership(CustomTestCase):
                 mgr._await_handles([object()], failure_seen=True), (False, True)
             )
 
+    def test_first_native_poll_error_retained_once_per_handle_across_drains(self):
+        mgr = manager()
+        owner = mgr._transfer_handle_owner
+        owner.handles = []
+        owner.payload_tags = {}
+        owner.poll_errors = {}
+        owner.first_poll_error = None
+        owner.room, owner.worker_index, owner.chunk_id = 123, 1, 96
+        state, aux = object(), object()
+        mgr._post_xfer(state, "state post", payload_tag="123_state_0_0")
+        mgr._post_xfer(aux, "aux post", payload_tag="123_aux")
+        first = _NIXL_TRANSPORT_ERRORS[0]("NIXL_ERR_REMOTE_DISCONNECT")
+        second = RuntimeError("unreadable sibling")
+
+        def poll(handle):
+            raise first if handle is state else second
+
+        mgr.agent.check_xfer_state = poll
+        with patch(MODULE + ".logger") as log, patch(
+            MODULE + "._ERR_SETTLE_TIMEOUT_S", 0
+        ):
+            self.assertEqual(
+                mgr._await_handles([state, state, aux], failure_seen=False),
+                (False, True),
+            )
+            self.assertEqual(
+                mgr._await_handles([state, aux], failure_seen=True), (False, True)
+            )
+        self.assertIs(owner.first_poll_error, first)
+        self.assertEqual(owner.poll_errors, {id(state): first, id(aux): second})
+        self.assertEqual(log.exception.call_count, 2)
+        self.assertEqual(log.exception.call_args_list[0].args[1:4], (123, 1, 96))
+        self.assertEqual(log.exception.call_args_list[0].args[5], "123_state_0_0")
+        self.assertNotIn("release", mgr.agent.events)
+
 
 class StopWorker(BaseException):
     pass
@@ -302,6 +341,22 @@ class TestRecoveryThroughWorker(CustomTestCase):
         self.assertEqual(mgr._unsettled_peers, {"peer"})
         self.assertEqual(mgr.agent.events.count("load"), 0)
         mgr._send_abort_ack.assert_not_called()
+
+    def test_poll_timeout_preserves_native_cause_and_ack_poison(self):
+        mgr, q = self.worker_manager()
+        native_error = _NIXL_TRANSPORT_ERRORS[0]("NIXL_ERR_REMOTE_DISCONNECT")
+        mgr.agent.check_xfer_state = MagicMock(side_effect=native_error)
+        with patch(MODULE + "._ERR_SETTLE_TIMEOUT_S", 0), patch(
+            MODULE + "._ERR_SETTLE_POLL_S", 0
+        ):
+            with self.assertRaises(StopWorker):
+                mgr.transfer_worker(q)
+        self.assertIs(mgr.exceptions[1].__cause__, native_error)
+        self.assertEqual(mgr._unsettled_peers, {"peer"})
+        self.assertIn(1, mgr._deferred_ack_poisoned_rooms)
+        mgr._send_abort_ack.assert_not_called()
+        self.assertNotIn("release", mgr.agent.events)
+        self.assertFalse(hasattr(mgr._transfer_handle_owner, "poll_errors"))
 
     def test_release_failure_prevents_peer_reload_and_drain_ack(self):
         mgr, q = self.worker_manager()
