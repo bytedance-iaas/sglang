@@ -67,6 +67,15 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+_PEER_RELOAD_MIN_INTERVAL_S = 1.0
+_ERR_SETTLE_TIMEOUT_S = 1.0
+_ERR_SETTLE_POLL_S = 0.01
+
+
+class _NixlPostError(RuntimeError):
+    """Posting failed after the worker took ownership of the transfer handle."""
+
+
 GUARD = "NixlMsgGuard".encode("ascii")
 KV_MEM_KINDS = {"VRAM", "DRAM"}
 
@@ -492,6 +501,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # peer_name -> (handle, num_slots, head_group_idx)
         self.prep_handles_segment_src: Dict[Tuple[int, int, str], Any] = {}
         self._num_slots_src: int = 0
+        self._transfer_handle_owner = threading.local()
+        self._peer_reload_lock = threading.Lock()
+        self._peer_reload_times: Dict[str, float] = {}
+        # An unreadable/running handle prevents an in-process peer reload. Do
+        # not post more writes through that peer until the engine is replaced.
+        self._unsettled_peers: Set[str] = set()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             if self.kv_args.kv_item_lens:
@@ -1093,16 +1108,121 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 dst_mem_kind=dst_mem_kind,
             )
 
+    def _post_xfer(self, handle: Any, error_msg: str) -> None:
+        # Own before posting: nested state/mixed transfers can raise before
+        # returning their partially built handle list to transfer_worker.
+        owner = getattr(self, "_transfer_handle_owner", None)
+        handles = getattr(owner, "handles", None)
+        if handles is not None and not any(h is handle for h in handles):
+            handles.append(handle)
+        try:
+            state = self.agent.transfer(handle)
+        except Exception as error:
+            raise _NixlPostError(f"{error_msg}: {error}") from error
+        if state == "ERR":
+            raise _NixlPostError(error_msg)
+
+    @staticmethod
+    def _unique_handles(handles: List[Any]) -> List[Any]:
+        # Existing send methods still return handles; the worker also owns
+        # them before POST. Deduplicate by identity, not native-handle equality.
+        seen = set()
+        result = []
+        for handle in handles:
+            if id(handle) not in seen:
+                seen.add(id(handle))
+                result.append(handle)
+        return result
+
+    def _await_handles(
+        self, handles: List[Any], *, failure_seen: bool
+    ) -> Tuple[bool, bool]:
+        """Settle every sibling; an unreadable state never proves quiescence.
+
+        Adapted from upstream's settle-before-peer-reload barrier. Healthy
+        transfers retain their normal wait; any failure arms a bounded drain.
+        """
+        handles = self._unique_handles(handles)
+        deadline = time.monotonic() + _ERR_SETTLE_TIMEOUT_S if failure_seen else None
+        while True:
+            settled = True
+            failed = failure_seen
+            for handle in handles:
+                try:
+                    state = self.agent.check_xfer_state(handle)
+                except Exception:
+                    settled = False
+                    failed = True
+                    continue
+                if state == "ERR":
+                    failed = True
+                elif state != "DONE":
+                    settled = False
+            if settled:
+                return True, failed
+            if failed:
+                if deadline is None:
+                    deadline = time.monotonic() + _ERR_SETTLE_TIMEOUT_S
+                elif time.monotonic() >= deadline:
+                    return False, True
+            time.sleep(_ERR_SETTLE_POLL_S if failed else 0)
+
+    def _reload_invalidated_peers(self, room_transfer_infos: Dict[str, Any]) -> None:
+        """Reload only after failed handles settled and released.
+
+        Destination-port sharding gives each peer set one transfer worker;
+        no other worker is using these destination dlists during replacement.
+        The failed request stays failed; subsequent requests use the new dlists.
+        """
+        for agent_name in list(room_transfer_infos):
+            peer_info = self.decode_kv_args_table.get(agent_name)
+            if peer_info is None or agent_name in self._unsettled_peers:
+                continue
+            try:
+                if self.agent.check_remote_metadata(agent_name):
+                    continue
+                with self._peer_reload_lock:
+                    if self.agent.check_remote_metadata(agent_name):
+                        continue
+                    now = time.monotonic()
+                    last = self._peer_reload_times.get(agent_name)
+                    if last is not None and now - last < _PEER_RELOAD_MIN_INTERVAL_S:
+                        continue
+                    self._peer_reload_times[agent_name] = now
+                    logger.warning(
+                        "NIXL invalidated remote agent %s; reloading its metadata",
+                        agent_name,
+                    )
+                    self.prep_handles.pop(agent_name, None)
+                    self.prep_handles_slice_dst.pop(agent_name, None)
+                    peer_info.kv_xfer_segments = None
+                    try:
+                        self.agent.add_remote_agent(peer_info.agent_metadata)
+                        self._prepare_payload_xfer(peer_info)
+                    except Exception:
+                        self.prep_handles.pop(agent_name, None)
+                        self.prep_handles_slice_dst.pop(agent_name, None)
+                        peer_info.kv_xfer_segments = None
+                        self.agent.remove_remote_agent(agent_name)
+                        raise
+            except Exception:
+                logger.exception("Failed to reload NIXL remote agent %s", agent_name)
+
     def transfer_worker(self, queue: FastQueue, staging_buffer=None, worker_index=0):
         # Per-worker staging strategy: lazy-created on first chunk so we
         # see kv_buffer_tensors (set by ModelRunner after engine init).
         # Never cache on self -- multiple workers would race the ring.
         staging_strategy = None
+        if not hasattr(self, "_transfer_handle_owner"):
+            self._transfer_handle_owner = threading.local()
 
         while True:
             kv_chunk: TransferKVChunk = queue.get()
             room = kv_chunk.room
             handles: List[Any] = []
+            self._transfer_handle_owner.handles = handles
+            room_transfer_infos = None
+            settle_timed_out = False
             try:
                 if room not in self.request_status:
                     logger.debug(
@@ -1149,6 +1269,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 self.update_status(room, KVPoll.Transferring)
 
                 reqs_to_be_processed = list(room_transfer_infos.values())
+                if any(
+                    req.agent_name in self._unsettled_peers
+                    for req in reqs_to_be_processed
+                ):
+                    raise RuntimeError(
+                        "NIXL peer has unsettled writes; replace the engine"
+                    )
                 # Note(kpham-sgl): Pack each DCP rank once into its fixed region.
                 # NIXL reads regions asynchronously; the chunk barrier prevents
                 # reuse until every transfer completes.
@@ -1358,24 +1485,18 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         )
                         handles.append(aux_xfer_handle)
 
+                settled, any_failed = self._await_handles(handles, failure_seen=False)
+                if not settled:
+                    settle_timed_out = True
+                    raise RuntimeError(f"NIXL transfer drain timed out room={room}")
+                if any_failed:
+                    raise RuntimeError(f"NIXL transfer encountered ERR room={room}")
+
                 if staging_deferred:
                     # Chunk has been re-enqueued; do not advance status.
                     continue
 
-                while handles:
-                    all_done = True
-                    for handle in handles:
-                        state = self.agent.check_xfer_state(handle)
-                        if state == "ERR":
-                            raise RuntimeError(
-                                f"NIXL transfer encountered ERR room={room}"
-                            )
-                        if state != "DONE":
-                            all_done = False
-                    if all_done:
-                        break
-                    time.sleep(0)
-
+                kv_chunk.staging_counted = False
                 self._staging_outstanding[room] -= 1
                 if self.enable_deferred_decode_kv_release:
                     # Handles all DONE => this room's writes landed; ack if it
@@ -1411,17 +1532,41 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             except Exception as e:
                 # Catch all exceptions to prevent silently killing this
                 # worker thread, but still propagate via failure_exception().
-                if isinstance(e, _NIXL_TRANSPORT_ERRORS):
+                if isinstance(e, _NIXL_TRANSPORT_ERRORS) or isinstance(
+                    e.__cause__, _NIXL_TRANSPORT_ERRORS
+                ):
                     logger.warning(f"NIXL transport error for room {room}: {e}")
                 else:
                     logger.exception(
                         f"Unexpected transfer worker error for room {room}"
                     )
+                settled = False
+                if not settle_timed_out:
+                    settled, _ = self._await_handles(handles, failure_seen=True)
+                if settled:
+                    try:
+                        for handle in self._unique_handles(handles):
+                            self.agent.release_xfer_handle(handle)
+                    except Exception:
+                        settled = False
+                        logger.exception(
+                            "Failed to release settled NIXL handles room=%s", room
+                        )
+                if not settled:
+                    self._unsettled_peers.update(room_transfer_infos or {})
+                    self.poison_deferred_ack_room(room)
                 self.exceptions[room] = e
                 self.record_failure(room, str(e))
                 self.update_status(room, KVPoll.Failed)
-                # No ack here on purpose: the DONE barrier bails on the first
-                # ERR, so siblings may still be writing; fall back to the timeout.
+                if settled:
+                    if kv_chunk.staging_counted:
+                        kv_chunk.staging_counted = False
+                        self._staging_outstanding[room] -= 1
+                    if self.enable_deferred_decode_kv_release:
+                        self._maybe_ack_drained_abort(room)
+                    self._reload_invalidated_peers(room_transfer_infos or {})
+            finally:
+                del self._transfer_handle_owner.handles
 
     def get_bootstrap_transfer_metadata(self) -> Optional[Dict[str, str]]:
         from sglang.srt.disaggregation.nixl.bootstrap import publish_peer_metadata
@@ -1558,9 +1703,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             if not xfer_handle:
                 raise Exception("KVSender failed to create prepped transfer")
-            state = self.agent.transfer(xfer_handle)
-            if state == "ERR":
-                raise Exception("KVSender failed to post prepped transfer")
+            self._post_xfer(xfer_handle, "KVSender failed to post prepped transfer")
             return xfer_handle
 
         # Non-prepped path: used for state transfers (SWA/NSA) via maybe_send_extra.
@@ -1690,9 +1833,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("KVSender failed to post transfer")
+        self._post_xfer(xfer_handle, "KVSender failed to post transfer")
         return xfer_handle
 
     def send_kvcache(
@@ -1828,9 +1969,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             if not xfer_handle:
                 raise Exception("KVSender failed to create mixed prepped transfer")
-            state = self.agent.transfer(xfer_handle)
-            if state == "ERR":
-                raise Exception("KVSender failed to post mixed prepped transfer")
+            self._post_xfer(
+                xfer_handle, "KVSender failed to post mixed prepped transfer"
+            )
             handles.append(xfer_handle)
         return handles
 
@@ -1875,9 +2016,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create prepped slice transfer")
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("KVSender failed to post prepped slice transfer")
+        self._post_xfer(xfer_handle, "KVSender failed to post prepped slice transfer")
         return xfer_handle
 
     def send_kvcache_staged(
@@ -1987,9 +2126,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 f"(src=0x{staging_buffer.get_ptr():x}, dst=0x{dst_write_ptr:x}, "
                 f"size={per_rank_bytes})"
             )
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise RuntimeError("[Staging] NIXL bulk transfer failed to post")
+        self._post_xfer(xfer_handle, "[Staging] NIXL bulk transfer failed to post")
         return xfer_handle
 
     def _try_create_staging_strategy(self, staging_buffer):
@@ -2122,9 +2259,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("KVSender failed to post transfer")
+        self._post_xfer(xfer_handle, "KVSender failed to post transfer")
         return xfer_handle
 
     def _send_mamba_state(
@@ -2178,9 +2313,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("Failed to create Mamba state transfer")
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("Failed to post Mamba state transfer")
+        self._post_xfer(xfer_handle, "Failed to post Mamba state transfer")
         return xfer_handle
 
     def _send_mamba_state_slice(
@@ -2307,9 +2440,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("Failed to create Mamba state slice transfer")
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("Failed to post Mamba state slice transfer")
+        self._post_xfer(xfer_handle, "Failed to post Mamba state slice transfer")
         return xfer_handle
 
     def maybe_send_extra(
@@ -2758,7 +2889,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     room_to_be_aborted, decode_ip, decode_port
                 )
                 self._maybe_ack_drained_abort(room_to_be_aborted)
-            elif self._staging_outstanding.get(room_to_be_aborted, 0) == 0:
+            elif self._staging_outstanding.get(
+                room_to_be_aborted, 0
+            ) == 0 and room_to_be_aborted not in getattr(
+                self, "_deferred_ack_poisoned_rooms", ()
+            ):
                 self._send_abort_ack(decode_ip, decode_port, room_to_be_aborted)
 
         return True

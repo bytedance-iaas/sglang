@@ -434,6 +434,7 @@ class TestNixlUpdateStatus(CustomTestCase):
 class TestNixlTransferWorker(CustomTestCase):
     def _make_manager(self, room):
         mgr = object.__new__(NixlKVManager)
+        mgr._unsettled_peers = set()
         mgr.request_status = {room: KVPoll.WaitingForInput}
         mgr.transfer_infos = {
             room: {

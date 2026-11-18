@@ -247,6 +247,7 @@ class CommonKVManager(BaseKVManager):
             # Deferred KV release: aborted room -> (decode_ip, decode_port);
             # ack held until the transfer drains.
             self._deferred_ack_targets: Dict[int, Tuple[str, int]] = {}
+            self._deferred_ack_poisoned_rooms: Set[int] = set()
             self.req_to_decode_prefix_len: Dict[int, int] = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
@@ -373,6 +374,10 @@ class CommonKVManager(BaseKVManager):
             # pollute a future request that reuses the same bootstrap_room.
             if status == KVPoll.Failed:
                 return
+            if status in (KVPoll.Bootstrapping, KVPoll.WaitingForInput):
+                getattr(self, "_deferred_ack_poisoned_rooms", set()).discard(
+                    bootstrap_room
+                )
             self.request_status[bootstrap_room] = status
         else:
             if status == KVPoll.Failed:
@@ -437,6 +442,9 @@ class CommonKVManager(BaseKVManager):
         (outstanding == 0). pop() makes it fire at most once."""
         if self._staging_outstanding.get(room, 0) > 0:
             return
+        if room in getattr(self, "_deferred_ack_poisoned_rooms", ()):
+            self._deferred_ack_targets.pop(room, None)
+            return
         target = self._deferred_ack_targets.pop(room, None)
         if target is not None:
             self._send_abort_ack(target[0], target[1], room)
@@ -447,7 +455,15 @@ class CommonKVManager(BaseKVManager):
         """Hold this room's ack until its transfer drains. Callers must mark the
         room Failed FIRST -- registering while it still accepts chunks lets the
         worker ack, then a new chunk writes pages the decode already released."""
-        self._deferred_ack_targets[room] = (decode_ip, decode_port)
+        if room not in getattr(self, "_deferred_ack_poisoned_rooms", ()):
+            self._deferred_ack_targets[room] = (decode_ip, decode_port)
+
+    def poison_deferred_ack_room(self, room: int) -> None:
+        """Suppress later ACKs when NIXL cannot prove old writes have ended."""
+        self._deferred_ack_targets.pop(room, None)
+        if not hasattr(self, "_deferred_ack_poisoned_rooms"):
+            self._deferred_ack_poisoned_rooms = set()
+        self._deferred_ack_poisoned_rooms.add(room)
 
     def get_kv_replica_factor(self) -> int:
         if self._kv_replica_factor is None:
