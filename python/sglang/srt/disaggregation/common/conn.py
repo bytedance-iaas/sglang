@@ -137,6 +137,7 @@ class PrefillServerInfo:
 class PrefillRankInfo:
     rank_ip: str
     rank_port: int
+    transfer_metadata: Optional[Dict[str, str]] = None
 
     def __post_init__(self):
         self.rank_ip = str(self.rank_ip)
@@ -150,6 +151,7 @@ class CommonKVManager(BaseKVManager):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
+        defer_bootstrap_registration: bool = False,
     ):
         self.kv_args = args
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
@@ -239,7 +241,8 @@ class CommonKVManager(BaseKVManager):
             self.bootstrap_port = self._sync_bootstrap_port_across_nodes(
                 self.bootstrap_port
             )
-            self.register_to_bootstrap()
+            if not defer_bootstrap_registration:
+                self.register_to_bootstrap()
             self.transfer_infos = {}
             # Deferred KV release: aborted room -> (decode_ip, decode_port);
             # ack held until the transfer drains.
@@ -788,6 +791,9 @@ class CommonKVManager(BaseKVManager):
             )
         return synced_port
 
+    def get_bootstrap_transfer_metadata(self) -> Optional[Dict[str, str]]:
+        return None
+
     def register_to_bootstrap(self):
         """Register prefill server info to bootstrap server via HTTP PUT."""
         if self.dist_init_addr:
@@ -818,6 +824,7 @@ class CommonKVManager(BaseKVManager):
             "system_dp_rank": self.system_dp_rank,
             "rank_ip": self.local_ip,
             "rank_port": self.rank_port,
+            "transfer_metadata": self.get_bootstrap_transfer_metadata(),
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.kv_cache_dtype_str,
             "load_balance_method": get_parallel().load_balance_method,
@@ -1796,6 +1803,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             tp_group_table[pp_rank] = PrefillRankInfo(
                 rank_ip=rank_ip,
                 rank_port=rank_port,
+                transfer_metadata=data.get("transfer_metadata"),
             )
 
             self._registered_count += 1

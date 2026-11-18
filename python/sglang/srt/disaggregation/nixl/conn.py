@@ -404,7 +404,15 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ):
-        super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        # UCX connection metadata must describe the initialized agent and its
+        # registered buffers. Publish this rank after those objects exist.
+        super().__init__(
+            args,
+            disaggregation_mode,
+            server_args,
+            is_mla_backend,
+            defer_bootstrap_registration=True,
+        )
         self.transfer_source_rank = (
             self.kv_args.pp_rank * get_parallel().tp_size + self.kv_args.engine_rank
         )
@@ -428,6 +436,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             ) from e
 
         backend = envs.SGLANG_DISAGGREGATION_NIXL_BACKEND.get()
+        self.nixl_backend = backend
         num_threads = 8 if disaggregation_mode == DisaggregationMode.PREFILL else 0
         backend_params = json.loads(
             envs.SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS.get()
@@ -458,6 +467,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             elif backend == "UCCL":
                 backend_params.setdefault("num_cpus", str(num_threads))
         self.agent.create_backend(backend, backend_params)
+
+        from sglang.srt.disaggregation.nixl.bootstrap import PrefillPeerRegistrar
+
+        self._prefill_peer_registrar = PrefillPeerRegistrar(self.agent, backend)
 
         available_plugins = self.agent.get_plugin_list()
         if backend not in available_plugins:
@@ -511,6 +524,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     daemon=True,
                 ).start()
             self._start_bootstrap_thread()
+            self.register_to_bootstrap()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
                 TransferStatus
@@ -1408,6 +1422,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 self.update_status(room, KVPoll.Failed)
                 # No ack here on purpose: the DONE barrier bails on the first
                 # ERR, so siblings may still be writing; fall back to the timeout.
+
+    def get_bootstrap_transfer_metadata(self) -> Optional[Dict[str, str]]:
+        from sglang.srt.disaggregation.nixl.bootstrap import publish_peer_metadata
+
+        return publish_peer_metadata(self.agent, self.nixl_backend)
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
@@ -3044,6 +3063,19 @@ class NixlKVReceiver(CommonKVReceiver):
 
     def _register_kv_args(self) -> bool:
         for bootstrap_info in self.bootstrap_infos:
+            transfer_metadata = bootstrap_info.get("transfer_metadata")
+            if transfer_metadata is not None:
+                try:
+                    self.kv_mgr._prefill_peer_registrar.register(transfer_metadata)
+                except Exception as error:
+                    # Fail this room before the producer can enqueue a write.
+                    self.kv_mgr.record_failure(
+                        self.bootstrap_room,
+                        f"NIXL prefill peer registration failed: {error}",
+                    )
+                    self.conclude_state = KVPoll.Failed
+                    self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                    return False
             packed_kv_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
             )

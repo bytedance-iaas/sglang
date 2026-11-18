@@ -39,6 +39,20 @@ class TestRegisterToBootstrap(CustomTestCase):
         mock_put.assert_called_once()
         mock_time.sleep.assert_not_called()
 
+    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    def test_transfer_metadata_is_published_without_dropping_rank_identity(
+        self, mock_put
+    ):
+        mock_put.return_value.status_code = 200
+        mgr = self._make_manager()
+        metadata = {"version": "1", "backend": "UCX", "agent_metadata": "bWQ="}
+        mgr.get_bootstrap_transfer_metadata = MagicMock(return_value=metadata)
+        mgr.register_to_bootstrap()
+        payload = mock_put.call_args.kwargs["json"]
+        self.assertEqual(payload["transfer_metadata"], metadata)
+        self.assertEqual(payload["rank_ip"], mgr.local_ip)
+        self.assertEqual(payload["rank_port"], mgr.rank_port)
+
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
     def test_succeeds_after_retries(self, mock_put, mock_time):
@@ -257,6 +271,11 @@ class TestRegisterToBootstrap(CustomTestCase):
         # Bind the real method to the mock
         mgr.register_to_bootstrap = CommonKVManager.register_to_bootstrap.__get__(
             mgr, CommonKVManager
+        )
+        mgr.get_bootstrap_transfer_metadata = (
+            CommonKVManager.get_bootstrap_transfer_metadata.__get__(
+                mgr, CommonKVManager
+            )
         )
 
         # Set attributes that register_to_bootstrap reads
