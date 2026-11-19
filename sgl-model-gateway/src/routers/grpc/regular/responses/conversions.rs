@@ -182,6 +182,7 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
         stream_options: if is_streaming {
             Some(StreamOptions {
                 include_usage: Some(true),
+                ..StreamOptions::default()
             })
         } else {
             None
