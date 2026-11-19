@@ -2439,7 +2439,13 @@ def test_write_back_load_back_ignores_auxiliary_nodes_for_pending_ownership():
     core.sanity_check([], [])
 
 
-def _swa_cache(window: int = 8, page_size: int = 1, backend="rust", ring=False):
+def _swa_cache(
+    window: int = 8,
+    page_size: int = 1,
+    backend="rust",
+    ring=False,
+    swa_gates_prefix_match=True,
+):
     """A real UnifiedRadixCache and SWA allocator, defaulting to the Rust core."""
     from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -2484,6 +2490,7 @@ def _swa_cache(window: int = 8, page_size: int = 1, backend="rust", ring=False):
                 page_size=page_size,
                 disable=False,
                 sliding_window_size=window,
+                swa_gates_prefix_match=swa_gates_prefix_match,
                 tree_components=(ComponentType.FULL, ComponentType.SWA),
             )
         )
@@ -2633,7 +2640,9 @@ def _mock_swa_write_back_io(case, backup="success"):
         host_pool.available_size.return_value = count
         return count
 
-    def write(node, full, transfers, sidecars):
+    def write(node, full, transfers, sidecars, *, agree_allocation=None):
+        # The legacy rank-local callback must not enter a new collective.
+        assert agree_allocation is None
         assert sidecars == []
         assert_resident(node, transfers)
         case.events.append(("write", node))
@@ -3823,6 +3832,31 @@ def test_swa_match_uses_allocator_layout(backend, ring, hicache, has_swa_host_po
     )
 
 
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("swa_gates_prefix_match", [True, False])
+def test_native_decode_swa_gate_preserves_full_prefix(backend, swa_gates_prefix_match):
+    """Decode can rebuild private SWA while reusing FULL; ordinary paged SWA gates it."""
+    cache, allocator = _swa_cache(
+        backend=backend, swa_gates_prefix_match=swa_gates_prefix_match
+    )
+    indices = allocator.alloc(12)
+    cache.insert(
+        InsertParams(
+            key=_key(list(range(12))),
+            value=indices,
+            component_evicted_seqlens={ComponentType.SWA: 8},
+        )
+    )
+    matched = cache.match_prefix(MatchPrefixParams(key=_key(list(range(8)))))
+    assert matched.full_kv_hit_length == 8
+    assert matched.host_hit_length == 0
+    assert matched.device_prefix_len == (0 if swa_gates_prefix_match else 8)
+    assert cache.path_device_indices(matched.last_device_node).tolist() == (
+        [] if swa_gates_prefix_match else indices[:8].tolist()
+    )
+    cache.tree_core.sanity_check([], [])
+
+
 def test_buffer_backup_snapshot_round_trips_and_detects_a_split():
     core = _tree_core()
     core.enable_storage = True
@@ -4342,7 +4376,8 @@ def test_internal_mamba_write_back_preserves_state_until_ack(backend, backup):
         host_pool.available_size.return_value = 1
         return 1
 
-    def write(node_id, values, transfers, sidecars):
+    def write(node_id, values, transfers, sidecars, *, agree_allocation=None):
+        assert agree_allocation is None
         assert node_id == node and values.tolist() == [10] and sidecars == []
         assert_state_resident()
         events.append("write")

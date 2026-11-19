@@ -267,6 +267,46 @@ class TestShardedFullPoolInvariant(CustomTestCase):
         with self.assertRaisesRegex(AssertionError, "Full Pool Mem Leak Detected"):
             checker.self_check_during_busy()
 
+    def test_decode_queue_and_restore_receipt_are_counted_once(self):
+        checker = self._make_checker()
+        active = self._active_partial_page(checker)
+        queued_indices, _ = self._allocate(3)
+        checker.req_to_token_pool.req_to_token[1, :3] = queued_indices
+        queued = SimpleNamespace(
+            kv=SimpleNamespace(
+                holds_kv=True,
+                req_pool_idx=1,
+                kv_allocated_len=3,
+                cache_protected_len=0,
+            ),
+            beam_group=None,
+        )
+        receipt, _ = self._allocate(self.PAGE_SIZE)
+        self.cache._decode_storage_device_reservations[id(receipt)] = receipt
+        transfer_queue = SimpleNamespace(
+            queue=[
+                SimpleNamespace(req=active, host_staged=False),
+                SimpleNamespace(req=queued, host_staged=False),
+                SimpleNamespace(req=queued, host_staged=False),
+                SimpleNamespace(req=None, host_staged=True),
+            ]
+        )
+        checker.get_decode_transfer_queue = lambda: transfer_queue
+        self.running_batch = SimpleNamespace(reqs=[active])
+        self.chunked_req = active
+
+        # Four real pages: cached prefix, active tail, queued-only tail, receipt.
+        # The receipt has no request row; aliases must not count either tail twice.
+        self.assertEqual(
+            self.allocator.aggregate_free_size(),
+            self.allocator.size - 4 * self.PAGE_SIZE,
+        )
+        self.assertEqual(checker._get_total_uncached_sizes(), (3 * self.PAGE_SIZE, 0))
+        leak, message = checker._check_full_pool(
+            checker.pool_stats_observer.get_pool_stats(), uncached=3 * self.PAGE_SIZE
+        )
+        self.assertFalse(leak, message)
+
     def test_partial_active_page_is_accounted_without_slack_exemption(self):
         checker = self._make_checker()
         req = self._active_partial_page(checker)

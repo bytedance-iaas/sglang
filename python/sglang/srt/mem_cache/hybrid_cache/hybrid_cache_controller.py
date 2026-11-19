@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -33,6 +34,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    SidecarPoolSpec,
     count_pool_hits,
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer
@@ -293,6 +295,92 @@ class HybridCacheController(BaseHiCacheController):
         """Only opt in backends whose FULL object is the complete shared page."""
         return storage_backend is None or storage_backend == "mori"
 
+    def _uses_dsv4_storage_namespace(self, storage_backend, extra_config):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+        from sglang.srt.runtime_context import get_disagg
+
+        if storage_backend != "mooncake" or not isinstance(
+            self.mem_pool_device, DeepSeekV4TokenToKVPool
+        ):
+            return False
+        if "dsv4_cache_namespace" in (extra_config or {}):
+            return True
+        disagg = get_disagg()
+        pool = self.mem_pool_device
+        ratios = pool.compression_ratios
+        return (
+            disagg.disaggregation_mode == "decode"
+            and disagg.disaggregation_decode_enable_radix_cache
+            and type(pool) is DeepSeekV4TokenToKVPool
+            and not pool._unified_kv
+            and any(ratio in (1, 2) for ratio in ratios)
+            and not (set(ratios) - {0, 1, 2})
+        )
+
+    def _prepare_storage_backend_extra_config(self, storage_backend, extra_config):
+        from sglang.srt.mem_cache.dsv4_storage_namespace import (
+            dsv4_mooncake_extra_config,
+        )
+
+        extra = super()._prepare_storage_backend_extra_config(
+            storage_backend, extra_config
+        )
+        if self._uses_dsv4_storage_namespace(storage_backend, extra):
+            extra = dsv4_mooncake_extra_config(
+                self.mem_pool_device, self.page_size, extra
+            )
+        return extra
+
+    def _register_storage_host_pools(self, host_pools):
+        super()._register_storage_host_pools(host_pools)
+        self._persistent_storage_pool_plan = None
+        if self.storage_backend_type not in ("file", "mooncake"):
+            return
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+        from sglang.srt.mem_cache.dsv41_decode_storage import (
+            build_decode_storage_pool_plan,
+        )
+
+        pool = self.mem_pool_device
+        if (
+            type(pool) is not DeepSeekV4TokenToKVPool
+            or pool._unified_kv
+            or not any(ratio in (1, 2) for ratio in pool.compression_ratios)
+            or set(pool.compression_ratios) - {0, 1, 2}
+        ):
+            return
+        # The same physical C1/C2 group is shared by Prefill, Colocated and
+        # Decode. SWA/request state remains outside this persistent plan.
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+            describe_dsv4_persistent_pools,
+        )
+
+        specs = [
+            SidecarPoolSpec(info.pool_name, info.indices_from_pool)
+            for info in describe_dsv4_persistent_pools(pool, self.page_size)
+            if info.indices_from_pool == PoolName.KV
+        ]
+        plan = build_decode_storage_pool_plan(pool, self.page_size, specs)
+        self.storage_backend.configure_persistent_pool_bundle(plan)
+        self._persistent_storage_pool_plan = plan
+
+    def _storage_registration_identity(self):
+        namespace = None
+        if self._uses_dsv4_storage_namespace(
+            self.storage_backend_type, self.storage_config.extra_config
+        ):
+            namespace = self.storage_config.extra_config["dsv4_cache_namespace_digest"]
+            if len(bytes.fromhex(namespace)) != 32:
+                raise ValueError("Storage registration identity must be SHA256")
+        plan = getattr(self, "_persistent_storage_pool_plan", None)
+        if plan is not None:
+            return hashlib.sha256(
+                json.dumps(
+                    [namespace, plan.fingerprint], separators=(",", ":")
+                ).encode()
+            ).hexdigest()
+        return namespace
+
     def attach_storage_backend(
         self,
         storage_backend: str,
@@ -331,15 +419,13 @@ class HybridCacheController(BaseHiCacheController):
                 prefetch_threshold=prefetch_threshold,
                 model_name=model_name,
                 storage_backend_extra_config=storage_backend_extra_config,
+                host_pools=host_pools,
             )
         except Exception:
             if self.pp_prefetch_command_group is not None:
                 torch.distributed.destroy_process_group(self.pp_prefetch_command_group)
                 self.pp_prefetch_command_group = None
             raise
-
-        for entry in host_pools or []:
-            self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
 
     def detach_storage_backend(self):
         super().detach_storage_backend()
@@ -541,8 +627,49 @@ class HybridCacheController(BaseHiCacheController):
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
         flush: bool = True,
+        allocation_agreement: Optional[Callable[[bool], bool]] = None,
     ) -> Optional[torch.Tensor]:
+        original_indices = (
+            [
+                (transfer, transfer.host_indices, transfer.device_indices)
+                for transfer in extra_pools or []
+            ]
+            if allocation_agreement is not None
+            else []
+        )
         allocation = self.allocate_host_transfers(device_indices, extra_pools)
+        if allocation_agreement is not None:
+            # The caller enters from one rank-consistent tree backup action.
+            # No operation/DMA/tree commit owns these newly reserved slots yet.
+            def rollback():
+                if allocation is not None:
+                    host_indices, _ = allocation
+                    for transfer, previous_host, _ in original_indices:
+                        if (
+                            previous_host is None
+                            and transfer.indices_from_pool is None
+                            and transfer.host_indices is not None
+                        ):
+                            self.mem_pool_host.free(
+                                transfer.host_indices, pool=transfer.name
+                            )
+                    self.mem_pool_host.free(host_indices)
+                for transfer, previous_host, previous_device in original_indices:
+                    transfer.host_indices = previous_host
+                    transfer.device_indices = previous_device
+
+            try:
+                accepted = allocation_agreement(allocation is not None)
+            except BaseException as error:
+                try:
+                    rollback()
+                except BaseException as cleanup_error:
+                    raise error from cleanup_error
+                raise
+            if not accepted:
+                rollback()
+                return None
+            assert allocation is not None, "Allocation agreement accepted a local miss"
         if allocation is None:
             return None
         host_indices, pool_transfers = allocation
@@ -962,15 +1089,25 @@ class HybridCacheController(BaseHiCacheController):
         priority: Optional[int] = None,
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        *,
+        device_indices: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
+        """Queue H2D into new FULL rows or caller-owned reservation rows.
+
+        Caller-owned rows stay with their receipt if side-pool allocation fails.
+        Successful submission transfers the rows to the load operation.
+        """
         need_load_kv = host_indices.numel() > 0
+        caller_owned = device_indices is not None
 
         full_allocator = getattr(
             self.mem_pool_device_allocator,
             "full_attn_allocator",
             self.mem_pool_device_allocator,
         )
-        if not need_load_kv:
+        if caller_owned:
+            assert len(device_indices) == len(host_indices)
+        elif not need_load_kv:
             device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
         else:
             device_indices = full_allocator.alloc(len(host_indices))
@@ -983,7 +1120,7 @@ class HybridCacheController(BaseHiCacheController):
             kv_host_indices=host_indices,
         )
         if pool_transfers is None and extra_pools:
-            if need_load_kv:
+            if need_load_kv and not caller_owned:
                 full_allocator.free(device_indices)
             return None
 
@@ -1573,27 +1710,34 @@ class HybridCacheController(BaseHiCacheController):
             pool_hits = count_pool_hits(results)
             operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
 
+        # A logical KV anchor may acknowledge a no-op even when required
+        # physical sidecars failed. Backup progress must reflect both results.
+        sidecar_ok = True
+        for transfer in backup_transfers:
+            result = results.get(transfer.name)
+            if result is None:
+                result = results.get(transfer.name.value)
+            expected = len(transfer.keys or [])
+            if expected == 0 and transfer.host_indices is not None:
+                expected = int(transfer.host_indices.numel())
+            if (
+                not isinstance(result, (list, tuple))
+                or len(result) != expected
+                or not all(ok is True for ok in result)
+            ):
+                sidecar_ok = False
+                break
+
         if not self.backup_skip:
             super()._page_backup(operation)
+            if not sidecar_ok:
+                # The sidecar RPC reports one operation, not progressive ACKs.
+                operation.completed_tokens = 0
         else:
-            sidecar_ok = bool(backup_transfers)
-            if sidecar_ok:
-                for transfer in backup_transfers:
-                    result = results.get(transfer.name)
-                    if result is None:
-                        result = results.get(transfer.name.value)
-                    expected = len(transfer.keys or [])
-                    if expected == 0 and transfer.host_indices is not None:
-                        expected = int(transfer.host_indices.numel())
-                    if (
-                        not isinstance(result, (list, tuple))
-                        or len(result) != expected
-                        or not all(bool(ok) for ok in result)
-                    ):
-                        sidecar_ok = False
-                        break
             operation.completed_tokens = (
-                len(operation.hash_value) * self.page_size if sidecar_ok else 0
+                len(operation.hash_value) * self.page_size
+                if backup_transfers and sidecar_ok
+                else 0
             )
 
     def should_backup(self, transfer: PoolTransfer) -> bool:

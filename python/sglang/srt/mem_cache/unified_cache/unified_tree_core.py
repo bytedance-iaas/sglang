@@ -75,6 +75,8 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     DropSubtreeNoHostResult,
     EvictDeviceLeafResult,
     EvictDeviceNextNodeResult,
+    HostReclaimCandidate,
+    HostReclaimNode,
     InsertStepResult,
     NodeId,
     RadixCacheWalkResult,
@@ -433,6 +435,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.write_through_threshold = 256
         self.is_write_back = False
         self.has_swa_host_pool = False
+        self.swa_gates_prefix_match = params.swa_gates_prefix_match
         self.enable_session_radix_cache = params.enable_session_radix_cache
         self.eviction_strategy = get_eviction_strategy(
             params.eviction_policy.lower(), params.eviction_policy_config
@@ -883,18 +886,23 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         full_kv_hit_length = 0
         action: Optional[CacheAction | ComponentAction] = None
         separate_device_match = self.enable_hicache
+        match_components = tuple(
+            comp
+            for comp in self.components
+            if comp.component_type != ComponentType.SWA or self.swa_gates_prefix_match
+        )
         if separate_device_match:
             validators = tuple(
-                comp.create_match_validator() for comp in self.components
+                comp.create_match_validator() for comp in match_components
             )
             device_validators = tuple(
                 comp.create_match_validator(match_device_only=True)
-                for comp in self.components
+                for comp in match_components
             )
         else:
             validators = tuple(
                 comp.create_match_validator(match_device_only=True)
-                for comp in self.components
+                for comp in match_components
             )
 
         def _all_valid(validators, node):
@@ -1850,6 +1858,129 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             node, tracker, device_frees=device_frees, host_frees=host_frees
         )
 
+    def _host_reclaim_node(self, node):
+        if (
+            not self._can_reclaim_full_host_duplicate(node)
+            or len(node.component_data[BASE_COMPONENT_TYPE].host_value) != len(node.key)
+            or not len(node.key)
+            or self.is_eagle
+            or any(cd.host_lock_ref for cd in node.component_data)
+            or any(
+                cd.host_value is not None
+                for ct, cd in enumerate(node.component_data)
+                if ct != BASE_COMPONENT_TYPE
+            )
+        ):
+            return None
+        path, cur = [], node
+        while cur is not self.root_node:
+            path.append(cur.key)
+            cur = cur.parent
+        tokens = [token for key in reversed(path) for token in key]
+        return HostReclaimNode(
+            node.id,
+            tuple(tokens),
+            node.key.extra_key,
+            node.key.cache_salt,
+            False,
+            len(node.component_data[BASE_COMPONENT_TYPE].host_value),
+        )
+
+    def _host_reclaim_candidate(self, node):
+        root = self._host_reclaim_node(node)
+        if root is None:
+            return None
+        members, pending = [], [node]
+        while pending:
+            cur = pending.pop()
+            # Walk through Host-less nodes too: a deeper backed owner must not
+            # be orphaned, and any in-flight/pinned subtree blocks its parent.
+            if (
+                cur.write_through_pending_id is not None
+                or cur.load_back_pending_id is not None
+                or any(cd.host_lock_ref for cd in cur.component_data)
+                or any(
+                    cd.host_value is not None
+                    for ct, cd in enumerate(cur.component_data)
+                    if ct != BASE_COMPONENT_TYPE
+                )
+            ):
+                return None
+            if cur.component_data[BASE_COMPONENT_TYPE].host_value is not None:
+                member = self._host_reclaim_node(cur)
+                if member is None:
+                    return None
+                members.append(member)
+            pending.extend(cur.children.values())
+        # Only logical paths determine order; never rank-local handles or the
+        # children map's iteration order. A descendant always precedes its parent.
+        members.sort(key=lambda m: (-len(m.token_ids), m.token_ids))
+        return HostReclaimCandidate(
+            root.node_id,
+            root.token_ids,
+            root.extra_key,
+            root.cache_salt,
+            root.is_bigram,
+            sum(m.host_tokens for m in members),
+            tuple(members),
+        )
+
+    def snapshot_host_reclaim(self, excluded_node_ids):
+        excluded = set()
+        for node_id in excluded_node_ids:
+            cur = self.node_by_id(node_id)
+            while cur is not self.root_node:
+                excluded.add(cur.id)
+                cur = cur.parent
+        # Choose disjoint maximal safe groups; overlapping plans would count the
+        # same Host slots twice in the controller's capacity agreement.
+        roots = [
+            member
+            for node in self.full_host_duplicates.values()
+            if node.id not in excluded
+            and (member := self._host_reclaim_node(node)) is not None
+        ]
+        roots.sort(key=lambda m: len(m.token_ids))
+        candidates, covered = [], set()
+        for root in roots:
+            if root.node_id in covered:
+                continue
+            candidate = self._host_reclaim_candidate(self.node_by_id(root.node_id))
+            if candidate is not None and not any(
+                m.node_id in excluded for m in candidate.members
+            ):
+                candidates.append(candidate)
+                covered.update(m.node_id for m in candidate.members)
+        return candidates
+
+    def validate_host_reclaim(self, candidates):
+        seen = set()
+        for candidate in candidates:
+            node = self._node_arena.get(candidate.node_id)
+            if node is None or self._host_reclaim_candidate(node) != candidate:
+                return False
+            for member in candidate.members:
+                if member.node_id in seen:
+                    return False
+                seen.add(member.node_id)
+        return True
+
+    def commit_host_reclaim(self, candidates):
+        if not self.validate_host_reclaim(candidates):
+            return None
+        result = DriveHostEvictionResult()
+        for candidate in candidates:
+            for member in candidate.members:
+                node = self.node_by_id(member.node_id)
+                self._release_full_host_copy(
+                    node,
+                    result.tracker,
+                    result.device_frees,
+                    result.host_frees,
+                )
+                self.full_host_duplicates.pop(node.id, None)
+        return result
+
     def drive_host_eviction(
         self, component_type: ComponentType, num_tokens: int
     ) -> DriveHostEvictionResult:
@@ -1943,6 +2074,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Free only the Full host layer; aux host slices stay under their own
         pools' LRU (a host-only aux slice may be a sole copy)."""
         assert self._can_reclaim_full_host_duplicate(node)
+        self._release_full_host_copy(node, tracker, device_frees, host_frees)
+        self.write_back_duplicate_reclaim_digest = (
+            self.write_back_duplicate_reclaim_digest * 1000003 + node.id + 1
+        ) & _RECLAIM_DIGEST_MASK
+
+    def _release_full_host_copy(self, node, tracker, device_frees, host_frees):
+        """Release only FULL Host ownership; caller owns protocol bookkeeping."""
         self.kv_events.record_remove(node, medium=StorageMedium.CPU)
         self._evict_component_and_detach_lru(
             node,
@@ -1952,9 +2090,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             device_frees=device_frees,
             host_frees=host_frees,
         )
-        self.write_back_duplicate_reclaim_digest = (
-            self.write_back_duplicate_reclaim_digest * 1000003 + node.id + 1
-        ) & _RECLAIM_DIGEST_MASK
 
     def _evict_host_leaf(
         self,

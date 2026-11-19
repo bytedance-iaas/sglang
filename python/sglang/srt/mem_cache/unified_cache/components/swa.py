@@ -89,6 +89,7 @@ class SWAComponent(TreeComponent):
         super().__init__(cache, params)
         self._session_leaf_covered_len: dict[str, dict[UnifiedTreeNode, int]] = {}
         self.sliding_window_size = params.sliding_window_size
+        self.swa_gates_prefix_match = params.swa_gates_prefix_match
         self.full_window_pages = (
             self.sliding_window_size + params.page_size - 1
         ) // params.page_size
@@ -333,6 +334,8 @@ class SWAComponent(TreeComponent):
     def create_match_validator(
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
+        if not self.swa_gates_prefix_match:
+            return lambda node: True
         sliding_window_size = self.sliding_window_size
         ct = self.component_type
         state = {"len": float("inf")}
