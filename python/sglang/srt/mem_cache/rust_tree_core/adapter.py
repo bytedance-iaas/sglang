@@ -53,6 +53,8 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     DropSubtreeNoHostResult,
     EvictDeviceLeafResult,
     EvictDeviceNextNodeResult,
+    HostReclaimCandidate,
+    HostReclaimNode,
     InsertStepResult,
     NodeId,
     RadixCacheWalkResult,
@@ -421,6 +423,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 device=str(self.device),
                 swa_sliding_window_size=params.sliding_window_size,
                 swa_req_ring=is_swa_req_ring(self._allocator),
+                swa_gates_prefix_match=params.swa_gates_prefix_match,
                 enable_kv_cache_events=params.enable_kv_cache_events,
                 mamba_cache_chunk_size=(
                     mamba_cache_chunk_size() if has_mamba else None
@@ -760,6 +763,61 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def end_insert(self) -> list[CacheAction | ComponentAction]:
         return _cache_actions_from_tagged(self._binding.end_insert())
+
+    def snapshot_host_reclaim(self, excluded_node_ids):
+        return [
+            HostReclaimCandidate(
+                node,
+                tuple(tokens),
+                extra,
+                salt,
+                bigram,
+                count,
+                tuple(
+                    HostReclaimNode(n, tuple(t), e, s, b, c)
+                    for n, t, e, s, b, c in members
+                ),
+            )
+            for node, tokens, extra, salt, bigram, count, members in self._binding.snapshot_host_reclaim(
+                list(excluded_node_ids)
+            )
+        ]
+
+    @staticmethod
+    def _host_reclaim_args(candidates):
+        return [
+            (
+                c.node_id,
+                list(c.token_ids),
+                c.extra_key,
+                c.cache_salt,
+                c.is_bigram,
+                c.host_tokens,
+                [
+                    (
+                        m.node_id,
+                        list(m.token_ids),
+                        m.extra_key,
+                        m.cache_salt,
+                        m.is_bigram,
+                        m.host_tokens,
+                    )
+                    for m in c.members
+                ],
+            )
+            for c in candidates
+        ]
+
+    def validate_host_reclaim(self, candidates):
+        return self._binding.validate_host_reclaim(self._host_reclaim_args(candidates))
+
+    def commit_host_reclaim(self, candidates):
+        result = self._binding.commit_host_reclaim(self._host_reclaim_args(candidates))
+        return (
+            None
+            if result is None
+            else _fill_evict_result(result, DriveHostEvictionResult())
+        )
 
     def drive_host_eviction(
         self, component_type: ComponentType, num_tokens: int

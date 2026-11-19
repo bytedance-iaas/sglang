@@ -18,9 +18,9 @@ use crate::unified_lru_list::{TlruFloatConfig, TlruPromptEstimate};
 use crate::unified_tree_core::KvCacheEvent;
 use crate::unified_tree_core::{
     BufferBackupSnapshot, BufferBackupState, CacheAction, CacheInitParams, CacheTransferPhase,
-    DecLockRefParams, EvictLayer, EvictionStepResult, InsertParams, InsertResult, InsertStepResult,
-    MatchPrefixParams, MatchResult, PoolHitPolicy, PoolName, PoolTransfer, PoolTransferResult, Req,
-    UnifiedTreeCore,
+    DecLockRefParams, EvictLayer, EvictionStepResult, HostReclaimCandidate, InsertParams,
+    InsertResult, InsertStepResult, MatchPrefixParams, MatchResult, PoolHitPolicy, PoolName,
+    PoolTransfer, PoolTransferResult, Req, UnifiedTreeCore,
 };
 
 /// Translate only Rust panics; ordinary Python errors pass through unchanged.
@@ -499,6 +499,7 @@ pub struct TreeCoreInitParamsBinding {
     pub device: String,
     pub swa_sliding_window_size: Option<usize>,
     pub swa_req_ring: bool,
+    pub swa_gates_prefix_match: bool,
     pub enable_kv_cache_events: bool,
     pub mamba_cache_chunk_size: Option<usize>,
     pub mamba_max_states_per_path: Option<usize>,
@@ -519,6 +520,7 @@ impl TreeCoreInitParamsBinding {
             device: parse_device(&self.device)?,
             swa_sliding_window_size: self.swa_sliding_window_size,
             swa_req_ring: self.swa_req_ring,
+            swa_gates_prefix_match: self.swa_gates_prefix_match,
             // Wired post-construction via set_has_swa_host_pool.
             has_swa_host_pool: false,
             enable_kv_cache_events: self.enable_kv_cache_events,
@@ -531,7 +533,7 @@ impl TreeCoreInitParamsBinding {
 #[pymethods]
 impl TreeCoreInitParamsBinding {
     #[new]
-    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false, tlru_tail_budget = 0, tlru_float_config = None))]
+    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false, tlru_tail_budget = 0, tlru_float_config = None, swa_gates_prefix_match = true))]
     fn new(
         eviction_policy: String,
         page_size: usize,
@@ -547,6 +549,7 @@ impl TreeCoreInitParamsBinding {
         swa_req_ring: bool,
         tlru_tail_budget: usize,
         tlru_float_config: Option<TlruFloatConfigBinding>,
+        swa_gates_prefix_match: bool,
     ) -> Self {
         TreeCoreInitParamsBinding {
             eviction_policy,
@@ -560,6 +563,7 @@ impl TreeCoreInitParamsBinding {
             device,
             swa_sliding_window_size,
             swa_req_ring,
+            swa_gates_prefix_match,
             enable_kv_cache_events,
             mamba_cache_chunk_size,
             mamba_max_states_per_path,
@@ -1986,6 +1990,36 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         })
     }
 
+    fn snapshot_host_reclaim(
+        &self,
+        py: Python<'_>,
+        excluded: Vec<NodeId>,
+    ) -> PyResult<Vec<HostReclaimCandidate>> {
+        py.allow_threads(|| self.core().snapshot_host_reclaim(&excluded))
+            .map_err(node_access_error)
+    }
+
+    fn validate_host_reclaim(&self, py: Python<'_>, candidates: Vec<HostReclaimCandidate>) -> bool {
+        py.allow_threads(|| self.core().validate_host_reclaim(&candidates))
+    }
+
+    fn commit_host_reclaim(
+        &self,
+        py: Python<'_>,
+        candidates: Vec<HostReclaimCandidate>,
+    ) -> PyResult<Option<HostEvictionResultBinding>> {
+        let result = py.allow_threads(|| self.core().commit_host_reclaim(&candidates));
+        result
+            .map(|result| {
+                Ok(HostEvictionResultBinding {
+                    tracker: tracker_to_py(result.tracker),
+                    new_device_frees: frees_to_py(py, result.device_frees)?,
+                    new_host_frees: frees_to_py(py, result.host_frees)?,
+                })
+            })
+            .transpose()
+    }
+
     /// Evict up to num_tokens of one component's host resources.
     fn drive_host_eviction(
         &self,
@@ -3299,6 +3333,20 @@ macro_rules! tree_core_binding {
             /// Release a node's device KV once its host copy exists.
             fn demote(&self, py: Python<'_>, node_id: NodeId) -> PyResult<DemoteResultBinding> {
                 catch_native_panic(|| self.inner.demote(py, node_id))
+            }
+
+            fn snapshot_host_reclaim(&self, py: Python<'_>, excluded: Vec<NodeId>)
+                -> PyResult<Vec<HostReclaimCandidate>> {
+                catch_native_panic(|| self.inner.snapshot_host_reclaim(py, excluded))
+            }
+
+            fn validate_host_reclaim(&self, py: Python<'_>, candidates: Vec<HostReclaimCandidate>) -> PyResult<bool> {
+                catch_native_panic(|| Ok(self.inner.validate_host_reclaim(py, candidates)))
+            }
+
+            fn commit_host_reclaim(&self, py: Python<'_>, candidates: Vec<HostReclaimCandidate>)
+                -> PyResult<Option<HostEvictionResultBinding>> {
+                catch_native_panic(|| self.inner.commit_host_reclaim(py, candidates))
             }
 
             /// Evict up to num_tokens of one component's host resources.

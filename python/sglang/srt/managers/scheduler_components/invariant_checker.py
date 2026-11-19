@@ -69,6 +69,7 @@ class SchedulerInvariantChecker:
     # The chunked-prefill request parked between chunks is in neither batch;
     # it still owns its KV row.
     get_chunked_req: Callable = field(default=lambda: None)
+    get_decode_transfer_queue: Callable = field(default=lambda: None)
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
@@ -279,6 +280,9 @@ class SchedulerInvariantChecker:
         # ScheduleBatch's dataclass __eq__ compares tensors and raises.
         if running_batch is not None and running_batch is not last_batch:
             reqs += running_batch.reqs
+        transfer_queue = self.get_decode_transfer_queue()
+        if transfer_queue is not None:
+            reqs += [dr.req for dr in transfer_queue.queue if not dr.host_staged]
         chunked_req = self.get_chunked_req()
         if chunked_req is not None:
             reqs.append(chunked_req)
@@ -295,8 +299,8 @@ class SchedulerInvariantChecker:
         return owners
 
     def _get_total_uncached_sizes(self) -> Tuple[int, int]:
-        """(full, swa) footprint of the KV rows requests own; 0 swa off hybrid-SWA."""
-        full_uncached = 0
+        """Request-owned rows and cache-owned restore reservations outside the tree."""
+        full_uncached = self.tree_cache.full_transient_size()
         swa_uncached = self.tree_cache.swa_transient_size()
         for req in self._requests_owning_rows():
             assert req.kv.cache_protected_len % self.page_size == 0
