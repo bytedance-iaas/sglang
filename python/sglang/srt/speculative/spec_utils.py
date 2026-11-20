@@ -45,7 +45,7 @@ from sglang.srt.mem_cache.allocation import (
 from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -673,9 +673,19 @@ def load_token_map(token_map_path: str) -> List[int]:
 
 @contextmanager
 def draft_tp_context(tp_group: GroupCoordinator):
-    # Draft model doesn't use dp and has its own tp group.
-    # We disable mscclpp now because it doesn't support 2 comm groups.
-    with patch_tensor_parallel_group(tp_group):
+    # Draft models use their own TP group and a replicated KV cache. In
+    # particular, a dense MHA/GQA draft must not inherit target DCP: DCP treats
+    # ranks as sequence shards of the same KV heads, while dense draft TP ranks
+    # own different KV heads. The draft KV configurator already expands the
+    # replicated pool to cover the target allocator's virtual DCP loc space.
+    parallel = get_parallel()
+    with patch_tensor_parallel_group(tp_group), parallel.override(
+        dcp_enabled=False,
+        dcp_size=1,
+        dcp_rank=0,
+        attn_dcp_size=1,
+        attn_dcp_rank=0,
+    ):
         yield
 
 

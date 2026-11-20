@@ -393,9 +393,21 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                 decode_attention_backend="tokenspeed_mla",
                 kv_cache_dtype="fp8_e4m3",
             )
+        elif decode_backend == "flashmla":
+            # The stock Kimi-K3 gate predates FlashMLA's dense-FP8 DCP path.
+            # FlashMLA's external dense-FP8 DCP path is decode-only on Hopper.
+            # Preserve an explicitly selected prefill backend (for example,
+            # Triton) instead of routing extend through FlashMLA, whose
+            # forward_extend interface does not accept Kimi-K3's q_rope input.
+            logger.info(
+                "Kimi-K3 DCP enables external FlashMLA decode "
+                f"while preserving prefill={prefill_backend!r}."
+            )
+            overrides["decode_attention_backend"] = "flashmla"
         else:
             raise AssertionError(
-                f"Decode attention backend for Kimi-K3 DCP must be 'cutedsl_mla' or 'tokenspeed_mla', got {decode_backend!r}."
+                "Decode attention backend for Kimi-K3 DCP must be "
+                f"'cutedsl_mla', 'tokenspeed_mla', or 'flashmla', got {decode_backend!r}."
             )
 
         if server_args.dcp_replicate_q_proj is None:

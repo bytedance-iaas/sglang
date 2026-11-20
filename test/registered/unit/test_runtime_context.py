@@ -4,6 +4,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+import contextlib
 import dataclasses
 import os
 import unittest
@@ -186,6 +187,37 @@ class TestParallelDCP(_IsolatedOverrides):
             self.assertEqual(get_parallel().attn_dcp_size, 8)
             self.assertEqual(get_parallel().attn_dcp_rank, 3)
             is_cuda.assert_not_called()
+
+    def test_draft_tp_context_masks_target_dcp_and_restores_it(self):
+        from sglang.srt.speculative import spec_utils
+
+        parallel = get_parallel()
+        draft_tp_group = object()
+        with parallel.override(
+            dcp_enabled=True,
+            dcp_size=8,
+            dcp_rank=3,
+            attn_dcp_size=8,
+            attn_dcp_rank=3,
+        ):
+            with patch.object(
+                spec_utils,
+                "patch_tensor_parallel_group",
+                return_value=contextlib.nullcontext(),
+            ) as patch_tp:
+                with spec_utils.draft_tp_context(draft_tp_group):
+                    self.assertFalse(parallel.dcp_enabled)
+                    self.assertEqual(parallel.dcp_size, 1)
+                    self.assertEqual(parallel.dcp_rank, 0)
+                    self.assertEqual(parallel.attn_dcp_size, 1)
+                    self.assertEqual(parallel.attn_dcp_rank, 0)
+
+            patch_tp.assert_called_once_with(draft_tp_group)
+            self.assertTrue(parallel.dcp_enabled)
+            self.assertEqual(parallel.dcp_size, 8)
+            self.assertEqual(parallel.dcp_rank, 3)
+            self.assertEqual(parallel.attn_dcp_size, 8)
+            self.assertEqual(parallel.attn_dcp_rank, 3)
 
 
 class _IsolatedServerArgs(CustomTestCase):

@@ -3990,6 +3990,11 @@ class MLATokenToKVPool(KVCache):
             if not valid_mask.all():
                 loc = loc[valid_mask]
                 cache_k = cache_k[valid_mask]
+            # DCP allocation uses logical pages of
+            # page_size * attn_dcp_size tokens. Each rank stores its cyclic
+            # shard compactly, so translate logical token locations to the
+            # rank-local physical offsets before the KV write.
+            loc = loc // parallel.attn_dcp_size
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 
@@ -4090,6 +4095,23 @@ class MLATokenToKVPool(KVCache):
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         """Relocate accepted-token combined MLA KV (latent + rope) per layer."""
+        parallel = get_parallel()
+        if parallel.dcp_enabled:
+            # Speculative commit locations live in the widened logical DCP
+            # address space, while every rank materializes only its compact
+            # cyclic shard.  The MLA scatter-write kernel applies this mapping
+            # on insert; relocation must apply the identical owner filter and
+            # logical-to-local translation or accepted KV is copied from/to the
+            # wrong rows after the first target-verify step.
+            dcp_size = parallel.attn_dcp_size
+            dcp_rank = parallel.attn_dcp_rank
+            owned = (tgt_loc % dcp_size == dcp_rank) & (
+                src_loc % dcp_size == dcp_rank
+            )
+            zero = torch.zeros((), dtype=tgt_loc.dtype, device=tgt_loc.device)
+            tgt_loc = torch.where(owned, tgt_loc // dcp_size, zero)
+            src_loc = torch.where(owned, src_loc // dcp_size, zero)
+
         size_limit = self.size + self.page_size
         maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
         maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
