@@ -1206,19 +1206,28 @@ class TritonAttnBackend(AttentionBackend):
         k_scale=None,
         v_scale=None,
     ) -> None:
-        # DCP writes to the local physical shard (loc = out_cache_loc //
-        # dcp_size) through the masked path so each rank only stores the tokens
-        # it owns. Non-DCP keeps the original write loc and plain set_kv_buffer.
+        # The MLA pool owns the logical-DCP to compact-local translation.  Do
+        # not pre-divide its locations here: MLATokenToKVPool.set_kv_buffer()
+        # filters by owner and divides exactly once.  Pre-dividing here loses
+        # most chunked-prefill KV entries because the pool applies both steps a
+        # second time.  MHA pools still consume the pre-translated location and
+        # explicit ownership mask used by their existing DCP write path.
         if self.dcp_size > 1:
-            loc = forward_batch.out_cache_loc // self.dcp_size
-            if (
-                forward_batch.positions is not None
-                and forward_batch.positions.numel() == loc.numel()
-            ):
-                dcp_kv_mask = forward_batch.positions % self.dcp_size == self.dcp_rank
+            if self.use_mla:
+                loc = loc_info
+                kwargs = {}
             else:
-                dcp_kv_mask = forward_batch.dcp_kv_mask
-            kwargs = {"dcp_kv_mask": dcp_kv_mask}
+                loc = forward_batch.out_cache_loc // self.dcp_size
+                if (
+                    forward_batch.positions is not None
+                    and forward_batch.positions.numel() == loc.numel()
+                ):
+                    dcp_kv_mask = (
+                        forward_batch.positions % self.dcp_size == self.dcp_rank
+                    )
+                else:
+                    dcp_kv_mask = forward_batch.dcp_kv_mask
+                kwargs = {"dcp_kv_mask": dcp_kv_mask}
         else:
             loc = loc_info
             kwargs = {}
