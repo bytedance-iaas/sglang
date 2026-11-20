@@ -500,7 +500,11 @@ class ExecKernel(msgspec.Struct):
             "wherever it is supported -- gfx950 (MI355X) with aiter preshuffle "
             "and an fp8 e4m3fn index cache -- and the runtime declines with a "
             "logged reason wherever any of that is missing. Pass "
-            "--no-enable-dsa-fused-indexer to force the standard path.",
+            "--no-enable-dsa-fused-indexer to force the standard path. "
+            "On SM120, explicit --enable-dsa-fused-indexer selects exact "
+            "FP8 paged prefill scoring/top-k with per-query CP causal lengths; "
+            "it requires a full-source FlashInfer wheel and declines unsupported "
+            "formats/capture/forced-token layouts to the native path.",
             action=argparse.BooleanOptionalAction,
             resolvable=True,
         ),

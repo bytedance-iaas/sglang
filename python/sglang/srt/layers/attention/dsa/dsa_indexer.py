@@ -576,9 +576,24 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and gfx950_fused_indexer_runtime_ok()
         )
         self._gfx950_fused = None
+        from sglang.srt.layers.attention.dsa import sm120_fused_indexer
+
+        self.use_sm120_fused_indexer = (
+            _is_cuda
+            and sm120_fused_indexer.shape_supported(
+                self.n_heads,
+                self.head_dim,
+                self.index_topk,
+                self.num_init_tokens,
+                self.num_local_tokens,
+            )
+            and sm120_fused_indexer.runtime_ok()
+        )
+        self._sm120_reported = set()
         if (
             # Only when asked for by name: unset, this path is a default.
-            get_exec().kernel.enable_dsa_fused_indexer is True
+            _is_hip
+            and get_exec().kernel.enable_dsa_fused_indexer is True
             and not self.use_gfx950_fused_indexer
         ):
             logger.info(
@@ -1862,6 +1877,40 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
         seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
         max_seq_len = torch.max(indexer_seq_lens_cpu).item()
+        if (
+            self.use_sm120_fused_indexer
+            and not self.fp4_index_k
+            and not dsa_shards_index_k()
+            and isinstance(metadata, DSAIndexerMetadata)
+            and metadata.topk_transform_method == TopkTransformMethod.PAGED
+        ):
+            from sglang.srt.layers.attention.dsa.sm120_fused_indexer import prefill_topk
+
+            fused, reason = prefill_topk(
+                q_fp8,
+                weights,
+                get_token_to_kv_pool().get_index_k_with_scale_buffer(layer_id),
+                block_tables,
+                metadata.attn_metadata.real_page_table,
+                metadata.get_token_to_batch_idx(),
+                ks,
+                ke,
+                topk_result,
+                page_size,
+                self._get_mqa_logits_budget_bytes(device_index),
+            )
+            report = reason or "hit"
+            if report not in self._sm120_reported:
+                logger.info(
+                    "SM120 exact prefill indexer layer=%s result=%s rows=%s keys=%s",
+                    layer_id,
+                    report,
+                    ks.shape[0],
+                    max_seq_len,
+                )
+                self._sm120_reported.add(report)
+            if fused is not None:
+                return fused
         if self.fp4_index_k:
             # MXFP4 keys of every DCP rank, staged into pages, in kv_fp8's place
             kv_fp8 = dsa_indexer_hip.fp4_dcp_gather_index_k(
