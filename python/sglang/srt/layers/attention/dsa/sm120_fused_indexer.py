@@ -79,12 +79,18 @@ def prefill_topk(
     out: torch.Tensor,
     page_size: int,
     scratch_budget: int,
+    physical_slots: bool,
 ) -> tuple[Optional[torch.Tensor], Optional[str]]:
-    """Write native physical slots, preserving padded rows and current streams.
+    """Write the top-k in the representation the caller's backend consumes.
 
-    The source index table and destination MLA table may differ; only the
-    request-local positions cross that boundary. Unsupported formats decline
-    before touching output. Kernel/runtime failures propagate normally.
+    ``physical_slots`` mirrors the native fused transform: it is set only when
+    the attention backend treats the buffer as allocator slots. With it clear
+    (PD Prefill disables the fused transform so its seed stays request-local)
+    the kernel's own request-local positions are kept and the backend maps them
+    through the page table exactly once. The source index table and destination
+    MLA table may differ; only the request-local positions cross that boundary.
+    Unsupported formats decline before touching output. Kernel/runtime failures
+    propagate normally.
     """
     if torch.cuda.is_current_stream_capturing():
         return None, "prefill CUDA capture"
@@ -154,9 +160,10 @@ def prefill_topk(
                 block_table=table,
                 context_lens=lengths[begin:end].reshape(-1, next_n),
             )
-            topk_page_table_transform_(
-                out[begin:end], output_table, row_batch[begin:end], page_size
-            )
+            if physical_slots:
+                topk_page_table_transform_(
+                    out[begin:end], output_table, row_batch[begin:end], page_size
+                )
         event = torch.cuda.Event()
         event.record(stream)
         _last_use[device] = (stream.cuda_stream, event)

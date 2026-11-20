@@ -1886,6 +1886,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         ):
             from sglang.srt.layers.attention.dsa.sm120_fused_indexer import prefill_topk
 
+            # Match the native transform's output contract: only the fused
+            # path emits allocator slots. PD Prefill keeps the fused transform
+            # off so its IndexShare seed stays request-local, and its backend
+            # then maps the positions through the page table once.
+            physical_slots = not metadata.force_unfused_topk
             fused, reason = prefill_topk(
                 q_fp8,
                 weights,
@@ -1898,8 +1903,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 topk_result,
                 page_size,
                 self._get_mqa_logits_budget_bytes(device_index),
+                physical_slots,
             )
-            report = reason or "hit"
+            report = reason or ("hit-slots" if physical_slots else "hit-local")
             if report not in self._sm120_reported:
                 logger.info(
                     "SM120 exact prefill indexer layer=%s result=%s rows=%s keys=%s",

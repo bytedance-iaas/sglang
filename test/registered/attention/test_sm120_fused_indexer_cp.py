@@ -72,7 +72,7 @@ class TestSm120Prefill(unittest.TestCase):
             scales,
         )
 
-    def assert_exact(self, values, out):
+    def assert_exact(self, values, out, physical=True):
         q, w, _, table, output_table, batch, starts, ends, keys, scales = values
         for row in range(q.shape[0]):
             b = int(batch[row])
@@ -94,21 +94,38 @@ class TestSm120Prefill(unittest.TestCase):
                 visible - 1 - scores.flip(0).argsort(descending=True, stable=True)[:64]
             )
             expected = output_table[b, wanted // 64].long() * 64 + wanted % 64
+            if not physical:
+                expected = wanted
             self.assertTrue(
                 torch.equal(out[row].long().sort().values, expected.sort().values)
             )
 
-    def call(self, values, budget=1 << 26, check_padding=True):
+    def call(self, values, budget=1 << 26, check_padding=True, physical=True):
         q, w, raw, table, target, batch, starts, ends, *_ = values
         out = torch.full((q.shape[0] + 2, 64), -1, dtype=torch.int32, device="cuda")
         result, reason = self.prefill_topk(
-            q, w, raw, table, target, batch, starts, ends, out, 64, budget
+            q, w, raw, table, target, batch, starts, ends, out, 64, budget, physical
         )
         self.assertIsNone(reason)
         self.assertIs(result, out)
         if check_padding:
             self.assertTrue(torch.all(out[q.shape[0] :] == -1))
         return out[: q.shape[0]]
+
+    def test_unfused_pd_prefill_keeps_request_local_positions(self):
+        # PD Prefill disables the fused transform so its IndexShare seed stays
+        # request-local; the backend then maps the positions exactly once.
+        values = self.inputs()
+        local = self.call(values, physical=False)
+        slots = self.call(values, physical=True)
+        self.assert_exact(values, local, physical=False)
+        _, _, _, _, output_table, batch, *_ = values
+        for row in range(local.shape[0]):
+            b = int(batch[row])
+            mapped = (
+                output_table[b, local[row].long() // 64] * 64 + local[row].long() % 64
+            )
+            self.assertTrue(torch.equal(mapped.sort().values, slots[row].sort().values))
 
     def test_cp_full_tail_and_independent_slot_ownership(self):
         values = self.inputs()
@@ -134,12 +151,13 @@ class TestSm120Prefill(unittest.TestCase):
             out,
             64,
             1 << 20,
+            True,
         )
         self.assertIsNone(result)
         self.assertIsNotNone(reason)
         self.assertTrue(torch.all(out == 71))
         result, reason = self.prefill_topk(
-            q, w, raw, table, target, batch, starts, ends, out, 64, 1
+            q, w, raw, table, target, batch, starts, ends, out, 64, 1, True
         )
         self.assertIsNone(result)
         self.assertIsNotNone(reason)
