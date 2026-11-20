@@ -21,6 +21,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.common import get_bool_env_var, get_int_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +98,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
 
         self.cuda_graph_kv_indices = None
+        self.cuda_graph_canonical_kv_indices = None
         self.cuda_graph_mla_metadata = None
         self.cuda_graph_num_splits = None
         self.cuda_graph_mla_metadata_view = None
@@ -113,9 +115,45 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         # get dcp info
         self.dcp_world_size = get_parallel().attn_dcp_size
         self.dcp_rank = get_parallel().attn_dcp_rank
+        self.dcp_fp32_local_output = get_bool_env_var(
+            "SGLANG_DCP_FP32_LOCAL_OUTPUT"
+        )
+        self.dcp_canonical_peer = (
+            get_bool_env_var("SGLANG_DCP_CANONICAL_PEER")
+            and self.is_fp8_kvcache
+            and self.dcp_world_size > 1
+        )
+        self.dcp_canonical_chunk_size = get_int_env_var(
+            "SGLANG_DCP_CANONICAL_CHUNK_SIZE", 1216
+        )
+        self.dcp_canonical_workspace = None
+        if self.dcp_canonical_peer:
+            if self.dcp_world_size != 8:
+                raise RuntimeError(
+                    "SGLANG_DCP_CANONICAL_PEER currently requires DCP=8"
+                )
+            if (
+                self.dcp_canonical_chunk_size <= 0
+                or self.dcp_canonical_chunk_size % PAGE_SIZE
+            ):
+                raise RuntimeError(
+                    "SGLANG_DCP_CANONICAL_CHUNK_SIZE must be a positive "
+                    "multiple of 64"
+                )
 
     def _use_dense_fp8_dcp(self) -> bool:
         return self.is_fp8_kvcache and self.dcp_world_size > 1
+
+    def _use_canonical_dcp_peer(self) -> bool:
+        return self.dcp_canonical_peer and self._use_dense_fp8_dcp()
+
+    def _canonical_min_block_table_pages(self) -> int:
+        return self.dcp_canonical_chunk_size // PAGE_SIZE
+
+    def _pad_canonical_block_table_pages(self, pages: int) -> int:
+        if self._use_canonical_dcp_peer():
+            return max(pages, self._canonical_min_block_table_pages())
+        return pages
 
     def _dcp_cache_seqlens(self, global_seqlens: torch.Tensor) -> torch.Tensor:
         import flash_mla as dcp_flash_mla
@@ -137,6 +175,25 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         if self._use_dense_fp8_dcp():
             import flash_mla as dcp_flash_mla
 
+            if self._use_canonical_dcp_peer():
+                torch._assert_async(
+                    torch.all(
+                        global_seqlens
+                        <= self.dcp_canonical_chunk_size * self.dcp_world_size
+                    ),
+                    "canonical DCP8 KV length exceeds configured capacity",
+                )
+                chunk_begin = self.dcp_rank * self.dcp_canonical_chunk_size
+                chunk_seqlens = torch.clamp(
+                    global_seqlens - chunk_begin,
+                    min=0,
+                    max=self.dcp_canonical_chunk_size,
+                ).to(torch.int32)
+                return dcp_flash_mla.get_mla_metadata_canonical_dense_fp8(
+                    chunk_seqlens,
+                    self.dcp_canonical_chunk_size,
+                    1,
+                )
             return dcp_flash_mla.get_mla_metadata_dense_fp8(
                 self._dcp_cache_seqlens(global_seqlens),
                 num_q_tokens_per_head_k,
@@ -198,7 +255,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         )
         if forward_batch.forward_mode.is_decode_or_idle():
             flashmla_page_size = self._flashmla_page_size()
-            max_seqlen_pad = triton.cdiv(eager_max_k, flashmla_page_size)
+            max_seqlen_pad = self._pad_canonical_block_table_pages(
+                triton.cdiv(eager_max_k, flashmla_page_size)
+            )
             block_kv_indices = self._eager_block_kv_indices(bs, max_seqlen_pad)
             create_flashmla_kv_indices_triton[
                 (
@@ -230,8 +289,10 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             seq_lens = forward_batch.seq_lens + self.num_draft_tokens
 
             flashmla_page_size = self._flashmla_page_size()
-            max_seqlen_pad = triton.cdiv(
-                eager_max_k + self.num_draft_tokens, flashmla_page_size
+            max_seqlen_pad = self._pad_canonical_block_table_pages(
+                triton.cdiv(
+                    eager_max_k + self.num_draft_tokens, flashmla_page_size
+                )
             )
             block_kv_indices = self._eager_block_kv_indices(bs, max_seqlen_pad)
             create_flashmla_kv_indices_triton[
@@ -269,8 +330,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             ).to(torch.int32)
 
             flashmla_page_size = self._flashmla_page_size()
-            max_seqlen_pad = triton.cdiv(
-                eager_max_k + window, flashmla_page_size
+            max_seqlen_pad = self._pad_canonical_block_table_pages(
+                triton.cdiv(eager_max_k + window, flashmla_page_size)
             )
             block_kv_indices = self._eager_block_kv_indices(bs, max_seqlen_pad)
             create_flashmla_kv_indices_triton[
@@ -319,6 +380,14 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         else:
             self.cuda_graph_kv_indices = block_kv_indices
 
+        if self._use_canonical_dcp_peer():
+            self.cuda_graph_canonical_kv_indices = torch.full(
+                (max_bs, self._canonical_min_block_table_pages()),
+                1,
+                dtype=torch.int32,
+                device="cuda",
+            )
+
         device_props = torch.cuda.get_device_properties(self.req_to_token.device)
         max_num_sm_parts = device_props.multi_processor_count
 
@@ -349,6 +418,30 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                     device="cuda",
                 )
 
+        if self._use_canonical_dcp_peer():
+            import flash_mla as dcp_flash_mla
+
+            canonical_num_heads = self.num_q_heads * self.dcp_world_size
+            self.dcp_canonical_workspace = (
+                dcp_flash_mla.create_canonical_dcp8_workspace(
+                    max_batch_size=max_bs,
+                    max_seqlen_q=8,
+                    num_heads=canonical_num_heads,
+                    head_dim=self.kv_cache_dim,
+                    head_dim_v=self.kv_lora_rank,
+                    chunk_size=self.dcp_canonical_chunk_size,
+                    group=get_parallel().dcp_group.device_group,
+                    device=torch.device("cuda", torch.cuda.current_device()),
+                )
+            )
+            logger.info(
+                "Initialized exact canonical DCP8 peer workspace: "
+                "chunk_size=%d, capacity=%d, max_batch=%d",
+                self.dcp_canonical_chunk_size,
+                self.dcp_canonical_chunk_size * self.dcp_world_size,
+                max_bs,
+            )
+
     def get_verify_buffers_to_fill_after_draft(self):
         return [self.cuda_graph_custom_mask, None]
 
@@ -375,18 +468,26 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             # Tight block-table slice when the CPU mirror is free; static
             # bound otherwise (no D2H; kernel reads are capped by seq_lens_k).
             flashmla_page_size = self._flashmla_page_size()
+            block_kv_indices = (
+                self.cuda_graph_canonical_kv_indices
+                if self._use_canonical_dcp_peer()
+                else self.cuda_graph_kv_indices
+            )
             if seq_lens_cpu is not None:
                 max_seqlen_pad = triton.cdiv(
                     seq_lens_cpu.max().item(), flashmla_page_size
                 )
             else:
-                max_seqlen_pad = self.cuda_graph_kv_indices.shape[1]
+                max_seqlen_pad = block_kv_indices.shape[1]
+            max_seqlen_pad = self._pad_canonical_block_table_pages(
+                max_seqlen_pad
+            )
 
             create_flashmla_kv_indices_triton[
                 (
                     bs,
                     get_num_kv_index_blocks_flashmla(
-                        self.cuda_graph_kv_indices.stride(0), flashmla_page_size
+                        block_kv_indices.stride(0), flashmla_page_size
                     ),
                 )
             ](
@@ -394,9 +495,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 req_pool_indices[:bs],
                 seq_lens,
                 None,
-                self.cuda_graph_kv_indices,
+                block_kv_indices,
                 self.req_to_token.stride(0),
-                self.cuda_graph_kv_indices.stride(0),
+                block_kv_indices.stride(0),
                 PAGED_SIZE=flashmla_page_size,
             )
 
@@ -445,7 +546,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             self.forward_metadata = FlashMLADecodeMetadata(
                 self.cuda_graph_mla_metadata_view,
                 self.cuda_graph_num_splits_view,
-                self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
+                block_kv_indices[:bs, :max_seqlen_pad],
                 seq_lens_k,
             )
 
@@ -520,6 +621,28 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 import flash_mla as dcp_flash_mla
 
                 global_seqlens = forward_batch.seq_lens.to(torch.int32)
+                if self._use_canonical_dcp_peer():
+                    if self.dcp_canonical_workspace is None:
+                        raise RuntimeError(
+                            "canonical DCP8 workspace is not initialized; "
+                            "CUDA Graph state must be initialized first"
+                        )
+                    o, _ = self.dcp_canonical_workspace.attention(
+                        q=reshape_q_fp8,
+                        k_cache=k_cache.view(
+                            -1, PAGE_SIZE, 1, self.kv_cache_dim
+                        ),
+                        block_table=self.forward_metadata.block_kv_indices[:bs],
+                        global_cache_seqlens=global_seqlens,
+                        tile_scheduler_metadata=(
+                            self.forward_metadata.flashmla_metadata
+                        ),
+                        num_splits=self.forward_metadata.num_splits,
+                        softmax_scale=layer.scaling,
+                        descale_q=descale_q,
+                        descale_k=descale_k,
+                    )
+                    return o.view(-1, o.shape[2] * layer.v_head_dim), None
                 local_seqlens = self._dcp_cache_seqlens(global_seqlens)
                 local_causal_seqlens = (
                     dcp_flash_mla.make_cyclic_local_causal_seqlens(
@@ -529,7 +652,12 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                         self.dcp_rank,
                     )
                 )
-                o, lse = dcp_flash_mla.flash_mla_dense_fp8(
+                dcp_flash_mla_fn = (
+                    dcp_flash_mla.flash_mla_dense_fp8_fp32
+                    if self.dcp_fp32_local_output
+                    else dcp_flash_mla.flash_mla_dense_fp8
+                )
+                o, lse = dcp_flash_mla_fn(
                     q=reshape_q_fp8,
                     k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
                     block_table=self.forward_metadata.block_kv_indices[:bs],
@@ -676,6 +804,30 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                     import flash_mla as dcp_flash_mla
 
                     global_seqlens = cache_seqlens.to(torch.int32)
+                    if self._use_canonical_dcp_peer():
+                        if self.dcp_canonical_workspace is None:
+                            raise RuntimeError(
+                                "canonical DCP8 workspace is not initialized; "
+                                "CUDA Graph state must be initialized first"
+                            )
+                        o, _ = self.dcp_canonical_workspace.attention(
+                            q=reshape_q_fp8,
+                            k_cache=k_cache.view(
+                                -1, PAGE_SIZE, 1, self.kv_cache_dim
+                            ),
+                            block_table=(
+                                self.forward_metadata.block_kv_indices[:bs]
+                            ),
+                            global_cache_seqlens=global_seqlens,
+                            tile_scheduler_metadata=(
+                                self.forward_metadata.flashmla_metadata
+                            ),
+                            num_splits=self.forward_metadata.num_splits,
+                            softmax_scale=layer.scaling,
+                            descale_q=descale_q,
+                            descale_k=descale_k,
+                        )
+                        return o.view(-1, o.shape[2] * layer.v_head_dim), None
                     local_seqlens = self._dcp_cache_seqlens(global_seqlens)
                     local_causal_seqlens = (
                         dcp_flash_mla.make_cyclic_local_causal_seqlens(
@@ -685,7 +837,12 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                             self.dcp_rank,
                         )
                     )
-                    o, lse = dcp_flash_mla.flash_mla_dense_fp8(
+                    dcp_flash_mla_fn = (
+                        dcp_flash_mla.flash_mla_dense_fp8_fp32
+                        if self.dcp_fp32_local_output
+                        else dcp_flash_mla.flash_mla_dense_fp8
+                    )
+                    o, lse = dcp_flash_mla_fn(
                         q=reshape_q_fp8,
                         k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
                         block_table=self.forward_metadata.block_kv_indices[:bs],

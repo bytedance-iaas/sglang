@@ -844,35 +844,46 @@ class DeepseekMLAForwardMixin:
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
         ) and get_parallel().dcp_enabled:
-            attn_output = attn_output.view(
-                -1,
-                self.num_local_heads * get_parallel().attn_dcp_size,
-                self.kv_lora_rank,
-            )
-            if get_in_autotune_dummy_run():
-                # The synthetic FlashInfer MoE autotune pass discards model
-                # outputs. Avoid an unnecessary cross-node MNNVL exchange of
-                # zero attention partials.
-                attn_output = _select_local_dcp_heads_for_autotune(
-                    attn_output, self.num_local_heads
+            if lse is None:
+                # Canonical FlashMLA already returned this rank's exact
+                # compact H/DCP shard from its fixed peer tree.
+                attn_output = attn_output.view(
+                    -1, self.num_local_heads, self.kv_lora_rank
                 )
             else:
-                dcp_comm_backend = get_server_args().dcp_comm_backend
-                if dcp_comm_backend in ("a2a", "fi_a2a"):
-                    # A2A exchange of head partials + LSE, then local Triton combine.
-                    # MLA decode LSE is base-2 (FlashInfer-MLA/FlashMLA) -> base_on_e=False.
-                    attn_output = dcp_a2a_lse_reduce(
-                        attn_output.contiguous(),
-                        lse.contiguous(),
-                        get_parallel().dcp_group,
-                        is_lse_base_on_e=False,
-                        comm_backend=dcp_comm_backend,
+                attn_output = attn_output.view(
+                    -1,
+                    self.num_local_heads * get_parallel().attn_dcp_size,
+                    self.kv_lora_rank,
+                )
+                if get_in_autotune_dummy_run():
+                    # The synthetic FlashInfer MoE autotune pass discards model
+                    # outputs. Avoid an unnecessary cross-node MNNVL exchange of
+                    # zero attention partials.
+                    attn_output = _select_local_dcp_heads_for_autotune(
+                        attn_output, self.num_local_heads
                     )
                 else:
-                    attn_output = cp_lse_ag_out_rs_mla(
-                        attn_output, lse, get_parallel().dcp_group
-                    )
-                    attn_output = attn_output.transpose(0, 1)
+                    dcp_comm_backend = get_server_args().dcp_comm_backend
+                    if dcp_comm_backend in ("a2a", "fi_a2a"):
+                        # A2A exchange of head partials + LSE, then local
+                        # Triton combine. MLA LSE is base-2 here.
+                        attn_output = dcp_a2a_lse_reduce(
+                            attn_output.contiguous(),
+                            lse.contiguous(),
+                            get_parallel().dcp_group,
+                            is_lse_base_on_e=False,
+                            comm_backend=dcp_comm_backend,
+                        )
+                    else:
+                        attn_output = cp_lse_ag_out_rs_mla(
+                            attn_output, lse, get_parallel().dcp_group
+                        )
+                        attn_output = attn_output.transpose(0, 1)
+            # The accurate dense-FP8 DCP path keeps each rank-local state in
+            # FP32 through the global LSE merge. Cast exactly once at the
+            # original attention ABI boundary; same-dtype .to() is a no-op.
+            attn_output = attn_output.to(q_nope_out.dtype)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         _kvb_v = None
