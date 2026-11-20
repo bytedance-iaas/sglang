@@ -3036,6 +3036,7 @@ class DeepseekSparseAttnBackend(
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 page_table_1 = topk_indices
             return self._forward_flashinfer_sparse_mla(
+                forward_batch=forward_batch,
                 q_all=q_all,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
@@ -3241,6 +3242,7 @@ class DeepseekSparseAttnBackend(
             if q_all is None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashinfer_sparse_mla(
+                forward_batch=forward_batch,
                 q_all=q_all,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
@@ -3911,6 +3913,7 @@ class DeepseekSparseAttnBackend(
 
     def _forward_flashinfer_sparse_mla(
         self,
+        forward_batch: ForwardBatch,
         q_all: torch.Tensor,
         kv_cache: torch.Tensor,
         page_table_1: torch.Tensor,
@@ -3922,8 +3925,18 @@ class DeepseekSparseAttnBackend(
             flashinfer_sparse_mla_forward,
         )
 
+        # Eager attention-DP draft steps can carry padded queries while their
+        # metadata covers only the live requests. Use the same row ownership
+        # plan as TRT-LLM MLA; padding must never read another request's KV.
+        row_plan = _plan_live_rows(q_all.shape[0], seq_lens.shape[0], forward_batch)
+        q_all, page_table_1 = _apply_q_row_plan(row_plan, q_all, page_table_1)
+        if row_plan.live_rows == 0:
+            return q_all.new_zeros(
+                (row_plan.q_pad_rows, q_all.shape[1], self.kv_lora_rank),
+                dtype=torch.bfloat16,
+            )
         assert self.workspace_buffer is not None
-        return flashinfer_sparse_mla_forward(
+        output = flashinfer_sparse_mla_forward(
             q=q_all,
             kv_cache=kv_cache,
             indices=page_table_1,
@@ -3937,6 +3950,7 @@ class DeepseekSparseAttnBackend(
             sm_scale=sm_scale,
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         )
+        return _restore_live_rows(output, row_plan)
 
     def _flashmla_kv_q(
         self, q_nope: torch.Tensor, q_rope: torch.Tensor

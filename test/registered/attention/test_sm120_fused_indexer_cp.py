@@ -1,6 +1,7 @@
 """Exact CP visibility, independent KV ownership, scratch and stream contracts."""
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -175,6 +176,74 @@ class TestSm120Prefill(unittest.TestCase):
         self.assertLessEqual(
             sum(t.numel() * t.element_size() for t in buffers), 1 << 26
         )
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "GPU required")
+class TestSm120SparseMlaRows(unittest.TestCase):
+    def setUp(self):
+        if torch.cuda.get_device_capability()[0] != 12:
+            self.skipTest("SM120 required")
+        from sglang.kernels.ops.quantization.dsa_quant_k_cache import quantize_k_cache
+        from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+
+        self.forward = DeepseekSparseAttnBackend._forward_flashinfer_sparse_mla
+        gen = torch.Generator(device="cuda").manual_seed(37)
+        kv = torch.randn(2, 64, 1, 576, generator=gen, device="cuda").bfloat16()
+        self.cache = quantize_k_cache(kv)
+        self.q = torch.randn(8, 32, 576, generator=gen, device="cuda").bfloat16()
+        self.indices = torch.full((8, 2048), -1, dtype=torch.int32, device="cuda")
+        self.indices[:, :64] = torch.arange(64, dtype=torch.int32, device="cuda")
+        self.backend = SimpleNamespace(
+            workspace_buffer=torch.empty(1 << 28, dtype=torch.uint8, device="cuda"),
+            physical_page_size=64,
+            kv_cache_dim=656,
+            qk_nope_head_dim=192,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+        )
+
+    def call(self, rows, lengths, cp=False):
+        return self.forward(
+            self.backend,
+            forward_batch=SimpleNamespace(attn_cp_metadata=object() if cp else None),
+            q_all=self.q[:rows],
+            kv_cache=self.cache,
+            page_table_1=self.indices[:rows],
+            seq_lens=lengths,
+            sm_scale=576**-0.5,
+            skip_softmax_threshold_scale_factor=None,
+        )
+
+    def test_eager_dp_draft_padding_preserves_live_output(self):
+        for physical, live in [(4, 1), (4, 3), (8, 2), (4, 0)]:
+            with self.subTest(physical=physical, live=live):
+                lengths = torch.full((live,), 64, dtype=torch.int32, device="cuda")
+                out = self.call(physical, lengths)
+                self.assertEqual(tuple(out.shape), (physical, 32, 512))
+                self.assertTrue(torch.all(out[live:] == 0))
+                if live:
+                    expected = self.call(live, lengths)
+                    self.assertTrue(torch.isfinite(expected).all())
+                    self.assertTrue(torch.any(expected != 0))
+                    self.assertTrue(torch.equal(out[:live], expected))
+
+    def test_cp_metadata_padding_preserves_query_shape(self):
+        lengths = torch.tensor([64, 0, 0, 0], dtype=torch.int32, device="cuda")
+        out = self.call(1, lengths, cp=True)
+        self.assertEqual(tuple(out.shape), (1, 32, 512))
+        self.assertTrue(torch.equal(out, self.call(1, lengths[:1])))
+
+    def test_padded_query_cuda_graph_replay(self):
+        lengths = torch.tensor([64], dtype=torch.int32, device="cuda")
+        self.call(4, lengths)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = self.call(4, lengths)
+        self.q[:1].mul_(0.5)
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(out[:1], self.call(1, lengths)))
+        self.assertTrue(torch.all(out[1:] == 0))
 
 
 if __name__ == "__main__":
