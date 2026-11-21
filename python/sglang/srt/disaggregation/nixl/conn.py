@@ -3284,13 +3284,18 @@ class NixlKVReceiver(CommonKVReceiver):
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
         self.init_time = None
 
-    def supports_paired_prefix(self) -> bool:
-        participating = [
-            info for info in (self.bootstrap_infos or ()) if not info["is_dummy"]
+    def paired_prefix_producer_agents(self) -> tuple[str, ...]:
+        agents = [
+            info.get("verified_paired_dsa_agent")
+            for info in (self.bootstrap_infos or ())
+            if not info["is_dummy"]
         ]
-        return bool(participating) and all(
-            info.get("verified_paired_dsa_agent") for info in participating
-        )
+        if not all(agents):
+            return ()
+        return tuple(sorted(set(agents)))
+
+    def supports_paired_prefix(self) -> bool:
+        return bool(self.paired_prefix_producer_agents())
 
     def send_metadata(
         self,

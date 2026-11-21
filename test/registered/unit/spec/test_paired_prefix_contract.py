@@ -1,5 +1,6 @@
 import dataclasses
 import unittest
+from array import array
 
 from sglang.srt.speculative.paired_prefix_contract import (
     PairedPrefixContext,
@@ -7,6 +8,7 @@ from sglang.srt.speculative.paired_prefix_contract import (
     PairedPrefixIdentity,
     PairedPrefixRegistry,
     PairedPrefixState,
+    guarded_prompt_radix_key,
     plan_paired_prompt_prefix,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -52,6 +54,19 @@ class TestPairedPrefixPlanner(unittest.TestCase):
             draft_page_generation=12,
         )
         return dataclasses.replace(state, **changes)
+
+    def test_guarded_key_partitions_prompt_tail_namespace_and_producer(self):
+        prompt = array("q", [1, 2, 3, 4])
+        agents = ("source-0", "source-1")
+        key = guarded_prompt_radix_key("adapter", prompt, agents)
+        self.assertEqual(key, guarded_prompt_radix_key("adapter", prompt[:], agents))
+        self.assertNotEqual(
+            key, guarded_prompt_radix_key("adapter", array("q", [1, 2, 3, 9]), agents)
+        )
+        self.assertNotEqual(key, guarded_prompt_radix_key("other", prompt, agents))
+        self.assertNotEqual(
+            key, guarded_prompt_radix_key("adapter", prompt, ("source-0", "restarted"))
+        )
 
     def test_frontier_is_common_committed_prompt_only(self):
         plan = plan_paired_prompt_prefix(

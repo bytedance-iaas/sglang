@@ -101,6 +101,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
 )
+from sglang.srt.speculative.paired_prefix_contract import guarded_prompt_radix_key
 from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
@@ -297,6 +298,7 @@ class DecodeRequest:
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
     is_rebootstrap: bool = False
+    guarded_producer_agents: Optional[tuple[str, ...]] = None
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -351,6 +353,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.transfer_queue = transfer_queue
         self.tree_cache = tree_cache
         self.decode_input_only_cache = envs.SGLANG_PD_DECODE_CACHE_INPUT_ONLY.get()
+        self.decode_min_prefix_tokens = (
+            envs.SGLANG_PD_DECODE_CACHE_MIN_PREFIX_TOKENS.get()
+        )
+        if self.decode_min_prefix_tokens and (
+            not self.decode_input_only_cache
+            or self.decode_min_prefix_tokens < 0
+            or self.decode_min_prefix_tokens % self.token_to_kv_pool_allocator.page_size
+        ):
+            raise ValueError(
+                "SGLANG_PD_DECODE_CACHE_MIN_PREFIX_TOKENS requires input-only "
+                "decode caching and a positive multiple of the KV page size"
+            )
         if self.decode_input_only_cache and not (
             isinstance(self.token_to_kv_pool, DSATokenToKVPool)
             and isinstance(self.draft_token_to_kv_pool, DSATokenToKVPool)
@@ -674,6 +688,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             cow_mamba=self.tree_cache.supports_mamba(),
             include_req=True,
         )
+        if 0 < len(result.device_indices) < self.decode_min_prefix_tokens:
+            result = match_prefix_for_req(
+                self.tree_cache,
+                req,
+                req.origin_input_ids[:0],
+                include_req=True,
+            )
         # Keep aggregated scheduling semantics while preserving the SWA lock
         # boundary needed for the matching dec_lock_ref.
         lock_result = self.tree_cache.inc_lock_ref(result.last_device_node)
@@ -1217,6 +1238,33 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 and not _is_fake_transfer(decode_req.req)
                 and decode_req.kv_receiver.supports_paired_prefix()
             )
+            if self.decode_min_prefix_tokens:
+                req = decode_req.req
+                agents = (
+                    decode_req.kv_receiver.paired_prefix_producer_agents()
+                    if paired_peer_verified
+                    else ()
+                )
+                if (
+                    not agents
+                    or req.skip_radix_cache_insert
+                    or req._compute_max_prefix_len(len(req.origin_input_ids))
+                    < self.decode_min_prefix_tokens
+                    or req.input_embeds is not None
+                    or req.positional_embed_overrides is not None
+                    or req.multimodal_inputs is not None
+                    or (
+                        decode_req.guarded_producer_agents is not None
+                        and decode_req.guarded_producer_agents != agents
+                    )
+                ):
+                    req.skip_radix_cache_insert = True
+                    paired_peer_verified = False
+                elif decode_req.guarded_producer_agents is None:
+                    req.extra_key = guarded_prompt_radix_key(
+                        req.extra_key, req.origin_input_ids, agents
+                    )
+                    decode_req.guarded_producer_agents = agents
             if use_decode_radix_cache:
                 # Match prefix against decode's radix cache.
                 prefix_match = self._match_prefix_and_lock(

@@ -634,6 +634,7 @@ class Envs:
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
     SGLANG_PD_DECODE_CACHE_INPUT_ONLY = EnvBool(False)
+    SGLANG_PD_DECODE_CACHE_MIN_PREFIX_TOKENS = EnvInt(0)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
     # Deprecated: the unified radix tree is the default tree cache now, so the

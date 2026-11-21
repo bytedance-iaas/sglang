@@ -56,6 +56,21 @@ class TestNixlBootstrapMetadata(CustomTestCase):
             "agent_metadata": base64.b64encode(raw).decode(),
         }
 
+    def test_guarded_producer_requires_every_participating_agent(self):
+        receiver = object.__new__(NixlKVReceiver)
+        receiver.bootstrap_infos = [
+            {"is_dummy": False, "verified_paired_dsa_agent": "source-1"},
+            {"is_dummy": True},
+            {"is_dummy": False, "verified_paired_dsa_agent": "source-0"},
+            {"is_dummy": False, "verified_paired_dsa_agent": "source-1"},
+        ]
+        self.assertEqual(
+            receiver.paired_prefix_producer_agents(), ("source-0", "source-1")
+        )
+        receiver.bootstrap_infos[0].pop("verified_paired_dsa_agent")
+        self.assertEqual(receiver.paired_prefix_producer_agents(), ())
+        self.assertFalse(receiver.supports_paired_prefix())
+
     def test_publish_does_not_load_another_backend(self):
         agent = FakeAgent()
         self.assertIsNone(publish_peer_metadata(agent, "LIBFABRIC"))

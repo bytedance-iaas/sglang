@@ -9,8 +9,11 @@ target/draft preparation path.
 
 from __future__ import annotations
 
+import json
+from array import array
 from dataclasses import dataclass, field
 from enum import Enum
+from hashlib import sha256
 from typing import Generic, Hashable, Protocol, TypeVar
 
 
@@ -255,3 +258,14 @@ class PairedPrefixRegistry(Generic[ReuseValue]):
     @property
     def retired_count(self) -> int:
         return sum(entry.retired for entry in self._entries.values())
+
+
+def guarded_prompt_radix_key(
+    extra_key: str | None, token_ids: array, producer_agents: tuple[str, ...]
+) -> str:
+    """Keep exact whole prompts and verified producer generations separate."""
+    token_digest = sha256(memoryview(token_ids).cast("B")).hexdigest()
+    return json.dumps(
+        ("paired-input-v1", extra_key, token_digest, producer_agents),
+        separators=(",", ":"),
+    )
