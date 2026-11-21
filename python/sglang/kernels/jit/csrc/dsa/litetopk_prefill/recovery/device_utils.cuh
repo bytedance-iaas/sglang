@@ -109,10 +109,14 @@ FMT_DEVICE bool elect_one_lane() {
 }
 template <typename T>
 FMT_DEVICE T reduce_max(T v) {
-  if constexpr (std::is_same_v<T, float>)
-    return deep_gemm::ptx::reduce_max_sync(v);
-  else
+  if constexpr (std::is_same_v<T, float>) {
+    // Preserve the SM100 reduction on DeepGEMM versions without this helper.
+    float r;
+    asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(r) : "f"(v));
+    return r;
+  } else {
     return __reduce_max_sync(kFullMask, v);
+  }
 }
 // DeepGEMM has no redux.sync min.
 FMT_DEVICE float reduce_min(float v) {
@@ -245,7 +249,8 @@ struct TCGen05 {
   }
   // The caller is the elected lane (cutlass::arch::umma_arrive elects again).
   FMT_DEVICE static void commit(uint64_t* bar) {
-    deep_gemm::ptx::umma_arrive_no_elect(*reinterpret_cast<Bar*>(bar));
+    asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];"
+                 :: "r"(to_shared(bar)));
   }
   FMT_DEVICE static void mma_f8_ss(uint32_t d, uint64_t a, uint64_t b, uint32_t idesc, uint32_t acc) {
     deep_gemm::ptx::SM100_MMA_F8F6F4_SS::fma(a, b, d, acc, uint64_t{idesc} << 32);
