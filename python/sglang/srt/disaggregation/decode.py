@@ -86,6 +86,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
     HybridReqToTokenPool,
     KVCache,
     ReqToTokenPool,
@@ -349,6 +350,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.scheduler = scheduler
         self.transfer_queue = transfer_queue
         self.tree_cache = tree_cache
+        self.decode_input_only_cache = envs.SGLANG_PD_DECODE_CACHE_INPUT_ONLY.get()
+        if self.decode_input_only_cache and not (
+            isinstance(self.token_to_kv_pool, DSATokenToKVPool)
+            and isinstance(self.draft_token_to_kv_pool, DSATokenToKVPool)
+        ):
+            raise ValueError(
+                "Paired prefix reuse requires both target and draft DSA pools"
+            )
         self.gloo_group = gloo_group
         # Destinations visible to prefill but not yet on the transfer queue.
         self._num_published_destinations = 0
@@ -651,7 +660,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             self.pending_reqs.append(decode_req)
 
-    def _match_prefix_and_lock(self, req: Req) -> DecodePrefixMatch:
+    def _match_prefix_and_lock(
+        self, req: Req, reuse_allowed: bool = True
+    ) -> DecodePrefixMatch:
         """
         Match a request against the decode-side radix cache, lock the matched
         node to prevent eviction, and return the matched prefix information.
@@ -659,7 +670,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         result = match_prefix_for_req(
             self.tree_cache,
             req,
-            req.origin_input_ids,
+            req.origin_input_ids if reuse_allowed else req.origin_input_ids[:0],
             cow_mamba=self.tree_cache.supports_mamba(),
             include_req=True,
         )
@@ -1200,9 +1211,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.scheduler.server_args.disaggregation_decode_enable_radix_cache
                 and not decode_req.is_rebootstrap
             )
+            paired_peer_verified = (
+                self.decode_input_only_cache
+                and use_decode_radix_cache
+                and not _is_fake_transfer(decode_req.req)
+                and decode_req.kv_receiver.supports_paired_prefix()
+            )
             if use_decode_radix_cache:
                 # Match prefix against decode's radix cache.
-                prefix_match = self._match_prefix_and_lock(decode_req.req)
+                prefix_match = self._match_prefix_and_lock(
+                    decode_req.req,
+                    reuse_allowed=(
+                        not self.decode_input_only_cache or paired_peer_verified
+                    ),
+                )
                 prefix_indices = prefix_match.prefix_indices
                 # prefix_len: tokens already on device (L1 hit).
                 # total_prefix_len: full prefix promised to prefill
@@ -1381,6 +1403,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
 
             seq_len = origin_input_len
+            paired_prefix = paired_peer_verified and total_prefix_len > 0
 
             def _mamba_payload():
                 return [
@@ -1407,9 +1430,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
                 return kv_to_page_indices(window_kv_indices_swa, page_size)
 
-            def _full_kv_pages_payload():
+            def _full_kv_pages_payload(start: int = 0):
                 kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.kv.req_pool_idx, :seq_len
+                    decode_req.req.kv.req_pool_idx, start:seq_len
                 ]
                 # Indexer lives on device pool; always use device page_size
                 device_page_size = self.token_to_kv_pool.page_size
@@ -1446,7 +1469,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             payloads = {
                 StateType.MAMBA: _mamba_payload,
                 StateType.SWA: _swa_payload,
-                StateType.DSA: _full_kv_pages_payload,
+                StateType.DSA: lambda: _full_kv_pages_payload(
+                    total_prefix_len if paired_prefix else 0
+                ),
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.C128_STATE: _c128_state_payload,
@@ -1503,6 +1528,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         "the Mooncake backend"
                     )
             metadata_kwargs = {"decode_prefix_len": total_prefix_len}
+            if paired_prefix:
+                metadata_kwargs["paired_prefix"] = True
             if device_page_indices is not None:
                 metadata_kwargs["device_kv_indices"] = device_page_indices
             if (

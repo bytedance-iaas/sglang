@@ -75,6 +75,22 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             )
 
     if cfg.disaggregation_mode == "decode":
+        input_only = envs.SGLANG_PD_DECODE_CACHE_INPUT_ONLY.get()
+        if input_only and not (
+            cfg.disaggregation_decode_enable_radix_cache
+            and cfg.speculative_algorithm == "EAGLE"
+            and cfg.disaggregation_transfer_backend == "nixl"
+            and cfg.pp_size == cfg.attn_cp_size == cfg.dcp_size == 1
+            and not cfg.enable_hierarchical_cache
+            and not cfg.disaggregation_decode_enable_offload_kvcache
+            and not cfg.enable_session_radix_cache
+            and envs.SGLANG_DISAGGREGATION_NIXL_BACKEND.get() == "UCX"
+            and envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
+        ):
+            raise ValueError(
+                "SGLANG_PD_DECODE_CACHE_INPUT_ONLY requires EAGLE, device radix "
+                "cache, NIXL/UCX with deferred release, and PP/CP/DCP=1 on decode"
+            )
         if cfg.disaggregation_decode_enable_radix_cache:
             if cfg.enable_hisparse:
                 raise ValueError(
@@ -86,7 +102,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with --disaggregation-transfer-backend fake"
                 )
-            if cfg.speculative_algorithm is not None:
+            if cfg.speculative_algorithm is not None and not input_only:
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with speculative decoding "

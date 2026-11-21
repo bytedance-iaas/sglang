@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import logging
 import struct
@@ -8,6 +9,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
+from functools import cached_property
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -161,6 +163,21 @@ class _KVXferPreparedSegment:
     dst_num_slots: int
 
 
+def _paired_dsa_state_suffix(source, destination, prefix_tokens: int, page_size: int):
+    prefix_pages, remainder = divmod(prefix_tokens, page_size)
+    if (
+        remainder
+        or prefix_pages <= 0
+        or not source
+        or len(source) != 1
+        or len(destination) != 1
+        or len(source[0]) != prefix_pages + len(destination[0])
+    ):
+        raise RuntimeError("Paired DSA suffix span mismatch")
+    suffix = source[0][prefix_pages:]
+    return [suffix] if len(suffix) else None
+
+
 @dataclasses.dataclass
 class TransferInfo:
     """Contains indices for a transfer, sent by KVReceiver. Received by prefill bootstrap thread."""
@@ -175,6 +192,9 @@ class TransferInfo:
     dst_state_indices: List[List[int]]
     decode_prefix_len: Optional[int] = None  # for decode radix cache
     is_dummy_rank: Optional[bool] = None
+    paired_prefix_source_agent: Optional[str] = dataclasses.field(
+        default=None, kw_only=True
+    )
     # NOTE: optional staging field; populated via STAGING_RSP. Keep at the
     # end so positional construction in from_zmq() continues to work.
     staging: Optional[StagingTransferInfo] = None
@@ -212,6 +232,9 @@ class TransferInfo:
                 bool(int(msg[9].decode("ascii")))
                 if len(msg) > 9 and msg[9] != b""
                 else None
+            ),
+            paired_prefix_source_agent=(
+                msg[10].decode("ascii") if len(msg) > 10 and msg[10] else None
             ),
         )
 
@@ -1362,6 +1385,15 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
                 reqs_to_be_processed = list(room_transfer_infos.values())
                 if any(
+                    req.paired_prefix_source_agent is not None
+                    and (
+                        req.paired_prefix_source_agent != self.agent.name
+                        or self.paired_dsa_layout is None
+                    )
+                    for req in reqs_to_be_processed
+                ):
+                    raise RuntimeError("Paired prefix prefill agent or layout changed")
+                if any(
                     req.agent_name in self._unsettled_peers
                     for req in reqs_to_be_processed
                 ):
@@ -1536,10 +1568,18 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
                     if kv_chunk.is_last_chunk:
                         dst_info = self.decode_kv_args_table[req.agent_name]
-                        if kv_chunk.state_indices:
+                        state_indices = kv_chunk.state_indices
+                        if req.paired_prefix_source_agent is not None:
+                            state_indices = _paired_dsa_state_suffix(
+                                state_indices,
+                                req.dst_state_indices,
+                                req.decode_prefix_len or 0,
+                                self.kv_args.page_size,
+                            )
+                        if state_indices:
                             state_xfer_handles = self.maybe_send_extra(
                                 req.agent_name,
-                                kv_chunk.state_indices,
+                                state_indices,
                                 dst_info.dst_state_data_ptrs,
                                 req.dst_state_indices,
                                 dst_info.gpu_id,
@@ -1668,10 +1708,31 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 del self._transfer_handle_owner.worker_index
                 del self._transfer_handle_owner.chunk_id
 
+    @cached_property
+    def paired_dsa_layout(self) -> Optional[str]:
+        if (
+            self.nixl_backend != "UCX"
+            or not self.enable_deferred_decode_kv_release
+            or self.enable_staging
+            or self.pp_size != 1
+            or self.kv_args.state_types != [StateType.DSA]
+        ):
+            return None
+        layout = (
+            self.kv_args.page_size,
+            self.kv_args.kv_item_lens,
+            self.kv_args.kv_layer_ids,
+            self.kv_args.state_item_lens,
+        )
+        return hashlib.sha256(repr(layout).encode()).hexdigest()
+
     def get_bootstrap_transfer_metadata(self) -> Optional[Dict[str, str]]:
         from sglang.srt.disaggregation.nixl.bootstrap import publish_peer_metadata
 
-        return publish_peer_metadata(self.agent, self.nixl_backend)
+        metadata = publish_peer_metadata(self.agent, self.nixl_backend)
+        if metadata is not None and (layout := self.paired_dsa_layout) is not None:
+            metadata.update(paired_dsa_v1=layout, paired_dsa_agent=self.agent.name)
+        return metadata
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
@@ -3223,12 +3284,21 @@ class NixlKVReceiver(CommonKVReceiver):
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
         self.init_time = None
 
+    def supports_paired_prefix(self) -> bool:
+        participating = [
+            info for info in (self.bootstrap_infos or ()) if not info["is_dummy"]
+        ]
+        return bool(participating) and all(
+            info.get("verified_paired_dsa_agent") for info in participating
+        )
+
     def send_metadata(
         self,
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        paired_prefix: bool = False,
     ):
         if self.bootstrap_infos is None:
             logger.error(
@@ -3239,6 +3309,8 @@ class NixlKVReceiver(CommonKVReceiver):
 
         # Register staging room bootstrap info for staging handler
         self.chunk_staging_infos = []
+        if paired_prefix and not (self.supports_paired_prefix() and decode_prefix_len):
+            raise ValueError("Paired DSA prefix requires an agreed prefill layout")
         if (
             self.kv_mgr.enable_staging
             and self.kv_mgr._staging_ctx.allocator is not None
@@ -3278,6 +3350,15 @@ class NixlKVReceiver(CommonKVReceiver):
                             packed_state_indices,
                             str(decode_prefix_len or 0).encode("ascii"),
                             str(int(is_dummy)).encode("ascii"),
+                            *(
+                                [
+                                    bootstrap_info["verified_paired_dsa_agent"].encode(
+                                        "ascii"
+                                    )
+                                ]
+                                if paired_prefix and not is_dummy
+                                else []
+                            ),
                         ]
                     )
             except zmq.ZMQError:
@@ -3294,7 +3375,10 @@ class NixlKVReceiver(CommonKVReceiver):
         # Match the prefill-side truthy check: an empty list means the
         # model has no state types (e.g. dense LLaMA/Qwen), and prefill
         # won't send state notifs, so we must not expect them.
-        if state_indices:
+        if state_indices and (
+            not paired_prefix
+            or any(idx is not None and len(idx) for idx in state_indices)
+        ):
             self.kv_mgr.transfer_statuses[self.bootstrap_room].expects_state = True
 
         self.started_transfer = True
@@ -3331,11 +3415,24 @@ class NixlKVReceiver(CommonKVReceiver):
         return KVPoll.WaitingForInput  # type: ignore
 
     def _register_kv_args(self) -> bool:
+        layout = self.kv_mgr.paired_dsa_layout
         for bootstrap_info in self.bootstrap_infos:
             transfer_metadata = bootstrap_info.get("transfer_metadata")
+            bootstrap_info.pop("verified_paired_dsa_agent", None)
             if transfer_metadata is not None:
                 try:
-                    self.kv_mgr._prefill_peer_registrar.register(transfer_metadata)
+                    registrar = self.kv_mgr._prefill_peer_registrar
+                    registrar.register(transfer_metadata)
+                    advertised_agent = transfer_metadata.get("paired_dsa_agent")
+                    if (
+                        not bootstrap_info["is_dummy"]
+                        and layout is not None
+                        and transfer_metadata.get("paired_dsa_v1") == layout
+                        and advertised_agent
+                        and advertised_agent
+                        == registrar.accepted_peer(transfer_metadata)
+                    ):
+                        bootstrap_info["verified_paired_dsa_agent"] = advertised_agent
                     recovery = getattr(self.kv_mgr, "_peer_recovery", None)
                     if recovery is not None:
                         recovery.remember_producer(

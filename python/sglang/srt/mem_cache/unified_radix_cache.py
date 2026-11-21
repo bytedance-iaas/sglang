@@ -87,6 +87,7 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetricsCollector,
 )
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_memory,
     get_model,
     get_observability,
@@ -205,6 +206,21 @@ class UnifiedRadixCache(BasePrefixCache):
             params=params,
             components=self.components,
         )
+        self._decode_input_only_cache = (
+            envs.SGLANG_PD_DECODE_CACHE_INPUT_ONLY.get()
+            and get_disagg().disaggregation_mode == "decode"
+        )
+        if self._decode_input_only_cache and (
+            self.disable
+            or not self.tree_core.is_eagle
+            or self.tree_components != (ComponentType.FULL,)
+            or self.enable_session_radix_cache
+            or self._tree_core_backend != "python"
+        ):
+            raise ValueError(
+                "SGLANG_PD_DECODE_CACHE_INPUT_ONLY requires an enabled Python "
+                "EAGLE FULL-only radix cache without session tracking"
+            )
         # Components execute boundary actions through the tree core.
         for component in self.components.values():
             component.tree_core = self.tree_core
@@ -350,6 +366,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
+        if self._decode_input_only_cache:
+            raise ValueError(
+                "Input-only decode caching does not support external KV stores"
+            )
         self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
 
     def reset(self) -> None:
@@ -385,6 +405,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
+        if self._decode_input_only_cache:
+            raise ValueError("Input-only decode caching does not support HiCache")
         self.host_memory_mode = get_memory().hicache_host_memory_mode
         if self.host_memory_mode == "buffer_only":
             # TODO(Jialin): Extend buffer-only state handoff to Mamba in a
@@ -835,6 +857,12 @@ class UnifiedRadixCache(BasePrefixCache):
             return DecLockRefResult()
         return self.tree_core.dec_host_lock_ref(node_id, params)
 
+    def _cacheable_token_count(self, req: Req, token_count: int) -> int:
+        if self._decode_input_only_cache:
+            # Apply the input boundary before EAGLE bigrams and page alignment.
+            return min(token_count, len(req.origin_input_ids))
+        return token_count
+
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
     ) -> None:
@@ -862,7 +890,7 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
             # components prepare insert data + return effective cache_len
-            effective_cache_len = len(token_ids)
+            effective_cache_len = self._cacheable_token_count(req, len(token_ids))
             for comp in self._components_tuple:
                 cl = comp.prepare_for_caching_req(
                     req=req,
@@ -945,7 +973,7 @@ class UnifiedRadixCache(BasePrefixCache):
             chunked=chunked,
             priority=getattr(req, "priority", 0) or 0,
         )
-        effective_cache_len = len(token_ids)
+        effective_cache_len = self._cacheable_token_count(req, len(token_ids))
         for comp in self._components_tuple:
             cl = comp.prepare_for_caching_req(
                 req=req,
@@ -990,11 +1018,20 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params.value = values
         result = self.insert(insert_params)
 
-        # Match prefix. SWA insertion retains one extra window before the
-        # page-aligned boundary, so the normal match remains safe to repoint.
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key, req=req))
-        new_indices = match_result.device_indices
-        new_last_node = match_result.last_device_node
+        if self._decode_input_only_cache:
+            # Protect the entire canonical range the tree just took ownership of.
+            new_last_node = result.last_device_node
+            assert new_last_node is not None
+            new_indices = self.tree_core.collect_full_device_indices(
+                new_last_node, self.root_node_handle()
+            )
+            assert len(new_indices) == page_aligned_len
+        else:
+            # SWA insertion retains one extra window before the page-aligned
+            # boundary, so the normal match remains safe to repoint.
+            match_result = self.match_prefix(MatchPrefixParams(key=radix_key, req=req))
+            new_indices = match_result.device_indices
+            new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
         assert (
             req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1

@@ -155,7 +155,7 @@ class TestNixlBootstrapMetadata(CustomTestCase):
         receiver = NixlKVReceiver.__new__(NixlKVReceiver)
         receiver.bootstrap_room = 42
         receiver.conclude_state = None
-        receiver.bootstrap_infos = [{"transfer_metadata": metadata}]
+        receiver.bootstrap_infos = [{"transfer_metadata": metadata, "is_dummy": False}]
         args = SimpleNamespace(
             kv_data_ptrs=[],
             kv_data_mem_kinds=[],
@@ -173,6 +173,7 @@ class TestNixlBootstrapMetadata(CustomTestCase):
             kv_args=args,
             agent=agent,
             _prefill_peer_registrar=PrefillPeerRegistrar(agent, "UCX"),
+            paired_dsa_layout=None,
             enable_staging=False,
             local_ip="192.168.0.7",
             rank_port=1234,
@@ -207,6 +208,20 @@ class TestNixlBootstrapMetadata(CustomTestCase):
         self.assertTrue(receiver._register_kv_args())
         self.assertEqual(events, ["export", "send"])
         self.assertEqual(agent.loads, [])
+
+    def test_paired_prefix_requires_reconciled_layout_and_agent(self):
+        for layout, peer, expected in (
+            ("layout-v1", "prefill", True),
+            ("other-layout", "prefill", False),
+            ("layout-v1", "previous-agent", False),
+        ):
+            with self.subTest(layout=layout, peer=peer):
+                metadata = self.metadata()
+                metadata.update(paired_dsa_v1=layout, paired_dsa_agent=peer)
+                receiver, _, _, _ = self.make_receiver(metadata)
+                receiver.kv_mgr.paired_dsa_layout = "layout-v1"
+                self.assertTrue(receiver._register_kv_args())
+                self.assertEqual(receiver.supports_paired_prefix(), expected)
 
 
 if __name__ == "__main__":

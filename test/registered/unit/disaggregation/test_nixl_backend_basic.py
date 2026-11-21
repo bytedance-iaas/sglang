@@ -23,6 +23,7 @@ from sglang.srt.disaggregation.nixl.conn import (
     TransferInfo,
     TransferKVChunk,
     TransferStatus,
+    _paired_dsa_state_suffix,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -149,6 +150,36 @@ class TestNixlTransferInfo(CustomTestCase):
 
         self.assertEqual(info.dst_state_indices, [])
         self.assertIsNone(info.decode_prefix_len)
+        self.assertIsNone(info.paired_prefix_source_agent)
+
+    def test_paired_dsa_transfers_the_same_logical_suffix_on_both_sides(self):
+        source = [np.array([11, 18, 47], dtype=np.int32)]
+        destination = [[5]]
+        msg = [
+            b"9",
+            b"127.0.0.1",
+            b"12347",
+            b"decode_agent",
+            np.array([5], dtype=np.int32).tobytes(),
+            b"2",
+            b"1",
+            pack_int_lists(destination, "i"),
+            b"128",
+            b"0",
+            b"prefill-generation",
+        ]
+        info = TransferInfo.from_zmq(msg)
+        self.assertEqual(info.paired_prefix_source_agent, "prefill-generation")
+        suffix = _paired_dsa_state_suffix(
+            source, info.dst_state_indices, info.decode_prefix_len, 64
+        )
+        np.testing.assert_array_equal(suffix[0], [47])
+        np.testing.assert_array_equal(source[0], [11, 18, 47])
+        self.assertIsNone(_paired_dsa_state_suffix(source, [[]], 192, 64))
+        with self.assertRaisesRegex(RuntimeError, "suffix span mismatch"):
+            _paired_dsa_state_suffix(source, destination, 127, 64)
+        with self.assertRaisesRegex(RuntimeError, "suffix span mismatch"):
+            _paired_dsa_state_suffix(source, [[5, 8]], 128, 64)
 
     def test_decode_radix_full_hit_is_not_dummy(self):
         info = TransferInfo.from_zmq(
