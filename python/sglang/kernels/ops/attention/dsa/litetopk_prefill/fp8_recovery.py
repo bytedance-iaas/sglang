@@ -87,7 +87,7 @@ def _jit_module(num_heads: int, topk: int) -> Module:
         "dsa_prefill_fp8_litetopk_recovery",
         *args,
         cuda_files=["dsa/litetopk_prefill/recovery/fp8_indexer_topk.cuh"],
-        cuda_wrappers=[("run", f"Fp8IndexerTopKRecoveryKernel<{args}>::run")],
+        cuda_wrappers=[("run", f"sglang::Fp8IndexerTopKRecoveryKernel<{args}>::run")],
         extra_cuda_cflags=["-Xcicc", "-disable-new-nvvm-remat"],
         extra_dependencies=["cutlass"],
     )

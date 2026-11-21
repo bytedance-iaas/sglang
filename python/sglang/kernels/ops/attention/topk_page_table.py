@@ -28,7 +28,7 @@ def _jit_topk_page_table_transform_module(page_size: int, topk: int) -> Module:
         "topk_page_table_transform",
         *args,
         cuda_files=["attention/topk_page_table_transform.cuh"],
-        cuda_wrappers=[("run", f"TopkPageTableTransformKernel<{args}>::run")],
+        cuda_wrappers=[("run", f"sglang::TopkPageTableTransformKernel<{args}>::run")],
     )
 
 
