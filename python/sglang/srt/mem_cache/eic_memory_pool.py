@@ -21,10 +21,9 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.memory_pool_host import synchronized
 from sglang.srt.runtime_context import get_parallel
 
-try:
-    import eic
-except ImportError:
-    eic = None
+# Loading the native EIC extension can interpose symbols in unrelated CUDA
+# extensions. Only load it when an EIC client is actually selected.
+eic = None
 
 logger = logging.getLogger(__name__)
 
@@ -198,8 +197,14 @@ class EICKVClient:
     """
 
     def __init__(self, kv_cache_dtype, kv_cache_shape, device_pool, device="cpu"):
+        global eic
         if eic is None:
-            raise ImportError("eic module is not found, please install eic package")
+            try:
+                import eic
+            except ImportError as exc:
+                raise ImportError(
+                    "eic module is not found, please install eic package"
+                ) from exc
         global G_EnableKVSetGPUDirect, G_EnableKVGetGPUDirect, G_EnableAsyncKVSet
         global GPUNicAffinity, CPUNicAffinity, G_EnableGPUNicAffinity, G_KVSetTTLOption
         global G_GDRBounceBufferSize, G_GDRBounceTensorCount

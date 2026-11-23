@@ -1,7 +1,9 @@
 import os
+import subprocess
 import sys
 import unittest
 from queue import Queue
+from textwrap import dedent
 from types import SimpleNamespace
 from unittest import mock
 
@@ -44,6 +46,41 @@ class FakeDeviceAllocator:
 
 
 class TestEICHiCacheRegression(unittest.TestCase):
+    def test_native_eic_is_imported_only_when_client_is_selected(self):
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                dedent("""
+                    import importlib.abc
+                    import sys
+
+                    attempts = []
+
+                    class MissingEIC(importlib.abc.MetaPathFinder):
+                        def find_spec(self, fullname, path=None, target=None):
+                            if fullname == "eic":
+                                attempts.append(fullname)
+                                raise ModuleNotFoundError(fullname, name=fullname)
+
+                    sys.meta_path.insert(0, MissingEIC())
+                    from sglang.srt.mem_cache.eic_memory_pool import EICKVClient
+                    assert not attempts
+                    assert "eic" not in sys.modules
+                    try:
+                        EICKVClient(None, None, None)
+                    except ImportError as exc:
+                        assert "please install eic package" in str(exc)
+                        assert isinstance(exc.__cause__, ModuleNotFoundError)
+                    else:
+                        raise AssertionError("EIC selection must require the EIC package")
+                    assert attempts == ["eic"]
+                    """),
+            ],
+            check=True,
+            timeout=40,
+        )
+
     def test_match_from_remote_skips_zero_committed_tokens(self):
         cache = object.__new__(EICPagedHiRadixCache)
         cache.match_req_set = {}
