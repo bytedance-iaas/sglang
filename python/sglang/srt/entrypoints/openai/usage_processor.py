@@ -10,9 +10,9 @@ class UsageProcessor:
     """Stateless helpers that turn raw token counts into a UsageInfo."""
 
     @staticmethod
-    def _details_if_cached(count: int) -> Optional[PromptTokensDetails]:
-        """Return PromptTokensDetails only when count > 0 (keeps JSON slim)."""
-        return PromptTokensDetails(cached_tokens=count) if count > 0 else None
+    def _details_if_cached(count: Optional[int]) -> Optional[PromptTokensDetails]:
+        """Preserve reported zero counts while leaving missing counts unknown."""
+        return PromptTokensDetails(cached_tokens=count) if count is not None else None
 
     @staticmethod
     def calculate_response_usage(
@@ -38,9 +38,14 @@ class UsageProcessor:
 
         cached_details = None
         if enable_cache_report:
-            cached_total = sum(
-                responses[i]["meta_info"].get("cached_tokens", 0)
+            counts = [
+                responses[i]["meta_info"].get("cached_tokens")
                 for i in range(0, len(responses), n_choices)
+            ]
+            cached_total = (
+                sum(counts)
+                if counts and all(count is not None for count in counts)
+                else None
             )
             cached_details = UsageProcessor._details_if_cached(cached_total)
 
@@ -59,7 +64,7 @@ class UsageProcessor:
         prompt_tokens: Mapping[int, int],
         reasoning_tokens: Mapping[int, int],
         completion_tokens: Mapping[int, int],
-        cached_tokens: Mapping[int, int],
+        cached_tokens: Mapping[int, Optional[int]],
         n_choices: int,
         enable_cache_report: bool = False,
         image_tokens: int = 0,
@@ -73,13 +78,19 @@ class UsageProcessor:
         total_reasoning_tokens = sum(reasoning_tokens.values())
         total_completion_tokens = sum(completion_tokens.values())
 
-        cached_details = (
-            UsageProcessor._details_if_cached(
-                sum(tok for idx, tok in cached_tokens.items() if idx % n_choices == 0)
+        cached_details = None
+        if enable_cache_report:
+            counts = [
+                cached_tokens.get(idx)
+                for idx in prompt_tokens
+                if idx % n_choices == 0
+            ]
+            cached_total = (
+                sum(counts)
+                if counts and all(count is not None for count in counts)
+                else None
             )
-            if enable_cache_report
-            else None
-        )
+            cached_details = UsageProcessor._details_if_cached(cached_total)
 
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=total_prompt_tokens,
