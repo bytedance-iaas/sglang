@@ -72,6 +72,14 @@ class EPLBStageDomain:
                 f"ranks={global_ranks}, node_ids={node_ids}"
             )
 
+        device_group = group.device_group
+        if group.world_size == launch_world_size:
+            # Full-world PP1 migration shares the transport warmed by bootstrap.
+            # NPU uses its existing TP group instead of the default group.
+            from sglang.srt.eplb.expert_location import get_eplb_group
+
+            device_group = get_eplb_group()
+
         return cls(
             pp_rank=parallel.pp_rank,
             global_rank=group.rank,
@@ -80,7 +88,7 @@ class EPLBStageDomain:
             global_ranks=global_ranks,
             node_ids=node_ids,
             root_global_rank=group.first_rank,
-            device_group=group.device_group,
+            device_group=device_group,
             cpu_group=group.cpu_group,
         )
 
