@@ -2,6 +2,7 @@
 
 import math
 import re
+import secrets
 import tempfile
 import unittest
 from contextlib import ExitStack
@@ -11,6 +12,7 @@ import requests
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.utils.auth import admin_auth_headers
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
@@ -37,6 +39,7 @@ class _PPEPLBServer(CustomTestCase):
         cls.dumps.mkdir()
         cls.log = (cls.root / "server.log").open("w")
         cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.admin_api_key = secrets.token_urlsafe(24)
         args = [
             "--trust-remote-code",
             "--tp-size",
@@ -68,6 +71,7 @@ class _PPEPLBServer(CustomTestCase):
             args.append("--enable-eplb")
         with ExitStack() as stack:
             for field, value in (
+                (envs.SGLANG_ADMIN_API_KEY, cls.admin_api_key),
                 (envs.SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR, str(cls.dumps)),
                 (envs.SGLANG_EXPERT_LOCATION_UPDATER_CANARY, True),
                 (envs.SGLANG_LOG_EXPERT_LOCATION_METADATA, True),
@@ -92,7 +96,9 @@ class _PPEPLBServer(CustomTestCase):
 
     def control(self, action, *, status=200):
         response = requests.post(
-            f"{self.base_url}/{action}_expert_distribution_record", timeout=120
+            f"{self.base_url}/{action}_expert_distribution_record",
+            headers=admin_auth_headers(self.admin_api_key),
+            timeout=120,
         )
         self.assertEqual(response.status_code, status, response.text)
         return response
