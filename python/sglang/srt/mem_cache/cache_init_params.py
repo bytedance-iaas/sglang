@@ -58,3 +58,6 @@ class CacheInitParams:
     tree_core_backend: Optional[str] = dataclasses.field(default=None, kw_only=True)
 
     mtp_draft_device_pools: tuple[object, ...] = ()
+
+    # Decode may receive request-private SWA fresh while reusing FULL pages.
+    swa_gates_prefix_match: bool = True

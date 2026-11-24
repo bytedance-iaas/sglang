@@ -56,6 +56,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    _all_reduce_polls,
     _is_fake_transfer,
     build_kv_layer_ids,
     build_staging_slot_metadata,
@@ -77,11 +78,15 @@ from sglang.srt.managers.schedule_batch import (
     NextBatchPlan,
     ScheduleBatch,
 )
+from sglang.srt.managers.scheduler_components.pool_stats_observer import (
+    kv_private_swa_tokens,
+    kv_private_tokens,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocation import ensure_mamba_capacity
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
+from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring, uses_swa_tail_prealloc
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     EvictParams,
@@ -105,7 +110,6 @@ from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     ReqToTokenPool,
 )
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
@@ -470,10 +474,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.scheduler.kv_checksum_computer = None
 
     def _uses_swa_tail_prealloc(self) -> bool:
-        return (
-            isinstance(self.token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool))
-            and self.token_to_kv_pool_allocator.page_size > 1
-            and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
+        return uses_swa_tail_prealloc(
+            self.token_to_kv_pool, self.token_to_kv_pool_allocator
         )
 
     def _uses_swa_reservation(self) -> bool:
@@ -501,13 +503,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         full_allocatable_tokens: int,
         swa_allocatable_tokens: Optional[int],
     ) -> bool:
-        return self.token_to_kv_pool_allocator.prealloc_fits(
+        fits = self.token_to_kv_pool_allocator.prealloc_fits(
             self.tree_cache,
             full_tokens,
             swa_tokens,
             full_budget_tokens=full_allocatable_tokens,
             swa_budget_tokens=swa_allocatable_tokens,
         )
+        if (
+            isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+            and not self.token_to_kv_pool._unified_kv
+        ):
+            # A rank-local shortage must not leave peers allocating/publishing
+            # the same request while this rank exits the admission loop.
+            fits = bool(_all_reduce_polls([int(fits)], self.gloo_group)[0])
+        return fits
 
     def _reclaim_swa_tail_capacity(
         self, swa_tail_len: int, req_id: str, *, full_len: int = 0
@@ -1511,20 +1521,32 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     failed_reqs.append(decode_req)
                     indices_to_remove.add(i)
                     continue
+            if self.scheduler.enable_decode_hicache:
+                # Prefill is promised only the L3 span the prefetch took.
+                self._start_hicache_prefetch(decode_req.req, prefix_match)
+                if prefix_match is not None:
+                    total_prefix_len = prefix_match.decode_prefix_len
+            reserved_device_tokens = (
+                prefix_match.reserved_device_tokens if prefix_match is not None else 0
+            )
+            reservation_kwargs = (
+                {"reserved_restore_tokens": reserved_device_tokens}
+                if reserved_device_tokens
+                else {}
+            )
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
                 prefix_len,
                 total_prefix_len,
+                **reservation_kwargs,
             )
             decode_req.prefix_match = prefix_match
-            if self.scheduler.enable_decode_hicache:
-                self._start_hicache_prefetch(decode_req.req, prefix_match)
             hisparse_req_budget -= 1
             # Recompute from actual pool state for the next queue entry.
             # This accounts for page rounding and newly locked evictable cache.
             if prefix_match is not None:
-                reserved_restore_tokens += prefix_match.restore_token_count
+                reserved_restore_tokens += prefix_match.unallocated_restore_tokens
             full_allocatable_tokens = self._allocatable_token_budgets(
                 retractable_tokens=retractable_tokens,
                 count_retracted=True,
@@ -1842,11 +1864,24 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     @property
     def num_tokens_pre_allocated(self):
-        return sum(
-            decode_req.req.extend_end
-            for decode_req in self.transfer_queue.queue
-            if not decode_req.host_staged
-        )
+        return self.pre_allocated_token_counts()[0]
+
+    def pre_allocated_token_counts(self) -> Tuple[int, int]:
+        """(full, SWA) slots held for transfer-queue requests.
+
+        Include the File prefetch's real FULL reservation before it is redeemed
+        into the tree. Its incoming suffix is already in the request KV row.
+        """
+        page_size = self.token_to_kv_pool_allocator.page_size
+        full_tokens = swa_tokens = 0
+        for decode_req in self.transfer_queue.queue:
+            if decode_req.host_staged:
+                continue
+            full_tokens += kv_private_tokens(decode_req.req.kv, page_size)
+            if decode_req.prefix_match is not None:
+                full_tokens += decode_req.prefix_match.reserved_device_tokens
+            swa_tokens += kv_private_swa_tokens(decode_req.req.kv, page_size)
+        return full_tokens, swa_tokens
 
     def _need_space_for_single_req(
         self, retractable_tokens: Optional[int] = None
@@ -2064,6 +2099,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         prefix_indices: Optional[torch.Tensor] = None,
         prefix_len: Optional[int] = None,
         total_prefix_len: Optional[int] = None,
+        *,
+        reserved_restore_tokens: int = 0,
     ) -> torch.Tensor:
         """Pre-allocate the memory for req_to_token and token_kv_pool.
 
@@ -2099,6 +2136,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         required_alloc_tokens = self._required_alloc_tokens(
             fill_len=fill_len, prefix_len=prefix_len
         )
+
+        # A File restore already owns its GPU gap. Only the remaining pages
+        # need reclaiming; charging the reservation again can evict peers.
+        assert 0 <= reserved_restore_tokens <= total_prefix_len - prefix_len
+        required_alloc_tokens -= reserved_restore_tokens
 
         # Evict cached entries if the pool doesn't have enough free pages.
         if (

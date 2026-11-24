@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
+from sglang.srt.mem_cache.allocator.swa import uses_swa_tail_prealloc
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -36,7 +37,7 @@ from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
+from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel, get_serving
 
 if TYPE_CHECKING:
     import torch
@@ -690,6 +691,118 @@ def _dsv4_indexer_regions(kvcache: Any, page_size: int) -> list[_IndexerRegion]:
             page_aligned_only=True,
         ),
     ]
+
+
+@dataclass(frozen=True)
+class _Dsv4PersistentBufferInfo:
+    buffers: tuple[Any, ...]
+    page_slots: int
+    page_bytes: int
+    layout: str
+
+
+@dataclass(frozen=True)
+class _Dsv4PersistentPoolInfo:
+    pool_name: PoolName
+    layer_ids: tuple[int, ...]
+    buffer_info: _Dsv4PersistentBufferInfo
+    indices_from_pool: PoolName = PoolName.KV
+
+
+def describe_dsv4_persistent_pools(kvcache: Any, page_size: int) -> tuple:
+    """Read physical owner pages without allocating host pools or private state.
+
+    The target branch exposes these native buffers directly, rather than via
+    DevicePoolInfo. Plan and namespace consumers share this one descriptor.
+    Layer IDs remain global owner IDs, including a PP-local replicated source.
+    """
+    import torch
+
+    names_by_ratio = {
+        1: (
+            PoolName.DEEPSEEK_V4_C1,
+            PoolName.DEEPSEEK_V4_C1_INDEXER,
+            PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE,
+        ),
+        2: (
+            PoolName.DEEPSEEK_V4_C2,
+            PoolName.DEEPSEEK_V4_C2_INDEXER,
+            PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE,
+        ),
+        4: (
+            PoolName.DEEPSEEK_V4_C4,
+            PoolName.DEEPSEEK_V4_C4_INDEXER,
+            PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
+        ),
+        128: (PoolName.DEEPSEEK_V4_C128, None, None),
+    }
+    infos = []
+
+    def append(name, layers, buffers, slots, layout):
+        if not buffers or len(buffers) != len(layers):
+            raise ValueError("Persistent pool owner and buffer counts differ")
+        if slots <= 0 or page_size % slots:
+            raise ValueError("Persistent physical pages must divide logical pages")
+        infos.append(
+            _Dsv4PersistentPoolInfo(
+                name,
+                layers,
+                _Dsv4PersistentBufferInfo(
+                    tuple(buffers),
+                    int(slots),
+                    int(buffers[0][0].numel() * buffers[0].element_size()),
+                    layout,
+                ),
+            )
+        )
+
+    for ratio, sources in kvcache.sources_by_ratio.items():
+        if not sources:
+            continue
+        names = names_by_ratio[ratio]
+        layers = tuple(sources)
+        kv_pool = kvcache.kv_pools[ratio]
+        if getattr(kvcache, "_unified_kv", False):
+            buffers, _ = _dsv4_compressed_region_buffers(kvcache, ratio)
+            append(names[0], layers, buffers, page_size // ratio, "unified")
+            rope = _dsv4_rope_sibling(kvcache, ratio)
+            if rope is not None:
+                append(rope[0], layers, rope[1], page_size // ratio, "unified")
+        else:
+            append(
+                names[0],
+                layers,
+                kv_pool.kv_buffer,
+                kv_pool.page_size,
+                kv_pool.kv_layout.value,
+            )
+        index = kvcache.index_pools.get(ratio)
+        if index is None:
+            continue
+        if index.index_k_with_scale_buffer is not None:
+            append(
+                names[1],
+                layers,
+                index.index_k_with_scale_buffer,
+                index.index_page_size,
+                "index_fused",
+            )
+        else:
+            slots = index.index_k_payload_buffer[0].shape[3]
+            if index.index_k_scale_buffer[0].shape[3] != slots:
+                raise ValueError("FP4 payload and scale page slots differ")
+            for name, buffers in (
+                (names[1], index.index_k_payload_buffer),
+                (names[2], index.index_k_scale_buffer),
+            ):
+                append(
+                    name,
+                    layers,
+                    [buffer.view(torch.uint8).flatten(1) for buffer in buffers],
+                    slots,
+                    "index_fp4",
+                )
+    return tuple(infos)
 
 
 def _dsv4_low_ratio_entries(
@@ -1749,6 +1862,14 @@ class _DeepSeekV4Strategy(StackStrategy):
             enable_storage_metrics=enable_storage_metrics,
             layer_mappings=layer_mappings,
         )
+        # Decode receives fresh request-local SWA/state from Prefill. Never
+        # restore a previous request's tail over the incoming transfer.
+        fresh_decode_tail = (
+            get_disagg().disaggregation_mode == "decode"
+            and get_disagg().disaggregation_decode_enable_radix_cache
+            and any(r in (1, 2) for r in kvcache.compression_ratios)
+            and uses_swa_tail_prealloc(kvcache, params.token_to_kv_pool_allocator)
+        )
         # NPU drives C128 as an independent tree component, so adding a KV-derived
         # sidecar would duplicate transfers. Add that sidecar only on GPU.
         # The *_ROPE entries only resolve under unified fp8 kv; entry_map filters
@@ -1783,11 +1904,12 @@ class _DeepSeekV4Strategy(StackStrategy):
             )
             for name, src in _sidecar_srcs
             if name in host_pool_group.entry_map
+            and not (fresh_decode_tail and src == PoolName.SWA)
         ]
         component_host_pools = {
             ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
         }
-        if PoolName.SWA in host_pool_group.entry_map:
+        if not fresh_decode_tail and PoolName.SWA in host_pool_group.entry_map:
             component_host_pools[ComponentType.SWA] = host_pool_group.get_pool(
                 PoolName.SWA
             )

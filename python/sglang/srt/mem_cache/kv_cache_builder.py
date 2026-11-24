@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.runtime_context import get_exec
 
@@ -37,9 +38,13 @@ from sglang.srt.configs.hybrid_arch import (
 from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
+from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring, uses_swa_tail_prealloc
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.dsv4_decode_storage_config import (
+    validate_dsv4_decode_storage_config,
+)
 from sglang.srt.mem_cache.hicache_auto_size import auto_size_hicache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import _WRITE_BACK_STAGING_PAGE_CHUNK
@@ -54,6 +59,8 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
     get_schedule,
+    get_serving,
+    get_spec,
 )
 from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
 from sglang.srt.utils import ceil_align, is_hip
@@ -244,6 +251,185 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
     return backend
 
 
+def swa_gates_tree_prefix_match(token_to_kv_pool, token_to_kv_pool_allocator) -> bool:
+    # Decode caps FULL reuse before the window, then allocates and receives a
+    # fresh tail. Its old tree SWA must not discard that reusable FULL prefix.
+    return not (
+        is_swa_req_ring(token_to_kv_pool_allocator)
+        or (
+            isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+            and token_to_kv_pool.request_window is not None
+        )
+        or (
+            get_disagg().disaggregation_mode == "decode"
+            and get_disagg().disaggregation_decode_enable_radix_cache
+            and uses_swa_tail_prealloc(token_to_kv_pool, token_to_kv_pool_allocator)
+        )
+    )
+
+
+def _validate_dsv41_decode_dspark(
+    model_config: ModelConfig,
+    token_to_kv_pool: DeepSeekV4TokenToKVPool,
+    token_to_kv_pool_allocator: object,
+) -> None:
+    """Admit the paged DSpark profile without bypassing PD state registration.
+
+    The draft pool is not an input to this admission API. Its shared mapping
+    and paired SWA geometry are checked by static_kv_storage; get_dsv41_spec_layout checks
+    the target/draft wire layout before a peer can transfer request state.
+    """
+    from sglang.srt.speculative.ragged_verify import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
+    )
+
+    spec = get_spec()
+    disagg = get_disagg()
+    features = get_exec().features
+    if (
+        str(spec.speculative_algorithm).upper() != "DSPARK"
+        or getattr(getattr(model_config, "hf_config", None), "model_type", None)
+        != "deepseek_v41"
+        or getattr(
+            getattr(model_config, "hf_text_config", None), "dspark_block_size", None
+        )
+        != 5
+        or spec.speculative_num_draft_tokens != 6
+        or type(token_to_kv_pool) is not DeepSeekV4TokenToKVPool
+        or token_to_kv_pool.kv_layout is not KVLayout.V4
+        or set(token_to_kv_pool.compression_ratios) != {0, 1, 2}
+        or token_to_kv_pool.page_size != 256
+        or token_to_kv_pool.request_window is not None
+        or getattr(token_to_kv_pool, "swa_req_ring_size", None) is not None
+        or get_exec().kernel.dsv4_attn_backend != "flashmla"
+        or features.enable_encoder_swa_bounded_replay
+        or features.enable_decoder_swa_bounded_replay is not False
+        or disagg.disaggregation_mode != "decode"
+        or not disagg.disaggregation_decode_enable_radix_cache
+        or disagg.disaggregation_transfer_backend != "mooncake"
+        or read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
+        or token_to_kv_pool_allocator is None
+        or not uses_swa_tail_prealloc(token_to_kv_pool, token_to_kv_pool_allocator)
+    ):
+        raise ValueError(
+            "DeepSeek-V4 CUDA paged decode radix cache with speculative decoding "
+            "requires DeepSeek-V4.1 DSPARK with six verify tokens, native V4 "
+            "C1/C2 page256 pools, flashmla, static verify, Mooncake PD and a fresh "
+            "SWA tail allocator, with encoder/decoder bounded replay disabled."
+        )
+
+
+def validate_decode_radix_cache(
+    *,
+    model_config: ModelConfig,
+    token_to_kv_pool: object,
+    is_hybrid_swa: bool,
+    enable_hierarchical_cache: bool,
+    token_to_kv_pool_allocator: object = None,
+) -> None:
+    """Reject decode-side radix cache on KV layouts its prefix reuse cannot serve.
+
+    SWA models go through the unified tree, whose component pools preserve the
+    full-attention prefix while the SWA window is transferred fresh. Hybrid
+    SSM/KDA uses UnifiedRadixCache's Mamba component (match + lock + CoW), the
+    same path as colocated serving.
+    """
+    is_dsv4 = getattr(model_config, "is_deepseek_v4_arch", False)
+    if not is_hybrid_swa and not is_dsv4:
+        return
+    # Paged CUDA KV transfers suffix pages plus fresh request state through the
+    # same protocol as unified KV. Admit the native pool and known main layouts;
+    # keep the previously supported unified-KV path unchanged.
+    if is_dsv4 and not getattr(token_to_kv_pool, "_unified_kv", False):
+        if (
+            is_hip()
+            or not isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+            or str(token_to_kv_pool.device).split(":")[0] != "cuda"
+            or token_to_kv_pool.kv_layout not in (KVLayout.V4, KVLayout.V41)
+        ):
+            raise ValueError(
+                "DeepSeek-V4 decode radix cache requires native CUDA paged KV "
+                "or the unified KV layout."
+            )
+        if get_spec().speculative_algorithm is not None:
+            _validate_dsv41_decode_dspark(
+                model_config, token_to_kv_pool, token_to_kv_pool_allocator
+            )
+        parallel = get_parallel()
+        if (
+            parallel.attn_cp_size != 1
+            or parallel.pp_size != 1
+            or parallel.attn_dp_size != 1
+            or parallel.dcp_enabled
+        ):
+            raise ValueError(
+                "DeepSeek-V4 CUDA paged decode radix cache currently requires "
+                "CP1/PP1 without DP attention or DCP."
+            )
+    if enable_hierarchical_cache:
+        # Decode restores persistent compressed pages, never request-local SWA.
+        # File L3 uses the same verified Host stack and request readiness gate.
+        if (
+            not is_dsv4
+            or not isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+            or getattr(token_to_kv_pool, "_unified_kv", False)
+            or not any(r in (1, 2) for r in token_to_kv_pool.compression_ratios)
+            or token_to_kv_pool_allocator is None
+            or not uses_swa_tail_prealloc(token_to_kv_pool, token_to_kv_pool_allocator)
+        ):
+            raise ValueError(
+                "DeepSeek-V4 decode --enable-hierarchical-cache requires native "
+                "C1/C2 pools and a fresh SWA tail allocator."
+            )
+        memory = get_memory()
+        if (
+            memory.hicache_host_memory_mode != "cache"
+            or memory.hicache_storage_backend not in (None, "file", "mooncake")
+            or memory.enable_unified_cache_external_linker
+            or memory.enable_hisparse
+        ):
+            raise ValueError(
+                "DeepSeek-V4 decode radix cache supports Host L2, File or namespaced Mooncake L3 in cache "
+                "mode, without external linkers or HiSparse."
+            )
+        if (
+            memory.hicache_storage_backend in ("file", "mooncake")
+            and type(token_to_kv_pool) is not DeepSeekV4TokenToKVPool
+        ):
+            raise ValueError(
+                "DeepSeek-V4 Decode L3 requires the exact native paged pool; "
+                "unverified pool subclasses cannot use a generic storage plan."
+            )
+        if memory.hicache_storage_backend in ("file", "mooncake") and set(
+            token_to_kv_pool.compression_ratios
+        ) - {0, 1, 2}:
+            raise ValueError("Decode L3 supports native C1/C2 persistent pools only.")
+        extra = None
+        if memory.hicache_storage_backend is not None:
+            from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+                HybridCacheController,
+            )
+
+            extra, *_ = HybridCacheController.parse_storage_backend_extra_config(
+                memory.hicache_storage_backend_extra_config
+            )
+        validate_dsv4_decode_storage_config(
+            backend=memory.hicache_storage_backend,
+            host_memory_mode=memory.hicache_host_memory_mode,
+            write_policy=memory.hicache_write_policy,
+            prefetch_policy=memory.hicache_storage_prefetch_policy,
+            extra_config=extra,
+            file_storage_path=get_serving().file_storage_path,
+            file_storage_path_override=envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get(),
+        )
+    if getattr(model_config, "is_hybrid_swa_compress", False):
+        raise ValueError(
+            "--disaggregation-decode-enable-radix-cache does not support "
+            "SWA-compress models (e.g. Gemma4 / MiMo-V2) yet."
+        )
+
+
 def build_kv_cache(
     *,
     server_args: ServerArgs,
@@ -282,6 +468,9 @@ def build_kv_cache(
 
     req_to_token_pool, token_to_kv_pool_allocator = tp_worker.get_memory_pool()
     mtp_draft_device_pools = tp_worker.model_runner.mtp_draft_device_pools
+    swa_gates_prefix_match = swa_gates_tree_prefix_match(
+        token_to_kv_pool, token_to_kv_pool_allocator
+    )
 
     retraction_backup = resolve_decode_retraction_backup(tp_worker=tp_worker)
 
@@ -302,24 +491,13 @@ def build_kv_cache(
         get_disagg().disaggregation_decode_enable_radix_cache
         and get_disagg().disaggregation_mode == "decode"
     ):
-        if is_hybrid_swa:
-            if enable_hierarchical_cache:
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache with sliding "
-                    "window attention (SWA) models currently supports only "
-                    "device-resident cache and is incompatible with "
-                    "--enable-hierarchical-cache."
-                )
-            if getattr(model_config, "is_deepseek_v4_arch", False):
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache does not support "
-                    "DeepSeek-V4 (DSA) compressed KV (c4/c128/indexer) yet."
-                )
-            if getattr(model_config, "is_hybrid_swa_compress", False):
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache does not support "
-                    "SWA-compress models (e.g. Gemma4 / MiMo-V2) yet."
-                )
+        validate_decode_radix_cache(
+            model_config=model_config,
+            token_to_kv_pool=token_to_kv_pool,
+            is_hybrid_swa=is_hybrid_swa,
+            enable_hierarchical_cache=enable_hierarchical_cache,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        )
 
     effective_chunked_prefill_size = get_schedule().chunked_prefill_size
     if model_config.is_multimodal and uses_transformers_backend:
@@ -356,6 +534,7 @@ def build_kv_cache(
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
         mtp_draft_device_pools=mtp_draft_device_pools,
+        swa_gates_prefix_match=swa_gates_prefix_match,
     )
 
     tree_context = TreeCacheBuildContext(

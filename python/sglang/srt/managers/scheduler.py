@@ -2384,6 +2384,7 @@ class Scheduler(
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
             get_chunked_req=lambda: self.chunked_req,
+            get_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
 
