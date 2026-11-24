@@ -143,7 +143,14 @@ class TestExpertDistributionControl(CustomTestCase):
             recorder._current_layer_idx = Withable()
             recorder._single_pass_gatherers = {}
             recorder._accumulator = Accumulator()
-            get_resources().expert_distribution_recorder = recorder
+            resources = get_resources()
+            self.addCleanup(
+                setattr,
+                resources,
+                "expert_distribution_recorder",
+                resources.expert_distribution_recorder,
+            )
+            resources.expert_distribution_recorder = recorder
             control = ExpertDistributionControl(tokenizer_ipc_name="unused")
             domain = SimpleNamespace(ep_size=1, pp_rank=0, root_global_rank=0)
             req = _request(1)
